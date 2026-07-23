@@ -2010,6 +2010,7 @@ export function forkWorker(
   if (ds.session.sandbox === undefined) {
     if (!resume) {
       ds.session.sandbox = botCfg.sandbox === true;
+      ds.session.sandboxPaths = botCfg.sandboxPaths;
       ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
       ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
       ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
@@ -2218,6 +2219,7 @@ export function forkWorker(
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,
+    sandboxPaths: ds.session.sandboxPaths ?? botCfg.sandboxPaths,
     sandboxHidePaths: ds.session.sandboxHidePaths ?? [],
     sandboxReadonlyPaths: ds.session.sandboxReadonlyPaths ?? [],
     sandboxNetwork: ds.session.sandboxNetwork !== false,
