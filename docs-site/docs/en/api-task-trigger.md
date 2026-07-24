@@ -279,6 +279,11 @@ Robustness notes (all from the tested contract):
 
 - **Async result files are not auto-reclaimed yet**: `data/async-triggers/<sessionId>.json` grows monotonically (intentional — deleting on session close would drop the `completed` result and break restart-survival). The upside: even if the session record is later cleaned up, `completed` is still queryable as long as the file exists; the cost is unbounded accumulation. A conservative TTL sweep (clean only after N days completed) is planned; this doc will be updated then.
 
+- **`output.content` may rarely carry a preamble**: botmux already steers the model at the source (the HTTP-response-mode prompt) to "output only the final answer, no preamble/meta-commentary", so the vast majority of replies are clean. But this is prompt-level guidance, not a hard guarantee — an occasional preamble line can still slip through. If you render `output.content` directly to users and need it "guaranteed clean", add a **conservative trim** at the **presentation layer** as a fallback:
+  - ✅ Strip only **known, deterministic preamble prefixes** (e.g. match fixed patterns like `This is a system routing header…` / `here's my answer:`, and keep **everything** after the match).
+  - ❌ **Do NOT** use aggressive extraction like "take the last non-empty paragraph" — `output.content` can be legitimately multi-paragraph (bulleted answers, code blocks), and aggressive extraction would drop the real body, a far worse correctness bug than an occasional preamble. Prefer showing a full answer with one stray preamble line over losing the body.
+  - Trim at the **presentation layer only**; **persist/audit/replay the raw `content`**.
+
 ---
 
 ## Appendix: endpoint cheatsheet
