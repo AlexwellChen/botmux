@@ -30,6 +30,8 @@ describe('worker app-runner control-channel wiring', () => {
     );
     const oldRunnerWrites: string[] = [];
     const replacementWrites: string[] = [];
+    // Model freshness queue hold/release semantics; production flushPending
+    // delivers at most one raw input per invocation before normal inputs.
     const flush = (writes: string[]): void => {
       const raw = queue.takeRaw();
       if (raw) writes.push(`raw:${raw}`);
@@ -82,6 +84,9 @@ describe('worker app-runner control-channel wiring', () => {
     expect(workerSource).toContain('freshnessInputQueue.takeNormal()');
     expect(workerSource).toContain('freshnessInputQueue.takeRaw()');
     expect(workerSource).toContain('freshnessInputQueue.onPromptReady()');
+    expect(workerSource).toContain(
+      "restartCliProcess('stale runner reached idle', { immediate: true, preservePending: true })",
+    );
   });
 
   it('keeps both input kinds held after replacement failure', () => {
