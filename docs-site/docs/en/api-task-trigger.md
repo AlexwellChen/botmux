@@ -214,6 +214,7 @@ async function runAndAwait(instruction: string, botId: string): Promise<Result> 
     const r = await getTriggerResult(sessionId); // normalized below
     switch (r.state) {
       case 'running':   await sleep(3000); continue;
+      case 'unknown':   await sleep(3000); continue; // query itself failed; task may still run — back off & retry
       case 'completed': return { ok: true, content: r.output.content };
       case 'failed':    return { ok: false, needsReconcile: true }; // soft terminal
       case 'not_found': return { ok: false, notFound: true };
@@ -221,13 +222,28 @@ async function runAndAwait(instruction: string, botId: string): Promise<Result> 
   }
 }
 
-// getTriggerResult normalizes the two physical forms of not_found
+// getTriggerResult normalizes the two physical forms of not_found — and ONLY
+// those two. Everything else is "unknown", not not_found.
 async function getTriggerResult(sessionId: string) {
   const res = await fetch(`/api/sessions/${sessionId}/trigger-result`, { headers: cookie() });
-  if (res.status === 404) return { state: 'not_found' };  // proxy short-circuit
-  const body = await res.json();
-  if (!body.ok) return { state: 'not_found' };            // fallback: a broken query is not "running"
-  return body;                                            // { state, output?, errorCode?, finishedAt? }
+
+  // The only two "confirmed no such session" → not_found:
+  //  (1) proxy short-circuit: HTTP 404 + {ok:false, error:"unknown_session"}
+  //  (2) daemon four-state:   HTTP 200 + {ok:true, state:"not_found"}
+  if (res.status === 404) {
+    const b = await res.json().catch(() => ({}));
+    if (b?.error === 'unknown_session') return { state: 'not_found' };
+  }
+  if (res.ok) {
+    const body = await res.json();
+    if (body?.state) return body; // { state, output?, errorCode?, finishedAt? }
+  }
+
+  // ⚠️ Everything else (401/403 auth, 5xx, 502 daemon-unreachable, network
+  // timeout, non-JSON…) is NOT not_found — the task is likely still running.
+  // Never treat it as "no such session" and re-dispatch, or you double-execute.
+  // Treat as "this poll is unknown"; back off and retry the SAME sessionId.
+  return { state: 'unknown' }; // caller: sleep & retry, do not change terminal state
 }
 ```
 
@@ -235,7 +251,7 @@ Robustness notes (all from the tested contract):
 
 - Clamp `timeoutMs` to `[1000, 300000]` before sending.
 - In sync mode, treat `504/wait_timeout` as "possibly still running"; keep `sessionId` for a fallback query, don't kill it.
-- Poll on `state` only; normalize both forms of `not_found`.
+- Poll on `state` only; **only** a 404 `unknown_session` or `state:"not_found"` counts as not_found. Auth/5xx/network errors are "unknown, back off & retry" — the task may still be running, and treating them as not_found + re-dispatch causes double execution.
 
 ---
 

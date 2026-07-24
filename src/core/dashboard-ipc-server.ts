@@ -729,6 +729,31 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   const stored = ds?.session ?? sessionStore.getSession(sessionId);
   const persisted = asyncTriggerStore.lookup(sessionId, triggerId);
 
+  // Cross-bot isolation: sessionStore.getSession() scans every bot's
+  // sessions-*.json and the async store is a shared directory, so a request
+  // routed to THIS daemon carrying a sessionId owned by ANOTHER bot could
+  // otherwise read that bot's session record / persisted output. Require the
+  // resolved owner to match this daemon before trusting either source. When the
+  // owner mismatches we drop both to undefined so the resolver reports it as a
+  // clean miss rather than leaking another bot's result.
+  const owner = cachedLarkAppId;
+  const storedOwner = stored?.larkAppId;
+  const persistedOwner = persisted?.ownerLarkAppId;
+  const storedForeign = !!stored && !!storedOwner && !!owner && storedOwner !== owner;
+  const persistedForeign = !!persisted && !!persistedOwner && !!owner && persistedOwner !== owner;
+  // A live session in THIS daemon's registry is always ours, so a foreign
+  // stored record can only appear via the cross-scan when there's no live ds.
+  if ((storedForeign && !ds) || persistedForeign) {
+    return {
+      ok: true,
+      state: 'not_found',
+      triggerId,
+      errorCode: 'session_not_found',
+      error: `no session record for: ${sessionId}`,
+      message: 'no session found',
+    };
+  }
+
   const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
   const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
 

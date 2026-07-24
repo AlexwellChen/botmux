@@ -115,6 +115,47 @@ describe('resolveAsyncTriggerState — failed', () => {
   });
 });
 
+describe('resolveAsyncTriggerState — precise triggerId miss (P1-2)', () => {
+  it('session exists but requested triggerId has no record → bad_request (not running/failed)', () => {
+    // A live session with a DIFFERENT trigger; caller pins a trigger this
+    // session never had. Legacy semantics: bad_request precise-miss, NOT a
+    // fall-through to running just because the session is open.
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1',
+      liveActive: true,
+      storedStatus: 'open',
+      requestedTriggerId: 'trg_never',
+      // no memResult / persisted for trg_never
+    });
+    expect(r.ok).toBe(false);
+    expect(r.state).toBe('not_found');
+    expect(r.errorCode).toBe('bad_request');
+    expect(r.triggerId).toBe('trg_never');
+  });
+
+  it('closed session + unknown requested triggerId → bad_request (not failed)', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1',
+      liveActive: false,
+      storedStatus: 'closed',
+      requestedTriggerId: 'trg_never',
+    });
+    expect(r.errorCode).toBe('bad_request');
+  });
+
+  it('no triggerId pinned → NOT a precise miss (falls through to session state)', () => {
+    const r = resolveAsyncTriggerState({ sessionId: 's1', liveActive: true, storedStatus: 'open' });
+    expect(r.state).toBe('running');
+  });
+
+  it('ghost session + requested triggerId → session_not_found, not bad_request', () => {
+    // No session anywhere: this is a genuinely unknown session, not a
+    // precise-miss on an existing one.
+    const r = resolveAsyncTriggerState({ sessionId: 'ghost', liveActive: false, requestedTriggerId: 'trg_q' });
+    expect(r.errorCode).toBe('session_not_found');
+  });
+});
+
 describe('resolveAsyncTriggerState — not_found', () => {
   it('no session record and no persisted result', () => {
     const r = resolveAsyncTriggerState({
@@ -144,8 +185,8 @@ describe('resolveAsyncTriggerState — not_found', () => {
   });
 });
 
-describe('resolveAsyncTriggerState — response is always ok:true for resolved queries', () => {
-  it('every state carries ok:true (task state is in .state, not HTTP/ok)', () => {
+describe('resolveAsyncTriggerState — four resolved states carry ok:true', () => {
+  it('running/completed/failed/not_found are ok:true (task state is in .state, not ok/HTTP); only precise-miss is ok:false', () => {
     const inputs = [
       { sessionId: 's', liveActive: true, memResult: { status: 'completed' as const, content: 'c', completedAt: 1 }, memTriggerId: 't' },
       { sessionId: 's', liveActive: true, storedStatus: 'open' as const },

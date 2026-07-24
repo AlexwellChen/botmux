@@ -5,7 +5,7 @@ vi.mock('../src/services/trigger-log-store.js', () => ({ appendTriggerLog: vi.fn
 
 import { buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
-import { dispatchTriggerRequest } from '../src/dashboard/trigger-api.js';
+import { dispatchTriggerRequest, queryTriggerResult } from '../src/dashboard/trigger-api.js';
 
 function request(): TriggerRequest {
   return {
@@ -180,5 +180,43 @@ describe('dispatchTriggerRequest', () => {
     const res = await dispatchTriggerRequest(workflowReq('app1'), { proxyToDaemon });
     expect(res.status).toBe(502);
     expect(res.body).toMatchObject({ ok: false, errorCode: 'daemon_offline', error: 'connect ECONNREFUSED' });
+  });
+});
+
+// P1-3: the daemon's four-state trigger-result returns ok:true for terminal
+// failed/not_found. The legacy webhook async consumer (queryTriggerResult →
+// audit) derives outcome from `ok`, so this adapter must translate those two
+// terminal-miss states back to ok:false, while leaving completed/running as-is.
+describe('queryTriggerResult — legacy ok translation for webhook consumers', () => {
+  const proxyReturning = (body: unknown, status = 200) =>
+    vi.fn(async () => ({ status, text: async () => JSON.stringify(body) }) as unknown as Response);
+
+  it('failed(ok:true) is translated to ok:false, state preserved', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'failed', errorCode: 'no_output' });
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(false);
+    expect(res.body.state).toBe('failed');
+    expect(res.body.errorCode).toBe('no_output');
+  });
+
+  it('not_found(ok:true) is translated to ok:false', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'not_found', errorCode: 'session_not_found' });
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(false);
+    expect(res.body.state).toBe('not_found');
+  });
+
+  it('completed(ok:true) is left untouched', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'completed', output: { content: 'X' } });
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(true);
+    expect(res.body.output?.content).toBe('X');
+  });
+
+  it('running(ok:true) is left untouched', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'running' });
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(true);
+    expect(res.body.state).toBe('running');
   });
 });

@@ -33,8 +33,12 @@ export interface PersistedAsyncTriggerResult {
   content?: string;
 }
 
-/** On-disk shape: { latestTriggerId, results: { [triggerId]: result } }. */
+/** On-disk shape: { ownerLarkAppId, latestTriggerId, results }. ownerLarkAppId
+ *  stamps the bot that owns this session so a cross-bot lookup (a request routed
+ *  to daemon A carrying a sessionId that belongs to bot B) can be rejected even
+ *  after the session record itself is gone. */
 interface AsyncTriggerFile {
+  ownerLarkAppId?: string;
   latestTriggerId?: string;
   results: Record<string, PersistedAsyncTriggerResult>;
 }
@@ -58,7 +62,7 @@ function load(sessionId: string): AsyncTriggerFile {
   try {
     const data = JSON.parse(readFileSync(fp, 'utf-8')) as AsyncTriggerFile;
     if (!data || typeof data !== 'object' || typeof data.results !== 'object') return { results: {} };
-    return { latestTriggerId: data.latestTriggerId, results: data.results ?? {} };
+    return { ownerLarkAppId: data.ownerLarkAppId, latestTriggerId: data.latestTriggerId, results: data.results ?? {} };
   } catch (err) {
     logger.debug(`Failed to load async trigger results for ${sessionId}: ${err}`);
     return { results: {} };
@@ -78,17 +82,20 @@ function save(sessionId: string, file: AsyncTriggerFile): void {
 }
 
 /** Record a freshly-armed async trigger as pending. Best-effort; a failed write
- *  only loses the restart-recovery guarantee, never the in-memory path. */
-export function recordPending(sessionId: string, triggerId: string, createdAt: number): void {
+ *  only loses the restart-recovery guarantee, never the in-memory path.
+ *  `ownerLarkAppId` stamps the owning bot for cross-bot isolation. */
+export function recordPending(sessionId: string, triggerId: string, createdAt: number, ownerLarkAppId?: string): void {
   const file = load(sessionId);
+  if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
   file.results[triggerId] = { status: 'pending', createdAt };
   file.latestTriggerId = triggerId;
   save(sessionId, file);
 }
 
 /** Mark an async trigger completed with its captured final output. */
-export function recordCompleted(sessionId: string, triggerId: string, content: string, completedAt: number): void {
+export function recordCompleted(sessionId: string, triggerId: string, content: string, completedAt: number, ownerLarkAppId?: string): void {
   const file = load(sessionId);
+  if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
   const prev = file.results[triggerId];
   file.results[triggerId] = {
     status: 'completed',
@@ -101,17 +108,20 @@ export function recordCompleted(sessionId: string, triggerId: string, content: s
 }
 
 /** Look up a persisted result. With no triggerId, resolves the latest recorded
- *  one (mirrors the in-memory latestAsyncTriggerId semantics). */
+ *  one (mirrors the in-memory latestAsyncTriggerId semantics). Returns the
+ *  stamped `ownerLarkAppId` (if any) so the caller can enforce cross-bot
+ *  isolation before trusting the result. */
 export function lookup(sessionId: string, triggerId?: string): {
   triggerId: string;
   result: PersistedAsyncTriggerResult;
+  ownerLarkAppId?: string;
 } | undefined {
   const file = load(sessionId);
   const resolved = triggerId || file.latestTriggerId;
   if (!resolved) return undefined;
   const result = file.results[resolved];
   if (!result) return undefined;
-  return { triggerId: resolved, result };
+  return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
 }
 
 /** Delete a session's persisted async results (called on session close). */

@@ -102,6 +102,29 @@ describe('recordCompleted', () => {
   });
 });
 
+describe('owner stamping (cross-bot isolation)', () => {
+  it('recordPending stamps ownerLarkAppId and lookup returns it', () => {
+    recordPending('sess1', 'trg_a', 1000, 'cli_botA');
+    expect(lookup('sess1')?.ownerLarkAppId).toBe('cli_botA');
+  });
+
+  it('recordCompleted stamps ownerLarkAppId', () => {
+    recordCompleted('sess1', 'trg_a', 'x', 5000, 'cli_botA');
+    expect(lookup('sess1')?.ownerLarkAppId).toBe('cli_botA');
+  });
+
+  it('owner persists across pending → completed', () => {
+    recordPending('sess1', 'trg_a', 1000, 'cli_botA');
+    recordCompleted('sess1', 'trg_a', 'x', 5000); // no owner arg on completion
+    expect(lookup('sess1')?.ownerLarkAppId).toBe('cli_botA'); // preserved from pending
+  });
+
+  it('lookup returns undefined ownerLarkAppId when never stamped (legacy file)', () => {
+    recordPending('sess1', 'trg_a', 1000); // no owner
+    expect(lookup('sess1')?.ownerLarkAppId).toBeUndefined();
+  });
+});
+
 describe('deleteResults', () => {
   it('removes the persisted file', () => {
     recordPending('sess1', 'trg_a', 1000);

@@ -43,6 +43,25 @@ export interface AsyncStateInputs {
 export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse {
   const { sessionId, chatId } = inp;
 
+  // Precise-triggerId miss: the caller pinned ?triggerId= but no record (in
+  // memory or durable) matches it, AND a session context exists for this id.
+  // Preserve the legacy bad_request semantics — do NOT fall through to session
+  // open/closed and misreport running/failed for a trigger this session never
+  // had. (The caller only passes memResult/persisted that actually match the
+  // requested id, so "both absent + session exists" == precise miss.) When no
+  // session exists at all, this falls through to the not_found branch below.
+  const sessionExists = inp.liveActive || inp.storedStatus !== undefined;
+  if (inp.requestedTriggerId && !inp.memResult && !inp.persisted && sessionExists) {
+    return {
+      ok: false,
+      state: 'not_found',
+      triggerId: inp.requestedTriggerId,
+      errorCode: 'bad_request',
+      error: `async trigger not found for session: ${inp.requestedTriggerId}`,
+      message: 'requested triggerId not found for this session',
+    };
+  }
+
   const completed =
     (inp.memResult?.status === 'completed' && inp.memTriggerId
       ? { triggerId: inp.memTriggerId, content: inp.memResult.content, completedAt: inp.memResult.completedAt }

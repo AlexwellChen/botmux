@@ -78,6 +78,18 @@ export async function queryTriggerResult(
       errorCode: 'trigger_failed',
     };
   }
+  // Legacy-consumer adapter: the daemon's four-state trigger-result returns
+  // `ok:true` for terminal `failed`/`not_found` (task state lives in `.state`).
+  // Existing webhook async pollers + audit logging predate `.state` and derive
+  // outcome from `ok` alone — leaving `ok:true` here would record a failed/lost
+  // task as `completed`. Translate the two terminal-miss states back to the
+  // legacy `ok:false` shape for THIS webhook path only; the new four-state
+  // contract (raw dashboard proxy → riff-style callers) is unaffected because it
+  // does not pass through queryTriggerResult. `.state` is preserved for any
+  // consumer that has since adopted it.
+  if (parsed.ok && (parsed.state === 'failed' || parsed.state === 'not_found')) {
+    parsed = { ...parsed, ok: false };
+  }
   return { status: upstream.status, body: parsed };
 }
 

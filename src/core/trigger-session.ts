@@ -200,8 +200,9 @@ function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
   ds.latestAsyncTriggerId = triggerId;
   // Durably record the pending trigger so a poller can still resolve this
   // session after a daemon restart (the in-memory Map above does not survive
-  // one). Best-effort — a failed write only forfeits restart recovery.
-  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt);
+  // one). Stamp the owning bot for cross-bot isolation. Best-effort — a failed
+  // write only forfeits restart recovery.
+  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt, ds.larkAppId);
 }
 
 function buildAsyncQueuedResponse(

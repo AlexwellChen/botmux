@@ -214,6 +214,7 @@ async function runAndAwait(instruction: string, botId: string): Promise<Result> 
     const r = await getTriggerResult(sessionId); // 见下方归一
     switch (r.state) {
       case 'running':   await sleep(3000); continue;
+      case 'unknown':   await sleep(3000); continue; // 查询本身失败，任务可能仍在跑，退避重试
       case 'completed': return { ok: true, content: r.output.content };
       case 'failed':    return { ok: false, needsReconcile: true }; // 软终态，二次确认
       case 'not_found': return { ok: false, notFound: true };
@@ -224,10 +225,23 @@ async function runAndAwait(instruction: string, botId: string): Promise<Result> 
 // getTriggerResult 里把 not_found 的两种物理表现归一
 async function getTriggerResult(sessionId: string) {
   const res = await fetch(`/api/sessions/${sessionId}/trigger-result`, { headers: cookie() });
-  if (res.status === 404) return { state: 'not_found' };       // 代理层短路
-  const body = await res.json();
-  if (!body.ok) return { state: 'not_found' };                 // 兜底：查询本身异常也不当运行中
-  return body;                                                 // { state, output?, errorCode?, finishedAt? }
+
+  // 只有这两种才是「确认查无」→ not_found：
+  //  (1) 代理层短路：HTTP 404 + {ok:false, error:"unknown_session"}
+  //  (2) daemon 四态：HTTP 200 + {ok:true, state:"not_found"}
+  if (res.status === 404) {
+    const b = await res.json().catch(() => ({}));
+    if (b?.error === 'unknown_session') return { state: 'not_found' };
+  }
+  if (res.ok) {
+    const body = await res.json();
+    if (body?.state) return body; // { state, output?, errorCode?, finishedAt? }
+  }
+
+  // ⚠️ 其它一切（401/403 鉴权、5xx、502 daemon 不可达、网络超时、非 JSON…）
+  // 都【不是】not_found——原任务很可能仍在后台跑。绝不能当查无而补偿重派，
+  // 否则会重复执行。当成「本次查询未知」，退避后重试同一 sessionId。
+  return { state: 'unknown' }; // 调用方：sleep 后重试，不改判任务终态
 }
 ```
 
@@ -235,7 +249,7 @@ async function getTriggerResult(sessionId: string) {
 
 - `timeoutMs` 传参前先 clamp 到 `[1000, 300000]`。
 - 同步模式把 `504/wait_timeout` 当「可能仍在运行」，留 `sessionId` 兜底查，别判死。
-- 轮询只信 `state`，`not_found` 两种表现都归一。
+- 轮询只信 `state`；**只有** 404 `unknown_session` 或 `state:"not_found"` 才归 not_found。鉴权/5xx/网络错误一律当「未知、退避重试」——原任务可能仍在跑，误当查无补偿重派会导致重复执行。
 
 ---
 
