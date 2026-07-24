@@ -3358,6 +3358,28 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'steer_accepted': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored steer_accepted from stale worker generation`);
+          break;
+        }
+        logger.info(
+          `[${t}] Codex App steer accepted `
+          + `appTurn=${msg.appTurnId.slice(0, 12)} replyTurn=${msg.turnId.slice(0, 12)}`,
+        );
+        if (managedAuxUiSuppressed(msg.turnId, undefined)) break;
+        try {
+          await scopedReply(tr('worker.steer_accepted', undefined, loc), 'text', msg.turnId);
+        } catch {
+          logger.error(
+            `[${t}] Failed to deliver steer acknowledgement `
+            + `appTurn=${msg.appTurnId.slice(0, 12)} replyTurn=${msg.turnId.slice(0, 12)} `
+            + 'category=delivery',
+          );
+        }
+        break;
+      }
+
       case 'turn_terminal': {
         if (ds.worker !== worker) {
           logger.warn(`[${t}] Ignored turn_terminal from stale worker generation`);

@@ -49,6 +49,19 @@ describe('Codex App runner input protocol', () => {
     });
   });
 
+  it('uses the legacy sidecar client id when the top-level correlation field is absent', () => {
+    expect(decodeCodexAppRunnerInput(encodedLine({
+      type: 'message',
+      content: 'legacy',
+      codexAppInput: {
+        text: 'clean',
+        clientUserMessageId: 'om_legacy_sidecar',
+      },
+    }))).toMatchObject({
+      replyTurnId: 'om_legacy_sidecar',
+    });
+  });
+
   it.each([
     'not-a-control-line',
     `${CODEX_APP_INPUT_PREFIX}not-json`,

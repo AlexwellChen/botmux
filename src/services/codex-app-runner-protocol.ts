@@ -119,15 +119,17 @@ export function decodeCodexAppRunnerInput(line: string): CodexAppRunnerInput | u
   if (value.codexAppInput !== undefined && !isCodexAppTurnInput(value.codexAppInput)) {
     return undefined;
   }
+  const codexAppInput = isCodexAppTurnInput(value.codexAppInput)
+    ? value.codexAppInput
+    : undefined;
+  const replyTurnId = typeof value.replyTurnId === 'string'
+    ? value.replyTurnId
+    : codexAppInput?.clientUserMessageId;
   return {
     type: 'message',
     content: value.content,
-    ...(isCodexAppTurnInput(value.codexAppInput)
-      ? { codexAppInput: value.codexAppInput }
-      : {}),
-    ...(typeof value.replyTurnId === 'string'
-      ? { replyTurnId: value.replyTurnId }
-      : {}),
+    ...(codexAppInput ? { codexAppInput } : {}),
+    ...(replyTurnId ? { replyTurnId } : {}),
   };
 }
 

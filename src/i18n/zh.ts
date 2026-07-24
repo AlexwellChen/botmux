@@ -3,6 +3,7 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'worker.steer_accepted': '收到，引导成功',
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ 打开 Web 终端',
   'card.btn.open_writable_terminal': '🖥️ 打开可操作 Web 终端',

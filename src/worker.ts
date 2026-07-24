@@ -240,6 +240,11 @@ import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
+  normalizeAppRunnerFinalMarker,
+  normalizeCodexAppLifecycleEvent,
+  projectAppRunnerFinalIds,
+} from './services/codex-app-runner-protocol.js';
+import {
   hasMatchingManagedOriginCapability,
   managedOriginCapabilityPath,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
@@ -1366,6 +1371,34 @@ async function runStartupCommands(): Promise<void> {
 }
 
 const pendingMessages: PendingCliInput[] = [];
+/** Correlation ids that this worker actually wrote into the owned Codex App
+ * runner. Runner lifecycle/final markers may route only to ids in this bounded
+ * local set; model/user display bytes cannot add entries. */
+const submittedCodexAppReplyTurnIds = new Set<string>();
+const pendingCodexAppSteerAckIds = new Map<string, string>();
+const acknowledgedCodexAppSteers = new Set<string>();
+const CODEX_APP_CORRELATION_LIMIT = 256;
+function rememberBounded(set: Set<string>, value: string): void {
+  set.delete(value);
+  set.add(value);
+  while (set.size > CODEX_APP_CORRELATION_LIMIT) {
+    const oldest = set.values().next().value;
+    if (typeof oldest !== 'string') break;
+    set.delete(oldest);
+  }
+}
+function rememberBoundedMap(map: Map<string, string>, key: string, value: string): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > CODEX_APP_CORRELATION_LIMIT) {
+    const oldest = map.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    map.delete(oldest);
+  }
+}
+function shortCorrelationId(value: string | undefined): string {
+  return value?.slice(0, 12) ?? '-';
+}
 /** Literal commands that arrived while native /rename owned the TUI or while
  * an owned CLI restart was fenced. Normal raw_input commands are still
  * delivered immediately (including while busy). */
@@ -4603,9 +4636,89 @@ function handleCodexAppMarker(body: string): void {
     return;
   }
 
-  if (kind === 'final' && typeof payload.content === 'string') {
-    const startedAtMs = typeof payload.startedAtMs === 'number' ? payload.startedAtMs : undefined;
-    const completedAtMs = typeof payload.completedAtMs === 'number' ? payload.completedAtMs : Date.now();
+  if (kind === 'lifecycle') {
+    const event = normalizeCodexAppLifecycleEvent(payload);
+    if (!event) {
+      log(`${cliName()} rejected malformed lifecycle marker`);
+      return;
+    }
+    log(
+      `${cliName()} lifecycle kind=${event.kind}`
+      + ` appTurn=${shortCorrelationId(event.appTurnId)}`
+      + ` replyTurn=${shortCorrelationId(event.replyTurnId)}`
+      + `${event.queueLength !== undefined ? ` queue=${event.queueLength}` : ''}`,
+    );
+    if (!event.replyTurnId || !submittedCodexAppReplyTurnIds.has(event.replyTurnId)) return;
+    if (event.kind === 'steer_attempt') {
+      rememberBoundedMap(pendingCodexAppSteerAckIds, event.replyTurnId, event.appTurnId);
+      return;
+    }
+    const steerKey = `${event.appTurnId}\0${event.replyTurnId}`;
+    if (event.kind !== 'steer_accepted'
+      || pendingCodexAppSteerAckIds.get(event.replyTurnId) !== event.appTurnId
+      || acknowledgedCodexAppSteers.has(steerKey)) return;
+    pendingCodexAppSteerAckIds.delete(event.replyTurnId);
+    rememberBounded(acknowledgedCodexAppSteers, steerKey);
+    send({
+      type: 'steer_accepted',
+      appTurnId: event.appTurnId,
+      turnId: event.replyTurnId,
+    });
+    return;
+  }
+
+  if (kind === 'final') {
+    const marker = normalizeAppRunnerFinalMarker(payload);
+    if (!marker) {
+      log(`${cliName()} rejected malformed final marker`);
+      return;
+    }
+    const startedAtMs = marker.startedAtMs;
+    const completedAtMs = marker.completedAtMs ?? Date.now();
+    if (marker.appTurnId) {
+      const trustedReplyTurnId = marker.replyTurnId
+        && submittedCodexAppReplyTurnIds.has(marker.replyTurnId)
+        ? marker.replyTurnId
+        : undefined;
+      if (marker.replyTurnId && !trustedReplyTurnId) {
+        log(
+          `${cliName()} ignored unsubmitted final reply route `
+          + `(replyTurn=${shortCorrelationId(marker.replyTurnId)})`,
+        );
+      }
+      const identity = projectAppRunnerFinalIds(
+        { ...marker, replyTurnId: trustedReplyTurnId },
+        currentBotmuxTurnId,
+        `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`,
+      );
+      if (marker.appTurnId !== identity.turnId) {
+        log(
+          `${cliName()} app turn ${shortCorrelationId(marker.appTurnId)} mapped `
+          + `to botmux turn ${shortCorrelationId(identity.turnId)}`,
+        );
+      }
+      const dispatchAttempt = currentBotmuxDispatchAttempt;
+      if (startedAtMs !== undefined && shouldSuppressBridgeEmit(
+        { markTimeMs: startedAtMs, isLocal: false, finalText: marker.content },
+        completedAtMs + 5_001,
+        readSendMarkers(),
+        false,
+      )) {
+        log(`${cliName()} final_output suppressed (model already called botmux send)`);
+        emitTurnTerminal(identity.turnId, 'completed', undefined, dispatchAttempt);
+        return;
+      }
+      send({
+        type: 'final_output',
+        content: marker.content,
+        lastUuid: identity.lastUuid,
+        turnId: identity.turnId,
+        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      });
+      emitTurnTerminal(identity.turnId, 'completed', undefined, dispatchAttempt);
+      return;
+    }
+
     // Codex App keeps the app-server-generated id separately for diagnostics.
     // Routing must use its stable clientUserMessageId marker; legacy envelopes
     // intentionally omit it and fall back to the worker's frozen botmux turn.
@@ -4639,7 +4752,7 @@ function handleCodexAppMarker(body: string): void {
     const dispatchAttempt = currentBotmuxDispatchAttempt;
     if (startedAtMs !== undefined) {
       const sentByModel = shouldSuppressBridgeEmit(
-        { markTimeMs: startedAtMs, isLocal: false, finalText: payload.content },
+        { markTimeMs: startedAtMs, isLocal: false, finalText: marker.content },
         completedAtMs + 5_001,
         readSendMarkers(),
         false,
@@ -4652,7 +4765,7 @@ function handleCodexAppMarker(body: string): void {
     }
     send({
       type: 'final_output',
-      content: payload.content,
+      content: marker.content,
       lastUuid: turnId,
       turnId,
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
@@ -5373,7 +5486,14 @@ async function flushPending(): Promise<void> {
         log('Refused durable Claude submit: transcript terminal bridge is unavailable');
         break;
       }
-      log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
+      if (lastInitConfig?.cliId === 'codex-app') {
+        log(
+          `Writing Codex App input to PTY (flush): `
+          + `replyTurn=${shortCorrelationId(item.turnId)} chars=${msg.length}`,
+        );
+      } else {
+        log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
+      }
       // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
       // dead pane (they fire onExit instead), but writeInput can still throw
       // for other reasons (fs errors while resolving the JSONL, a future
@@ -5423,6 +5543,11 @@ async function flushPending(): Promise<void> {
           item,
         );
         break;
+      }
+      if (lastInitConfig?.cliId === 'codex-app'
+        && item.turnId
+        && result?.submitted !== false) {
+        rememberBounded(submittedCodexAppReplyTurnIds, item.turnId);
       }
       // Persist any sessionId the adapter observed via authoritative sources
       // (Claude's pid file, Codex's history). Done independently of submit
@@ -8094,6 +8219,9 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   currentBotmuxTurnId = undefined;
   currentBotmuxDispatchAttempt = undefined;
   currentVcMeetingImTurnOrigin = undefined;
+  submittedCodexAppReplyTurnIds.clear();
+  pendingCodexAppSteerAckIds.clear();
+  acknowledgedCodexAppSteers.clear();
   if (sandboxCleanup) {
     try { sandboxCleanup(); } catch { /* */ }
     sandboxCleanup = null;

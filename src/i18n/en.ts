@@ -1,5 +1,6 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'worker.steer_accepted': 'Got it — guidance accepted',
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ Open Web Terminal',
   'card.btn.open_writable_terminal': '🖥️ Open Writable Web Terminal',
