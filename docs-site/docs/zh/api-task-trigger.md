@@ -240,13 +240,15 @@ async function getTriggerResult(sessionId: string) {
   // 鉴权错误：token 失效/无权 → 终止（重试同样会被拒），交人处理
   if (res.status === 401 || res.status === 403) return { state: 'error', why: `auth ${res.status}` };
 
-  // 代理层短路：确认查无 → not_found
+  // 代理层短路 / 适配层 404
   if (res.status === 404) {
     const b = await res.json().catch(() => ({}));
-    if (b?.error === 'unknown_session') return { state: 'not_found' };
-    // 其它 404（含 webhook 适配层把 not_found/failed 翻成 404+ok:false）：带 body 就按 body 的 state 走
-    if (b?.state) return b;
-    return { state: 'not_found' };
+    if (b?.error === 'unknown_session') return { state: 'not_found' }; // (a) 确认查无
+    if (b?.state === 'not_found') return { state: 'not_found' };       // (b) 适配层翻译的查无
+    if (b?.state) return b; // 适配层把 failed 等翻成 404 时按 body 的 state 走（透传）
+    // ⚠️ 其它 404（网关/旧路由返回的 HTML、非 JSON → 解析成 {}）**不是**确认查无，
+    // 当可重试 unknown——否则会把「网关抽风」误判成任务丢失而补偿重派、双执行。
+    return { state: 'unknown', why: 'opaque 404' };
   }
 
   // 请求错误：如精确 triggerId 未命中的 400 bad_request → 终止

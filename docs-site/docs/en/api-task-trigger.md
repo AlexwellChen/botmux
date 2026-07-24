@@ -241,14 +241,16 @@ async function getTriggerResult(sessionId: string) {
   // Auth error: token expired / not permitted → terminal (retry is refused too)
   if (res.status === 401 || res.status === 403) return { state: 'error', why: `auth ${res.status}` };
 
-  // Proxy short-circuit: confirmed missing → not_found
+  // Proxy short-circuit / adapter 404
   if (res.status === 404) {
     const b = await res.json().catch(() => ({}));
-    if (b?.error === 'unknown_session') return { state: 'not_found' };
-    // other 404s (incl. the webhook adapter translating not_found/failed to 404+ok:false):
-    // honor the body's state if present
-    if (b?.state) return b;
-    return { state: 'not_found' };
+    if (b?.error === 'unknown_session') return { state: 'not_found' }; // (a) confirmed missing
+    if (b?.state === 'not_found') return { state: 'not_found' };       // (b) adapter-translated missing
+    if (b?.state) return b; // adapter translated failed etc. to 404 → honor body.state (pass through)
+    // ⚠️ Any other 404 (gateway/old-route HTML, non-JSON → parsed to {}) is NOT
+    // a confirmed miss; treat as retryable unknown — otherwise a flaky gateway
+    // gets misread as a lost task and triggers re-dispatch / double execution.
+    return { state: 'unknown', why: 'opaque 404' };
   }
 
   // Request error, e.g. the 400 bad_request for a precise-triggerId miss → terminal
