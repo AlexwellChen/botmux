@@ -5474,8 +5474,8 @@ function sendToPty(
     dispatchAttempt?: number;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   } = {},
-): void {
-  if (!cliAdapter) return;
+): boolean {
+  if (!cliAdapter) return false;
   const next: PendingCliInput = {
     content,
     turnId,
@@ -5492,7 +5492,7 @@ function sendToPty(
   if (cliRestartInProgress || !backend) {
     pendingMessages.push(next);
     log(`Queued message while CLI backend is restarting (${pendingMessages.length} pending)`);
-    return;
+    return true;
   }
   const supportsTypeAhead = pendingInputAllowsTypeAhead(
     cliAdapter.supportsTypeAhead === true,
@@ -5549,6 +5549,7 @@ function sendToPty(
     if (!mergedQueued) log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
     scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);
   }
+  return true;
 }
 
 // ─── Screen Update Timer ─────────────────────────────────────────────────────
@@ -9316,6 +9317,10 @@ function send(msg: WorkerToDaemon): void {
   process.send?.(payload);
 }
 
+function acknowledgeTurnInputCommitted(turnId?: string): void {
+  if (turnId) send({ type: 'turn_input_committed', turnId });
+}
+
 function publishLocalProcessAttestation(cliPid?: number): void {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
   send({
@@ -9502,6 +9507,7 @@ process.on('message', async (raw: unknown) => {
         //    execution — exactly-once, Codex P1-1). Ambiguous never reaches here.
         //  - RPC RESUME: queuePrompt=true → queue for post-ready flush (bridge
         //    marked at flush time, P0-1).
+        let initialInputCommitted = false;
         if (shouldQueueInitialPrompt({
           hasPrompt: !!msg.prompt,
           rpcEngineActive: !!codexRpcEngine,
@@ -9519,7 +9525,13 @@ process.on('message', async (raw: unknown) => {
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
             codexAppInput: msg.promptCodexAppInput,
           });
+          initialInputCommitted = true;
+        } else if (msg.prompt) {
+          // A successful spawn with a non-queued prompt means the adapter baked
+          // it into argv or the RPC engine already accepted it.
+          initialInputCommitted = true;
         }
+        if (initialInputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
 
         // Riff (remote HTTP backends): spawnCli already marked the prompt ready
         // (no local boot → isPromptReady=true immediately), but the initial prompt
@@ -9663,6 +9675,8 @@ process.on('message', async (raw: unknown) => {
               }
               if (result && result.submitted === false) {
                 scheduleSubmitFailureNotify(content, result.recheck, 'submit history', undefined, result.failureReason, turnSeq);
+              } else {
+                acknowledgeTurnInputCommitted(msg.turnId);
               }
             } catch (err: any) {
               log(`Adopt writeInput error (${lastInitConfig?.cliId}): ${err.message}`);
@@ -9679,8 +9693,10 @@ process.on('message', async (raw: unknown) => {
             // command (raw_input) fix.
             await new Promise(r => setTimeout(r, 200));
             (backend as any).sendSpecialKeys('Enter');
+            acknowledgeTurnInputCommitted(msg.turnId);
           } else {
             backend.write(content + '\r');
+            acknowledgeTurnInputCommitted(msg.turnId);
           }
           isPromptReady = false;
           idleDetector?.reset();
@@ -9691,11 +9707,12 @@ process.on('message', async (raw: unknown) => {
         // arrival. Marking now would race with a still-running previous
         // turn whose `botmux send` could sneak its sentAtMs past this
         // turn's markTimeMs and falsely suppress its fallback.
-        sendToPty(content, msg.turnId, {
+        const inputCommitted = sendToPty(content, msg.turnId, {
           codexAppInput,
           dispatchAttempt: msg.dispatchAttempt,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
         });
+        if (inputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
       }
       break;
     }

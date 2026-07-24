@@ -877,6 +877,8 @@ describe('loadBotConfigs', () => {
     fsMock.statSync.mockReturnValue({ mtimeMs: 0 });
     // Clean env
     delete process.env.BOTS_CONFIG;
+    delete process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID;
+    delete process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID;
   });
 
   it('should throw when no config source is available', () => {
@@ -902,6 +904,92 @@ describe('loadBotConfigs', () => {
     expect(configs[0].larkAppId).toBe('env_app');
     expect(configs[0].larkAppSecret).toBe('env_secret');
     expect(configs[0].cliId).toBe('claude-code'); // default
+  });
+
+  it('does not register activation-pending bots before their critical scopes are ready', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      {
+        larkAppId: 'pending_app',
+        larkAppSecret: 'pending_secret',
+        activationPending: true,
+      },
+      {
+        larkAppId: 'ready_app',
+        larkAppSecret: 'ready_secret',
+      },
+    ]));
+
+    const configs = mod.loadBotConfigs();
+    expect(configs.map(config => config.larkAppId)).toEqual(['ready_app']);
+  });
+
+  it('loads an activating raw slot only for its exact managed daemon identity', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'activating_app',
+      larkAppSecret: 'activating_secret',
+      activationStarting: { appId: 'activating_app', jobId: 'bot_activation' },
+    }]));
+
+    expect(mod.loadBotConfigs()).toEqual([]);
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID = 'activating_app';
+    process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID = 'bot_activation';
+    expect(mod.loadBotConfigAtIndex(0).larkAppId).toBe('activating_app');
+    expect(mod.isManagedActivationStartingAtIndex(0, 'activating_app', 'bot_activation')).toBe(true);
+  });
+
+  it('loads a committed raw slot only for the same managed activation receipt', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'committed_app',
+      larkAppSecret: 'committed_secret',
+      activationCommitted: { appId: 'committed_app', jobId: 'bot_committed' },
+    }]));
+
+    expect(mod.loadBotConfigs()).toEqual([]);
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID = 'committed_app';
+    process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID = 'wrong_job';
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID = 'bot_committed';
+    expect(mod.loadBotConfigAtIndex(0).larkAppId).toBe('committed_app');
+  });
+
+  it('rejects a deactivating slot even if a corrupted config lost activationPending', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'deactivating_app',
+      larkAppSecret: 'deactivating_secret',
+      activationDeactivating: { appId: 'deactivating_app', jobId: 'bot_deactivating' },
+    }]));
+
+    expect(mod.loadBotConfigs()).toEqual([]);
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+  });
+
+  it('keeps daemon slot indexes stable when an earlier bot is activation-pending', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      {
+        larkAppId: 'pending_app',
+        larkAppSecret: 'pending_secret',
+        activationPending: true,
+      },
+      {
+        larkAppId: 'ready_app',
+        larkAppSecret: 'ready_secret',
+      },
+    ]));
+
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    expect(mod.loadBotConfigAtIndex(1).larkAppId).toBe('ready_app');
   });
 
   it('should fall back to ~/.botmux/bots.json when BOTS_CONFIG is not set', () => {
