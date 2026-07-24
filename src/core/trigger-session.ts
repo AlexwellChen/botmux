@@ -1,4 +1,5 @@
 import * as sessionStore from '../services/session-store.js';
+import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
@@ -190,12 +191,17 @@ function waitForSessionFinalOutput(
 }
 
 function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
+  const createdAt = Date.now();
   ds.asyncTriggerResults ??= new Map();
   ds.asyncTriggerResults.set(triggerId, {
     status: 'pending',
-    createdAt: Date.now(),
+    createdAt,
   });
   ds.latestAsyncTriggerId = triggerId;
+  // Durably record the pending trigger so a poller can still resolve this
+  // session after a daemon restart (the in-memory Map above does not survive
+  // one). Best-effort — a failed write only forfeits restart recovery.
+  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt);
 }
 
 function buildAsyncQueuedResponse(

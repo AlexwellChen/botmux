@@ -10,6 +10,8 @@ import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-re
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
 import * as sessionStore from '../services/session-store.js';
+import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { resolveAsyncTriggerState } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
@@ -708,45 +710,39 @@ function findSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
 }
 
+/** Four-state async lookup with durable fallback (design A).
+ *
+ *  In-memory `asyncTriggerResults` lives only on the active DaemonSession and is
+ *  lost on daemon restart / idle-suspend. To keep a poller from misreading an
+ *  already-completed turn as `not_found`, this resolves against BOTH the live
+ *  session and the on-disk stores:
+ *   - completed (mem or disk)          → completed + output.content + finishedAt
+ *   - pending in mem / session active  → running
+ *   - session record closed, no output → failed (no_output; soft terminal —
+ *                                         may be a real failure OR a caller close)
+ *   - no session record AND no result  → not_found (never existed / invalid id)
+ *
+ *  Legacy `action`/`async` fields are still populated so existing webhook
+ *  consumers keep working; new callers branch on `state`. */
 function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
   const ds = findActiveBySessionId(sessionId);
-  if (!ds) {
-    return { ok: false, errorCode: 'session_not_found', error: `active session not found: ${sessionId}` };
-  }
-  const resolvedTriggerId = triggerId || ds.latestAsyncTriggerId;
-  if (!resolvedTriggerId) {
-    return { ok: false, errorCode: 'bad_request', error: 'no async trigger recorded for this session' };
-  }
-  const state = ds.asyncTriggerResults?.get(resolvedTriggerId);
-  if (!state) {
-    return { ok: false, errorCode: 'bad_request', error: `async trigger not found for session: ${resolvedTriggerId}` };
-  }
-  if (state.status === 'completed') {
-    return {
-      ok: true,
-      triggerId: resolvedTriggerId,
-      action: 'completed',
-      target: { kind: 'turn', sessionId, chatId: ds.chatId },
-      output: state.content ? { content: state.content } : undefined,
-      async: {
-        status: 'completed',
-        sessionId,
-        completedAt: state.completedAt ? new Date(state.completedAt).toISOString() : undefined,
-      },
-      message: 'async trigger completed',
-    };
-  }
-  return {
-    ok: true,
-    triggerId: resolvedTriggerId,
-    action: 'queued',
-    target: { kind: 'turn', sessionId, chatId: ds.chatId },
-    async: {
-      status: 'pending',
-      sessionId,
-    },
-    message: 'async trigger pending',
-  };
+  const stored = ds?.session ?? sessionStore.getSession(sessionId);
+  const persisted = asyncTriggerStore.lookup(sessionId, triggerId);
+
+  const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
+  const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
+
+  return resolveAsyncTriggerState({
+    sessionId,
+    liveActive: !!ds,
+    chatId: ds?.chatId ?? stored?.chatId,
+    memResult: memResult ? { status: memResult.status, content: memResult.content, completedAt: memResult.completedAt } : undefined,
+    memTriggerId: memResult ? memTriggerId : undefined,
+    persisted,
+    storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,
+    closedAt: stored?.closedAt,
+    requestedTriggerId: triggerId,
+  });
 }
 
 // 看板放置：dashboard 看板视图拖拽卡片后持久化列 + 列内排序位置。
@@ -932,12 +928,10 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   const url = new URL(req.url ?? '/', 'http://localhost');
   const triggerId = url.searchParams.get('triggerId') ?? undefined;
   const result = buildAsyncTriggerLookupResponse(params.sessionId, triggerId);
-  const status = result.ok
-    ? 200
-    : result.errorCode === 'session_not_found'
-      ? 404
-      : 400;
-  jsonRes(res, status, result);
+  // Four-state semantics: the query itself succeeds (HTTP 200) for every
+  // resolved state including not_found — task state lives in `result.state`,
+  // not the HTTP status. Only a malformed lookup (ok:false) maps to non-200.
+  jsonRes(res, result.ok ? 200 : 400, result);
 });
 
 // 会话 insight：只读解析本会话的 transcript，产出动作 span / 失败聚合 / 规则建议
