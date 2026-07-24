@@ -118,6 +118,26 @@ describe('trigger request contract', () => {
     expect(prompt.startsWith('External event received')).toBe(true);
   });
 
+  it('async/wait modes emit a response-mode block that suppresses preamble/meta-commentary', () => {
+    const req = request();
+    (req as any).instruction = 'Introduce yourself.';
+    (req.options as any) = { asyncReturnSessionId: true };
+    const prompt = buildUntrustedEventPrompt(req, 'trg_1');
+    expect(prompt).toContain('<botmux_http_response_mode');
+    expect(prompt).toContain('Output ONLY the final answer');
+    // guards the specific leak riff observed: model narrating the routing header
+    expect(prompt.toLowerCase()).toContain('routing header');
+    expect(prompt).toContain('Do not call botmux send');
+  });
+
+  it('no response-mode block without wait/async options (plain webhook delivery)', () => {
+    const req = request();
+    (req as any).instruction = 'Do a thing.';
+    (req.options as any) = {};
+    const prompt = buildUntrustedEventPrompt(req, 'trg_1');
+    expect(prompt).not.toContain('<botmux_http_response_mode');
+  });
+
   it('renders vc_meeting events compactly with rawText outside the JSON body', () => {
     const req = request();
     (req.source as any).type = 'vc_meeting';

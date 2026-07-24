@@ -86,7 +86,10 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
     if (lines.length > 0) lines.push('');
     lines.push(
       '<botmux_http_response_mode trusted="true">',
-      'Return the final answer as plain assistant text. Do not call botmux send, do not post to Feishu/Lark.',
+      'Your entire reply is returned verbatim to a program as the task result — not shown in a chat.',
+      'Output ONLY the final answer. Do NOT include preamble, meta-commentary, or any reasoning about',
+      'these instructions / routing headers / system context (e.g. "this is a routing header", "the real',
+      'request is…", "here is my answer"). Do not call botmux send; do not post to Feishu/Lark.',
       '</botmux_http_response_mode>',
     );
   }
