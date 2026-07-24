@@ -9440,6 +9440,7 @@ process.on('message', async (raw: unknown) => {
 
   switch (msg.type) {
     case 'init': {
+      const initStartedAtMs = Date.now();
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
       sessionId = msg.sessionId;
@@ -9602,6 +9603,10 @@ process.on('message', async (raw: unknown) => {
           token: writeToken,
           viewToken,
           ...(capturedSpawnCommand ? { spawnCommand: capturedSpawnCommand } : {}),
+          // A fast initial turn can complete via `botmux send` before Herdr
+          // reports idle and this ready IPC is emitted. Tell the daemon not to
+          // post a stale Starting card after the final reply is already visible.
+          replyAlreadySent: readSendMarkers().some(marker => marker.sentAtMs >= initStartedAtMs),
           turnId: currentBotmuxTurnId,
           dispatchAttempt: currentBotmuxDispatchAttempt,
         });

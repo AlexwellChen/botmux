@@ -3,6 +3,25 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 describe('worker pipe initial screen ordering', () => {
+  it('suppresses a starting card when botmux send completed before worker ready', () => {
+    const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const poolSource = readFileSync(join(process.cwd(), 'src/core/worker-pool.ts'), 'utf8');
+    const readyPayload = workerSource.slice(
+      workerSource.indexOf("type: 'ready'"),
+      workerSource.indexOf("case 'message':", workerSource.indexOf("type: 'ready'")),
+    );
+    const readyHandler = poolSource.slice(
+      poolSource.indexOf("case 'ready':"),
+      poolSource.indexOf("case 'cli_session_id':", poolSource.indexOf("case 'ready':")),
+    );
+
+    expect(readyPayload).toContain('replyAlreadySent: readSendMarkers().some');
+    expect(readyHandler).toContain('if (msg.replyAlreadySent)');
+    expect(readyHandler.indexOf('if (msg.replyAlreadySent)')).toBeLessThan(
+      readyHandler.indexOf('ds.streamCardId = CARD_POSTING_SENTINEL'),
+    );
+  });
+
   it('captures pipe initial screen after idle detector is registered', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     // The inline `const initial = backend.captureCurrentScreen()` was refactored

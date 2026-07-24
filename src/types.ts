@@ -618,7 +618,7 @@ export type DaemonToWorker =
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
-  | { type: 'ready'; port: number; token: string; viewToken?: string; spawnCommand?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'ready'; port: number; token: string; viewToken?: string; spawnCommand?: string; replyAlreadySent?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'persistent_backend_target'; target?: PersistentBackendTarget }
   /** The exact inbound turn is now durably owned by this worker generation's
    * CLI input queue. The daemon persists a root-bound receipt only after this

@@ -2539,6 +2539,19 @@ function setupWorkerHandlers(
           break;
         }
 
+        // Pi can finish a very fast startup turn through `botmux send` before
+        // Herdr reports idle and the worker emits ready. Posting the initial
+        // card now would put a stale "Starting" card *after* the final reply,
+        // with no later transcript output to withdraw it (the explicit send
+        // intentionally suppresses bridge fallback). Keep the terminal/runtime
+        // state above, but suppress this already-completed turn's card.
+        if (msg.replyAlreadySent) {
+          ds.streamCardPending = false;
+          persistStreamCardState(ds);
+          logger.info(`[${t}] Explicit reply landed before worker ready — skipping stale starting card`);
+          break;
+        }
+
         // Bot opted out of the streaming card: the terminal is up and the
         // final answer will still arrive via `botmux send`; just don't post the
         // live status card. (workerPort/token above are still set so the web
