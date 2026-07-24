@@ -18,6 +18,7 @@ import {
 import { repoPickerScanOptions } from './global-config.js';
 import { buildDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
@@ -28,10 +29,12 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { addReaction, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
+  loadBotConfigAtIndex,
   loadBotConfigs,
+  isManagedActivationStartingAtIndex,
   registerBot,
   getBot,
   getAllBots,
@@ -149,6 +152,10 @@ import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './co
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
+import {
+  buildBotmuxLarkNativeSessionTitle,
+  extractBotmuxLarkNativeSessionTitlePrompt,
+} from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -2349,6 +2356,39 @@ function setDirectChatDisplayNameFromSender(
   if (chatType !== 'p2p' || sender?.type !== 'user') return;
   const name = String(sender.name ?? '').trim();
   if (name) session.chatDisplayName = name;
+}
+
+const NATIVE_TITLE_CHAT_NAME_TIMEOUT_MS = 800;
+
+/** 首条只有机器人 mention 时，尽力取群名作为原生会话标题兜底。 */
+async function resolveGroupChatNameForNativeTitle(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p' | undefined,
+  cliId: string,
+  rawContent: unknown,
+  mentions?: readonly { name: string }[],
+): Promise<string | undefined> {
+  if (
+    chatType !== 'group'
+    || cliId !== 'codex'
+    || extractBotmuxLarkNativeSessionTitlePrompt(rawContent, mentions)
+  ) {
+    return undefined;
+  }
+
+  let timer: number | undefined;
+  const timeout = new Promise<undefined>(resolve => {
+    timer = setTimeout(resolve, NATIVE_TITLE_CHAT_NAME_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([
+      getChatNameAndMode(larkAppId, chatId).then(info => info.name ?? undefined),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 // Cache last /repo scan results per chat for /repo <number> fallback.
 // Bounded: this is a transient picker cache keyed by chatId (unbounded over a
@@ -14637,6 +14677,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
   // short budget; subsequent calls hit the cache and are sync-fast.
+  const groupChatNamePromise = resolveGroupChatNameForNativeTitle(
+    larkAppId,
+    chatId,
+    chatType,
+    botCfg.cliId,
+    parsed.content,
+    parsed.mentions,
+  );
   const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType);
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
@@ -14662,6 +14710,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
+  const groupChatName = await groupChatNamePromise;
+  if (groupChatName) session.chatDisplayName = groupChatName;
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
   session.ownerUnionId = senderUnionId;
@@ -14675,6 +14725,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
+  session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+    parsed.content,
+    parsed.mentions,
+    groupChatName,
+  );
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
@@ -15611,6 +15666,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const autoCreateChatId: string = ctxChatId ?? data?.message?.chat_id ?? '';
     const autoCreateChatType = ctxChatType ?? (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
     const botCfg = getBot(larkAppId).config;
+    const groupChatNamePromise = resolveGroupChatNameForNativeTitle(
+      larkAppId,
+      autoCreateChatId,
+      autoCreateChatType,
+      botCfg.cliId,
+      parsed.content,
+      parsed.mentions,
+    );
     logger.info(`No active session for ${scope}-scope ${anchor}, auto-creating new session...`);
     refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
     const senderOId = data.sender?.sender_id?.open_id;
@@ -15638,6 +15701,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
+    const groupChatName = await groupChatNamePromise;
+    if (groupChatName) session.chatDisplayName = groupChatName;
+    session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+      parsed.content,
+      parsed.mentions,
+      groupChatName,
+    );
     sessionStore.updateSession(session);
 
     // chat-scope only — see the handleNewTopic twin above (topic substitute
@@ -16279,6 +16349,25 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
   }
 }
 
+async function waitForManagedActivationCommit(index: number, appId: string): Promise<void> {
+  const activationAppId = process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID;
+  if (activationAppId === undefined) return;
+  if (activationAppId !== appId) {
+    throw new Error(`Managed activation App drifted at BOTMUX_BOT_INDEX=${index}`);
+  }
+  const activationJobId = process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID;
+  if (!activationJobId) {
+    throw new Error(`Managed activation receipt is missing at BOTMUX_BOT_INDEX=${index}`);
+  }
+  while (isManagedActivationStartingAtIndex(index, appId, activationJobId)) {
+    await new Promise<void>(resolve => setTimeout(resolve, 100));
+  }
+  const committed = loadBotConfigAtIndex(index);
+  if (committed.larkAppId !== appId) {
+    throw new Error(`Managed activation target drifted at BOTMUX_BOT_INDEX=${index}`);
+  }
+}
+
 export async function startDaemon(botIndex?: number): Promise<void> {
   // Repair a shared tmux server polluted by an older botmux immediately on
   // daemon startup. This must not depend on restoring/spawning a bmx-* session:
@@ -16299,24 +16388,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Load the assigned bot (one daemon per bot)
   let botConfigs = loadBotConfigs();
   const idx = botIndex ?? 0;
-  if (idx < 0 || idx >= botConfigs.length) {
-    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} bot(s) configured`);
+  let cfg = botIndex === undefined
+    ? botConfigs[idx]
+    : loadBotConfigAtIndex(idx);
+  if (!cfg) {
+    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} active bot(s) configured`);
   }
-  let cfg = botConfigs[idx];
+  if (botIndex !== undefined) {
+    // During managed activation PM2 may report this process online before it
+    // is allowed to register a bot or receive traffic. The dashboard clears
+    // the exact startup marker only after it has re-read the PM2 receipt ACK.
+    await waitForManagedActivationCommit(idx, cfg.larkAppId);
+    botConfigs = loadBotConfigs();
+    cfg = loadBotConfigAtIndex(idx);
+  }
   // One-time, lock-protected catalog bootstrap. This runs only after the
   // complete bots.json has parsed successfully, and the helper re-reads the
   // latest file under its lock before deciding. Explicit [] and legacy agent
   // policy are durable opt-outs. Reload the selected config after a write so
   // this daemon exposes the seeded selection card immediately on the same boot.
-  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(cfg.larkAppId);
+  const selectedAppId = cfg.larkAppId;
+  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(selectedAppId);
   if (profileBootstrap.ok) {
-    const selectedAppId = cfg.larkAppId;
-    // Reload even when another concurrent daemon won the one-time write. Both
-    // processes may have loaded the old file before taking the config lock;
-    // the loser still needs the winner's catalog on this boot.
-    botConfigs = loadBotConfigs();
-    cfg = botConfigs.find(candidate => candidate.larkAppId === selectedAppId)
-      ?? botConfigs[idx];
     if (profileBootstrap.seeded) {
       logger.info(
         `[vc-agent] seeded default meeting minutes profile listener=${selectedAppId} `
@@ -16328,6 +16421,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       `[vc-agent] default consumer profile bootstrap skipped: ${profileBootstrap.reason}`
       + `${profileBootstrap.error ? ` (${profileBootstrap.error})` : ''}`,
     );
+  }
+  // A bootstrap failure is not authority to keep an earlier in-memory config.
+  // Every explicit PM2 daemon must prove its same raw slot and App identity
+  // immediately before registerBot, regardless of the bootstrap result.
+  if (botIndex !== undefined) {
+    cfg = reloadExactDaemonBotConfig(idx, selectedAppId, loadBotConfigAtIndex);
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;

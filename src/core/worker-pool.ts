@@ -94,7 +94,12 @@ import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cl
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
+import {
+  buildBotmuxLarkNativeSessionTitle,
+  extractBotmuxLarkNativeSessionTitlePrompt,
+} from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
+import { recordDispatchInputCommit } from './dispatch.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -1858,11 +1863,35 @@ export function sendWorkerInput(
   if (!ds.worker || ds.worker.killed) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
   const codexAppInput = codexAppInputForSession(ds, normalized.codexAppInput, turnId);
+  let nativeSessionTitlePrompt: string | undefined;
+  let nativeSessionTitle: string | undefined;
+  if (ds.session.nativeSessionTitleAwaitingContent && !ds.session.nativeSessionTitleUserDefined && !ds.adoptedFrom) {
+    const bot = getBot(ds.larkAppId);
+    const effectiveCliId = ds.session.cliId ?? bot.config.cliId;
+    if (effectiveCliId === 'codex') {
+      nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
+        normalized.codexAppInput?.text ?? normalized.content,
+        bot.botName ? [{ name: bot.botName }] : undefined,
+      );
+      if (nativeSessionTitlePrompt) {
+        nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(nativeSessionTitlePrompt);
+        ds.session.nativeSessionTitle = nativeSessionTitle;
+        ds.session.nativeSessionTitleAwaitingContent = undefined;
+        if (ds.initConfig) {
+          ds.initConfig.nativeSessionTitle = nativeSessionTitle;
+          ds.initConfig.nativeSessionTitlePrompt = nativeSessionTitlePrompt;
+        }
+        sessionStore.updateSession(ds.session);
+      }
+    }
+  }
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, turnId);
   ds.worker.send({
     type: 'message',
     content: normalized.content,
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
+    ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(turnId ? { turnId } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(vcMeetingImTurnOrigin
@@ -1990,6 +2019,11 @@ export function forkWorker(
     sessionStore.updateSession(ds.session);
   }
 
+  // Reserve and durably publish the replacement lifetime before killing an
+  // existing worker. A failed reservation leaves the old worker untouched;
+  // a successful reservation immediately invalidates any late old-worker ACK.
+  const workerGeneration = reserveWorkerGeneration(ds);
+
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
     logger.warn(`[${t}] Worker already running (pid: ${ds.worker.pid}), killing before re-fork`);
@@ -2018,6 +2052,49 @@ export function forkWorker(
 
   const agentCfg = sessionAgentConfig(ds, botCfg);
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
+  let nativeSessionTitle: string | undefined;
+  let nativeSessionTitlePrompt: string | undefined;
+  if (agentCfg.cliId === 'codex' && !ds.adoptedFrom) {
+    const isFreshNativeSession = !resume && !ds.session.cliSessionId;
+    const titlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
+      promptPayload.codexAppInput?.text ?? prompt,
+      bot.botName ? [{ name: bot.botName }] : undefined,
+    );
+    if (isFreshNativeSession && !ds.session.nativeSessionTitleUserDefined) {
+      ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+        titlePrompt ? ds.session.title : undefined,
+        bot.botName ? [{ name: bot.botName }] : undefined,
+        ds.chatType === 'group' ? ds.session.chatDisplayName : undefined,
+      );
+      ds.session.nativeSessionTitleAwaitingContent = titlePrompt ? undefined : true;
+      nativeSessionTitlePrompt = titlePrompt;
+      sessionStore.updateSession(ds.session);
+    } else if (
+      ds.session.nativeSessionTitleAwaitingContent
+      && !ds.session.nativeSessionTitleUserDefined
+      && titlePrompt
+    ) {
+      ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(titlePrompt);
+      ds.session.nativeSessionTitleAwaitingContent = undefined;
+      nativeSessionTitlePrompt = titlePrompt;
+      sessionStore.updateSession(ds.session);
+    } else if (isFreshNativeSession && !ds.session.nativeSessionTitle) {
+      ds.session.nativeSessionTitle = ds.session.title;
+      sessionStore.updateSession(ds.session);
+    }
+    if (
+      isFreshNativeSession
+      || (resume && !!ds.session.cliSessionId && !!ds.session.nativeSessionTitle)
+      || (
+        resume
+        && !!ds.session.nativeSessionTitleAwaitingContent
+        && !!ds.session.nativeSessionTitle
+      )
+      || (!!nativeSessionTitlePrompt && !!ds.session.nativeSessionTitle)
+    ) {
+      nativeSessionTitle = ds.session.nativeSessionTitle;
+    }
+  }
   // Claude Code blocks on the interactive folder-trust dialog the first time
   // it runs in an untrusted workingDir; pre-accept it so the spawn doesn't hang.
   // Seed CLI (Claude Code fork) has the same dialog — drive both off the
@@ -2164,6 +2241,8 @@ export function forkWorker(
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
+    ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
+    ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
     resume,
@@ -2210,7 +2289,7 @@ export function forkWorker(
   }
 
   // Use shared handler for IPC messages and exit
-  setupWorkerHandlers(ds, worker, startupState);
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
   ds.spawnedAt = Date.now();
@@ -2246,11 +2325,18 @@ function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
   startupState: WorkerStartupState = { ready: false, failureNotified: false },
+  reservedWorkerGeneration?: number,
 ): void {
   const cb = requireCallbacks();
   const t = tag(ds);
-  const workerGeneration = (ds.workerGeneration ?? 0) + 1;
-  ds.workerGeneration = workerGeneration;
+  const workerGeneration = reservedWorkerGeneration
+    ?? reserveWorkerGeneration(ds);
+  if (
+    ds.workerGeneration !== workerGeneration
+    || ds.session.workerGeneration !== workerGeneration
+  ) {
+    throw new Error('worker generation reservation changed before IPC setup');
+  }
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -2366,6 +2452,25 @@ function setupWorkerHandlers(
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);
+        break;
+      }
+      case 'turn_input_committed': {
+        // Bind the receipt to the exact live worker generation. A late ACK
+        // from a replaced worker cannot make the replacement appear to have
+        // accepted this dispatch turn.
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored turn_input_committed from stale worker generation`);
+          break;
+        }
+        if (recordDispatchInputCommit(ds.session, msg.turnId, workerGeneration)) {
+          sessionStore.updateSession(ds.session);
+        } else {
+          logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
+        }
         break;
       }
       case 'session_ready_ack': {
@@ -2700,6 +2805,20 @@ function setupWorkerHandlers(
           && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
           scheduleLocalCliOpenReadinessPatch(ds);
         }
+        break;
+      }
+
+      case 'native_session_title_generated': {
+        if (ds.worker !== worker || ds.session.nativeSessionTitleUserDefined) break;
+        const title = msg.title.trim();
+        if (!title) break;
+        ds.session.nativeSessionTitle = title;
+        ds.session.nativeSessionTitleAwaitingContent = undefined;
+        if (ds.initConfig) {
+          ds.initConfig.nativeSessionTitle = title;
+          ds.initConfig.nativeSessionTitlePrompt = undefined;
+        }
+        sessionStore.updateSession(ds.session);
         break;
       }
 
@@ -3414,6 +3533,20 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;
+      // Fence this lifetime before a polling dispatcher can observe its last
+      // ACK. Keeping the old receipt is useful audit evidence, but the
+      // persisted current generation advances immediately so it cannot count
+      // as acceptance after the worker has died. A stale takeover worker never
+      // enters this branch and therefore cannot fence the replacement.
+      const fencedGeneration = Math.max(
+        workerGeneration,
+        ds.workerGeneration ?? 0,
+        ds.session.workerGeneration ?? 0,
+      ) + 1;
+      ds.workerGeneration = fencedGeneration;
+      ds.session.workerGeneration = fencedGeneration;
+      ds.session.pid = undefined;
+      sessionStore.updateSession(ds.session);
     }
     try {
       const notified = cb.onWorkerExit?.(ds, {
@@ -3837,6 +3970,27 @@ export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
+function reserveWorkerGeneration(ds: DaemonSession): number {
+  const previousDaemonGeneration = ds.workerGeneration;
+  const previousSessionGeneration = ds.session.workerGeneration;
+  const workerGeneration = Math.max(
+    previousDaemonGeneration ?? 0,
+    previousSessionGeneration ?? 0,
+  ) + 1;
+  ds.workerGeneration = workerGeneration;
+  ds.session.workerGeneration = workerGeneration;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    if (previousDaemonGeneration === undefined) delete ds.workerGeneration;
+    else ds.workerGeneration = previousDaemonGeneration;
+    if (previousSessionGeneration === undefined) delete ds.session.workerGeneration;
+    else ds.session.workerGeneration = previousSessionGeneration;
+    throw error;
+  }
+  return workerGeneration;
+}
+
 export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean }): void {
   const cb = requireCallbacks();
   const workerPath = join(__dirname, '..', 'worker.js');
@@ -3855,6 +4009,10 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     logger.warn(`[${t}] read-isolation bot: refusing to adopt existing CLI (would run unisolated); will cold-start isolated on next message`);
     return;
   }
+
+  // Reserve before replacing an existing bridge worker for the same reason as
+  // forkWorker: persistence failure must leave the old lifetime untouched.
+  const workerGeneration = reserveWorkerGeneration(ds);
 
   // Guard against double-fork
   if (ds.worker && !ds.worker.killed) {
@@ -4038,7 +4196,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   }
 
   // Use shared handler
-  setupWorkerHandlers(ds, worker, startupState);
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
   ds.spawnedAt = Date.now();
