@@ -200,6 +200,10 @@ function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+function canForwardPaneAgentArgs(args: readonly string[]): boolean {
+  return args.every(arg => !/[\x00-\x1f\x7f]/.test(arg));
+}
+
 /** Build a short-lived canonical launcher for Herdr's managed-agent facade.
  *
  * Herdr 0.7.5 rejects control characters in `agent start` arguments, while
@@ -767,6 +771,13 @@ export class HerdrBackend implements SessionBackend {
         '--kind', kind,
         '--pane', paneId,
         '--timeout', String(PANE_AGENT_START_TIMEOUT_MS),
+        // Herdr 0.7.5 on macOS resolves managed kinds through its integration
+        // instead of the workspace PATH, so the canonical launcher may not run.
+        // Forward control-character-free argv as well (Pi's @prompt-file path
+        // is safe) to preserve session identity and initial-message delivery.
+        // Multiline argv still stays exclusively in the launcher because Herdr
+        // rejects control characters with invalid_agent_argument.
+        ...(canForwardPaneAgentArgs(args) ? ['--', ...args] : []),
       ]);
       const readyDeadline = Date.now() + PANE_SHELL_READY_TIMEOUT_MS;
       let started: any;

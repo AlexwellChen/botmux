@@ -315,6 +315,29 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
+  it('Herdr 0.7.5: forwards safe Pi session and prompt-file args when the managed integration bypasses PATH', () => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('workspace') && a.includes('create'), reply: () => WORKSPACE_CREATED_REPLY('w_pi', 'w_pi-1') },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('w_pi-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('hello') },
+    ]);
+    const be = new HerdrBackend(SESSION);
+    be.spawn('/Users/test/.local/bin/node/bin/pi', ['--session-id', 'sid-1', '@/tmp/initial.prompt.md'], {
+      cwd: '/work', cols: 120, rows: 30, env: { PATH: '/usr/bin:/bin' },
+    });
+
+    expect(herdrCall(
+      'agent', 'start', 'botmux',
+      '--kind', 'pi',
+      '--pane', 'w_pi-1',
+      '--timeout', '30000',
+      '--', '--session-id', 'sid-1', '@/tmp/initial.prompt.md',
+    )).toBeDefined();
+    be.kill();
+  });
+
   it('Herdr 0.7.5: retries while a new workspace shell is not yet available', () => {
     let startAttempts = 0;
     mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
