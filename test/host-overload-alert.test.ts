@@ -1,0 +1,241 @@
+import { describe, expect, it } from 'vitest';
+import {
+  evaluateOverload,
+  formatOverloadAlert,
+  buildOverloadAlertCard,
+  buildOverloadRecoveredCard,
+  buildOverloadExpiredCard,
+  initialOverloadCardState,
+  OVERLOAD_ACTION_CLEAN_STOPPED,
+  OVERLOAD_ACTION_SUSPEND_IDLE,
+  OVERLOAD_ACTION_NOOP,
+  DEFAULT_OVERLOAD_THRESHOLDS,
+  INITIAL_OVERLOAD_STATE,
+  type HostReading,
+  type OverloadThresholds,
+} from '../src/core/host-overload-alert.js';
+import {
+  registerOverloadNonce,
+  claimOverloadNonce,
+  _resetOverloadNoncesForTest,
+} from '../src/im/lark/overload-nonce.js';
+
+const GB = 1024 * 1024 * 1024;
+
+function thresholds(overrides: Partial<OverloadThresholds> = {}): OverloadThresholds {
+  return { cpuCount: 10, ...DEFAULT_OVERLOAD_THRESHOLDS, ...overrides };
+}
+
+/** Healthy baseline: load well under cpuCount, memory comfortable, no swap. */
+function healthy(overrides: Partial<HostReading> = {}): HostReading {
+  return { load15: 3, memTotalBytes: 16 * GB, memFreeBytes: 12 * GB, ...overrides };
+}
+
+describe('evaluateOverload — load dimension', () => {
+  it('stays healthy when load is under the enter line', () => {
+    const { nextState, action } = evaluateOverload(INITIAL_OVERLOAD_STATE, healthy(), thresholds(), 1_000);
+    expect(nextState.overloaded).toBe(false);
+    expect(action).toBeUndefined();
+  });
+
+  it('fires exactly one "entered" alert on the healthy→overloaded edge', () => {
+    // cpuCount 10, enterLoadRatio 1.5 → enter above 15.
+    const reading = healthy({ load15: 20 });
+    const { nextState, action } = evaluateOverload(INITIAL_OVERLOAD_STATE, reading, thresholds(), 1_000);
+    expect(nextState.overloaded).toBe(true);
+    expect(nextState.lastEnteredAlertAt).toBe(1_000);
+    expect(action?.kind).toBe('entered');
+    expect(action?.reasons).toContain('load');
+  });
+
+  it('does NOT re-alert while it stays overloaded', () => {
+    const overloaded = { overloaded: true, lastEnteredAlertAt: 1_000 };
+    const { nextState, action } = evaluateOverload(overloaded, healthy({ load15: 22 }), thresholds(), 2_000);
+    expect(nextState.overloaded).toBe(true);
+    expect(action).toBeUndefined();
+  });
+
+  it('applies hysteresis: does not recover between exit and enter lines', () => {
+    // exitLoadRatio 1.0 → recover only at/below 10. load 12 is in the dead band.
+    const overloaded = { overloaded: true, lastEnteredAlertAt: 1_000 };
+    const { nextState, action } = evaluateOverload(overloaded, healthy({ load15: 12 }), thresholds(), 3_000);
+    expect(nextState.overloaded).toBe(true);
+    expect(action).toBeUndefined();
+  });
+
+  it('fires "recovered" once load falls to/below the exit line', () => {
+    const overloaded = { overloaded: true, lastEnteredAlertAt: 1_000 };
+    const { nextState, action } = evaluateOverload(overloaded, healthy({ load15: 9 }), thresholds(), 4_000);
+    expect(nextState.overloaded).toBe(false);
+    expect(action?.kind).toBe('recovered');
+  });
+});
+
+describe('evaluateOverload — memory dimension', () => {
+  it('enters on memory pressure alone (load calm)', () => {
+    // enterMemUsedFrac 0.92 → used >= 92%. 16GB total, 1GB free = 93.75% used.
+    const reading = healthy({ load15: 2, memFreeBytes: 1 * GB });
+    const { nextState, action } = evaluateOverload(INITIAL_OVERLOAD_STATE, reading, thresholds(), 1_000);
+    expect(nextState.overloaded).toBe(true);
+    expect(action?.reasons).toEqual(['memory']);
+  });
+
+  it('does not recover until BOTH load and memory clear their exit lines', () => {
+    const overloaded = { overloaded: true, lastEnteredAlertAt: 1_000 };
+    // load recovered (8 <= 10) but memory still 90% used (> exit 85%): stay.
+    const reading = healthy({ load15: 8, memFreeBytes: 1.6 * GB });
+    const { nextState, action } = evaluateOverload(overloaded, reading, thresholds(), 5_000);
+    expect(nextState.overloaded).toBe(true);
+    expect(action).toBeUndefined();
+  });
+});
+
+describe('evaluateOverload — min re-alert window', () => {
+  it('suppresses a fresh "entered" alert within minReAlertMs of the last one', () => {
+    // Episode 1 entered at t=1000. Recover, then re-enter within 15 min.
+    const t = thresholds({ minReAlertMs: 15 * 60_000 });
+    const afterRecover = { overloaded: false, lastEnteredAlertAt: 1_000 };
+    // Re-enter at t=1000 + 5 min < 15 min window → state flips but no alert.
+    const reEnter = evaluateOverload(afterRecover, healthy({ load15: 20 }), t, 1_000 + 5 * 60_000);
+    expect(reEnter.nextState.overloaded).toBe(true);
+    expect(reEnter.action).toBeUndefined();
+    // lastEnteredAlertAt preserved so the window keeps counting from episode 1.
+    expect(reEnter.nextState.lastEnteredAlertAt).toBe(1_000);
+  });
+
+  it('allows a fresh "entered" alert once the window has elapsed', () => {
+    const t = thresholds({ minReAlertMs: 15 * 60_000 });
+    const afterRecover = { overloaded: false, lastEnteredAlertAt: 1_000 };
+    const reEnter = evaluateOverload(afterRecover, healthy({ load15: 20 }), t, 1_000 + 16 * 60_000);
+    expect(reEnter.action?.kind).toBe('entered');
+    expect(reEnter.nextState.lastEnteredAlertAt).toBe(1_000 + 16 * 60_000);
+  });
+
+  it('never rate-limits the recovered alert', () => {
+    const overloaded = { overloaded: true, lastEnteredAlertAt: 999_999_999 };
+    const { action } = evaluateOverload(overloaded, healthy({ load15: 5 }), thresholds(), 1_000);
+    expect(action?.kind).toBe('recovered');
+  });
+});
+
+describe('evaluateOverload — edge cases', () => {
+  it('treats cpuCount<=0 as "load dimension disabled"', () => {
+    const t = thresholds({ cpuCount: 0 });
+    const { nextState, action } = evaluateOverload(INITIAL_OVERLOAD_STATE, healthy({ load15: 999 }), t, 1_000);
+    expect(nextState.overloaded).toBe(false);
+    expect(action).toBeUndefined();
+  });
+
+  it('ignores swap when the reading omits it', () => {
+    const reading = healthy({ load15: 20 }); // no swap fields
+    const { action } = evaluateOverload(INITIAL_OVERLOAD_STATE, reading, thresholds(), 1_000);
+    expect(action?.reasons).not.toContain('swap');
+  });
+});
+
+describe('formatOverloadAlert', () => {
+  it('renders an entered alert with the tripped dimensions and remediation', () => {
+    const reading = healthy({ load15: 30 });
+    const { action } = evaluateOverload(INITIAL_OVERLOAD_STATE, reading, thresholds(), 1_000);
+    const text = formatOverloadAlert(action!, 'mac-mini');
+    expect(text).toContain('⚠️ 机器过载告警');
+    expect(text).toContain('mac-mini');
+    expect(text).toContain('CPU 负载');
+    expect(text).toContain('maxLiveWorkers');
+  });
+
+  it('renders a recovered alert', () => {
+    const overloaded = { overloaded: true, lastEnteredAlertAt: 1_000 };
+    const { action } = evaluateOverload(overloaded, healthy({ load15: 5 }), thresholds(), 2_000);
+    const text = formatOverloadAlert(action!);
+    expect(text).toContain('✅ 机器负载已恢复');
+  });
+});
+
+describe('buildOverloadAlertCard (stateful, two persistent buttons)', () => {
+  function enteredState() {
+    const { action } = evaluateOverload(INITIAL_OVERLOAD_STATE, healthy({ load15: 30 }), thresholds(), 1_000);
+    return initialOverloadCardState(action!, { stopped: 4, idle: 7 }, 'nonce-123');
+  }
+
+  it('initial card shows both live buttons with candidate counts + carries state', () => {
+    const card = JSON.parse(buildOverloadAlertCard(enteredState()));
+    expect(card.header.template).toBe('red');
+    const actionEl = card.elements.find((e: any) => e.tag === 'action');
+    const [clean, suspend] = actionEl.actions;
+    expect(clean.text.content).toContain('(4)');
+    expect(suspend.text.content).toContain('(7)');
+    expect(clean.value.action).toBe(OVERLOAD_ACTION_CLEAN_STOPPED);
+    expect(suspend.value.action).toBe(OVERLOAD_ACTION_SUSPEND_IDLE);
+    // Each live button carries the serialized state (so any daemon can rebuild).
+    expect(JSON.parse(clean.value.st).nonce).toBe('nonce-123');
+    expect(clean.disabled).toBeFalsy();
+    expect(suspend.disabled).toBeFalsy();
+  });
+
+  it('header/body always show the current candidate counts before any click', () => {
+    const card = JSON.parse(buildOverloadAlertCard(enteredState()));
+    const body = card.elements.map((e: any) => e.text?.content ?? '').join('\n');
+    expect(body).toContain('僵尸会话 4 个');
+    expect(body).toContain('闲置会话 7 个');
+  });
+
+  it('after clean: clean button is disabled with ✓done, suspend stays live (both visible)', () => {
+    const st = { ...enteredState(), cleanedN: 3, stopped: 0 };
+    const card = JSON.parse(buildOverloadAlertCard(st));
+    const actionEl = card.elements.find((e: any) => e.tag === 'action');
+    const [clean, suspend] = actionEl.actions;
+    // Clicked button: disabled, shows result, becomes a harmless noop.
+    expect(clean.disabled).toBe(true);
+    expect(clean.text.content).toContain('已清理 3');
+    expect(clean.value.action).toBe(OVERLOAD_ACTION_NOOP);
+    // Other button: STILL clickable (the whole point of董思琪's bug report).
+    expect(suspend.disabled).toBeFalsy();
+    expect(suspend.value.action).toBe(OVERLOAD_ACTION_SUSPEND_IDLE);
+  });
+
+  it('after both clicked: both disabled with their result counts', () => {
+    const st = { ...enteredState(), cleanedN: 2, suspendedN: 5 };
+    const card = JSON.parse(buildOverloadAlertCard(st));
+    const [clean, suspend] = card.elements.find((e: any) => e.tag === 'action').actions;
+    expect(clean.disabled).toBe(true);
+    expect(suspend.disabled).toBe(true);
+    expect(clean.text.content).toContain('已清理 2');
+    expect(suspend.text.content).toContain('已挂起 5');
+  });
+});
+
+describe('buildOverloadRecoveredCard / buildOverloadExpiredCard', () => {
+  it('recovered card is display-only (no action buttons)', () => {
+    const overloaded = { overloaded: true, lastEnteredAlertAt: 1_000 };
+    const { action } = evaluateOverload(overloaded, healthy({ load15: 5 }), thresholds(), 2_000);
+    const card = JSON.parse(buildOverloadRecoveredCard(action!));
+    expect(card.header.template).toBe('green');
+    expect(card.elements.find((e: any) => e.tag === 'action')).toBeUndefined();
+  });
+
+  it('expired card is grey and button-less', () => {
+    const card = JSON.parse(buildOverloadExpiredCard());
+    expect(card.header.template).toBe('grey');
+    expect(card.elements.find((e: any) => e.tag === 'action')).toBeUndefined();
+  });
+});
+
+describe('overload nonce (one-shot per action)', () => {
+  it('claims once per (nonce, action); both buttons on one card each claim once', () => {
+    _resetOverloadNoncesForTest();
+    registerOverloadNonce('n1');
+    expect(claimOverloadNonce('n1', OVERLOAD_ACTION_CLEAN_STOPPED)).toBe(true);
+    // Second click of the SAME button → rejected.
+    expect(claimOverloadNonce('n1', OVERLOAD_ACTION_CLEAN_STOPPED)).toBe(false);
+    // The OTHER button on the same card → still allowed once.
+    expect(claimOverloadNonce('n1', OVERLOAD_ACTION_SUSPEND_IDLE)).toBe(true);
+    expect(claimOverloadNonce('n1', OVERLOAD_ACTION_SUSPEND_IDLE)).toBe(false);
+  });
+
+  it('rejects unknown / never-registered nonce (stale card after daemon restart)', () => {
+    _resetOverloadNoncesForTest();
+    expect(claimOverloadNonce('never-issued', OVERLOAD_ACTION_CLEAN_STOPPED)).toBe(false);
+    expect(claimOverloadNonce('', OVERLOAD_ACTION_CLEAN_STOPPED)).toBe(false);
+  });
+});

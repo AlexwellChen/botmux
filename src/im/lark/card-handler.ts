@@ -16,6 +16,17 @@ import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied, getPendingQuota, getPendingMessage } from './grant-pending.js';
+import { claimOverloadNonce } from './overload-nonce.js';
+import {
+  buildOverloadAlertCard,
+  buildOverloadExpiredCard,
+  OVERLOAD_ACTION_CLEAN_STOPPED,
+  OVERLOAD_ACTION_SUSPEND_IDLE,
+  OVERLOAD_ACTION_NOOP,
+  type OverloadCardState,
+} from '../../core/host-overload-alert.js';
+import { listOnlineDaemons } from '../../utils/daemon-discovery.js';
+import { fetchDaemonIpc } from '../../core/daemon-ipc-auth.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import {
   handleV3GateAction,
@@ -723,6 +734,57 @@ export async function runAutoWorktreeCommit(deps: {
 
 // ─── Main handler ─────────────────────────────────────────────────────────
 
+/**
+ * Fan a host-overload降压 sweep out to every online daemon's IPC and sum the
+ * affected counts. For `suspend_idle` each daemon suspends its OWN idle live
+ * workers (workers only exist in their owning process). For `clean_stopped` the
+ * session store is shared, so the first daemon closes all zombies and the rest
+ * return 0 — summing is still correct and idempotent. Per-daemon failures are
+ * logged and skipped so one offline/slow daemon can't sink the whole action.
+ */
+async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promise<number> {
+  const daemons = listOnlineDaemons();
+  let affected = 0;
+  await Promise.all(daemons.map(async (d) => {
+    try {
+      const res = await fetchDaemonIpc(d.ipcPort, '/api/host-overload/sweep', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      const body: any = await res.json().catch(() => ({}));
+      if (res.ok && body?.ok && typeof body.affected === 'number') affected += body.affected;
+      else logger.warn(`[overload-sweep] daemon ${d.larkAppId} returned ${res.status} ${JSON.stringify(body)}`);
+    } catch (err) {
+      logger.warn(`[overload-sweep] daemon ${d.larkAppId} unreachable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }));
+  return affected;
+}
+
+/**
+ * Machine-wide counts for the overload alert preview. `stopped` (zombies) reads
+ * the SHARED session store, so every daemon returns the same number → take the
+ * max (any one authoritative). `idle` live workers are per-owning-daemon → sum.
+ * Best-effort: an unreachable daemon just contributes 0.
+ */
+export async function countHostOverload(): Promise<{ stopped: number; idle: number }> {
+  const daemons = listOnlineDaemons();
+  let stopped = 0;
+  let idle = 0;
+  await Promise.all(daemons.map(async (d) => {
+    try {
+      const res = await fetchDaemonIpc(d.ipcPort, '/api/host-overload/counts', { method: 'GET' });
+      const body: any = await res.json().catch(() => ({}));
+      if (res.ok && body?.ok) {
+        if (typeof body.stopped === 'number') stopped = Math.max(stopped, body.stopped);
+        if (typeof body.idle === 'number') idle += body.idle;
+      }
+    } catch { /* unreachable daemon contributes 0 */ }
+  }));
+  return { stopped, idle };
+}
+
 export async function handleCardAction(data: CardActionData, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
   const { activeSessions, lastRepoScan } = deps;
   // turnId is forwarded only when the caller actually has a turn anchor
@@ -769,6 +831,46 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!a.ok) return JSON.parse(buildLandResultCard('failed', a.error, loc));
     logger.info(`Land applied: ${d.files} files (+${d.insertions}/-${d.deletions}) → ${wd}`);
     return JSON.parse(buildLandResultCard('applied', t('card.land.applied_body', { files: d.files, ins: d.insertions, del: d.deletions, dir: wd }, loc), loc));
+  }
+  // ─── 机器过载告警卡动作（overload_clean_stopped / overload_suspend_idle / noop）──
+  // 不绑 session。owner 强闸门 + nonce 一次性核销（每按钮各一次，防重复点/超时重投/旧卡）。
+  // 点完不替换成死卡：重建同一张卡，把点过的按钮标 done+数量并 disabled，另一个仍可点。
+  if (value?.action === OVERLOAD_ACTION_NOOP) {
+    // 已完成的按钮（disabled 兜底）——个别客户端仍会回调，给个 toast 不做任何事。
+    return { toast: { type: 'info', content: '该操作已执行过' } };
+  }
+  if (value?.action && (value.action === OVERLOAD_ACTION_CLEAN_STOPPED || value.action === OVERLOAD_ACTION_SUSPEND_IDLE) && larkAppId) {
+    const owner = getOwnerOpenId(larkAppId);
+    if (!operatorOpenId || operatorOpenId !== owner) {
+      logger.info(`Overload action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
+      return { toast: { type: 'error', content: '仅管理员可操作' } };
+    }
+    // Parse the card state carried on the button. Missing/corrupt → treat as a
+    // stale card (daemon restart drops the nonce too).
+    let st: OverloadCardState;
+    try { st = JSON.parse(value.st ?? ''); } catch { return JSON.parse(buildOverloadExpiredCard()); }
+    if (!st?.nonce) return JSON.parse(buildOverloadExpiredCard());
+    // One-shot per (nonce, action): the OTHER button on the same card stays
+    // clickable (different action), but this button can't re-fire.
+    if (!claimOverloadNonce(st.nonce, value.action)) {
+      return JSON.parse(buildOverloadExpiredCard('这个按钮已点过，或该告警卡已过期。'));
+    }
+    const mode = value.action === OVERLOAD_ACTION_CLEAN_STOPPED ? 'clean_stopped' : 'suspend_idle';
+    try {
+      const affected = await sweepHostOverload(mode);
+      if (mode === 'clean_stopped') st.cleanedN = affected; else st.suspendedN = affected;
+      // Refresh the machine-wide candidate counts so the still-live button and
+      // the header reflect what's left after this sweep.
+      const counts = await countHostOverload();
+      st.stopped = counts.stopped;
+      st.idle = counts.idle;
+      logger.info(`[overload] ${value.action} by owner ${operatorOpenId}: affected=${affected}, remaining stopped=${st.stopped} idle=${st.idle}`);
+      // Rebuild the SAME card: clicked button → ✓done+disabled, other → still live.
+      return JSON.parse(buildOverloadAlertCard(st));
+    } catch (err) {
+      logger.warn(`[overload] ${value.action} failed: ${err instanceof Error ? err.message : String(err)}`);
+      return { toast: { type: 'error', content: '执行失败，请稍后重试或用 CLI 手动处理' } };
+    }
   }
   // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny，talk-only）─────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
