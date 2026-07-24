@@ -9,7 +9,62 @@
  * Run:  pnpm vitest run test/async-trigger-state.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { resolveAsyncTriggerState } from '../src/services/async-trigger-state.js';
+import { resolveAsyncTriggerState, decideAsyncOwnership } from '../src/services/async-trigger-state.js';
+
+describe('decideAsyncOwnership — fail-closed cross-bot isolation (P1-1)', () => {
+  const OWNER = 'cli_me';
+
+  it('live ds → both sources kept (always ours)', () => {
+    const d = decideAsyncOwnership({ owner: OWNER, liveDs: true, storedExists: true, storedOwner: undefined, persistedExists: true, persistedOwner: undefined });
+    expect(d).toMatchObject({ keepStored: true, keepPersisted: true, foreignLeak: false });
+  });
+
+  it('stored record owned by another bot (no ds) → dropped, foreignLeak', () => {
+    const d = decideAsyncOwnership({ owner: OWNER, liveDs: false, storedExists: true, storedOwner: 'cli_other', persistedExists: false });
+    expect(d.keepStored).toBe(false);
+    expect(d.foreignLeak).toBe(true);
+  });
+
+  it('persisted stamped with another bot → dropped, foreignLeak', () => {
+    const d = decideAsyncOwnership({ owner: OWNER, liveDs: false, storedExists: false, persistedExists: true, persistedOwner: 'cli_other' });
+    expect(d.keepPersisted).toBe(false);
+    expect(d.foreignLeak).toBe(true);
+  });
+
+  it('THE fail-open regression: unstamped legacy persisted file + no owned session → DROPPED', () => {
+    // Pre-owner-stamping file (persistedOwner undefined) with no stored record
+    // and no live ds. Owner is unprovable → must NOT be served to any daemon.
+    const d = decideAsyncOwnership({ owner: OWNER, liveDs: false, storedExists: false, persistedExists: true, persistedOwner: undefined });
+    expect(d.keepPersisted).toBe(false);
+    expect(d.foreignLeak).toBe(true);
+  });
+
+  it('unstamped legacy persisted file CORROBORATED by our own stored record → kept', () => {
+    // Same unstamped file, but a stored record owned by us exists for the id —
+    // that positively attributes it to us, so the legacy file resolves.
+    const d = decideAsyncOwnership({ owner: OWNER, liveDs: false, storedExists: true, storedOwner: OWNER, persistedExists: true, persistedOwner: undefined });
+    expect(d.keepStored).toBe(true);
+    expect(d.keepPersisted).toBe(true);
+    expect(d.foreignLeak).toBe(false);
+  });
+
+  it('persisted stamped with OUR owner → kept even with no stored record', () => {
+    const d = decideAsyncOwnership({ owner: OWNER, liveDs: false, storedExists: false, persistedExists: true, persistedOwner: OWNER });
+    expect(d.keepPersisted).toBe(true);
+    expect(d.foreignLeak).toBe(false);
+  });
+
+  it('no raw data at all → no foreignLeak (falls through to normal not_found)', () => {
+    const d = decideAsyncOwnership({ owner: OWNER, liveDs: false, storedExists: false, persistedExists: false });
+    expect(d).toMatchObject({ keepStored: false, keepPersisted: false, foreignLeak: false });
+  });
+
+  it('empty owner (larkAppId not yet cached) never spuriously matches a stamped file', () => {
+    const d = decideAsyncOwnership({ owner: '', liveDs: false, storedExists: false, persistedExists: true, persistedOwner: 'cli_other' });
+    expect(d.keepPersisted).toBe(false);
+    expect(d.foreignLeak).toBe(true);
+  });
+});
 
 describe('resolveAsyncTriggerState — completed', () => {
   it('from live in-memory result', () => {
@@ -128,8 +183,8 @@ describe('resolveAsyncTriggerState — precise triggerId miss (P1-2)', () => {
       // no memResult / persisted for trg_never
     });
     expect(r.ok).toBe(false);
-    expect(r.state).toBe('not_found');
     expect(r.errorCode).toBe('bad_request');
+    expect(r.state).toBeUndefined(); // request-shape error, not a task-lifecycle state
     expect(r.triggerId).toBe('trg_never');
   });
 

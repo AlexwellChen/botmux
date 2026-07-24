@@ -48,7 +48,7 @@ describe('recordPending + lookup', () => {
   });
 
   it('records a pending trigger and resolves it by sessionId (latest)', () => {
-    recordPending('sess1', 'trg_a', 1000);
+    recordPending('sess1', 'trg_a', 1000, 'cli_test');
     const got = lookup('sess1');
     expect(got?.triggerId).toBe('trg_a');
     expect(got?.result.status).toBe('pending');
@@ -56,8 +56,8 @@ describe('recordPending + lookup', () => {
   });
 
   it('resolves by explicit triggerId even when not the latest', () => {
-    recordPending('sess1', 'trg_a', 1000);
-    recordPending('sess1', 'trg_b', 2000);
+    recordPending('sess1', 'trg_a', 1000, 'cli_test');
+    recordPending('sess1', 'trg_b', 2000, 'cli_test');
     // latest is trg_b
     expect(lookup('sess1')?.triggerId).toBe('trg_b');
     // explicit still finds trg_a
@@ -67,15 +67,15 @@ describe('recordPending + lookup', () => {
   });
 
   it('returns undefined for an unknown triggerId on a known session', () => {
-    recordPending('sess1', 'trg_a', 1000);
+    recordPending('sess1', 'trg_a', 1000, 'cli_test');
     expect(lookup('sess1', 'trg_missing')).toBeUndefined();
   });
 });
 
 describe('recordCompleted', () => {
   it('marks a previously-pending trigger completed with content', () => {
-    recordPending('sess1', 'trg_a', 1000);
-    recordCompleted('sess1', 'trg_a', 'BOTMUX_RUN_OK', 5000);
+    recordPending('sess1', 'trg_a', 1000, 'cli_test');
+    recordCompleted('sess1', 'trg_a', 'BOTMUX_RUN_OK', 5000, 'cli_test');
     const got = lookup('sess1', 'trg_a');
     expect(got?.result.status).toBe('completed');
     expect(got?.result.content).toBe('BOTMUX_RUN_OK');
@@ -85,7 +85,7 @@ describe('recordCompleted', () => {
   });
 
   it('records completed even with no prior pending entry', () => {
-    recordCompleted('sess1', 'trg_a', 'late', 5000);
+    recordCompleted('sess1', 'trg_a', 'late', 5000, 'cli_test');
     const got = lookup('sess1', 'trg_a');
     expect(got?.result.status).toBe('completed');
     expect(got?.result.content).toBe('late');
@@ -93,8 +93,8 @@ describe('recordCompleted', () => {
   });
 
   it('persists content across a fresh load (simulated restart)', () => {
-    recordPending('sess1', 'trg_a', 1000);
-    recordCompleted('sess1', 'trg_a', 'survives restart', 5000);
+    recordPending('sess1', 'trg_a', 1000, 'cli_test');
+    recordCompleted('sess1', 'trg_a', 'survives restart', 5000, 'cli_test');
     // A brand-new lookup reads from disk (no in-memory state in this module).
     const got = lookup('sess1');
     expect(got?.result.status).toBe('completed');
@@ -115,19 +115,19 @@ describe('owner stamping (cross-bot isolation)', () => {
 
   it('owner persists across pending → completed', () => {
     recordPending('sess1', 'trg_a', 1000, 'cli_botA');
-    recordCompleted('sess1', 'trg_a', 'x', 5000); // no owner arg on completion
+    recordCompleted('sess1', 'trg_a', 'x', 5000, ''); // no owner on completion (legacy-unstamped)
     expect(lookup('sess1')?.ownerLarkAppId).toBe('cli_botA'); // preserved from pending
   });
 
   it('lookup returns undefined ownerLarkAppId when never stamped (legacy file)', () => {
-    recordPending('sess1', 'trg_a', 1000); // no owner
+    recordPending('sess1', 'trg_a', 1000, ''); // no owner (legacy-unstamped)
     expect(lookup('sess1')?.ownerLarkAppId).toBeUndefined();
   });
 });
 
 describe('deleteResults', () => {
   it('removes the persisted file', () => {
-    recordPending('sess1', 'trg_a', 1000);
+    recordPending('sess1', 'trg_a', 1000, 'cli_test');
     const fp = join(tempDir, 'async-triggers', 'sess1.json');
     expect(existsSync(fp)).toBe(true);
     deleteResults('sess1');
@@ -142,7 +142,7 @@ describe('deleteResults', () => {
 
 describe('robustness', () => {
   it('atomic write leaves no .tmp behind', () => {
-    recordPending('sess1', 'trg_a', 1000);
+    recordPending('sess1', 'trg_a', 1000, 'cli_test');
     expect(existsSync(join(tempDir, 'async-triggers', 'sess1.json.tmp'))).toBe(false);
   });
 
@@ -154,8 +154,8 @@ describe('robustness', () => {
   });
 
   it('isolates different sessions', () => {
-    recordCompleted('sess1', 'trg_a', 'one', 1);
-    recordCompleted('sess2', 'trg_b', 'two', 2);
+    recordCompleted('sess1', 'trg_a', 'one', 1, 'cli_test');
+    recordCompleted('sess2', 'trg_b', 'two', 2, 'cli_test');
     expect(lookup('sess1')?.result.content).toBe('one');
     expect(lookup('sess2')?.result.content).toBe('two');
     deleteResults('sess1');
@@ -165,7 +165,7 @@ describe('robustness', () => {
 
   it('handles session ids with :: separators', () => {
     const sid = 'om_root::cli_app';
-    recordCompleted(sid, 'trg_x', 'ok', 9);
+    recordCompleted(sid, 'trg_x', 'ok', 9, 'cli_test');
     expect(lookup(sid)?.result.content).toBe('ok');
   });
 });

@@ -191,32 +191,43 @@ describe('queryTriggerResult — legacy ok translation for webhook consumers', (
   const proxyReturning = (body: unknown, status = 200) =>
     vi.fn(async () => ({ status, text: async () => JSON.stringify(body) }) as unknown as Response);
 
-  it('failed(ok:true) is translated to ok:false, state preserved', async () => {
-    const proxyToDaemon = proxyReturning({ ok: true, state: 'failed', errorCode: 'no_output' });
+  it('failed(ok:true) is translated to ok:false + status 404, state preserved', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'failed', errorCode: 'no_output' }, 200);
     const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
     expect(res.body.ok).toBe(false);
+    expect(res.status).toBe(404);
     expect(res.body.state).toBe('failed');
     expect(res.body.errorCode).toBe('no_output');
   });
 
-  it('not_found(ok:true) is translated to ok:false', async () => {
-    const proxyToDaemon = proxyReturning({ ok: true, state: 'not_found', errorCode: 'session_not_found' });
+  it('not_found(ok:true) is translated to ok:false + status 404', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'not_found', errorCode: 'session_not_found' }, 200);
     const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
     expect(res.body.ok).toBe(false);
+    expect(res.status).toBe(404);
     expect(res.body.state).toBe('not_found');
   });
 
-  it('completed(ok:true) is left untouched', async () => {
-    const proxyToDaemon = proxyReturning({ ok: true, state: 'completed', output: { content: 'X' } });
+  it('completed(ok:true) is left untouched, status 200', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'completed', output: { content: 'X' } }, 200);
     const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
     expect(res.body.ok).toBe(true);
+    expect(res.status).toBe(200);
     expect(res.body.output?.content).toBe('X');
   });
 
-  it('running(ok:true) is left untouched', async () => {
-    const proxyToDaemon = proxyReturning({ ok: true, state: 'running' });
+  it('running(ok:true) is left untouched, status 200', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'running' }, 200);
     const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
     expect(res.body.ok).toBe(true);
+    expect(res.status).toBe(200);
     expect(res.body.state).toBe('running');
+  });
+
+  it('bad_request precise-miss (already ok:false, non-200) is passed through unchanged', async () => {
+    const proxyToDaemon = proxyReturning({ ok: false, errorCode: 'bad_request' }, 400);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(false);
+    expect(res.status).toBe(400);
   });
 });

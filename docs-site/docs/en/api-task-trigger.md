@@ -211,39 +211,57 @@ async function runAndAwait(instruction: string, botId: string): Promise<Result> 
 
   // 2) poll, read state only
   for (;;) {
-    const r = await getTriggerResult(sessionId); // normalized below
+    const r = await getTriggerResult(sessionId); // classified below
     switch (r.state) {
       case 'running':   await sleep(3000); continue;
-      case 'unknown':   await sleep(3000); continue; // query itself failed; task may still run — back off & retry
+      case 'unknown':   await sleep(3000); continue; // retryable: network/timeout/5xx/non-JSON, task may still run
       case 'completed': return { ok: true, content: r.output.content };
-      case 'failed':    return { ok: false, needsReconcile: true }; // soft terminal
-      case 'not_found': return { ok: false, notFound: true };
+      case 'failed':    return { ok: false, needsReconcile: true };  // soft terminal
+      case 'not_found': return { ok: false, notFound: true };        // terminal: confirmed no such session
+      case 'error':     return { ok: false, fatal: true, why: r.why }; // terminal: request/auth error, retrying won't help
     }
   }
 }
 
-// getTriggerResult normalizes the two physical forms of not_found — and ONLY
-// those two. Everything else is "unknown", not not_found.
+// getTriggerResult sorts the response into 5 classes. The point is to never
+// conflate "unknown/retryable" with "definitely terminal":
+//  - not_found  : confirmed missing → terminal  ((a) 404 unknown_session; (b) 200 state:not_found)
+//  - completed/running/failed : the daemon's four states, passed through
+//  - error      : request error (400) / auth (401/403) → terminal, retry is pointless
+//  - unknown    : network/timeout/5xx/502/non-JSON → retryable, task may still be running
 async function getTriggerResult(sessionId: string) {
-  const res = await fetch(`/api/sessions/${sessionId}/trigger-result`, { headers: cookie() });
+  let res: Response;
+  try {
+    res = await fetch(`/api/sessions/${sessionId}/trigger-result`, { headers: cookie() });
+  } catch (e) {
+    // fetch itself threw: unreachable / DNS / reset / timeout → retryable
+    return { state: 'unknown', why: `network: ${String(e)}` };
+  }
 
-  // The only two "confirmed no such session" → not_found:
-  //  (1) proxy short-circuit: HTTP 404 + {ok:false, error:"unknown_session"}
-  //  (2) daemon four-state:   HTTP 200 + {ok:true, state:"not_found"}
+  // Auth error: token expired / not permitted → terminal (retry is refused too)
+  if (res.status === 401 || res.status === 403) return { state: 'error', why: `auth ${res.status}` };
+
+  // Proxy short-circuit: confirmed missing → not_found
   if (res.status === 404) {
     const b = await res.json().catch(() => ({}));
     if (b?.error === 'unknown_session') return { state: 'not_found' };
-  }
-  if (res.ok) {
-    const body = await res.json();
-    if (body?.state) return body; // { state, output?, errorCode?, finishedAt? }
+    // other 404s (incl. the webhook adapter translating not_found/failed to 404+ok:false):
+    // honor the body's state if present
+    if (b?.state) return b;
+    return { state: 'not_found' };
   }
 
-  // ⚠️ Everything else (401/403 auth, 5xx, 502 daemon-unreachable, network
-  // timeout, non-JSON…) is NOT not_found — the task is likely still running.
-  // Never treat it as "no such session" and re-dispatch, or you double-execute.
-  // Treat as "this poll is unknown"; back off and retry the SAME sessionId.
-  return { state: 'unknown' }; // caller: sleep & retry, do not change terminal state
+  // Request error, e.g. the 400 bad_request for a precise-triggerId miss → terminal
+  if (res.status === 400) return { state: 'error', why: 'bad_request' };
+
+  // 5xx / 502 daemon-unreachable → retryable (the task may still be running; never re-dispatch)
+  if (res.status >= 500) return { state: 'unknown', why: `upstream ${res.status}` };
+
+  // 2xx: parse JSON; non-JSON (gateway/proxy HTML etc.) → retryable unknown
+  let body: any;
+  try { body = await res.json(); } catch { return { state: 'unknown', why: 'non-json 2xx' }; }
+  if (body?.state) return body; // { state, output?, errorCode?, finishedAt? }
+  return { state: 'unknown', why: 'no state field' };
 }
 ```
 
@@ -251,7 +269,7 @@ Robustness notes (all from the tested contract):
 
 - Clamp `timeoutMs` to `[1000, 300000]` before sending.
 - In sync mode, treat `504/wait_timeout` as "possibly still running"; keep `sessionId` for a fallback query, don't kill it.
-- Poll on `state` only; **only** a 404 `unknown_session` or `state:"not_found"` counts as not_found. Auth/5xx/network errors are "unknown, back off & retry" — the task may still be running, and treating them as not_found + re-dispatch causes double execution.
+- Sort polls into 5 classes; never conflate "retryable" with "terminal": **not_found** (404 unknown_session / `state:not_found`) and **error** (400 request error, 401/403 auth) are terminal; **unknown** (network/timeout/5xx/502/non-JSON) is retryable — the task may still be running, and treating it as missing + re-dispatch causes double execution. Wrap both `fetch` and `res.json()` in try/catch so an exception never bubbles up and breaks the poll loop.
 
 ---
 

@@ -211,37 +211,55 @@ async function runAndAwait(instruction: string, botId: string): Promise<Result> 
 
   // 2) 轮询，只看 state
   for (;;) {
-    const r = await getTriggerResult(sessionId); // 见下方归一
+    const r = await getTriggerResult(sessionId); // 见下方分类
     switch (r.state) {
       case 'running':   await sleep(3000); continue;
-      case 'unknown':   await sleep(3000); continue; // 查询本身失败，任务可能仍在跑，退避重试
+      case 'unknown':   await sleep(3000); continue; // 可重试：网络/超时/5xx/非JSON，任务可能仍在跑
       case 'completed': return { ok: true, content: r.output.content };
       case 'failed':    return { ok: false, needsReconcile: true }; // 软终态，二次确认
-      case 'not_found': return { ok: false, notFound: true };
+      case 'not_found': return { ok: false, notFound: true };        // 终止：确认查无
+      case 'error':     return { ok: false, fatal: true, why: r.why }; // 终止：请求/鉴权错误，重试也没用
     }
   }
 }
 
-// getTriggerResult 里把 not_found 的两种物理表现归一
+// getTriggerResult 把响应分成 5 类，关键是别把"未知/可重试"和"确定终止"搞混：
+//  - not_found  : 确认查无 → 终止（(a) 404 unknown_session；(b) 200 state:not_found）
+//  - completed/running/failed : daemon 四态原样透传
+//  - error      : 请求错误(400)/鉴权(401/403) → 终止，重试无意义
+//  - unknown    : 网络异常/超时/5xx/502/非JSON → 可重试，任务可能仍在后台跑
 async function getTriggerResult(sessionId: string) {
-  const res = await fetch(`/api/sessions/${sessionId}/trigger-result`, { headers: cookie() });
+  let res: Response;
+  try {
+    res = await fetch(`/api/sessions/${sessionId}/trigger-result`, { headers: cookie() });
+  } catch (e) {
+    // fetch 直接 throw：网络不可达 / DNS / 连接重置 / 超时 → 可重试
+    return { state: 'unknown', why: `network: ${String(e)}` };
+  }
 
-  // 只有这两种才是「确认查无」→ not_found：
-  //  (1) 代理层短路：HTTP 404 + {ok:false, error:"unknown_session"}
-  //  (2) daemon 四态：HTTP 200 + {ok:true, state:"not_found"}
+  // 鉴权错误：token 失效/无权 → 终止（重试同样会被拒），交人处理
+  if (res.status === 401 || res.status === 403) return { state: 'error', why: `auth ${res.status}` };
+
+  // 代理层短路：确认查无 → not_found
   if (res.status === 404) {
     const b = await res.json().catch(() => ({}));
     if (b?.error === 'unknown_session') return { state: 'not_found' };
-  }
-  if (res.ok) {
-    const body = await res.json();
-    if (body?.state) return body; // { state, output?, errorCode?, finishedAt? }
+    // 其它 404（含 webhook 适配层把 not_found/failed 翻成 404+ok:false）：带 body 就按 body 的 state 走
+    if (b?.state) return b;
+    return { state: 'not_found' };
   }
 
-  // ⚠️ 其它一切（401/403 鉴权、5xx、502 daemon 不可达、网络超时、非 JSON…）
-  // 都【不是】not_found——原任务很可能仍在后台跑。绝不能当查无而补偿重派，
-  // 否则会重复执行。当成「本次查询未知」，退避后重试同一 sessionId。
-  return { state: 'unknown' }; // 调用方：sleep 后重试，不改判任务终态
+  // 请求错误：如精确 triggerId 未命中的 400 bad_request → 终止
+  if (res.status === 400) return { state: 'error', why: 'bad_request' };
+
+  // 5xx / 502 daemon 不可达 → 可重试（原任务可能仍在跑，绝不能当查无重派）
+  if (res.status >= 500) return { state: 'unknown', why: `upstream ${res.status}` };
+
+  // 2xx：解析 JSON；非 JSON（网关/代理返回 HTML 等）当可重试 unknown
+  let body: any;
+  try { body = await res.json(); } catch { return { state: 'unknown', why: 'non-json 2xx' }; }
+  if (body?.state) return body; // { state, output?, errorCode?, finishedAt? }
+  return { state: 'unknown', why: 'no state field' };
 }
 ```
 
@@ -249,7 +267,7 @@ async function getTriggerResult(sessionId: string) {
 
 - `timeoutMs` 传参前先 clamp 到 `[1000, 300000]`。
 - 同步模式把 `504/wait_timeout` 当「可能仍在运行」，留 `sessionId` 兜底查，别判死。
-- 轮询只信 `state`；**只有** 404 `unknown_session` 或 `state:"not_found"` 才归 not_found。鉴权/5xx/网络错误一律当「未知、退避重试」——原任务可能仍在跑，误当查无补偿重派会导致重复执行。
+- 轮询按 5 类分流，别把「可重试」和「终止」混为一谈：**not_found**（404 unknown_session / `state:not_found`）与 **error**（400 请求错误、401/403 鉴权）是终止态；**unknown**（网络异常/超时/5xx/502/非 JSON）是可重试态——原任务可能仍在后台跑，误当查无补偿重派会导致重复执行。`fetch` 与 `res.json()` 都要包 try/catch，别让异常冒泡打断轮询。
 
 ---
 

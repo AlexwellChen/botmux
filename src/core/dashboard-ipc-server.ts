@@ -11,7 +11,7 @@ import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
-import { resolveAsyncTriggerState } from '../services/async-trigger-state.js';
+import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
@@ -726,24 +726,25 @@ function findSessionRecord(sessionId: string): Session | undefined {
  *  consumers keep working; new callers branch on `state`. */
 function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
   const ds = findActiveBySessionId(sessionId);
-  const stored = ds?.session ?? sessionStore.getSession(sessionId);
-  const persisted = asyncTriggerStore.lookup(sessionId, triggerId);
+  const storedRaw = ds?.session ?? sessionStore.getSession(sessionId);
+  const persistedRaw = asyncTriggerStore.lookup(sessionId, triggerId);
 
-  // Cross-bot isolation: sessionStore.getSession() scans every bot's
-  // sessions-*.json and the async store is a shared directory, so a request
-  // routed to THIS daemon carrying a sessionId owned by ANOTHER bot could
-  // otherwise read that bot's session record / persisted output. Require the
-  // resolved owner to match this daemon before trusting either source. When the
-  // owner mismatches we drop both to undefined so the resolver reports it as a
-  // clean miss rather than leaking another bot's result.
-  const owner = cachedLarkAppId;
-  const storedOwner = stored?.larkAppId;
-  const persistedOwner = persisted?.ownerLarkAppId;
-  const storedForeign = !!stored && !!storedOwner && !!owner && storedOwner !== owner;
-  const persistedForeign = !!persisted && !!persistedOwner && !!owner && persistedOwner !== owner;
-  // A live session in THIS daemon's registry is always ours, so a foreign
-  // stored record can only appear via the cross-scan when there's no live ds.
-  if ((storedForeign && !ds) || persistedForeign) {
+  // Cross-bot isolation (fail-closed / positive-proof) — see decideAsyncOwnership.
+  // Both sessionStore.getSession() (cross-scans every bot's sessions-*.json) and
+  // the async store (machine-wide shared dir) can surface another bot's data for
+  // a sessionId routed to THIS daemon; keep only sources positively proven ours.
+  const decision = decideAsyncOwnership({
+    owner: cachedLarkAppId,
+    liveDs: !!ds,
+    storedOwner: storedRaw?.larkAppId,
+    storedExists: !!storedRaw,
+    persistedOwner: persistedRaw?.ownerLarkAppId,
+    persistedExists: !!persistedRaw,
+  });
+  const stored = decision.keepStored ? storedRaw : undefined;
+  const persisted = decision.keepPersisted ? persistedRaw : undefined;
+
+  if (decision.foreignLeak) {
     return {
       ok: true,
       state: 'not_found',

@@ -83,8 +83,11 @@ function save(sessionId: string, file: AsyncTriggerFile): void {
 
 /** Record a freshly-armed async trigger as pending. Best-effort; a failed write
  *  only loses the restart-recovery guarantee, never the in-memory path.
- *  `ownerLarkAppId` stamps the owning bot for cross-bot isolation. */
-export function recordPending(sessionId: string, triggerId: string, createdAt: number, ownerLarkAppId?: string): void {
+ *  `ownerLarkAppId` is REQUIRED — it stamps the owning bot so cross-bot lookups
+ *  can be rejected fail-closed (an unstamped file would be un-attributable and
+ *  therefore un-servable). Pass '' only in tests that deliberately exercise the
+ *  legacy-unstamped path. */
+export function recordPending(sessionId: string, triggerId: string, createdAt: number, ownerLarkAppId: string): void {
   const file = load(sessionId);
   if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
   file.results[triggerId] = { status: 'pending', createdAt };
@@ -92,8 +95,9 @@ export function recordPending(sessionId: string, triggerId: string, createdAt: n
   save(sessionId, file);
 }
 
-/** Mark an async trigger completed with its captured final output. */
-export function recordCompleted(sessionId: string, triggerId: string, content: string, completedAt: number, ownerLarkAppId?: string): void {
+/** Mark an async trigger completed with its captured final output.
+ *  `ownerLarkAppId` is REQUIRED (see recordPending). */
+export function recordCompleted(sessionId: string, triggerId: string, content: string, completedAt: number, ownerLarkAppId: string): void {
   const file = load(sessionId);
   if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
   const prev = file.results[triggerId];

@@ -17,6 +17,51 @@
  */
 import type { TriggerResponse } from './trigger-types.js';
 
+/** Fail-closed / positive-proof cross-bot ownership gate for trigger-result.
+ *
+ *  sessionStore.getSession() scans EVERY bot's sessions-*.json and the async
+ *  store is a machine-wide shared directory, so a request routed to daemon A
+ *  carrying a sessionId owned by bot B could read B's record / persisted output.
+ *  This decides which of the two shared-store sources daemon `owner` may trust.
+ *
+ *  A source is kept ONLY with POSITIVE proof of ownership — "not known-foreign"
+ *  is deliberately insufficient, so a legacy unstamped persisted file with no
+ *  owned session (unprovable owner) is dropped rather than leaked.
+ *
+ *   - live ds:   always ours (in THIS daemon's registry) → caller passes liveDs.
+ *   - stored:    keep iff there's a live ds OR its larkAppId == owner.
+ *   - persisted: keep iff stamped with owner, OR (unstamped legacy) corroborated
+ *                by an owned session context for the same id.
+ *
+ *  Returns which sources survive, plus `foreignLeak` = raw data existed but none
+ *  of it is attributable to us (→ caller returns a clean not_found miss). */
+export interface OwnershipInputs {
+  owner: string;                    // this daemon's larkAppId (cachedLarkAppId)
+  liveDs: boolean;                  // a live DaemonSession exists in this registry
+  storedOwner?: string;             // larkAppId on the (possibly cross-scanned) stored record
+  storedExists: boolean;            // a stored session record was found at all
+  persistedOwner?: string;          // ownerLarkAppId stamped on the persisted file
+  persistedExists: boolean;         // a persisted result was found at all
+}
+export interface OwnershipDecision {
+  keepStored: boolean;
+  keepPersisted: boolean;
+  foreignLeak: boolean;
+}
+export function decideAsyncOwnership(inp: OwnershipInputs): OwnershipDecision {
+  const keepStored = inp.storedExists && (inp.liveDs || (!!inp.owner && inp.storedOwner === inp.owner));
+  const ownedSessionForId = inp.liveDs || keepStored;
+  const keepPersisted = inp.persistedExists && (
+    (!!inp.owner && inp.persistedOwner === inp.owner) ||
+    (inp.persistedOwner === undefined && ownedSessionForId)
+  );
+  // Raw data surfaced from the shared stores, but nothing is attributable to us.
+  const foreignLeak =
+    !inp.liveDs && !keepStored && !keepPersisted && (inp.storedExists || inp.persistedExists);
+  return { keepStored, keepPersisted, foreignLeak };
+}
+
+
 export interface AsyncStateInputs {
   sessionId: string;
   /** Whether a live DaemonSession is currently registered for this id. */
@@ -52,9 +97,12 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
   // session exists at all, this falls through to the not_found branch below.
   const sessionExists = inp.liveActive || inp.storedStatus !== undefined;
   if (inp.requestedTriggerId && !inp.memResult && !inp.persisted && sessionExists) {
+    // No `state`: this is a request-shape error (the caller pinned a triggerId
+    // this session never had), NOT one of the four task-lifecycle states. Keep
+    // it distinct from the public `state:"not_found"` (ok:true, session absent)
+    // so callers don't conflate "bad request" with "no such session".
     return {
       ok: false,
-      state: 'not_found',
       triggerId: inp.requestedTriggerId,
       errorCode: 'bad_request',
       error: `async trigger not found for session: ${inp.requestedTriggerId}`,
