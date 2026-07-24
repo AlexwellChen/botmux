@@ -10014,8 +10014,8 @@ process.on('message', async (raw: unknown) => {
       // barrier（shouldDeferUserFlush——/cd 未落地前任何用户输入都不得写入，
       // 否则 passthrough 会执行在旧 cwd 的 CLI 里）时入队。注入排空后由
       // flushPendingInjections 的 finally 补踢 flushPending 送达。
-      if (cliRestartInProgress || rawInputRestartGate
-        || shouldHoldCodexRunnerInput(codexRunnerFreshness) || sessionRenameInFlight
+      if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight
+        || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)) {
         pendingRawInputs.push(msg);
         log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
