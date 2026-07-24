@@ -25,7 +25,7 @@ import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -1357,15 +1357,17 @@ export async function handleCommand(
 
       case '/restart': {
         if (ds) {
-          if (ds.worker && !ds.worker.killed) {
-            ds.worker.send({ type: 'restart' } as DaemonToWorker);
-            const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
-            await sessionReply(rootId, t('cmd.restart.in_progress', { cliName }, loc));
-          } else {
-            killWorker(ds);
-            const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
-            await sessionReply(rootId, t('cmd.restart.terminated', { cliName }, loc));
+          if (ds.adoptedFrom) {
+            await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, loc));
+            break;
           }
+          const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+          requestSessionRestart(ds, {
+            source: 'slash',
+            notify: async status => {
+              await sessionReply(rootId, t(`cmd.restart.${status}`, { cliName }, loc));
+            },
+          });
           logger.info(`[${logTag}] Restart by /restart command`);
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));

@@ -52,6 +52,12 @@ import {
   shouldWaitForPostSessionStartPromptEvidence,
   shouldWriteNow,
 } from './utils/input-gate.js';
+import {
+  decideCodexRunnerFreshness,
+  shouldHoldCodexRunnerInput,
+  transitionOnCodexRunnerPrompt,
+  type CodexRunnerFreshnessState,
+} from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
@@ -996,6 +1002,12 @@ const IDLE_PROBE_INTERVAL_MS = 3_500;
 const IDLE_PROBE_MAX_ATTEMPTS = 24;
 let busyPatternIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
+let codexRunnerFreshness: CodexRunnerFreshnessState = 'current';
+let persistCodexRunnerBuildOnReady = false;
+let activeRestartAttemptId: string | undefined;
+/** Distinguishes a replacement's synchronous ready signal (Riff) from a late
+ * idle callback emitted by the backend being torn down. */
+let replacementSpawnInProgress = false;
 /** The effectiveResume flag used by the most recent spawnCli call. Written
  *  immediately after the two-tier fallback check so late-attach timers
  *  (hermes, cursor, etc.) can read THE SAME semantics the spawn used,
@@ -4924,6 +4936,10 @@ function markPromptReadyFromPty(): void {
 
 function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
+  if (cliRestartInProgress && !replacementSpawnInProgress) {
+    log('Ignoring prompt-ready from backend generation being replaced');
+    return;
+  }
   stopBusyPatternIdleProbe();
   // Ready-gate: a startup selector's ❯ (cjadk et al.) falsely matches
   // readyPattern → the IdleDetector fires idle while the CLI is NOT actually at
@@ -4953,6 +4969,14 @@ function markPromptReady(): void {
     log('Idle detected during ready-gate settle; deferring prompt-ready until settle completes');
     return;
   }
+  const freshnessTransition = transitionOnCodexRunnerPrompt(codexRunnerFreshness);
+  codexRunnerFreshness = freshnessTransition.state;
+  if (freshnessTransition.action === 'reload') {
+    log('Stale Codex App runner became idle; replacing it before releasing queued input');
+    void restartCliProcess('stale runner reached idle', { immediate: true, preservePending: true });
+    return;
+  }
+  if (freshnessTransition.action === 'ignore') return;
   isPromptReady = true;
   clearSessionRenameInFlight();
   // An old backend can still report idle while its async teardown is running.
@@ -4981,6 +5005,23 @@ function markPromptReady(): void {
     renderer?.markNewTurn();  // exclude history replay from streaming card
   }
   send({ type: 'prompt_ready' });
+  if (
+    persistCodexRunnerBuildOnReady
+    && lastInitConfig?.cliId === 'codex-app'
+    && lastInitConfig.runnerBuildId
+  ) {
+    send({ type: 'runner_build_ready', runnerBuildId: lastInitConfig.runnerBuildId });
+    persistCodexRunnerBuildOnReady = false;
+  }
+  if (activeRestartAttemptId) {
+    send({
+      type: 'restart_result',
+      attemptId: activeRestartAttemptId,
+      status: 'succeeded',
+      category: 'prompt_ready',
+    });
+    activeRestartAttemptId = undefined;
+  }
   // Send immediate idle snapshot so Lark card reflects idle status.
   // BUT: skip when messages are pending — flushPending() will immediately
   // make the CLI busy, so the idle state is transient and shouldn't appear
@@ -5281,6 +5322,7 @@ async function flushPending(): Promise<void> {
   // old CLI. Never let a new flush (including one triggered by the old
   // backend's idle/task-done callback) write across that restart boundary.
   if (cliRestartInProgress) return;
+  if (shouldHoldCodexRunnerInput(codexRunnerFreshness)) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
   if (pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null) return;  // nothing to flush — keep isPromptReady
@@ -5635,6 +5677,7 @@ function sendToPty(
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
+    holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   }) && cliAdapter.mergeQueuedInput === true;
   const mergedQueued = shouldMergeQueued && mergeQueuedCliInput(pendingMessages, next);
   if (mergedQueued) {
@@ -5671,7 +5714,11 @@ function sendToPty(
   // delivers queued messages instead. See input-gate.ts; this fixes dispatch's
   // brief reaching Codex before its first idle and never landing.
   if (!sessionRenameInFlight && commandLineWritesPending === 0 && shouldWriteNow({
-    isPromptReady, isFlushing, supportsTypeAhead, awaitingFirstPrompt,
+    isPromptReady,
+    isFlushing,
+    supportsTypeAhead,
+    awaitingFirstPrompt,
+    holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   })) {
     if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
@@ -6624,6 +6671,28 @@ async function spawnCli(
       persistentSessionName = selectedBackend.persistentSessionName;
       willReattachPersistent = selectedBackend.isReattach === true;
     }
+  }
+
+  const replacementExpectedFresh = codexRunnerFreshness === 'restarting_fresh';
+  const freshness = decideCodexRunnerFreshness({
+    cliId: cfg.cliId,
+    adoptMode: cfg.adoptMode === true,
+    persistentReattach: willReattachPersistent,
+    replacementExpectedFresh,
+    currentBuildId: cfg.runnerBuildId,
+    persistedBuildId: cfg.persistedRunnerBuildId,
+  });
+  codexRunnerFreshness = freshness.state;
+  persistCodexRunnerBuildOnReady = freshness.persistOnReady;
+  log(`Codex runner freshness=${freshness.state} reason=${freshness.reason}`);
+  if (freshness.reason === 'replacement_reattached' && activeRestartAttemptId) {
+    send({
+      type: 'restart_result',
+      attemptId: activeRestartAttemptId,
+      status: 'failed',
+      category: 'spawn_failed',
+    });
+    activeRestartAttemptId = undefined;
   }
 
   // The plugin set is stable only for the lifetime of one real CLI process.
@@ -8089,6 +8158,16 @@ async function spawnCli(
     isPromptReady = false;
     currentBotmuxTurnId = undefined;
     currentBotmuxDispatchAttempt = undefined;
+    if (!intentionalRestart && activeRestartAttemptId) {
+      send({
+        type: 'restart_result',
+        attemptId: activeRestartAttemptId,
+        status: 'failed',
+        category: 'runner_exited',
+      });
+      activeRestartAttemptId = undefined;
+      codexRunnerFreshness = 'failed';
+    }
     if (intentionalRestart) {
       log('Suppressed claude_exit for intentional in-worker restart');
     } else {
@@ -8261,6 +8340,7 @@ async function restartCliProcess(
   // of firing idle/task-done callbacks. Inputs accepted in that interval must
   // remain queued until a replacement backend has been installed.
   cliRestartInProgress = true;
+  replacementSpawnInProgress = false;
   rawInputRestartGate = true;
   // The Node worker stays alive through this restart, so the daemon will see
   // neither claude_exit nor worker-exit. Explicitly revoke the old turn's
@@ -8315,16 +8395,20 @@ async function restartCliProcess(
               rpcPluginGenerationPrepared = true;
               await engageCodexRpc(restartCfg);
             }
+            replacementSpawnInProgress = true;
             await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
             await prepareCodexNativeTitleGeneration(restartCfg, codexRpcEngine);
+            replacementSpawnInProgress = false;
             if (codexRpcEngine) armRpcStartupDialogDismiss();
           } catch (err) {
+            replacementSpawnInProgress = false;
             cliRestartInProgress = false;
             await sendFatalWorkerErrorAndExit(err);
             return;
           }
         }
         cliRestartInProgress = false;
+        replacementSpawnInProgress = false;
         // Riff marks itself prompt-ready inside spawnCli(); that early flush is
         // intentionally held by the restart gate above. Release its raw-input
         // fence now; other backends keep it until their later markPromptReady().
@@ -8332,6 +8416,7 @@ async function restartCliProcess(
         void flushPending();
       }, 500);
     } catch (err) {
+      replacementSpawnInProgress = false;
       cliRestartInProgress = false;
       try {
         await sendFatalWorkerErrorAndExit(err);
@@ -9550,6 +9635,15 @@ async function sendFatalWorkerErrorAndExit(
 ): Promise<void> {
   if (fatalWorkerErrorPending) return;
   fatalWorkerErrorPending = true;
+  if (activeRestartAttemptId) {
+    await sendAndFlush({
+      type: 'restart_result',
+      attemptId: activeRestartAttemptId,
+      status: 'failed',
+      category: 'spawn_failed',
+    });
+    activeRestartAttemptId = undefined;
+  }
   await sendAndFlush({
     type: 'error',
     message: err instanceof Error ? err.message : String(err),
@@ -9576,6 +9670,7 @@ process.on('message', async (raw: unknown) => {
       const initStartedAtMs = Date.now();
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
+      activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
       refreshTerminalViewToken();
       if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
@@ -9919,7 +10014,8 @@ process.on('message', async (raw: unknown) => {
       // barrier（shouldDeferUserFlush——/cd 未落地前任何用户输入都不得写入，
       // 否则 passthrough 会执行在旧 cwd 的 CLI 里）时入队。注入排空后由
       // flushPendingInjections 的 finally 补踢 flushPending 送达。
-      if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight
+      if (cliRestartInProgress || rawInputRestartGate
+        || shouldHoldCodexRunnerInput(codexRunnerFreshness) || sessionRenameInFlight
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)) {
         pendingRawInputs.push(msg);
         log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
@@ -9958,6 +10054,8 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'restart': {
+      activeRestartAttemptId = msg.attemptId;
+      codexRunnerFreshness = 'restarting_fresh';
       await restartCliProcess('daemon request', { preservePending: true });
       break;
     }

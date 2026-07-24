@@ -17,4 +17,26 @@ describe('worker app-runner control-channel wiring', () => {
     expect(workerSource).toContain('const dispatchAttempt = currentBotmuxDispatchAttempt;');
     expect(workerSource).not.toContain('const dispatchAttempt = payload.dispatchAttempt');
   });
+
+  it('keeps stale-busy normal and raw input queued until replacement readiness', () => {
+    const flushStart = workerSource.indexOf('async function flushPending(): Promise<void>');
+    const rawInputCase = workerSource.indexOf("case 'raw_input':");
+    const normalInputGate = workerSource.indexOf(
+      'holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness)',
+    );
+
+    expect(workerSource.slice(flushStart, flushStart + 800)).toContain(
+      'if (shouldHoldCodexRunnerInput(codexRunnerFreshness)) return;',
+    );
+    expect(workerSource.slice(rawInputCase, rawInputCase + 1_500)).toContain(
+      'shouldHoldCodexRunnerInput(codexRunnerFreshness)',
+    );
+    expect(normalInputGate).toBeGreaterThan(0);
+    expect(workerSource).toContain(
+      "pendingRawInputs.push(msg);",
+    );
+    expect(workerSource).toContain(
+      "void restartCliProcess('stale runner reached idle', { immediate: true, preservePending: true });",
+    );
+  });
 });

@@ -37,11 +37,14 @@ import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
+import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
+import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomUUID();
+const restartCoordinator = new RestartCoordinator();
 
 export function getDaemonBootId(): string {
   return DAEMON_BOOT_ID;
@@ -1302,6 +1305,7 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
 export function killWorker(ds: DaemonSession): void {
+  restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.localProcessAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
@@ -1333,6 +1337,27 @@ export function killWorker(ds: DaemonSession): void {
   ds.workerPort = null;
   ds.workerToken = null;
   ds.workerViewToken = null;
+}
+
+/** Join or start one correlated physical restart for a session. */
+export function requestSessionRestart(
+  ds: DaemonSession,
+  observer: RestartObserver,
+): { attemptId: string; joined: boolean } {
+  return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
+    if (ds.worker && !ds.worker.killed) {
+      ds.worker.send({ type: 'restart', attemptId } as DaemonToWorker);
+      return;
+    }
+    forkWorker(ds, '', {
+      resume: ds.hasHistory,
+      restartAttemptId: attemptId,
+    });
+  });
+}
+
+export function __testOnly_resetRestartCoordinator(): void {
+  restartCoordinator.reset();
 }
 
 /**
@@ -1911,6 +1936,7 @@ export function forkWorker(
     resume?: boolean;
     turnId?: string;
     dispatchAttempt?: number;
+    restartAttemptId?: string;
   } = false,
 ): void {
   // Device enrollment briefly freezes every daemon before the one-way host
@@ -1949,12 +1975,14 @@ export function forkWorker(
   let resume = false;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
+  let restartAttemptId: string | undefined;
   if (typeof resumeOrTurnId === 'string') {
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
     resume = resumeOrTurnId.resume === true;
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
+    restartAttemptId = resumeOrTurnId.restartAttemptId;
   } else {
     resume = resumeOrTurnId;
   }
@@ -2193,6 +2221,7 @@ export function forkWorker(
     promptPayload.codexAppInput,
     initAttributionTurnId,
   );
+  const runtimeIdentity = runtimeBuildIdentity();
   const initMsg: DaemonToWorker = {
     type: 'init',
     sessionId: ds.session.sessionId,
@@ -2266,6 +2295,11 @@ export function forkWorker(
     ),
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
+    ...(runtimeIdentity.status === 'known'
+      ? { runnerBuildId: runtimeIdentity.id }
+      : {}),
+    ...(ds.session.runnerBuildId ? { persistedRunnerBuildId: ds.session.runnerBuildId } : {}),
+    ...(restartAttemptId ? { restartAttemptId } : {}),
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -2803,6 +2837,31 @@ function setupWorkerHandlers(
             ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
           }, { codexAppInputAccepted: !!followUpCodexAppInput });
         }
+        break;
+      }
+
+      case 'runner_build_ready': {
+        const identity = runtimeBuildIdentity();
+        if (
+          ds.worker === worker
+          && effectiveCliId === 'codex-app'
+          && identity.status === 'known'
+          && msg.runnerBuildId === identity.id
+        ) {
+          ds.session.runnerBuildId = msg.runnerBuildId;
+          sessionStore.updateSession(ds.session);
+        } else {
+          logger.warn(`[${t}] Ignored invalid or stale runner_build_ready`);
+        }
+        break;
+      }
+
+      case 'restart_result': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
+          break;
+        }
+        restartCoordinator.resolve(ds.session.sessionId, msg.attemptId, msg.status);
         break;
       }
 
@@ -3568,6 +3627,7 @@ function setupWorkerHandlers(
     // A stale takeover worker never clears the replacement — during takeover the
     // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
+      restartCoordinator.failSession(ds.session.sessionId);
       ds.worker = null;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;
