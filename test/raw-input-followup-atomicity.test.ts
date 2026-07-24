@@ -36,7 +36,7 @@ describe('worker raw_input handler', () => {
     const gateIdx = region.indexOf(
       'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight',
     );
-    const queueIdx = region.indexOf('pendingRawInputs.push(msg)');
+    const queueIdx = region.indexOf('freshnessInputQueue.enqueueRaw(msg)');
     const deliverIdx = region.indexOf('await deliverRawInput(msg)');
 
     expect(gateIdx).toBeGreaterThanOrEqual(0);

@@ -54,8 +54,8 @@ import {
 } from './utils/input-gate.js';
 import {
   decideCodexRunnerFreshness,
+  CodexRunnerFreshnessInputQueue,
   shouldHoldCodexRunnerInput,
-  transitionOnCodexRunnerPrompt,
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
@@ -1382,7 +1382,14 @@ async function runStartupCommands(): Promise<void> {
   idleDetector?.reset();
 }
 
-const pendingMessages: PendingCliInput[] = [];
+const freshnessInputQueue = new CodexRunnerFreshnessInputQueue<
+  PendingCliInput,
+  Extract<DaemonToWorker, { type: 'raw_input' }>
+>(
+  () => codexRunnerFreshness,
+  state => { codexRunnerFreshness = state; },
+);
+const pendingMessages = freshnessInputQueue.normal;
 /** Correlation ids that this worker actually wrote into the owned Codex App
  * runner. Runner lifecycle/final markers may route only to ids in this bounded
  * local set; model/user display bytes cannot add entries. */
@@ -1414,7 +1421,7 @@ function shortCorrelationId(value: string | undefined): string {
 /** Literal commands that arrived while native /rename owned the TUI or while
  * an owned CLI restart was fenced. Normal raw_input commands are still
  * delivered immediately (including while busy). */
-const pendingRawInputs: Array<Extract<DaemonToWorker, { type: 'raw_input' }>> = [];
+const pendingRawInputs = freshnessInputQueue.raw;
 /** Latest requested canonical session title. Unlike a normal prompt this is an
  * administrative TUI command: never type-ahead while the agent is busy, never
  * open a model turn, and latest-wins if several renames arrive before idle. */
@@ -4969,14 +4976,13 @@ function markPromptReady(): void {
     log('Idle detected during ready-gate settle; deferring prompt-ready until settle completes');
     return;
   }
-  const freshnessTransition = transitionOnCodexRunnerPrompt(codexRunnerFreshness);
-  codexRunnerFreshness = freshnessTransition.state;
-  if (freshnessTransition.action === 'reload') {
+  const freshnessAction = freshnessInputQueue.onPromptReady();
+  if (freshnessAction === 'reload') {
     log('Stale Codex App runner became idle; replacing it before releasing queued input');
     void restartCliProcess('stale runner reached idle', { immediate: true, preservePending: true });
     return;
   }
-  if (freshnessTransition.action === 'ignore') return;
+  if (freshnessAction === 'ignore') return;
   isPromptReady = true;
   clearSessionRenameInFlight();
   // An old backend can still report idle while its async teardown is running.
@@ -5443,7 +5449,8 @@ async function flushPending(): Promise<void> {
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
     // applying the canonical title last keeps the resume-picker label aligned.
     if (rawInputReady && pendingRawInputs.length > 0 && backend) {
-      const raw = pendingRawInputs.shift()!;
+      const raw = freshnessInputQueue.takeRaw();
+      if (!raw) return;
       await deliverRawInput(raw);
       return;
     }
@@ -5471,7 +5478,8 @@ async function flushPending(): Promise<void> {
       return;
     }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
-      const item = pendingMessages.shift()!;
+      const item = freshnessInputQueue.takeNormal();
+      if (!item) break;
       const durableWrite = item.dispatchAttempt !== undefined;
       if (durableWrite) durableTurnInFlight = true;
       // Track as in-flight until the CLI returns to idle (markPromptReady).
@@ -5662,7 +5670,7 @@ function sendToPty(
   // old early-return silently dropped it after receiver had already persisted
   // DISPATCHED.
   if (cliRestartInProgress || !backend) {
-    pendingMessages.push(next);
+    freshnessInputQueue.enqueueNormal(next);
     log(`Queued message while CLI backend is restarting (${pendingMessages.length} pending)`);
     return true;
   }
@@ -5683,7 +5691,7 @@ function sendToPty(
   if (mergedQueued) {
     log(`Merged queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
   } else {
-    pendingMessages.push(next);
+    freshnessInputQueue.enqueueNormal(next);
   }
   // User-override semantics: a fresh Lark message while a TUI prompt is "active"
   // takes precedence over the AI-detected prompt. The screen analyzer can be
@@ -8166,8 +8174,8 @@ async function spawnCli(
         category: 'runner_exited',
       });
       activeRestartAttemptId = undefined;
-      codexRunnerFreshness = 'failed';
     }
+    if (!intentionalRestart) freshnessInputQueue.onReplacementFailed();
     if (intentionalRestart) {
       log('Suppressed claude_exit for intentional in-worker restart');
     } else {
@@ -10017,7 +10025,7 @@ process.on('message', async (raw: unknown) => {
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)) {
-        pendingRawInputs.push(msg);
+        freshnessInputQueue.enqueueRaw(msg);
         log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
       } else {
         await deliverRawInput(msg);

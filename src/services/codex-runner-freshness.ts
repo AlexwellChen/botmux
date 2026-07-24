@@ -64,3 +64,47 @@ export function transitionOnCodexRunnerPrompt(state: CodexRunnerFreshnessState):
   if (state === 'failed') return { state: 'failed', action: 'ignore' };
   return { state, action: 'publish_ready' };
 }
+
+/**
+ * Worker-owned input queues whose dequeue boundary is fenced by runner
+ * freshness. Keeping this small seam outside worker.ts makes the stale-runner
+ * contract executable without importing the worker process (which installs
+ * IPC handlers and starts runtime services at module load).
+ */
+export class CodexRunnerFreshnessInputQueue<TNormal, TRaw> {
+  readonly normal: TNormal[] = [];
+  readonly raw: TRaw[] = [];
+
+  constructor(
+    private readonly getState: () => CodexRunnerFreshnessState,
+    private readonly setState: (state: CodexRunnerFreshnessState) => void,
+  ) {}
+
+  enqueueNormal(input: TNormal): void {
+    this.normal.push(input);
+  }
+
+  enqueueRaw(input: TRaw): void {
+    this.raw.push(input);
+  }
+
+  takeNormal(): TNormal | undefined {
+    if (shouldHoldCodexRunnerInput(this.getState())) return undefined;
+    return this.normal.shift();
+  }
+
+  takeRaw(): TRaw | undefined {
+    if (shouldHoldCodexRunnerInput(this.getState())) return undefined;
+    return this.raw.shift();
+  }
+
+  onPromptReady(): 'publish_ready' | 'reload' | 'ignore' {
+    const transition = transitionOnCodexRunnerPrompt(this.getState());
+    this.setState(transition.state);
+    return transition.action;
+  }
+
+  onReplacementFailed(): void {
+    if (this.getState() === 'restarting_fresh') this.setState('failed');
+  }
+}
