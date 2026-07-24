@@ -269,7 +269,6 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
-  detachWorker: vi.fn(() => false),
   killWorker: vi.fn(),
   suspendWorker: vi.fn(() => false),
   forkWorker: vi.fn(),
@@ -464,7 +463,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { detachWorker, killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
@@ -1410,54 +1409,6 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('没有活跃的会话'),
-        undefined,
-        LARK_APP_ID,
-        'msg_001',
-      );
-    });
-  });
-
-  // ─── /detach ───────────────────────────────────────────────────────────
-
-  describe('/detach', () => {
-    it('releases a managed persistent session without killing its CLI', async () => {
-      const ds = makeDaemonSession({
-        session: {
-          ...makeSession(),
-          backendType: 'herdr',
-          persistentBackendTarget: { backendType: 'herdr', sessionName: 'botmux', agentName: 'botmux-sess-001' },
-        },
-      });
-      const deps = makeDeps(ds);
-      vi.mocked(detachWorker).mockReturnValueOnce(true);
-
-      await handleCommand('/detach', ROOT_ID, makeLarkMessage('/detach'), deps, LARK_APP_ID);
-
-      expect(detachWorker).toHaveBeenCalledWith(ds);
-      expect(killWorker).not.toHaveBeenCalled();
-      expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-001');
-      expect(deps.activeSessions.has(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(false);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('原 CLI 会话不受影响'),
-        undefined,
-        LARK_APP_ID,
-        'msg_001',
-      );
-    });
-
-    it('rejects a non-persistent managed session', async () => {
-      const ds = makeDaemonSession();
-      const deps = makeDeps(ds);
-
-      await handleCommand('/detach', ROOT_ID, makeLarkMessage('/detach'), deps, LARK_APP_ID);
-
-      expect(detachWorker).toHaveBeenCalledWith(ds);
-      expect(sessionStore.closeSession).not.toHaveBeenCalled();
-      expect(deps.activeSessions.has(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(true);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('/detach 不适用'),
         undefined,
         LARK_APP_ID,
         'msg_001',

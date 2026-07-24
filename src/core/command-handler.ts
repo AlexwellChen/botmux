@@ -25,7 +25,7 @@ import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { detachWorker, killWorker, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -1335,29 +1335,23 @@ export async function handleCommand(
 
       case '/detach':
       case '/disconnect': {
-        // Disconnect only Botmux ownership while preserving the CLI. Adopted
-        // targets already belong to the user; managed persistent targets use a
-        // dedicated detach IPC so their pane survives and becomes /adopt-able.
+        // 文字版的"⏏ 断开"按钮：仅 adopt 会话适用——botmux 只是观察用户原本在
+        // 跑的 CLI，断开只清掉 botmux 这一侧的 worker / polling，绝不结束 CLI
+        // 进程本身。等价于 card-handler 里 `actionType === 'disconnect'` 那段。
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
           break;
         }
-        let detached: boolean;
-        if (ds.adoptedFrom) {
-          killWorker(ds);
-          detached = true;
-        } else {
-          detached = detachWorker(ds);
-        }
-        if (!detached) {
+        if (!ds.adoptedFrom) {
           await sessionReply(rootId, t('cmd.detach.not_adopted', undefined, loc));
           break;
         }
         const closedSessionId = ds.session.sessionId;
+        killWorker(ds);
         sessionStore.closeSession(closedSessionId);
         activeSessions.delete(sessionKey(rootId, larkAppId!));
         await sessionReply(rootId, t('cmd.detach.success', undefined, loc));
-        logger.info(`[${logTag}] Detached (${ds.adoptedFrom ? 'adopt' : 'managed persistent'}) by ${cmd} command`);
+        logger.info(`[${logTag}] Detached (adopt) by ${cmd} command`);
         break;
       }
 

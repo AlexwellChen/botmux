@@ -1383,35 +1383,6 @@ function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
   try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); } catch { /* absent — benign */ }
 }
 
-/** Disconnect Botmux from a persistent CLI without terminating its backing
- * pane. The logical session can then be closed and the orphaned pane becomes
- * eligible for an explicit /adopt from another topic. */
-export function detachWorker(ds: DaemonSession): boolean {
-  if (!getSessionPersistentBackendType(ds)) return false;
-
-  clearUsageLimitState(ds);
-  ds.localProcessAttestation = undefined;
-  ds.managedTurnOrigin = undefined;
-  const worker = ds.worker;
-  if (worker && !worker.killed) {
-    try {
-      worker.send({ type: 'detach' } as DaemonToWorker);
-    } catch {
-      try { worker.kill('SIGTERM'); } catch { /* already gone */ }
-    }
-    armWorkerKillBackstop(worker, tag(ds));
-  }
-  ds.worker = null;
-  ds.workerPort = null;
-  ds.workerToken = null;
-  ds.workerViewToken = null;
-  ds.lastScreenStatus = undefined;
-  ds.session.webPort = undefined;
-  sessionStore.updateSessionPid(ds.session.sessionId, null);
-  sessionStore.updateSession(ds.session);
-  return true;
-}
-
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
   if (!ds.worker || ds.worker.killed) {
     // There is no live generation that can still own this capability.

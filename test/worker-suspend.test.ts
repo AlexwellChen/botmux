@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import type { BackendType } from '../src/adapters/backend/types.js';
 import type { CliId } from '../src/adapters/cli/types.js';
@@ -19,7 +18,7 @@ vi.mock('../src/utils/logger.js', () => ({
   },
 }));
 
-import { detachWorker, suspendWorker } from '../src/core/worker-pool.js';
+import { suspendWorker } from '../src/core/worker-pool.js';
 import { isSuspendableBackendType } from '../src/core/persistent-backend.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 
@@ -68,64 +67,6 @@ function fakeWorker() {
     signalCode: null,
   } as any;
 }
-
-describe('detachWorker', () => {
-  it('worker detach IPC disconnects the observer without destroying the persistent pane', () => {
-    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    const start = source.indexOf("case 'detach':");
-    const end = source.indexOf("case 'suspend':", start);
-    const handler = source.slice(start, end);
-
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(handler).toContain('backend?.kill()');
-    expect(handler).not.toMatch(/backend\?\.destroySession|destroySession\?\./);
-  });
-
-  it('asks a persistent worker to detach and clears only Botmux runtime ownership', () => {
-    const worker = fakeWorker();
-    const ds: any = {
-      session: {
-        sessionId: 'sid-detach',
-        status: 'active',
-        backendType: 'herdr',
-        persistentBackendTarget: { backendType: 'herdr', sessionName: 'botmux', agentName: 'botmux-sid' },
-        webPort: 3456,
-      },
-      initConfig: { backendType: 'herdr' },
-      worker,
-      workerPort: 3456,
-      workerToken: 'token',
-      workerViewToken: 'view-token',
-      managedTurnOrigin: { capability: 'cap-live', turnId: 'om-live' },
-      lastScreenStatus: 'idle',
-    };
-
-    expect(detachWorker(ds)).toBe(true);
-    expect(worker.send).toHaveBeenCalledWith({ type: 'detach' });
-    expect(ds.worker).toBe(null);
-    expect(ds.workerPort).toBe(null);
-    expect(ds.workerToken).toBe(null);
-    expect(ds.workerViewToken).toBe(null);
-    expect(ds.managedTurnOrigin).toBeUndefined();
-    expect(ds.session.persistentBackendTarget).toEqual({
-      backendType: 'herdr', sessionName: 'botmux', agentName: 'botmux-sid',
-    });
-    expect(ds.session.suspendedColdResume).toBeUndefined();
-  });
-
-  it('refuses to detach a PTY session', () => {
-    const worker = fakeWorker();
-    const ds: any = {
-      session: { sessionId: 'sid-pty', status: 'active', backendType: 'pty' },
-      initConfig: { backendType: 'pty' },
-      worker,
-    };
-
-    expect(detachWorker(ds)).toBe(false);
-    expect(worker.send).not.toHaveBeenCalled();
-    expect(ds.worker).toBe(worker);
-  });
-});
 
 describe('suspendWorker', () => {
   it('suspends a persistent worker without closing the active session', () => {
