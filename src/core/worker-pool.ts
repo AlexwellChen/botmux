@@ -35,7 +35,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -1367,7 +1367,7 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
   try {
-    killPersistentSession(backendType, persistentSessionName(backendType, ds.session.sessionId));
+    killPersistentBackendTarget(persistentBackendTargetForSession(ds)!);
     logger.info(`[${tag(ds)}] killWorker: no live worker — destroyed orphaned ${backendType} backing session`);
   } catch (err) {
     logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
@@ -2234,6 +2234,9 @@ export function forkWorker(
     // getSessionPersistentBackendType). A brand-new session (no stamp) resolves
     // from live config, so a dashboard backend switch only affects NEW sessions.
     backendType: resolvePairedSpawnBackendType(agentCfg.cliId, ds.session.backendType, botCfg.backendType, config.daemon.backendType),
+    // Shared Herdr is not derivable from sessionId: preserve the exact host +
+    // managed-agent affinity across daemon/worker replacement.
+    persistentBackendTarget: ds.session.persistentBackendTarget,
     backendConfig: botCfg.riff,
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
@@ -2446,6 +2449,11 @@ function setupWorkerHandlers(
   worker.on('message', async (msg: WorkerToDaemon) => {
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'persistent_backend_target': {
+        ds.session.persistentBackendTarget = msg.target;
+        sessionStore.updateSession(ds.session);
+        break;
+      }
       case 'turn_input_committed': {
         // Bind the receipt to the exact live worker generation. A late ACK
         // from a replaced worker cannot make the replacement appear to have
@@ -2528,6 +2536,19 @@ function setupWorkerHandlers(
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           logger.info(`[${t}] Managed/silent turn — suppressing ready/streaming card output`);
+          break;
+        }
+
+        // Pi can finish a very fast startup turn through `botmux send` before
+        // Herdr reports idle and the worker emits ready. Posting the initial
+        // card now would put a stale "Starting" card *after* the final reply,
+        // with no later transcript output to withdraw it (the explicit send
+        // intentionally suppresses bridge fallback). Keep the terminal/runtime
+        // state above, but suppress this already-completed turn's card.
+        if (msg.replyAlreadySent) {
+          ds.streamCardPending = false;
+          persistStreamCardState(ds);
+          logger.info(`[${t}] Explicit reply landed before worker ready — skipping stale starting card`);
           break;
         }
 
@@ -4357,8 +4378,16 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
 
   if (!multiBot && lastCliId && lastCliId !== currentCliId) {
     logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all ${backendType} sessions`);
+    // Legacy per-topic hosts are still enumerable by bmx-* name.
     for (const name of backend.listBotmuxSessions()) {
       backend.killSession(name);
+    }
+    // Machine-wide Herdr agents are not separate bmx-* sessions. Tear down
+    // each persisted managed target precisely so a CLI switch cannot reattach
+    // the old executable, while never stopping the shared `botmux` host or an
+    // explicitly adopted user pane.
+    for (const target of managedTargetsForCliChange(backendType, activeSessions_)) {
+      killPersistentBackendTarget(target);
     }
   } else {
     const activeNames = new Set(
@@ -4379,9 +4408,16 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
       let botCliId: CliId | undefined;
       try { botCliId = getBot(session.larkAppId).config.cliId; } catch { continue; }
       if (botCliId && sessionCliId !== botCliId) {
-        const name = backend.sessionName(session.sessionId);
-        logger.info(`CLI mismatch for ${session.sessionId.substring(0, 8)} (session=${sessionCliId}, bot=${botCliId}), killing ${backendType} ${name}`);
-        backend.killSession(name);
+        const target = resolvePersistentBackendTarget(
+          backendType,
+          session.sessionId,
+          session.persistentBackendTarget,
+        );
+        const label = target.backendType === 'herdr' && target.agentName
+          ? `${target.sessionName}/${target.agentName}`
+          : target.sessionName;
+        logger.info(`CLI mismatch for ${session.sessionId.substring(0, 8)} (session=${sessionCliId}, bot=${botCliId}), killing ${backendType} ${label}`);
+        killPersistentBackendTarget(target);
       }
     }
   }
