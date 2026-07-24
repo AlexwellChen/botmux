@@ -5391,9 +5391,14 @@ async function flushPending(): Promise<void> {
           await codexRpcEngine.sendTurn(msg, item.turnId);
           result = { submitted: true };
         } else if (item.codexAppInput && cliAdapter.writeStructuredInput) {
-          result = await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput);
+          result = await cliAdapter.writeStructuredInput(
+            backend,
+            msg,
+            item.codexAppInput,
+            { turnId: item.turnId },
+          );
         } else {
-          result = await cliAdapter.writeInput(backend, msg);
+          result = await cliAdapter.writeInput(backend, msg, { turnId: item.turnId });
         }
         scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
       } catch (err: any) {
