@@ -9753,6 +9753,21 @@ process.on('message', async (raw: unknown) => {
       process.exit(0);
     }
 
+    case 'detach': {
+      log('Detach requested');
+      stopScreenshotLoop();
+      stopBridgeWatcher();
+      revokeManagedTurnOriginForRestart();
+      // SessionBackend.kill() only disconnects Botmux's observer/client. Unlike
+      // destroySession(), it intentionally leaves tmux/zellij/Herdr and the CLI
+      // alive so another topic can discover it through /adopt.
+      try { backend?.kill(); } catch { /* best-effort */ }
+      backend = null;
+      isPromptReady = false;
+      cleanup();
+      process.exit(0);
+    }
+
     case 'suspend': {
       log('Suspend requested');
       stopScreenshotLoop();

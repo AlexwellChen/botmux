@@ -563,6 +563,7 @@ export type DaemonToWorker =
    *  it; all other CLIs ignore it. */
   | { type: 'rename_session'; title: string }
   | { type: 'close' }
+  | { type: 'detach' }
   | { type: 'suspend' }
   | { type: 'restart' }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
