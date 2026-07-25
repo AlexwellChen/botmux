@@ -6655,10 +6655,19 @@ async function spawnCli(
       log(`[sandbox] WARN could not write send-cred file: ${(e as Error).message}`);
     }
   }
+  // In the file sandbox, canonicalize the workingDir handed to buildArgs. CLIs
+  // that pass it as a chdir arg (codex/traex `-C`) fail otherwise on a symlinked
+  // $HOME host: the lexical /home/u/... prefix doesn't exist inside the bwrap
+  // root (only canonical /data00/... is bound), so the CLI's chdir/readlink
+  // ENOENTs and it aborts with "No such file or directory (os error 2)". Off
+  // sandbox this is a no-op (same dir); best-effort if unresolvable.
+  const buildArgsWorkingDir = sandboxRequested
+    ? (() => { try { return realpathSync(cfg.workingDir); } catch { return cfg.workingDir; } })()
+    : cfg.workingDir;
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
-    workingDir: cfg.workingDir,
+    workingDir: buildArgsWorkingDir,
     resumeSessionId: effectiveCliSessionId,
     initialPrompt: preparedInitialPrompt,
     botName: cfg.botName,
