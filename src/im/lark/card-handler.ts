@@ -856,24 +856,33 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return JSON.parse(buildOverloadExpiredCard('这个按钮已点过，或该告警卡已过期。'));
     }
     const mode = value.action === OVERLOAD_ACTION_CLEAN_STOPPED ? 'clean_stopped' : 'suspend_idle';
+    let affected: number;
     try {
-      const affected = await sweepHostOverload(mode);
-      if (mode === 'clean_stopped') st.cleanedN = affected; else st.suspendedN = affected;
-      // Refresh the machine-wide candidate counts so the still-live button and
-      // the header reflect what's left after this sweep.
-      const counts = await countHostOverload();
-      st.stopped = counts.stopped;
-      st.idle = counts.idle;
-      logger.info(`[overload] ${value.action} by owner ${operatorOpenId}: affected=${affected}, remaining stopped=${st.stopped} idle=${st.idle}`);
-      // Rebuild the SAME card: clicked button → ✓done+disabled, other → still live.
-      return JSON.parse(buildOverloadAlertCard(st));
+      affected = await sweepHostOverload(mode);
     } catch (err) {
       logger.warn(`[overload] ${value.action} failed: ${err instanceof Error ? err.message : String(err)}`);
-      // Roll back the claim so a transient sweep failure doesn't permanently
-      // burn the button — the owner can click it again to retry.
+      // Only the destructive sweep is guarded here: roll back the claim so a
+      // transient sweep failure doesn't permanently burn the button — the owner
+      // can click it again to retry. (The post-sweep count refresh below is
+      // deliberately outside this try: once the sweep has run, its failure must
+      // not re-open the button for a second destructive run.)
       releaseOverloadNonce(st.nonce, value.action);
       return { toast: { type: 'error', content: '执行失败，请稍后重试或用 CLI 手动处理' } };
     }
+    if (mode === 'clean_stopped') st.cleanedN = affected; else st.suspendedN = affected;
+    // Refresh the machine-wide candidate counts so the still-live button and
+    // the header reflect what's left after this sweep. Best-effort: the sweep
+    // already succeeded, so a count failure must not roll back the nonce.
+    try {
+      const counts = await countHostOverload();
+      st.stopped = counts.stopped;
+      st.idle = counts.idle;
+    } catch (err) {
+      logger.warn(`[overload] post-sweep count refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    logger.info(`[overload] ${value.action} by owner ${operatorOpenId}: affected=${affected}, remaining stopped=${st.stopped} idle=${st.idle}`);
+    // Rebuild the SAME card: clicked button → ✓done+disabled, other → still live.
+    return JSON.parse(buildOverloadAlertCard(st));
   }
   // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny，talk-only）─────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
