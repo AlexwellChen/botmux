@@ -1,6 +1,6 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, openSync, writeSync, closeSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
@@ -74,7 +74,7 @@ import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
-import { withFileLock } from './utils/file-lock.js';
+import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
@@ -16306,51 +16306,44 @@ function resolveOverloadThresholds(): OverloadThresholds {
  * sampling load15 either side of an X.5 boundary rounded to different bands,
  * got different keys, and each DMed — so the band is dropped.)
  *
- * The claim is a real mutual exclusion, not a read-then-write: two daemons
- * racing the SAME fresh edge both go through `openSync(marker, 'wx')`, and the
- * kernel guarantees exactly one create wins (the loser gets EEXIST and backs
- * off). A previous version did existsSync-check + separate atomic write, whose
- * check and write weren't one critical section, so both siblings could pass the
- * check and each DM. On EEXIST we read the existing claim: same edge still
- * within the window ⇒ back off; a stale/expired/different-edge claim ⇒ take it
- * over with a single atomic replace. Best-effort: any FS error → allow the DM
- * (better a rare duplicate than a silent miss).
+ * The claim is a real mutual exclusion: the ENTIRE read-check-write runs inside
+ * one `withFileLockSync` critical section on the marker. An earlier version used
+ * `openSync(marker, 'wx')`, but that only serializes the FIRST claim — once the
+ * marker exists (it persists after the first alert), every later edge
+ * (recovered / expired) fell back to an unlocked read→replace, so two daemons
+ * both detecting the same `recovered` edge could both read the stale key, both
+ * replace it, and each DM. Serializing the whole section closes that hole. Best-
+ * effort: if the lock itself can't be taken (FS error), allow the DM (better a
+ * rare duplicate than a silent miss).
  */
 function claimOverloadEpisode(kind: 'entered' | 'recovered'): boolean {
   const DEDUP_WINDOW_MS = 60_000; // ≥ two 30s ticks; covers sibling daemons racing the same edge.
   const marker = join(config.session.dataDir, '.overload-episode.json');
   const key = kind;
-  const now = Date.now();
-  const payload = JSON.stringify({ key, at: now });
-  // Fast path: atomically create the marker. Whoever wins the create claims the
-  // episode; a concurrent sibling gets EEXIST and never reaches the DM.
   try {
-    const fd = openSync(marker, 'wx');
-    try { writeSync(fd, payload); } finally { closeSync(fd); }
-    return true;
-  } catch (err: any) {
-    if (err?.code !== 'EEXIST') {
-      // Can't even attempt the exclusive create (perm/FS error) → allow the DM
-      // so an edge is never silently dropped.
+    return withFileLockSync(marker, () => {
+      const now = Date.now();
+      if (existsSync(marker)) {
+        try {
+          const prev = JSON.parse(readFileSync(marker, 'utf8')) as { key?: string; at?: number };
+          if (prev.key === key && typeof prev.at === 'number' && now - prev.at < DEDUP_WINDOW_MS) {
+            return false; // Same edge already claimed within the window.
+          }
+        } catch {
+          // Corrupt marker → fall through and take it over.
+        }
+      }
+      // Winner: claim the episode. atomicWriteFileSync is fine here — the lock,
+      // not the write, provides mutual exclusion.
+      atomicWriteFileSync(marker, JSON.stringify({ key, at: now }));
       return true;
-    }
+    }, { maxWaitMs: 2_000 });
+  } catch (err) {
+    // Couldn't acquire the lock (timeout / FS error) → don't silently drop the
+    // edge; allow this DM (a rare duplicate is better than a missed alert).
+    logger.warn(`[overload] episode claim lock failed (${kind}): ${err instanceof Error ? err.message : String(err)}; allowing DM`);
+    return true;
   }
-  // Marker already exists — decide whether the existing claim still holds.
-  try {
-    const prev = JSON.parse(readFileSync(marker, 'utf8')) as { key?: string; at?: number };
-    if (prev.key === key && typeof prev.at === 'number' && now - prev.at < DEDUP_WINDOW_MS) {
-      return false; // Same edge already claimed within the window.
-    }
-  } catch {
-    // Corrupt marker → fall through and take it over.
-  }
-  // Stale / expired / different-edge claim: take it over with one atomic replace.
-  try {
-    atomicWriteFileSync(marker, payload);
-  } catch {
-    // Can't persist the claim; still allow this DM so an edge is never dropped.
-  }
-  return true;
 }
 
 /** Build the current dashboard URL (active token, not a rotation) from the

@@ -740,19 +740,20 @@ export async function runAutoWorktreeCommit(deps: {
  * `suspend_idle` fans out to EVERY online daemon and sums the affected counts —
  * live workers only exist in their owning daemon's process, so each must sweep
  * its own. `clean_stopped` operates on the SHARED, machine-wide session store,
- * so it targets a SINGLE daemon: fanning it out would make sibling daemons race
- * to close the same zombies, double-count them, and (with alreadyClosed) inflate
- * `affected` by the daemon count. Per-daemon failures are logged; if not one
- * daemon acknowledged, throws so the caller can roll back the nonce.
+ * so ONE daemon does the whole job: it tries daemons in order until the first
+ * one succeeds (not a fixed `daemons[0]`, so a single flaky descriptor doesn't
+ * sink the action while healthy siblings sit idle). Fanning clean_stopped out
+ * would make siblings race the same zombies and double-count them.
+ *
+ * Throws when there are no online daemons, or when every attempt failed — so
+ * the caller rolls back the nonce instead of burning the button on an action
+ * that never ran. A partial success (≥1 daemon ok) returns normally.
  */
 async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promise<number> {
   const daemons = listOnlineDaemons();
-  // clean_stopped is machine-wide (shared store) → one daemon does the whole job.
-  const targets = mode === 'clean_stopped' ? daemons.slice(0, 1) : daemons;
-  let affected = 0;
-  let ok = 0;      // daemons that returned a well-formed 2xx {ok:true}
-  let failed = 0;  // daemons unreachable or returning a non-2xx / malformed body
-  await Promise.all(targets.map(async (d) => {
+  if (daemons.length === 0) throw new Error(`sweep ${mode}: no online daemon`);
+
+  const postSweep = async (d: { ipcPort: number; larkAppId: string }): Promise<number | null> => {
     try {
       const res = await fetchDaemonIpc(d.ipcPort, '/api/host-overload/sweep', {
         method: 'POST',
@@ -760,21 +761,33 @@ async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promis
         body: JSON.stringify({ mode }),
       });
       const body: any = await res.json().catch(() => ({}));
-      if (res.ok && body?.ok && typeof body.affected === 'number') { affected += body.affected; ok++; }
-      else { failed++; logger.warn(`[overload-sweep] daemon ${d.larkAppId} returned ${res.status} ${JSON.stringify(body)}`); }
+      if (res.ok && body?.ok && typeof body.affected === 'number') return body.affected;
+      logger.warn(`[overload-sweep] daemon ${d.larkAppId} returned ${res.status} ${JSON.stringify(body)}`);
+      return null;
     } catch (err) {
-      failed++;
       logger.warn(`[overload-sweep] daemon ${d.larkAppId} unreachable: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
     }
-  }));
-  // If not a single daemon acknowledged the sweep (all unreachable / errored),
-  // the destructive action never ran — surface that as a throw so the caller
-  // rolls back the nonce and keeps the button clickable, instead of silently
-  // reporting "affected 0" and burning it. A partial success (≥1 daemon ok)
-  // still returns normally: the sweep did run where it could.
-  if (ok === 0 && failed > 0) {
-    throw new Error(`sweep ${mode} reached no daemon (${failed} failed)`);
+  };
+
+  if (mode === 'clean_stopped') {
+    // Machine-wide (shared store): try daemons in order, stop at the first
+    // success. Only if EVERY daemon failed do we throw (→ nonce rollback).
+    for (const d of daemons) {
+      const n = await postSweep(d);
+      if (n !== null) return n;
+    }
+    throw new Error(`sweep clean_stopped reached no daemon (${daemons.length} failed)`);
   }
+
+  // suspend_idle: fan out to all daemons and sum. Throw only if not one acked.
+  let affected = 0;
+  let ok = 0;
+  const results = await Promise.all(daemons.map(postSweep));
+  for (const n of results) {
+    if (n !== null) { affected += n; ok++; }
+  }
+  if (ok === 0) throw new Error(`sweep suspend_idle reached no daemon (${daemons.length} failed)`);
   return affected;
 }
 
