@@ -1,6 +1,6 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, openSync, writeSync, closeSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
@@ -16265,16 +16265,21 @@ function resolveOverloadThresholds(): OverloadThresholds {
   let exitLoadRatio = envFloat('BOTMUX_OVERLOAD_EXIT_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.exitLoadRatio);
   const enterMemUsedFrac = envFloat('BOTMUX_OVERLOAD_ENTER_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac);
   let exitMemUsedFrac = envFloat('BOTMUX_OVERLOAD_EXIT_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.exitMemUsedFrac);
-  // Hysteresis only works when the recover line sits below the enter line. A
-  // misconfigured env (exit >= enter) would make the state machine flap; clamp
-  // exit down to enter and warn rather than silently spamming the owner.
-  if (exitLoadRatio > enterLoadRatio) {
-    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_LOAD_RATIO (${exitLoadRatio}) > ENTER (${enterLoadRatio}); clamping exit to enter`);
-    exitLoadRatio = enterLoadRatio;
+  // Hysteresis only works when the recover line sits STRICTLY below the enter
+  // line. Clamping a misconfigured exit down to *equal* enter is not enough: at
+  // enter == exit the enter test (mem `>=`) and the recover test (mem `<=`) both
+  // fire at the exact threshold, so a reading pinned there flaps entered/
+  // recovered every tick. Force a small gap below enter (5%) and warn.
+  const HYSTERESIS_MARGIN = 0.95; // exit = 95% of enter when misconfigured
+  if (exitLoadRatio >= enterLoadRatio) {
+    const clamped = enterLoadRatio * HYSTERESIS_MARGIN;
+    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_LOAD_RATIO (${exitLoadRatio}) >= ENTER (${enterLoadRatio}); clamping exit to ${clamped}`);
+    exitLoadRatio = clamped;
   }
-  if (exitMemUsedFrac > enterMemUsedFrac) {
-    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_MEM_FRAC (${exitMemUsedFrac}) > ENTER (${enterMemUsedFrac}); clamping exit to enter`);
-    exitMemUsedFrac = enterMemUsedFrac;
+  if (exitMemUsedFrac >= enterMemUsedFrac) {
+    const clamped = enterMemUsedFrac * HYSTERESIS_MARGIN;
+    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_MEM_FRAC (${exitMemUsedFrac}) >= ENTER (${enterMemUsedFrac}); clamping exit to ${clamped}`);
+    exitMemUsedFrac = clamped;
   }
   return {
     cpuCount,
@@ -16299,28 +16304,49 @@ function resolveOverloadThresholds(): OverloadThresholds {
  * the first daemon to see an edge claims it and siblings back off. (An earlier
  * version bucketed `entered` by `Math.round(load15)`, but sibling daemons
  * sampling load15 either side of an X.5 boundary rounded to different bands,
- * got different keys, and each DMed — so the band is dropped.) Best-effort: any
- * FS error → allow the DM (better a rare duplicate than a silent miss). One
- * daemon per bot, one shared file, last-writer-wins is fine at 30s tick
- * granularity.
+ * got different keys, and each DMed — so the band is dropped.)
+ *
+ * The claim is a real mutual exclusion, not a read-then-write: two daemons
+ * racing the SAME fresh edge both go through `openSync(marker, 'wx')`, and the
+ * kernel guarantees exactly one create wins (the loser gets EEXIST and backs
+ * off). A previous version did existsSync-check + separate atomic write, whose
+ * check and write weren't one critical section, so both siblings could pass the
+ * check and each DM. On EEXIST we read the existing claim: same edge still
+ * within the window ⇒ back off; a stale/expired/different-edge claim ⇒ take it
+ * over with a single atomic replace. Best-effort: any FS error → allow the DM
+ * (better a rare duplicate than a silent miss).
  */
 function claimOverloadEpisode(kind: 'entered' | 'recovered'): boolean {
   const DEDUP_WINDOW_MS = 60_000; // ≥ two 30s ticks; covers sibling daemons racing the same edge.
   const marker = join(config.session.dataDir, '.overload-episode.json');
   const key = kind;
   const now = Date.now();
+  const payload = JSON.stringify({ key, at: now });
+  // Fast path: atomically create the marker. Whoever wins the create claims the
+  // episode; a concurrent sibling gets EEXIST and never reaches the DM.
   try {
-    if (existsSync(marker)) {
-      const prev = JSON.parse(readFileSync(marker, 'utf8')) as { key?: string; at?: number };
-      if (prev.key === key && typeof prev.at === 'number' && now - prev.at < DEDUP_WINDOW_MS) {
-        return false; // Same edge already claimed within the window.
-      }
+    const fd = openSync(marker, 'wx');
+    try { writeSync(fd, payload); } finally { closeSync(fd); }
+    return true;
+  } catch (err: any) {
+    if (err?.code !== 'EEXIST') {
+      // Can't even attempt the exclusive create (perm/FS error) → allow the DM
+      // so an edge is never silently dropped.
+      return true;
+    }
+  }
+  // Marker already exists — decide whether the existing claim still holds.
+  try {
+    const prev = JSON.parse(readFileSync(marker, 'utf8')) as { key?: string; at?: number };
+    if (prev.key === key && typeof prev.at === 'number' && now - prev.at < DEDUP_WINDOW_MS) {
+      return false; // Same edge already claimed within the window.
     }
   } catch {
-    // Corrupt/missing marker → fall through and claim.
+    // Corrupt marker → fall through and take it over.
   }
+  // Stale / expired / different-edge claim: take it over with one atomic replace.
   try {
-    atomicWriteFileSync(marker, JSON.stringify({ key, at: now }));
+    atomicWriteFileSync(marker, payload);
   } catch {
     // Can't persist the claim; still allow this DM so an edge is never dropped.
   }

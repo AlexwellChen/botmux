@@ -735,17 +735,24 @@ export async function runAutoWorktreeCommit(deps: {
 // ─── Main handler ─────────────────────────────────────────────────────────
 
 /**
- * Fan a host-overload降压 sweep out to every online daemon's IPC and sum the
- * affected counts. For `suspend_idle` each daemon suspends its OWN idle live
- * workers (workers only exist in their owning process). For `clean_stopped` the
- * session store is shared, so the first daemon closes all zombies and the rest
- * return 0 — summing is still correct and idempotent. Per-daemon failures are
- * logged and skipped so one offline/slow daemon can't sink the whole action.
+ * Drive a host-overload降压 sweep across daemons.
+ *
+ * `suspend_idle` fans out to EVERY online daemon and sums the affected counts —
+ * live workers only exist in their owning daemon's process, so each must sweep
+ * its own. `clean_stopped` operates on the SHARED, machine-wide session store,
+ * so it targets a SINGLE daemon: fanning it out would make sibling daemons race
+ * to close the same zombies, double-count them, and (with alreadyClosed) inflate
+ * `affected` by the daemon count. Per-daemon failures are logged; if not one
+ * daemon acknowledged, throws so the caller can roll back the nonce.
  */
 async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promise<number> {
   const daemons = listOnlineDaemons();
+  // clean_stopped is machine-wide (shared store) → one daemon does the whole job.
+  const targets = mode === 'clean_stopped' ? daemons.slice(0, 1) : daemons;
   let affected = 0;
-  await Promise.all(daemons.map(async (d) => {
+  let ok = 0;      // daemons that returned a well-formed 2xx {ok:true}
+  let failed = 0;  // daemons unreachable or returning a non-2xx / malformed body
+  await Promise.all(targets.map(async (d) => {
     try {
       const res = await fetchDaemonIpc(d.ipcPort, '/api/host-overload/sweep', {
         method: 'POST',
@@ -753,12 +760,21 @@ async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promis
         body: JSON.stringify({ mode }),
       });
       const body: any = await res.json().catch(() => ({}));
-      if (res.ok && body?.ok && typeof body.affected === 'number') affected += body.affected;
-      else logger.warn(`[overload-sweep] daemon ${d.larkAppId} returned ${res.status} ${JSON.stringify(body)}`);
+      if (res.ok && body?.ok && typeof body.affected === 'number') { affected += body.affected; ok++; }
+      else { failed++; logger.warn(`[overload-sweep] daemon ${d.larkAppId} returned ${res.status} ${JSON.stringify(body)}`); }
     } catch (err) {
+      failed++;
       logger.warn(`[overload-sweep] daemon ${d.larkAppId} unreachable: ${err instanceof Error ? err.message : String(err)}`);
     }
   }));
+  // If not a single daemon acknowledged the sweep (all unreachable / errored),
+  // the destructive action never ran — surface that as a throw so the caller
+  // rolls back the nonce and keeps the button clickable, instead of silently
+  // reporting "affected 0" and burning it. A partial success (≥1 daemon ok)
+  // still returns normally: the sweep did run where it could.
+  if (ok === 0 && failed > 0) {
+    throw new Error(`sweep ${mode} reached no daemon (${failed} failed)`);
+  }
   return affected;
 }
 

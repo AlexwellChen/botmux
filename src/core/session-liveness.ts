@@ -7,11 +7,14 @@
  * A zombie = a session the store still marks `active`, but whose CLI process is
  * gone and has no backing tmux session — i.e. nothing is actually running, it's
  * just a stale record holding a slot. Intentionally-suspended sessions are NOT
- * zombies: they're worker-less on purpose and cold-resume on the next message,
- * so callers must gate on `status === 'active'` (suspended sessions also read
- * as active in the store, so this predicate additionally requires the process
- * to be truly dead — a suspended session that still has a live detached CLI
- * would fail the pid/tmux check and be preserved).
+ * zombies: they're worker-less on purpose and cold-resume on the next message.
+ * botmux's own cap-suspend deliberately clears the pid AND destroys the backing
+ * CLI/tmux (that's how it reclaims memory), so the pid/tmux probe alone can't
+ * tell such a session apart from a true zombie — it would classify the just-
+ * suspended session as stopped and let the sweep permanently close it. The
+ * persisted `suspendedColdResume` marker is therefore authoritative and short-
+ * circuits to "not stopped", matching the CLI `list` prune guard
+ * (session-list-liveness.ts). Callers still gate on `status === 'active'`.
  */
 import { execFileSync } from 'node:child_process';
 import type { Session } from '../types.js';
@@ -54,6 +57,10 @@ function adoptedCliPid(s: Session): number | undefined {
  * dead. Caller is responsible for the `status === 'active'` gate.
  */
 export function isSessionStopped(s: Session): boolean {
+  // botmux cap-suspended a session on purpose: pid cleared + backing CLI/tmux
+  // destroyed, cold-resumes on the next message. The marker beats the generic
+  // zombie heuristic so the "清僵尸" sweep can't permanently close it.
+  if (s.suspendedColdResume === true) return false;
   const originalPid = adoptedCliPid(s);
   if (originalPid !== undefined) {
     return !isProcessAlive(originalPid);

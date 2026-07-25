@@ -488,7 +488,11 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
     for (const s of stopped) {
       try {
         const r = await closeSession(s.sessionId);
-        if (r.ok) affected++;
+        // Only count sessions this call actually closed. A shared-store session
+        // already closed by another daemon's concurrent sweep returns
+        // alreadyClosed=true — counting it would inflate `affected` by the
+        // number of daemons that raced on the same zombie.
+        if (r.ok && !r.alreadyClosed) affected++;
       } catch (err) {
         logger.warn(`[overload-sweep] close failed for ${s.sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }
