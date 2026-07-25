@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
@@ -2303,8 +2303,32 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               && !isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
               && !hasChatGrant(larkAppId, chatId, senderOpenId)
               && !hasGlobalGrant(larkAppId, senderOpenId)) {
-            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
-            return;
+            // Cold-start self-heal: the cross-ref (bot-openids-<appId>.json) is
+            // learned lazily from observed mentions[], so the FIRST bot→bot
+            // direct @ from a same-deployment sibling can arrive before the
+            // receiver has learned that sibling's receiver-scoped open_id
+            // (Lark open_id is per-app). That raced a real sibling into this
+            // "unknown external bot" branch and mis-fired a /grant card
+            // (regression from ec146a49). Before deciding unknown, confirm the
+            // sender against the group's LIVE `/members/bots` roster: accept
+            // only when it binds to exactly one locally-configured sibling of
+            // the same unique name that independently confirms is_in_chat.
+            // Fails closed to the grant card on any API error / ambiguity /
+            // genuine external bot — never a name-only shortcut.
+            const sibling = await resolveSiblingBotBySenderOpenId(larkAppId, chatId, senderOpenId)
+              .catch((err): { ok: false; reason: string } => ({ ok: false, reason: `resolve_threw: ${err?.message ?? String(err)}` }));
+            if (sibling.ok) {
+              // Persist the newly-proven mapping so subsequent @s from this
+              // sibling hit isKnownPeerBot directly (no live API roundtrip).
+              updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, [
+                { name: sibling.botName, id: { open_id: sibling.senderOpenId } },
+              ]);
+              logger.info(`Lazy sibling cross-ref backfill: ${sibling.botName} → ${senderOpenId?.substring(0, 12)} (was cold; skipping /grant)`);
+            } else {
+              logger.info(`Foreign bot @mention not a known sibling (${sibling.reason}); sending grant request card`);
+              await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+              return;
+            }
           }
         }
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);

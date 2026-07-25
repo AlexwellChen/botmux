@@ -1678,6 +1678,95 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
   return { ok: true, mappings };
 }
 
+/**
+ * A resolved same-deployment sibling identity: the receiver-scoped open_id
+ * `senderOpenId`, proven to belong to a locally-configured bot whose stable
+ * `larkAppId` and unique `botName` are returned so the caller can persist the
+ * receiver's cross-ref (botName → receiver-scoped open_id).
+ */
+export type SiblingBotResolution =
+  | { ok: true; larkAppId: string; botName: string; senderOpenId: string }
+  | { ok: false; reason: string };
+
+/**
+ * Resolve a foreign-bot SENDER open_id (receiver-scoped) to a same-deployment
+ * sibling, using only live authorization-grade signals — never the possibly
+ * stale/uninitialized cross-ref or observed stores. This closes the cold-start
+ * window where a same-machine sibling @s a receiver whose cross-ref has not yet
+ * learned that sibling's receiver-scoped open_id (Lark open_id is per-app).
+ *
+ * Identity is accepted only when all signals agree, mirroring
+ * {@link resolveCurrentChatBotOpenIdsByLarkAppIds}:
+ *  1. the receiver's live `/members/bots` row carries `bot_id === senderOpenId`;
+ *  2. exactly one locally-configured bot (other than the receiver) has that
+ *     exact `bot_name` in bots-info.json — a unique name binding;
+ *  3. that candidate app independently confirms `is_in_chat` and binds to
+ *     exactly one live row for its name (the strict resolver's own re-check).
+ *
+ * Fails closed (returns `{ ok: false }`) on any API error, ambiguity, or name
+ * collision, so the caller falls back to the `/grant` request card. Never
+ * authorizes a genuine external bot: an external sender's open_id has no
+ * locally-configured app of the same unique name, so step 2 fails.
+ */
+export async function resolveSiblingBotBySenderOpenId(
+  receiverLarkAppId: string,
+  chatId: string,
+  senderOpenId: string | undefined,
+): Promise<SiblingBotResolution> {
+  if (!senderOpenId) return { ok: false, reason: 'no_sender_open_id' };
+
+  const timeoutMs = config.chatBotDiscovery?.listBotsApiTimeoutMs ?? 3_000;
+  const live = await listChatBotsViaMembersBots(receiverLarkAppId, chatId, timeoutMs);
+  if (!live.ok) return { ok: false, reason: `live_membership_unavailable: ${live.reason}` };
+
+  // 1. The sender must appear in the receiver's live bot roster by open_id.
+  const liveRow = live.items.find(item => item.botId === senderOpenId);
+  if (!liveRow) return { ok: false, reason: 'sender_not_in_live_roster' };
+  const botName = liveRow.botName;
+
+  // 2. Exactly one locally-configured sibling (≠ receiver) must claim that
+  //    exact name. Read the controlled config fresh — a sibling appended after
+  //    this process started must still be recognized (auth boundary).
+  let candidateAppIds: string[] = [];
+  try {
+    const raw = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf-8'));
+    if (!Array.isArray(raw)) throw new Error('bots-info.json must contain an array');
+    const namesByAppId = new Map<string, string[]>();
+    for (const entry of raw) {
+      const appId = typeof entry?.larkAppId === 'string' ? entry.larkAppId.trim() : '';
+      const name = typeof entry?.botName === 'string' ? entry.botName.trim() : '';
+      if (!appId || !name) continue;
+      const names = namesByAppId.get(appId);
+      if (names) names.push(name);
+      else namesByAppId.set(appId, [name]);
+    }
+    for (const [appId, names] of namesByAppId) {
+      if (appId === receiverLarkAppId) continue;
+      // Require a unique name binding for the app — an app with multiple names
+      // is ambiguous and must not shortcut vetting.
+      if (names.length === 1 && names[0] === botName) candidateAppIds.push(appId);
+    }
+  } catch (err: any) {
+    return { ok: false, reason: `bots_info_unavailable: ${err?.message ?? String(err)}` };
+  }
+  if (candidateAppIds.length !== 1) {
+    return { ok: false, reason: candidateAppIds.length === 0 ? 'no_sibling_with_name' : 'ambiguous_sibling_name' };
+  }
+  const candidateAppId = candidateAppIds[0];
+
+  // 3. Delegate the strict re-check (is_in_chat + unique name + unique live
+  //    row) to the auth-grade resolver, then require it to bind back to exactly
+  //    the sender's open_id.
+  const resolved = await resolveCurrentChatBotOpenIdsByLarkAppIds(receiverLarkAppId, chatId, [candidateAppId]);
+  if (!resolved.ok) return { ok: false, reason: `strict_resolve_failed: ${resolved.error}` };
+  const mapping = resolved.mappings.find(m => m.larkAppId === candidateAppId);
+  if (!mapping || mapping.subjectOpenId !== senderOpenId) {
+    return { ok: false, reason: 'strict_resolve_open_id_mismatch' };
+  }
+
+  return { ok: true, larkAppId: candidateAppId, botName, senderOpenId };
+}
+
 // `/members/bots` returns the observer-scoped mention handle (`bot_id`) and
 // display name only. Bind botmux identity only when a configured bot has already
 // been proven to be in this chat and the name match is unique, OR the item's
