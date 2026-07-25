@@ -34,6 +34,22 @@ export interface StuckKeyGuardResult {
   wroteKeys: boolean;
 }
 
+/**
+ * Decide whether to re-arm the stuck detector after a tui_keys click.
+ *
+ * The detector re-arms ONLY when the card-handler explicitly flagged this as a
+ * stuck-warning Enter action (advances to the next review layer) AND keys were
+ * actually written. An expired click (CLI recovered, page changed — wroteKeys
+ * is false) must NOT re-arm: the detector should stay disarmed until the next
+ * real stall, otherwise a recovered CLI could immediately re-trigger a warning.
+ */
+export function shouldRearmStuckDetector(
+  rearmStuckDetector: boolean,
+  wroteKeys: boolean,
+): boolean {
+  return rearmStuckDetector && wroteKeys;
+}
+
 export interface StuckKeyGuardDeps {
   /** Live read of the current backend (may change between calls / awaits). */
   getBackend: () => SessionBackend | null;

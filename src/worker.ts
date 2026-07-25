@@ -214,7 +214,7 @@ import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { StuckDetector, matchHookReviewScreen } from './utils/stuck-detector.js';
-import { processStuckWarningTuiKeys } from './utils/stuck-key-guard.js';
+import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
@@ -10138,7 +10138,7 @@ process.on('message', async (raw: unknown) => {
       // recovered, page changed) must NOT re-arm — the detector should stay
       // disarmed until the next real stall. t/Esc and all ScreenAnalyzer cards
       // never set this flag.
-      if (msg.rearmStuckDetector && wroteKeys) stuckDetector?.arm();
+      if (shouldRearmStuckDetector(!!msg.rearmStuckDetector, wroteKeys)) stuckDetector?.arm();
       break;
     }
 

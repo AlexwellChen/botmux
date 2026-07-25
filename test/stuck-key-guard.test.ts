@@ -17,7 +17,7 @@
  * Run:  pnpm vitest run test/stuck-key-guard.test.ts
  */
 import { describe, it, expect, vi } from 'vitest';
-import { processStuckWarningTuiKeys, type StuckKeyGuardDeps, type StuckKeyGuardMessage } from '../src/utils/stuck-key-guard.js';
+import { processStuckWarningTuiKeys, shouldRearmStuckDetector, type StuckKeyGuardDeps, type StuckKeyGuardMessage } from '../src/utils/stuck-key-guard.js';
 
 const LEVEL_1_SNAPSHOT = 'Hooks\n\n⚠ 1 hook needs review before it can run.\n\nPress t to trust all; enter to review hooks; esc to close';
 
@@ -221,5 +221,23 @@ describe('processStuckWarningTuiKeys (worker fail-closed guard)', () => {
     const msg = makeMsg({ stuckNonce: 7, stuckCliLifetime: 1 });
     await processStuckWarningTuiKeys(msg, deps);
     expect(sendExpired).toHaveBeenCalledWith(7, 'turn_1', 1);
+  });
+});
+
+describe('shouldRearmStuckDetector (worker rearm decision)', () => {
+  it('rearm=true + wroteKeys=false → false (expired Enter must NOT re-arm)', () => {
+    expect(shouldRearmStuckDetector(true, false)).toBe(false);
+  });
+
+  it('rearm=true + wroteKeys=true → true (successful Enter re-arms once)', () => {
+    expect(shouldRearmStuckDetector(true, true)).toBe(true);
+  });
+
+  it('rearm=false + wroteKeys=true → false (t/Esc/ScreenAnalyzer never re-arm)', () => {
+    expect(shouldRearmStuckDetector(false, true)).toBe(false);
+  });
+
+  it('rearm=false + wroteKeys=false → false', () => {
+    expect(shouldRearmStuckDetector(false, false)).toBe(false);
   });
 });
