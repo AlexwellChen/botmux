@@ -12,6 +12,10 @@
  *   - backend/lifetime changed after capture, OR page type no longer matches
  *     → no keys written, send expired
  *   - write success → send delivered; write returns false or throws → send expired
+ *
+ * backend/lifetime are read via getters (not value snapshots) so the guard can
+ * re-check LIVE state after `await capture()` — a backend replacement or CLI
+ * restart that happens mid-capture must still be detected.
  */
 import type { SessionBackend } from '../adapters/backend/types.js';
 
@@ -31,10 +35,10 @@ export interface StuckKeyGuardResult {
 }
 
 export interface StuckKeyGuardDeps {
-  /** Current CLI lifetime nonce (incremented on every backend replacement). */
-  currentLifetime: number;
-  /** Current backend (may be null if CLI died). */
-  backend: SessionBackend | null;
+  /** Live read of the current backend (may change between calls / awaits). */
+  getBackend: () => SessionBackend | null;
+  /** Live read of the current CLI lifetime nonce (incremented on every backend replacement). */
+  getCurrentLifetime: () => number;
   renderCols: number;
   renderRows: number;
   turnId: string | undefined;
@@ -60,21 +64,21 @@ export interface StuckKeyGuardDeps {
  * Process a stuck-warning card's tui_keys click with full fail-closed guards.
  *
  * Returns a result describing what happened (for testing); production callers
- * ignore the return value and rely on the side effects (sendExpired/sendDelivered
- * callbacks + writeKeys).
+ * use `result.wroteKeys` to decide whether to re-arm the stuck detector.
  */
 export async function processStuckWarningTuiKeys(
   msg: StuckKeyGuardMessage,
   deps: StuckKeyGuardDeps,
 ): Promise<StuckKeyGuardResult> {
   const { stuckNonce, stuckPageType, stuckCliLifetime, keys, isFinal } = msg;
-  const { currentLifetime, backend, renderCols, renderRows, turnId, dispatchAttempt, capture, match, writeKeys, sendExpired, sendDelivered, log } = deps;
+  const { getBackend, getCurrentLifetime, renderCols, renderRows, turnId, dispatchAttempt, capture, match, writeKeys, sendExpired, sendDelivered, log } = deps;
 
   // P1-2: validate the CLI lifetime the card was issued for BEFORE doing
   // anything else. If the CLI restarted between card post and click,
-  // currentLifetime has changed and the card's expected lifetime won't match —
+  // the live lifetime has changed and the card's expected lifetime won't match —
   // fail-closed, do not inject keys into the new CLI. A missing expected
   // lifetime is also rejected (stuck cards must always carry it).
+  const currentLifetime = getCurrentLifetime();
   if (stuckCliLifetime === undefined || stuckCliLifetime !== currentLifetime) {
     log(`TUI keys from stale stuck-warning card (nonce=${stuckNonce}, expectedLifetime=${stuckCliLifetime ?? 'none'}, currentLifetime=${currentLifetime}) — CLI replaced since card issued, dropping`);
     sendExpired(stuckNonce, turnId, dispatchAttempt);
@@ -84,8 +88,8 @@ export async function processStuckWarningTuiKeys(
   // Freeze the backend identity + CLI lifetime BEFORE capture. If the CLI
   // restarts (new backend object / new cliLifetimeNonce) while we await the
   // capture, the frozen values won't match the live ones and we drop the keys.
-  const frozenBackend = backend;
-  const frozenLifetime = currentLifetime;
+  const frozenBackend = getBackend();
+  const frozenLifetime = getCurrentLifetime();
   let currentSnap: string | null = null;
   if (frozenBackend) {
     try {
@@ -96,8 +100,11 @@ export async function processStuckWarningTuiKeys(
     }
   }
 
-  // Fail-closed: no fresh snapshot OR backend/lifetime changed → expired.
-  if (!currentSnap || frozenBackend !== backend || frozenLifetime !== currentLifetime) {
+  // Fail-closed: no fresh snapshot OR backend/lifetime changed during capture → expired.
+  // Re-read LIVE state via getters — the values may have changed while we awaited capture.
+  const liveBackend = getBackend();
+  const liveLifetime = getCurrentLifetime();
+  if (!currentSnap || frozenBackend !== liveBackend || frozenLifetime !== liveLifetime) {
     log(`TUI keys from stale stuck-warning card (nonce=${stuckNonce}, expected=${stuckPageType}) — fresh capture failed or backend replaced, dropping`);
     sendExpired(stuckNonce, turnId, dispatchAttempt);
     return { sent: 'expired', wroteKeys: false };

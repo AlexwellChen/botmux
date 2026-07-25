@@ -10102,8 +10102,9 @@ process.on('message', async (raw: unknown) => {
       // mismatch (lifetime, capture, backend, page type, write failure) sends
       // stuck_warning_expired and drops the keys. ScreenAnalyzer TUI cards
       // (no stuckNonce) bypass the guard and write keys directly.
+      let wroteKeys = false;
       if (msg.stuckNonce !== undefined && msg.stuckPageType) {
-        await processStuckWarningTuiKeys(
+        const result = await processStuckWarningTuiKeys(
           {
             stuckNonce: msg.stuckNonce,
             stuckPageType: msg.stuckPageType,
@@ -10112,8 +10113,8 @@ process.on('message', async (raw: unknown) => {
             isFinal: msg.isFinal,
           },
           {
-            currentLifetime: cliLifetimeNonce,
-            backend,
+            getBackend: () => backend,
+            getCurrentLifetime: () => cliLifetimeNonce,
             renderCols,
             renderRows,
             turnId: currentBotmuxTurnId,
@@ -10126,13 +10127,18 @@ process.on('message', async (raw: unknown) => {
             log,
           },
         );
+        wroteKeys = result.wroteKeys;
       } else {
         await handleTuiKeys(msg.keys, msg.isFinal);
+        wroteKeys = true;
       }
       // Re-arm the stuck detector ONLY when the card-handler explicitly flags
       // this as a stuck-warning card's Enter action (advances to the next
-      // review layer). t/Esc and all ScreenAnalyzer cards never set this flag.
-      if (msg.rearmStuckDetector) stuckDetector?.arm();
+      // review layer) AND keys were actually written. An expired click (CLI
+      // recovered, page changed) must NOT re-arm — the detector should stay
+      // disarmed until the next real stall. t/Esc and all ScreenAnalyzer cards
+      // never set this flag.
+      if (msg.rearmStuckDetector && wroteKeys) stuckDetector?.arm();
       break;
     }
 
