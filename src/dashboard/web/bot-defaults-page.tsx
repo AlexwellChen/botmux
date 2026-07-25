@@ -1420,7 +1420,7 @@ const SBX_RESTRICTIVENESS: Record<SandboxTier, number> = { readWrite: 0, readOnl
  *  the UI's live labels + path tester agree with what the sandbox enforces.
  *  `home` expands a leading `~` the same way the worker does before matching, so
  *  recommendation entries like `~/.claude` line up with absolute tree nodes. */
-function effectiveAccess(tiers: SandboxTiers, path: string, home: string): { access: SandboxTier | 'none'; rule?: string } {
+export function effectiveAccess(tiers: SandboxTiers, path: string, home: string): { access: SandboxTier | 'none'; rule?: string } {
   const expand = (p: string) => (p === '~' || p.startsWith('~/')) ? home.replace(/\/+$/, '') + p.slice(1) : p;
   const norm = (p: string) => expand(p).replace(/\/+$/, '') || '/';
   const target = norm(path);
@@ -1525,9 +1525,9 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       if (!j.ok) return;
       if (!path) {
         setRoots(j.entries.map((e: any) => ({ name: e.name, path: e.path })));
-        // Root view returns [HOME, "/"] — the first entry is canonical $HOME.
-        const h = j.entries?.[0]?.path;
-        if (typeof h === 'string' && h.startsWith('/')) setHomeRoot(h);
+        // Backend returns canonical $HOME explicitly (realpath'd) so `~` expansion
+        // here matches the realpath'd child nodes + the worker's sandbox binds.
+        if (typeof j.home === 'string' && j.home.startsWith('/')) setHomeRoot(j.home);
       } else setChildren(prev => ({ ...prev, [path]: j.entries.map((e: any) => ({ name: e.name, path: e.path })) }));
     } catch { /* listing is best-effort; manual/text entry still works */ }
   }, []);

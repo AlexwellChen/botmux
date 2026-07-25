@@ -325,14 +325,23 @@ function listDirLocally(rawPath: string): {
   path: string | null;
   parent: string | null;
   entries: { name: string; path: string; kind: 'dir' }[];
+  home?: string;
   error?: string;
 } {
-  const home = homedir();
+  // Canonicalize $HOME so the root entry + the `~` the frontend expands both use
+  // the SAME canonical form the child listings (realpathSync below) and the
+  // worker's sandbox binds use. On a symlinked-$HOME host (/home/u →
+  // /data00/home/u) the lexical homedir() would make `~/.claude` expand to
+  // /home/u/.claude while the tree's child nodes come back as /data00/... — the
+  // picker would then never match its own recommendation entries.
+  let home = homedir();
+  try { home = realpathSync(home); } catch { /* lexical fallback if unresolvable */ }
   if (!rawPath) {
-    // Root view: HOME first (the common case), then filesystem root.
+    // Root view: HOME first (the common case), then filesystem root. `home` is
+    // also returned explicitly so the frontend doesn't guess from entries[0].
     const roots = [...new Set([home, '/'])];
     return {
-      ok: true, path: null, parent: null,
+      ok: true, path: null, parent: null, home,
       entries: roots.map(p => ({ name: p, path: p, kind: 'dir' as const })),
     };
   }
