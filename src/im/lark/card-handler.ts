@@ -16,7 +16,7 @@ import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied, getPendingQuota, getPendingMessage } from './grant-pending.js';
-import { claimOverloadNonce } from './overload-nonce.js';
+import { claimOverloadNonce, releaseOverloadNonce } from './overload-nonce.js';
 import {
   buildOverloadAlertCard,
   buildOverloadExpiredCard,
@@ -869,6 +869,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return JSON.parse(buildOverloadAlertCard(st));
     } catch (err) {
       logger.warn(`[overload] ${value.action} failed: ${err instanceof Error ? err.message : String(err)}`);
+      // Roll back the claim so a transient sweep failure doesn't permanently
+      // burn the button — the owner can click it again to retry.
+      releaseOverloadNonce(st.nonce, value.action);
       return { toast: { type: 'error', content: '执行失败，请稍后重试或用 CLI 手动处理' } };
     }
   }

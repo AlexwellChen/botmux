@@ -53,3 +53,15 @@ export function claimOverloadNonce(nonce: string, action: string): boolean {
 
 export function _resetOverloadNoncesForTest(): void { nonces.clear(); lastPrunedAt = 0; }
 export function _overloadNonceCountForTest(): number { return nonces.size; }
+
+/**
+ * Undo a claim for `(nonce, action)` so the button can be retried. Called when
+ * the action a claim guarded (the sweep) fails: without this a transient error
+ * would permanently burn the button and force the owner to the CLI. No-op if
+ * the nonce already expired/pruned.
+ */
+export function releaseOverloadNonce(nonce: string, action: string): void {
+  if (!nonce) return;
+  const e = nonces.get(nonce);
+  if (e) e.usedActions.delete(action);
+}

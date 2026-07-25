@@ -17,6 +17,7 @@ import {
 import {
   registerOverloadNonce,
   claimOverloadNonce,
+  releaseOverloadNonce,
   _resetOverloadNoncesForTest,
 } from '../src/im/lark/overload-nonce.js';
 
@@ -189,7 +190,7 @@ describe('buildOverloadAlertCard (stateful, two persistent buttons)', () => {
     expect(clean.disabled).toBe(true);
     expect(clean.text.content).toContain('已清理 3');
     expect(clean.value.action).toBe(OVERLOAD_ACTION_NOOP);
-    // Other button: STILL clickable (the whole point of董思琪's bug report).
+    // Other button: STILL clickable (the whole point — the two buttons are independent).
     expect(suspend.disabled).toBeFalsy();
     expect(suspend.value.action).toBe(OVERLOAD_ACTION_SUSPEND_IDLE);
   });
@@ -237,5 +238,20 @@ describe('overload nonce (one-shot per action)', () => {
     _resetOverloadNoncesForTest();
     expect(claimOverloadNonce('never-issued', OVERLOAD_ACTION_CLEAN_STOPPED)).toBe(false);
     expect(claimOverloadNonce('', OVERLOAD_ACTION_CLEAN_STOPPED)).toBe(false);
+  });
+
+  it('release re-opens a claim so a failed sweep can be retried (does not touch the other button)', () => {
+    _resetOverloadNoncesForTest();
+    registerOverloadNonce('n1');
+    expect(claimOverloadNonce('n1', OVERLOAD_ACTION_CLEAN_STOPPED)).toBe(true);
+    // Sweep failed → roll back this button's claim.
+    releaseOverloadNonce('n1', OVERLOAD_ACTION_CLEAN_STOPPED);
+    // Same button can be clicked again.
+    expect(claimOverloadNonce('n1', OVERLOAD_ACTION_CLEAN_STOPPED)).toBe(true);
+    // Releasing one action leaves the other button independently claimable.
+    releaseOverloadNonce('n1', OVERLOAD_ACTION_CLEAN_STOPPED);
+    expect(claimOverloadNonce('n1', OVERLOAD_ACTION_SUSPEND_IDLE)).toBe(true);
+    // Release on an unknown nonce is a no-op (no throw).
+    expect(() => releaseOverloadNonce('never-issued', OVERLOAD_ACTION_CLEAN_STOPPED)).not.toThrow();
   });
 });

@@ -58,7 +58,11 @@ export function isSessionStopped(s: Session): boolean {
   if (originalPid !== undefined) {
     return !isProcessAlive(originalPid);
   }
-  const hasPid = !!(s.pid && isProcessAlive(s.pid));
+  // A live worker pid alone proves the session isn't a zombie — short-circuit
+  // before touching tmux so the (synchronous, up-to-3s) tmux probe only ever
+  // runs for sessions whose pid is already dead. Keeps counts/sweep from
+  // spawning a tmux child per live session and stalling the daemon loop.
+  if (s.pid && isProcessAlive(s.pid)) return false;
   const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-  return !hasPid && !hasTmux;
+  return !hasTmux;
 }

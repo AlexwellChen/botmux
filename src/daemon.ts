@@ -16261,12 +16261,27 @@ function envFloat(name: string, dflt: number): number {
  */
 function resolveOverloadThresholds(): OverloadThresholds {
   const cpuCount = Math.max(1, cpus().length || 1);
+  const enterLoadRatio = envFloat('BOTMUX_OVERLOAD_ENTER_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio);
+  let exitLoadRatio = envFloat('BOTMUX_OVERLOAD_EXIT_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.exitLoadRatio);
+  const enterMemUsedFrac = envFloat('BOTMUX_OVERLOAD_ENTER_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac);
+  let exitMemUsedFrac = envFloat('BOTMUX_OVERLOAD_EXIT_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.exitMemUsedFrac);
+  // Hysteresis only works when the recover line sits below the enter line. A
+  // misconfigured env (exit >= enter) would make the state machine flap; clamp
+  // exit down to enter and warn rather than silently spamming the owner.
+  if (exitLoadRatio > enterLoadRatio) {
+    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_LOAD_RATIO (${exitLoadRatio}) > ENTER (${enterLoadRatio}); clamping exit to enter`);
+    exitLoadRatio = enterLoadRatio;
+  }
+  if (exitMemUsedFrac > enterMemUsedFrac) {
+    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_MEM_FRAC (${exitMemUsedFrac}) > ENTER (${enterMemUsedFrac}); clamping exit to enter`);
+    exitMemUsedFrac = enterMemUsedFrac;
+  }
   return {
     cpuCount,
-    enterLoadRatio: envFloat('BOTMUX_OVERLOAD_ENTER_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio),
-    exitLoadRatio: envFloat('BOTMUX_OVERLOAD_EXIT_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.exitLoadRatio),
-    enterMemUsedFrac: envFloat('BOTMUX_OVERLOAD_ENTER_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac),
-    exitMemUsedFrac: envFloat('BOTMUX_OVERLOAD_EXIT_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.exitMemUsedFrac),
+    enterLoadRatio,
+    exitLoadRatio,
+    enterMemUsedFrac,
+    exitMemUsedFrac,
     enterSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.enterSwapUsedFrac,
     exitSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.exitSwapUsedFrac,
     minReAlertMs: envFloat('BOTMUX_OVERLOAD_MIN_REALERT_MS', DEFAULT_OVERLOAD_THRESHOLDS.minReAlertMs),
@@ -16280,16 +16295,19 @@ function resolveOverloadThresholds(): OverloadThresholds {
  * episode marker in the shared botmux data dir so only the first daemon to see a
  * given edge actually sends; siblings within the dedup window back off.
  *
- * The key buckets `enter` edges by 15-min-load band so a single overload episode
- * (which the state machine only re-alerts every minReAlertMs anyway) maps to one
- * claim; `recovered` is a single key. Best-effort: any FS error → allow the DM
- * (better a rare duplicate than a silent miss). One daemon per bot, one shared
- * file, last-writer-wins is fine at 30s tick granularity.
+ * The key is just the edge kind (`entered` / `recovered`): within DEDUP_WINDOW_MS
+ * the first daemon to see an edge claims it and siblings back off. (An earlier
+ * version bucketed `entered` by `Math.round(load15)`, but sibling daemons
+ * sampling load15 either side of an X.5 boundary rounded to different bands,
+ * got different keys, and each DMed — so the band is dropped.) Best-effort: any
+ * FS error → allow the DM (better a rare duplicate than a silent miss). One
+ * daemon per bot, one shared file, last-writer-wins is fine at 30s tick
+ * granularity.
  */
-function claimOverloadEpisode(kind: 'entered' | 'recovered', load15: number): boolean {
+function claimOverloadEpisode(kind: 'entered' | 'recovered'): boolean {
   const DEDUP_WINDOW_MS = 60_000; // ≥ two 30s ticks; covers sibling daemons racing the same edge.
   const marker = join(config.session.dataDir, '.overload-episode.json');
-  const key = kind === 'recovered' ? 'recovered' : `entered:${Math.round(load15)}`;
+  const key = kind;
   const now = Date.now();
   try {
     if (existsSync(marker)) {
@@ -17127,7 +17145,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // Machine-wide de-dup: multiple bots may have the toggle on, but the
         // host is one machine. Claim a short-lived episode lock so only one bot
         // DMs per edge. Losing the claim = another bot already alerted this edge.
-        if (!claimOverloadEpisode(action.kind, action.metrics.load15)) {
+        if (!claimOverloadEpisode(action.kind)) {
           logger.info(`[overload] ${action.kind} edge already claimed by a sibling bot; skipping DM (${cfg.larkAppId})`);
           return;
         }
