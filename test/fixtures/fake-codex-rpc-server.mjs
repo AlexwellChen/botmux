@@ -19,6 +19,7 @@ const UPDATED_BEFORE = Number(process.env.FAKE_UPDATED_BEFORE ?? '100');
 const UPDATED_AFTER = Number(process.env.FAKE_UPDATED_AFTER ?? '101');
 let threadReadAttempt = 0;
 let currentThreadName;
+const REQUEST_USER_INPUT = process.env.FAKE_REQUEST_USER_INPUT === '1';
 
 const httpServer = createServer((req, res) => {
   if (req.url === '/readyz') { res.writeHead(200); res.end('ok'); return; }
@@ -26,8 +27,26 @@ const httpServer = createServer((req, res) => {
 });
 const wss = new WebSocketServer({ server: httpServer });
 wss.on('connection', (ws) => {
+  let pendingTurnReply;
   ws.on('message', (data) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
+    if (REQUEST_USER_INPUT && msg.id === 900 && (msg.result !== undefined || msg.error !== undefined)) {
+      if (!pendingTurnReply) return;
+      // Real traex 0.200.19 normalizes ANY reply to requestUserInput (empty
+      // answers OR a JSON-RPC error) into {answers:{}} and COMPLETES the turn.
+      // Model that: a direct reply always completes the turn. Only an explicit
+      // `turn/interrupt` (below) ends it as interrupted. This keeps the fixture
+      // faithful to the verified product behavior instead of inventing an
+      // "error bubbles up" semantics that traex does not implement.
+      const accepted = msg.result?.answers?.choice?.answers?.[0] === 'Yes';
+      ws.send(JSON.stringify({
+        jsonrpc: '2.0',
+        id: pendingTurnReply,
+        result: { accepted, status: 'completed' },
+      }));
+      pendingTurnReply = undefined;
+      return;
+    }
     if (typeof msg.id !== 'number' || typeof msg.method !== 'string') return;
     const reply = (result) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
     switch (msg.method) {
@@ -43,7 +62,53 @@ wss.on('connection', (ws) => {
           updatedAt: threadReadAttempt > UPDATED_DELAY_READS ? UPDATED_AFTER : UPDATED_BEFORE,
         } });
       case 'thread/name/set': currentThreadName = msg.params?.name; return reply({});
-      case 'turn/start': if (HANG_TURN) return; return reply({ accepted: true });
+      case 'turn/interrupt': {
+        // FAKE_INTERRUPT_ERROR=1 models an interrupt that itself fails: the
+        // app-server rejects turn/interrupt with a JSON-RPC error. The engine
+        // then has no lever left and must declare itself dead (onDead) rather
+        // than leaking a wedged turn.
+        if (process.env.FAKE_INTERRUPT_ERROR === '1') {
+          return ws.send(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id,
+            error: { code: -32000, message: 'interrupt failed' },
+          }));
+        }
+        // Verified real behavior: interrupt ends the in-flight turn as
+        // 'interrupted' and acks with {}. Resolve the pending turn/start as an
+        // interrupted turn so the engine test can assert the turn stopped
+        // instead of silently completing.
+        if (pendingTurnReply) {
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: pendingTurnReply,
+            result: { turn: { status: 'interrupted' } },
+          }));
+          pendingTurnReply = undefined;
+        }
+        return reply({});
+      }
+      case 'turn/start': {
+        if (HANG_TURN) return;
+        if (REQUEST_USER_INPUT) {
+          pendingTurnReply = msg.id;
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: 900,
+            method: 'item/tool/requestUserInput',
+            params: {
+              threadId: msg.params?.threadId ?? 'thread-fake-1',
+              turnId: 'turn-fake-1',
+              itemId: 'item-fake-1',
+              questions: [{
+                id: 'choice', header: 'Test', question: 'Continue?', multiSelect: false,
+                options: [{ label: 'Yes', description: '' }, { label: 'No', description: '' }],
+              }],
+            },
+          }));
+          return;
+        }
+        return reply({ accepted: true });
+      }
       default: return reply({});
     }
   });

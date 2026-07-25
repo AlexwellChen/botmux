@@ -251,6 +251,22 @@ export const config = {
       catch { return {}; }
     })() as Record<string, unknown>,
   },
+  stuckDetector: {
+    /**
+     * Lightweight, AI-free fallback that warns the user when a written input
+     * has not produced a completed turn within `timeoutMs`. Currently targets
+     * the Codex PreToolUse hook-review blocking state (level 1 hooks browser
+     * and level 2 per-hook review). Generic [Y/n]/permission/Press-to-continue
+     * prompts are intentionally NOT handled — they cannot be safely inferred
+     * from a regex and belong in a follow-up. Enabled by default because it
+     * has no external dependencies and only fires when the worker confirms the
+     * turn is genuinely stalled AND the snapshot matches a known hook screen.
+     */
+    enabled: (process.env.STUCK_DETECTOR_ENABLED ?? 'true').toLowerCase() !== 'false',
+    /** Milliseconds after a write before the detector checks whether the turn
+     *  is still unresolved. */
+    timeoutMs: Number(process.env.STUCK_DETECTOR_TIMEOUT_MS) || 45_000,
+  },
   worktreeSlugAI: {
     /**
      * Optional AI slugger for `/repo wt` auto branch/worktree naming. Disabled

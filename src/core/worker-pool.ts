@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
-import { installHook } from '../adapters/hook-installer.js';
+import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
@@ -25,6 +25,7 @@ import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.
 import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
@@ -1156,6 +1157,12 @@ const skillsInstalledCliIds = new Set<string>();
  */
 export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
+  if (cliId === 'traex') {
+    cleanupTraexAskHooks([
+      join(traeHome(), 'hooks.json'),
+      join(traeHome(), 'cli', 'hooks.json'),
+    ]);
+  }
 
   // Claude-family CLIs deliver skills per-session via `--plugin-dir` (no global
   // leak), so they always materialise their plugin dir — the builtin-injection
@@ -1309,6 +1316,10 @@ export function killWorker(ds: DaemonSession): void {
   // daemon-side copy synchronously; the worker may never get a chance to send
   // its ordered revoke IPC on close/crash paths.
   ds.managedTurnOrigin = undefined;
+  // The worker/CLI generation is ending — any outstanding stuck-warning card
+  // must be invalidated so a late click cannot inject keys into a replacement
+  // worker (or into nothing, if no replacement comes).
+  invalidateStuckWarning(ds, 'killWorker');
   if (!ds.worker || ds.worker.killed) {
     // No live worker to receive {type:'close'}, so its destroySession() — which
     // tears down the persistent backing session (tmux/herdr/zellij) — never
@@ -1413,6 +1424,10 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   ds.workerToken = null;
   ds.workerViewToken = null;
   ds.managedTurnOrigin = undefined;
+  // The worker is being suspended — the CLI will be destroyed and cold-resumed
+  // later. Invalidate any stuck-warning card so a late click cannot inject keys
+  // after the CLI is gone (or into a different CLI on resume).
+  invalidateStuckWarning(ds, 'suspendWorker');
   // Screen state describes the process we just stopped. Keeping it would make
   // the dashboard hydrate this process-less logical session as idle/working.
   ds.lastScreenStatus = undefined;
@@ -2326,6 +2341,46 @@ export function forkWorker(
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
 
+/**
+ * Clear the stuck-warning authority markers WITHOUT patching the card. Used by
+ * ACK paths (tui_keys_delivered / stuck_warning_expired) where the caller has
+ * already resolved the card to its final state — we only need to drop the
+ * nonce/cardId/turnId so a late duplicate click cannot re-inject keys.
+ */
+export function clearStuckWarningAuthority(ds: DaemonSession): void {
+  ds.stuckWarningCardId = undefined;
+  ds.stuckWarningTurnId = undefined;
+  ds.stuckWarningNonce = undefined;
+  ds.stuckWarningPageType = undefined;
+  ds.stuckWarningProcessing = false;
+  ds.stuckWarningCliLifetime = undefined;
+}
+
+/**
+ * Resolve any active stuck-warning card (PATCH it to "done") AND clear its
+ * markers. Called from every path where the CLI can recover or be replaced:
+ * prompt_ready, claude_exit, worker exit/kill/suspend/refork, and the worker's
+ * own stale-card notification. Centralising here avoids missing an exit path
+ * and leaving a clickable card that can inject keys into a different CLI.
+ *
+ * ACK paths (tui_keys_delivered / stuck_warning_expired) do NOT use this —
+ * they patch the card themselves with a context-specific message and then call
+ * clearStuckWarningAuthority() to drop the markers.
+ */
+export function invalidateStuckWarning(ds: DaemonSession, reason: string): void {
+  if (!ds.stuckWarningCardId && !ds.stuckWarningTurnId && ds.stuckWarningNonce === undefined) return;
+  const t = tag(ds);
+  if (ds.stuckWarningCardId) {
+    const locDs = localeForBot(ds.larkAppId);
+    const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+    updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+      logger.debug(`[${t}] Failed to resolve stuck-warning card (${reason}): ${err}`),
+    );
+  }
+  logger.debug(`[${t}] invalidateStuckWarning (${reason}): turn=${ds.stuckWarningTurnId ?? 'none'} nonce=${ds.stuckWarningNonce ?? 'none'}`);
+  clearStuckWarningAuthority(ds);
+}
+
 function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
@@ -2342,6 +2397,11 @@ function setupWorkerHandlers(
   ) {
     throw new Error('worker generation reservation changed before IPC setup');
   }
+  // A new worker generation is starting. As a backstop, invalidate any
+  // stuck-warning card posted by the previous generation — explicit kill/suspend/
+  // exit paths should already have done this, but fork/refork/takeover paths
+  // can leave a stale card that would otherwise inject keys into the new CLI.
+  invalidateStuckWarning(ds, 'new_worker_generation');
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -2764,6 +2824,7 @@ function setupWorkerHandlers(
       }
 
       case 'prompt_ready': {
+        if (ds.worker !== worker) break;
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
@@ -2805,6 +2866,8 @@ function setupWorkerHandlers(
             ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
           }, { codexAppInputAccepted: !!followUpCodexAppInput });
         }
+        // CLI reached its prompt — any previously posted stuck warning is stale.
+        invalidateStuckWarning(ds, 'prompt_ready');
         break;
       }
 
@@ -3112,6 +3175,149 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'stuck_warning': {
+        // Ignore stuck_warning from a stale worker generation — the CLI may have
+        // been replaced and a new worker owns the session now.
+        if (ds.worker !== worker) break;
+        // AI-free StuckDetector fired: a written input hasn't produced a
+        // completed turn within the timeout AND the PTY has been quiet, AND the
+        // snapshot matches a known Codex hook-review screen. The detector only
+        // emits when it matches level 1 or level 2 — there is no "unknown
+        // stall" path, so we always build an interactive card with the exact
+        // keys the screen documents.
+        // Dedup: skip if we already posted a warning for THIS turn, OR if a
+        // stuck-warning card is already active (covers the no-turnId case where
+        // a second stall fires before the first card is resolved).
+        const isDuplicateTurn = msg.turnId !== undefined && ds.stuckWarningTurnId === msg.turnId;
+        const hasActiveCard = !!ds.stuckWarningCardId;
+        if (isDuplicateTurn || hasActiveCard) {
+          logger.debug(`[${t}] Stuck warning dedup skipped (turn=${msg.turnId ?? 'none'}, activeCard=${hasActiveCard})`);
+          break;
+        }
+        // Allocate a daemon-side nonce for this warning (NOT the worker's
+        // generation — the daemon is the authority on which warning is active).
+        // If the CLI recovers (prompt_ready) or the worker is replaced while the
+        // POST is in flight, invalidateStuckWarning clears the nonce; when the
+        // POST returns we check it is still current and, if not, resolve the card
+        // immediately instead of registering it as active.
+        // Allocate a daemon-side nonce for this warning from a monotonic
+        // counter that is NEVER cleared (even when the active authority is
+        // dropped). This prevents the nonce-reuse race: warning nonce=1 POST
+        // awaits → prompt_ready clears active nonce → warning nonce=1 again
+        // would let the old POST register against the new authority. With a
+        // monotonic counter the second warning gets nonce=2, and the old
+        // POST's nonce=1 check fails.
+        const nonce = (ds.stuckWarningNonceCounter ?? 0) + 1;
+        ds.stuckWarningNonceCounter = nonce;
+        ds.stuckWarningNonce = nonce;
+        ds.stuckWarningTurnId = msg.turnId;
+        ds.stuckWarningCliLifetime = msg.cliLifetime;
+        const pageType = msg.matchedPattern;
+        ds.stuckWarningPageType = pageType;
+        const secs = Math.round(msg.elapsedMs / 1000);
+        logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s (${pageType}) nonce=${nonce}`);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'stuck_warning',
+          elapsedMs: msg.elapsedMs,
+          matchedPattern: pageType,
+        });
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+
+        let description: string;
+        let options: Array<{ label: string; text: string; selected: boolean; type: 'confirm' | 'select'; keys: string[] }>;
+        if (pageType === 'hook review level 2') {
+          // Level 2 — per-hook review: t=trust, Esc=go back. No Enter here.
+          description = `⚠️ Codex 卡在单项 hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
+          options = [
+            { label: 't', text: '信任 (trust)', selected: false, type: 'confirm' as const, keys: ['t'] },
+            { label: 'Esc', text: '返回 (go back)', selected: false, type: 'select' as const, keys: ['Escape'] },
+          ];
+        } else {
+          // Level 1 — hooks browser: t=trust all, Enter=review hooks, Esc=close.
+          description = `⚠️ Codex 卡在 hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
+          options = [
+            { label: 't', text: '信任全部 (trust all)', selected: false, type: 'confirm' as const, keys: ['t'] },
+            { label: 'Enter', text: '逐项审核 (review hooks)', selected: false, type: 'select' as const, keys: ['Enter'] },
+            { label: 'Esc', text: '关闭 (close)', selected: false, type: 'select' as const, keys: ['Escape'] },
+          ];
+        }
+        try {
+          const cardJson = buildTuiPromptCard(
+            sessionAnchorId(ds),
+            ds.session.sessionId,
+            description,
+            options,
+            false,
+            undefined,
+            loc,
+          );
+          const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
+          // Authority check: if the warning was invalidated (prompt_ready,
+          // CLI exit, worker replace) OR the worker was replaced while the POST
+          // was in flight, resolve the card immediately and do NOT register it
+          // as active — a late click would otherwise inject keys into a
+          // recovered/replaced CLI. Verify the full tuple: same worker process,
+          // same worker generation, same nonce.
+          if (ds.worker !== worker || ds.workerGeneration !== workerGeneration || ds.stuckWarningNonce !== nonce) {
+            logger.debug(`[${t}] Stuck warning card POSTed but authority stale (nonce=${nonce}, current=${ds.stuckWarningNonce ?? 'none'}, workerGen=${workerGeneration}) — resolving`);
+            const locDs = localeForBot(ds.larkAppId);
+            const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+            updateMessage(ds.larkAppId, cardMsgId, resolvedCard).catch(err =>
+              logger.debug(`[${t}] Failed to resolve stale stuck-warning card: ${err}`),
+            );
+            break;
+          }
+          ds.stuckWarningCardId = cardMsgId;
+          publishAttentionPatch(ds);
+        } catch (err: any) {
+          logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
+          // Card send failed — clear markers ONLY if this nonce is still
+          // current AND we still own the worker. A newer warning (nonce+1) may
+          // have started while this POST was in flight; we must not wipe the
+          // newer state.
+          if (ds.worker === worker && ds.workerGeneration === workerGeneration && ds.stuckWarningNonce === nonce) {
+            clearStuckWarningAuthority(ds);
+          }
+        }
+        break;
+      }
+
+      case 'stuck_warning_expired': {
+        // Ignore from a stale worker generation.
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        // Worker refused to inject keys from a stuck-warning card because the
+        // current screen no longer matches the page type the card was built for.
+        // Resolve the card with a "page changed" message so the user knows the
+        // action was NOT performed, then clear the authority.
+        if (ds.stuckWarningNonce === msg.nonce && ds.stuckWarningCardId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard('页面已变化，未发送按键', locDs);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to update stuck-warning card on expired: ${err}`),
+          );
+          clearStuckWarningAuthority(ds);
+        }
+        break;
+      }
+
+      case 'tui_keys_delivered': {
+        // Ignore from a stale worker generation.
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        // Worker confirmed the keys were written to the PTY. Clear the card
+        // authority and render success. We only do this AFTER the worker ACK
+        // (not on click), so a rejected click (stuck_warning_expired) does not
+        // falsely report success.
+        if (ds.stuckWarningNonce === msg.nonce && ds.stuckWarningCardId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to resolve stuck-warning card on delivered: ${err}`),
+          );
+          clearStuckWarningAuthority(ds);
+        }
+        break;
+      }
+
       case 'claude_exit': {
         // CLI-generation authority must not outlive the concrete worker/CLI
         // pair that issued it. A delayed message from a replaced Node worker
@@ -3121,6 +3327,10 @@ function setupWorkerHandlers(
           break;
         }
         ds.managedTurnOrigin = undefined;
+        // The worker/CLI generation ended. Disable an outstanding stuck-warning
+        // card before any replacement worker can be attached; otherwise a late
+        // click could inject its keys into the replacement CLI.
+        invalidateStuckWarning(ds, 'claude_exit');
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {
@@ -3551,6 +3761,9 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;
+      // This worker generation is gone. Invalidate any stuck-warning card it
+      // posted so a late click cannot inject keys into a replacement worker.
+      invalidateStuckWarning(ds, 'worker_exit');
       // Fence this lifetime before a polling dispatcher can observe its last
       // ACK. Keeping the old receipt is useful audit evidence, but the
       // persisted current generation advances immediately so it cannot count

@@ -1773,6 +1773,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'tui_keys' && ds) {
+      // Fail-closed: only act on a currently-active card (either the
+      // ScreenAnalyzer TUI prompt card or our stuck-warning card). A stale
+      // click from a resolved/replaced card must NOT send any IPC to the
+      // worker — the CLI may have moved on or recovered. PATCH is UI only,
+      // not an authorization check.
+      const isActiveTuiCard = !!ds.tuiPromptCardId && cardMessageId === ds.tuiPromptCardId;
+      const isActiveStuckCard = !!ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId;
+      if (!isActiveTuiCard && !isActiveStuckCard) {
+        logger.info(`[${tag(ds)}] tui_keys from stale card ${cardMessageId} — ignored (active tui=${ds.tuiPromptCardId ?? 'none'} stuck=${ds.stuckWarningCardId ?? 'none'})`);
+        return;
+      }
       let keys: string[] = [];
       try { keys = JSON.parse(value?.keys ?? '[]'); } catch { /* bad json */ }
       const isFinal = value?.is_final === '1';
@@ -1781,6 +1792,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
 
       if (optionType === 'toggle') {
+        // Only a ScreenAnalyzer TUI card may own toggle state. A stuck-warning
+        // card must never read or mutate the other card's global selections.
+        if (!isActiveTuiCard) {
+          logger.info(`[${tag(ds)}] Ignored toggle from non-TUI card ${cardMessageId}`);
+          return;
+        }
         // Toggle: only update card UI, do NOT send keys to terminal yet.
         // Keys will be sent in batch when confirm is clicked.
         if (!ds.tuiToggledIndices) ds.tuiToggledIndices = [];
@@ -1808,10 +1825,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return;
       }
 
-      // For confirm: batch all toggled options' keys first, then confirm keys
+      // For a normal TUI confirm: batch all toggled options' keys first.
+      // For a stuck-warning card: derive the single allowed key from the
+      // page type + selected index — NEVER trust value.keys from the card,
+      // which could be tampered to inject arbitrary keys. The allowlist is
+      // exactly the documented controls for each Codex hook-review screen.
       if (ds.worker) {
         let allKeys: string[] = [];
-        if (ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
+        let isFinalStuck = false;
+        if (isActiveTuiCard && ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
           // Send each toggled option's keys in sequence
           for (const ti of ds.tuiToggledIndices.sort((a, b) => a - b)) {
             const opt = ds.tuiPromptOptions[ti];
@@ -1819,21 +1841,100 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               allKeys.push(...opt.keys);
             }
           }
+          // Then the action's own keys (confirm/select)
+          allKeys.push(...keys);
+        } else if (isActiveStuckCard) {
+          // P1-4: do NOT trust the callback's selected_index. Require it to be
+          // present and a safe integer, then range-check against the page type's
+          // option count. A missing/malformed index must NOT default to 0 (trust),
+          // which is the highest-risk action.
+          const rawIdx = value?.selected_index;
+          if (rawIdx === undefined || rawIdx === null || rawIdx === '') {
+            logger.info(`[${tag(ds)}] Stuck-warning card click missing selected_index — dropped`);
+            return;
+          }
+          const idx = Number(rawIdx);
+          if (!Number.isSafeInteger(idx)) {
+            logger.info(`[${tag(ds)}] Stuck-warning card click with non-integer selected_index=${rawIdx} — dropped`);
+            return;
+          }
+          // Allowlist: map (pageType, idx) → the one safe key.
+          // Level 1: 0=t, 1=Enter, 2=Esc ; Level 2: 0=t, 1=Esc
+          const pt = ds.stuckWarningPageType;
+          const allowlist = pt === 'hook review level 1'
+            ? ['t', 'Enter', 'Escape']
+            : pt === 'hook review level 2'
+              ? ['t', 'Escape']
+              : null;
+          if (!allowlist || idx < 0 || idx >= allowlist.length) {
+            logger.info(`[${tag(ds)}] Stuck-warning card click with out-of-range index ${idx} for pageType=${pt ?? 'none'} — dropped`);
+            return;
+          }
+          allKeys = [allowlist[idx]];
+          // Stuck-card actions are always final (they resolve the current
+          // hook-review screen). Define this server-side — do NOT trust
+          // value.is_final from the callback.
+          isFinalStuck = true;
+        } else {
+          // Non-stuck, non-TUI card (shouldn't happen given the active-card
+          // guard above, but fail-closed).
+          allKeys.push(...keys);
         }
-        // Then the action's own keys (confirm/select)
-        allKeys.push(...keys);
 
         if (allKeys.length > 0) {
-          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal } as DaemonToWorker);
-          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} — "${selectedText}"`);
+          // Atomic processing claim: if a previous click is already in flight
+          // (waiting for tui_keys_delivered / stuck_warning_expired ACK), drop
+          // this duplicate. Without this, two rapid clicks could both pass the
+          // fresh-capture guard and inject keys twice.
+          if (isActiveStuckCard) {
+            if (ds.stuckWarningProcessing) {
+              logger.info(`[${tag(ds)}] Duplicate stuck-warning card click — dropped (processing already in flight)`);
+              return;
+            }
+            ds.stuckWarningProcessing = true;
+          }
+          // Only the stuck-warning card's Enter action re-arms the detector
+          // (Enter advances from the hook list to a per-hook review). Match by
+          // the actual keys sent — NOT by optionType, since t is typed 'confirm'
+          // in the card definition. t/Esc and all ScreenAnalyzer cards never
+          // set this flag. Also require the source card to be our own.
+          const isStuckWarningEnter = isActiveStuckCard
+            && allKeys.length === 1
+            && allKeys[0] === 'Enter';
+          // If this click is from a stuck-warning card, forward the nonce,
+          // cliLifetime, and page type so the worker can re-verify the current
+          // screen still matches before injecting keys. A stale click (CLI
+          // recovered) will be dropped at the worker boundary.
+          const stuckNonce = isActiveStuckCard ? ds.stuckWarningNonce : undefined;
+          const stuckCliLifetime = isActiveStuckCard ? ds.stuckWarningCliLifetime : undefined;
+          const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
+          const effectiveFinal = isFinal || isFinalStuck;
+          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal: effectiveFinal, rearmStuckDetector: isStuckWarningEnter, stuckNonce, stuckCliLifetime, stuckPageType: stuckPage } as DaemonToWorker);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${effectiveFinal} rearmStuck=${isStuckWarningEnter} stuckNonce=${stuckNonce ?? 'none'} — "${selectedText}"`);
         }
 
-        if (isFinal) {
-          const resolveText = ds.tuiToggledIndices?.length
+        if (isFinal || isFinalStuck) {
+          const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
             ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
             : selectedText;
           const finalText = resolveText || selectedText;
           const locDs = localeForBot(ds.larkAppId);
+          // For a stuck-warning card, do NOT clear authority or render success
+          // here. The worker may still reject the keys (stale screen). We show a
+          // "processing" state to block duplicate clicks, and wait for the
+          // worker's tui_keys_delivered (success) or stuck_warning_expired
+          // ("page changed, not sent") ACK before resolving the card.
+          if (isActiveStuckCard) {
+            if (cardMessageId) {
+              const processingCard = buildTuiPromptProcessingCard('处理中…', locDs);
+              updateMessage(ds.larkAppId, cardMessageId, processingCard).catch(err =>
+                logger.debug(`[${tag(ds)}] Failed to set stuck-warning card to processing: ${err}`),
+              );
+            }
+            publishAttentionPatch(ds);
+            try { return JSON.parse(buildTuiPromptProcessingCard('处理中…', locDs)); } catch { /* fall through */ }
+          }
+          // Normal TUI prompt card (ScreenAnalyzer): resolve immediately.
           if (cardMessageId) {
             setTimeout(() => {
               const resolvedCard = buildTuiPromptResolvedCard(finalText, locDs);
@@ -1842,10 +1943,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               );
             }, allKeys.length * 100 + 500);
           }
-          ds.tuiPromptCardId = undefined;
-          ds.tuiPromptOptions = undefined;
-          ds.tuiPromptMultiSelect = undefined;
-          ds.tuiToggledIndices = undefined;
+          // Clear state only for the card that was actually clicked — a stuck
+          // card click must NOT wipe the ScreenAnalyzer TUI prompt state (or
+          // vice versa) if both coexist / race.
+          if (cardMessageId === ds.tuiPromptCardId) {
+            ds.tuiPromptCardId = undefined;
+            ds.tuiPromptOptions = undefined;
+            ds.tuiPromptMultiSelect = undefined;
+            ds.tuiToggledIndices = undefined;
+          }
           publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }
         }
