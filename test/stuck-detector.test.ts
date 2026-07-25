@@ -8,53 +8,15 @@
  * Run:  pnpm vitest run test/stuck-detector.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { StuckDetector, matchHookReviewScreen } from '../src/utils/stuck-detector.js';
 
-// Official Codex TUI snapshot — level 1 hooks browser (the screen that blocks
-// on startup when a new PreToolUse hook needs review).
-// Source: openai/codex codex-rs/tui/src/bottom_pane/snapshots/...hooks_browser_events_with_review_column.snap
-const LEVEL_1_SNAPSHOT = [
-  'Hooks',
-  '',
-  'Lifecycle hooks from config and enabled plugins.',
-  '',
-  '',
-  '',
-  '⚠ 1 hook needs review before it can run.',
-  '',
-  '',
-  '',
-  'Event              Installed  Active  Review  Description',
-  '',
-  'PreToolUse         1          0       1       Before a tool executes',
-  '',
-  '...',
-  '',
-  '',
-  '',
-  'Press t to trust all; enter to review hooks; esc to close',
-].join('\n');
-
-// Official Codex TUI snapshot — level 2 per-hook review (after pressing Enter
-// on level 1). No Enter here; only t=trust and Esc=go back.
-// Source: openai/codex codex-rs/tui/src/bottom_pane/snapshots/...hooks_browser_review_needed_handler.snap
-const LEVEL_2_SNAPSHOT = [
-  'PreToolUse hooks',
-  '',
-  '1 hook needs review before it can run.',
-  '',
-  '',
-  '',
-  '[!] Hook 1 · new',
-  '',
-  '...',
-  '',
-  'Trust  New hook - review required',
-  '',
-  '',
-  '',
-  'Press t to trust; esc to go back',
-].join('\n');
+// Official Codex TUI snapshots read from fixture files (not inline constants)
+// so the classifier is tested against the real on-disk representation.
+const FIXTURES = join(__dirname, 'fixtures');
+const LEVEL_1_SNAPSHOT = readFileSync(join(FIXTURES, 'codex-hooks-browser-level1.snap'), 'utf-8');
+const LEVEL_2_SNAPSHOT = readFileSync(join(FIXTURES, 'codex-hooks-browser-level2.snap'), 'utf-8');
 
 describe('StuckDetector', () => {
   beforeEach(() => {
