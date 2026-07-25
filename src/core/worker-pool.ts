@@ -2345,7 +2345,7 @@ export function forkWorker(
  * already resolved the card to its final state — we only need to drop the
  * nonce/cardId/turnId so a late duplicate click cannot re-inject keys.
  */
-function clearStuckWarningAuthority(ds: DaemonSession): void {
+export function clearStuckWarningAuthority(ds: DaemonSession): void {
   ds.stuckWarningCardId = undefined;
   ds.stuckWarningTurnId = undefined;
   ds.stuckWarningNonce = undefined;
@@ -2365,7 +2365,7 @@ function clearStuckWarningAuthority(ds: DaemonSession): void {
  * they patch the card themselves with a context-specific message and then call
  * clearStuckWarningAuthority() to drop the markers.
  */
-function invalidateStuckWarning(ds: DaemonSession, reason: string): void {
+export function invalidateStuckWarning(ds: DaemonSession, reason: string): void {
   if (!ds.stuckWarningCardId && !ds.stuckWarningTurnId && ds.stuckWarningNonce === undefined) return;
   const t = tag(ds);
   if (ds.stuckWarningCardId) {
