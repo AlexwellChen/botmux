@@ -3001,7 +3001,15 @@ function setupWorkerHandlers(
         // POST is in flight, invalidateStuckWarning clears the nonce; when the
         // POST returns we check it is still current and, if not, resolve the card
         // immediately instead of registering it as active.
-        const nonce = (ds.stuckWarningNonce ?? 0) + 1;
+        // Allocate a daemon-side nonce for this warning from a monotonic
+        // counter that is NEVER cleared (even when the active authority is
+        // dropped). This prevents the nonce-reuse race: warning nonce=1 POST
+        // awaits → prompt_ready clears active nonce → warning nonce=1 again
+        // would let the old POST register against the new authority. With a
+        // monotonic counter the second warning gets nonce=2, and the old
+        // POST's nonce=1 check fails.
+        const nonce = (ds.stuckWarningNonceCounter ?? 0) + 1;
+        ds.stuckWarningNonceCounter = nonce;
         ds.stuckWarningNonce = nonce;
         ds.stuckWarningTurnId = msg.turnId;
         ds.stuckWarningCliLifetime = msg.cliLifetime;

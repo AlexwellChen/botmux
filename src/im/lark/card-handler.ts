@@ -1832,6 +1832,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // exactly the documented controls for each Codex hook-review screen.
       if (ds.worker) {
         let allKeys: string[] = [];
+        let isFinalStuck = false;
         if (isActiveTuiCard && ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
           // Send each toggled option's keys in sequence
           for (const ti of ds.tuiToggledIndices.sort((a, b) => a - b)) {
@@ -1843,20 +1844,37 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // Then the action's own keys (confirm/select)
           allKeys.push(...keys);
         } else if (isActiveStuckCard) {
-          // Allowlist: map (pageType, selectedIndex) → the one safe key.
-          // Level 1: 0=t, 1=Enter, 2=Esc ; Level 2: 0=t, 1=Esc
-          const pt = ds.stuckWarningPageType;
-          let allowedKey: string | undefined;
-          if (pt === 'hook review level 1') {
-            allowedKey = ['t', 'Enter', 'Escape'][selectedIndex];
-          } else if (pt === 'hook review level 2') {
-            allowedKey = ['t', 'Escape'][selectedIndex];
-          }
-          if (!allowedKey) {
-            logger.info(`[${tag(ds)}] Stuck-warning card click with invalid index ${selectedIndex} for pageType=${pt ?? 'none'} — dropped`);
+          // P1-4: do NOT trust the callback's selected_index. Require it to be
+          // present and a safe integer, then range-check against the page type's
+          // option count. A missing/malformed index must NOT default to 0 (trust),
+          // which is the highest-risk action.
+          const rawIdx = value?.selected_index;
+          if (rawIdx === undefined || rawIdx === null || rawIdx === '') {
+            logger.info(`[${tag(ds)}] Stuck-warning card click missing selected_index — dropped`);
             return;
           }
-          allKeys = [allowedKey];
+          const idx = Number(rawIdx);
+          if (!Number.isSafeInteger(idx)) {
+            logger.info(`[${tag(ds)}] Stuck-warning card click with non-integer selected_index=${rawIdx} — dropped`);
+            return;
+          }
+          // Allowlist: map (pageType, idx) → the one safe key.
+          // Level 1: 0=t, 1=Enter, 2=Esc ; Level 2: 0=t, 1=Esc
+          const pt = ds.stuckWarningPageType;
+          const allowlist = pt === 'hook review level 1'
+            ? ['t', 'Enter', 'Escape']
+            : pt === 'hook review level 2'
+              ? ['t', 'Escape']
+              : null;
+          if (!allowlist || idx < 0 || idx >= allowlist.length) {
+            logger.info(`[${tag(ds)}] Stuck-warning card click with out-of-range index ${idx} for pageType=${pt ?? 'none'} — dropped`);
+            return;
+          }
+          allKeys = [allowlist[idx]];
+          // Stuck-card actions are always final (they resolve the current
+          // hook-review screen). Define this server-side — do NOT trust
+          // value.is_final from the callback.
+          isFinalStuck = true;
         } else {
           // Non-stuck, non-TUI card (shouldn't happen given the active-card
           // guard above, but fail-closed).
@@ -1890,11 +1908,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           const stuckNonce = isActiveStuckCard ? ds.stuckWarningNonce : undefined;
           const stuckCliLifetime = isActiveStuckCard ? ds.stuckWarningCliLifetime : undefined;
           const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
-          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal, rearmStuckDetector: isStuckWarningEnter, stuckNonce, stuckCliLifetime, stuckPageType: stuckPage } as DaemonToWorker);
-          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} rearmStuck=${isStuckWarningEnter} stuckNonce=${stuckNonce ?? 'none'} — "${selectedText}"`);
+          const effectiveFinal = isFinal || isFinalStuck;
+          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal: effectiveFinal, rearmStuckDetector: isStuckWarningEnter, stuckNonce, stuckCliLifetime, stuckPageType: stuckPage } as DaemonToWorker);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${effectiveFinal} rearmStuck=${isStuckWarningEnter} stuckNonce=${stuckNonce ?? 'none'} — "${selectedText}"`);
         }
 
-        if (isFinal) {
+        if (isFinal || isFinalStuck) {
           const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
             ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
             : selectedText;

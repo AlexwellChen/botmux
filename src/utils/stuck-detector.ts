@@ -69,12 +69,14 @@ export function matchHookReviewScreen(snapshot: string): 'hook review level 1' |
   if (end === 0) return undefined;
   const trimmed = viewport.slice(0, end);
 
-  // The footer MUST be the last non-empty line of the viewport.
-  const lastLine = trimmed[trimmed.length - 1];
+  // The footer MUST be the last non-empty line of the viewport, matched as a
+  // whole line (^...$) — not a substring. A line like "The old footer said: ..."
+  // must NOT match.
+  const lastLine = trimmed[trimmed.length - 1].trim();
   let level: 1 | 2 | undefined;
-  if (/Press t to trust all; enter to review hooks; esc to close/i.test(lastLine)) {
+  if (/^Press t to trust all; enter to review hooks; esc to close$/i.test(lastLine)) {
     level = 1;
-  } else if (/Press t to trust; esc to go back/i.test(lastLine)) {
+  } else if (/^Press t to trust; esc to go back$/i.test(lastLine)) {
     level = 2;
   }
   if (!level) return undefined;
@@ -93,30 +95,30 @@ export function matchHookReviewScreen(snapshot: string): 'hook review level 1' |
   }
   if (titleIdx < 0) return undefined;
 
+  // Bind footer level to title: a level-1 footer (trust all / review / close)
+  // can only belong to the "Hooks" overview; a level-2 footer (trust / back)
+  // can only belong to the "PreToolUse hooks" detail. This prevents a stale
+  // overview title above a detail footer (or vice versa) from misclassifying.
   const titleLine = trimmed[titleIdx].trim();
+  if (level === 1 && titleLine !== 'Hooks') return undefined;
+  if (level === 2 && !/^PreToolUse hooks$/i.test(titleLine)) return undefined;
+
   const region = trimmed.slice(titleIdx, footerIdx + 1).join('\n');
 
   // Require the pending-review state line in the active region.
   if (!/hook needs review|needs review before it can run/i.test(region)) return undefined;
 
-  // Level 2 (detail) takes priority: if the nearest title is "PreToolUse hooks"
-  // and the L2 body semantics are present, it is level 2 even if a stale "Hooks"
-  // overview lingers above the title.
-  if (/^PreToolUse hooks$/i.test(titleLine)) {
-    // L2 semantic: the "Trust" action line must be present in the region.
+  // Level 2 (detail): require the "Trust" action line in the region.
+  if (level === 2) {
     if (/Trust\s+New hook/i.test(region)) return 'hook review level 2';
     return undefined;
   }
 
-  // Level 1 (overview): title is "Hooks". Require the table header + a row with
-  // Review > 0 to confirm this is the active hooks browser, not a pasted snippet.
-  if (titleLine === 'Hooks') {
-    const hasTableHeader = /Event\s+Installed\s+Active\s+Review/i.test(region);
-    const hasReviewRow = /PreToolUse\s+\d+\s+\d+\s+[1-9]/i.test(region);
-    if (hasTableHeader && hasReviewRow) return 'hook review level 1';
-    return undefined;
-  }
-
+  // Level 1 (overview): require the table header + a row with Review > 0 to
+  // confirm this is the active hooks browser, not a pasted snippet.
+  const hasTableHeader = /Event\s+Installed\s+Active\s+Review/i.test(region);
+  const hasReviewRow = /PreToolUse\s+\d+\s+\d+\s+[1-9]/i.test(region);
+  if (hasTableHeader && hasReviewRow) return 'hook review level 1';
   return undefined;
 }
 

@@ -9166,6 +9166,21 @@ process.on('message', async (raw: unknown) => {
       // lastAnalyzerSnapshot — a stale cache could match the old page type and
       // let us inject keys into a recovered CLI.
       if (msg.stuckNonce !== undefined && msg.stuckPageType) {
+        // P1-2: validate the CLI lifetime the card was issued for BEFORE doing
+        // anything else. If the CLI restarted between card post and click,
+        // cliLifetimeNonce has changed and the card's expected lifetime won't
+        // match — fail-closed, do not inject keys into the new CLI. A missing
+        // expected lifetime is also rejected (stuck cards must always carry it).
+        if (msg.stuckCliLifetime === undefined || msg.stuckCliLifetime !== cliLifetimeNonce) {
+          log(`TUI keys from stale stuck-warning card (nonce=${msg.stuckNonce}, expectedLifetime=${msg.stuckCliLifetime ?? 'none'}, currentLifetime=${cliLifetimeNonce}) — CLI replaced since card issued, dropping`);
+          send({
+            type: 'stuck_warning_expired',
+            nonce: msg.stuckNonce,
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+          });
+          break;
+        }
         // Freeze the backend identity + CLI lifetime BEFORE capture. If the
         // CLI restarts (new backend object / new cliLifetimeNonce) while we
         // await the capture, the frozen values won't match the live ones and

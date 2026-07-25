@@ -8,7 +8,7 @@
  * Run:  pnpm vitest run test/stuck-detector.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { StuckDetector } from '../src/utils/stuck-detector.js';
+import { StuckDetector, matchHookReviewScreen } from '../src/utils/stuck-detector.js';
 
 // Official Codex TUI snapshot — level 1 hooks browser (the screen that blocks
 // on startup when a new PreToolUse hook needs review).
@@ -241,5 +241,67 @@ describe('StuckDetector', () => {
 
     expect(onStuck).toHaveBeenCalledTimes(1);
     detector.dispose();
+  });
+});
+
+describe('matchHookReviewScreen classifier (P1-3 footer anchoring + level binding)', () => {
+  it('matches official level 1 snapshot', () => {
+    expect(matchHookReviewScreen(LEVEL_1_SNAPSHOT)).toBe('hook review level 1');
+  });
+
+  it('matches official level 2 snapshot', () => {
+    expect(matchHookReviewScreen(LEVEL_2_SNAPSHOT)).toBe('hook review level 2');
+  });
+
+  it('rejects when footer is not the last non-empty line (content below)', () => {
+    const snap = LEVEL_1_SNAPSHOT + '\nSome output below the footer';
+    expect(matchHookReviewScreen(snap)).toBeUndefined();
+  });
+
+  it('rejects when footer line contains extra text (not anchored ^...$)', () => {
+    const snap = LEVEL_1_SNAPSHOT.replace(
+      'Press t to trust all; enter to review hooks; esc to close',
+      'The old footer said: Press t to trust all; enter to review hooks; esc to close',
+    );
+    expect(matchHookReviewScreen(snap)).toBeUndefined();
+  });
+
+  it('rejects L1 body paired with L2 footer (level-title binding)', () => {
+    // Take the L1 body (title + table) but swap in the L2 footer.
+    const snap = LEVEL_1_SNAPSHOT.replace(
+      'Press t to trust all; enter to review hooks; esc to close',
+      'Press t to trust; esc to go back',
+    );
+    expect(matchHookReviewScreen(snap)).toBeUndefined();
+  });
+
+  it('rejects L2 body paired with L1 footer (level-title binding)', () => {
+    const snap = LEVEL_2_SNAPSHOT.replace(
+      'Press t to trust; esc to go back',
+      'Press t to trust all; enter to review hooks; esc to close',
+    );
+    expect(matchHookReviewScreen(snap)).toBeUndefined();
+  });
+
+  it('rejects ANSI-colorized footer that does not strip to exact match', () => {
+    // If the footer line has trailing junk after ANSI stripping, it must not match.
+    const snap = LEVEL_1_SNAPSHOT.replace(
+      'Press t to trust all; enter to review hooks; esc to close',
+      '\x1b[32mPress t to trust all; enter to review hooks; esc to close\x1b[0m (more)',
+    );
+    expect(matchHookReviewScreen(snap)).toBeUndefined();
+  });
+
+  it('accepts ANSI-colorized footer that strips to exact match', () => {
+    const snap = LEVEL_1_SNAPSHOT.replace(
+      'Press t to trust all; enter to review hooks; esc to close',
+      '\x1b[32mPress t to trust all; enter to review hooks; esc to close\x1b[0m',
+    );
+    expect(matchHookReviewScreen(snap)).toBe('hook review level 1');
+  });
+
+  it('strips \\r from lines', () => {
+    const snap = LEVEL_1_SNAPSHOT.replace(/\n/g, '\r\n');
+    expect(matchHookReviewScreen(snap)).toBe('hook review level 1');
   });
 });
