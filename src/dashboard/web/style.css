@@ -6147,9 +6147,9 @@ dialog.onboarding-dialog::backdrop {
   color: var(--muted);
 }
 .bd-section-note { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
-/* Read-isolation capability line under the file-sandbox toggle: green when this
-   bot's sandbox also read-isolates (claude/codex on macOS/Linux), muted grey when
-   it's write-protection only. Theme-safe via color-mix on the semantic tokens. */
+/* CLI-data-isolation capability line under the file-sandbox toggle: green when
+   the CLI data root is redirected into this bot's private BOT_HOME, muted grey
+   when only the base deny-by-default file sandbox applies. */
 .bd-section-note[data-read-iso-capability] { margin-top: 8px; padding: 7px 10px; border-radius: 9px; line-height: 1.55; }
 .bd-section-note[data-read-iso-capability="yes"] {
   color: var(--success);

@@ -1379,11 +1379,11 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     }
   }
 
-  // Read isolation rides the SAME toggle: it applies additionally wherever the
-  // CLI + platform can enforce it (claude/codex on macOS/Linux, no wrapper). Show a
-  // capability line so the owner sees whether THIS bot's sandbox also read-isolates
-  // (the "labelled separately" requirement) — best-effort: write protection always
-  // applies; read isolation only where supported.
+  // The unified fs-policy always provides deny-by-default file read/write
+  // isolation. This capability line is narrower: whether the CLI's global data
+  // root can additionally be redirected into this bot's private BOT_HOME
+  // (claude/codex, no wrapper), keeping CLI credentials/config/history separate
+  // from sibling bots. Keep that distinction explicit in the UI copy.
   const readIsoSupported = bot.readIsolationSupported === true;
   return (
     <section className="bd-section">
