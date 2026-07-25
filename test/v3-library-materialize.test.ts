@@ -147,6 +147,21 @@ describe('Saved Workflow compiler', () => {
       rmSync(base, { recursive: true, force: true });
     }
   });
+
+  it('rejects botmux send in a saved goal before publishing or running the workflow', () => {
+    const base = fresh('v3-lib-compile-chat-effect-');
+    try {
+      const runDir = seedSucceededAdHocRun(
+        base,
+        'chat-effect-source',
+        'Write the external record, then run botmux send --mention ou_owner "done"',
+      );
+      expect(() => compileSavedWorkflowFromRun(runDir)).toThrow(/chat-facing side effect/);
+      expect(() => compileSavedWorkflowFromRun(runDir)).toThrow(/hostExecutor feishu-send\/feishu-reply/);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('Saved Workflow materialization + daemon execution', () => {

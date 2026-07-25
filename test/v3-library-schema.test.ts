@@ -11,6 +11,7 @@ import {
   validateSavedWorkflowMetadata,
   validateSavedWorkflowRevisionPayload,
   validateSpecTemplate,
+  collectSavedWorkflowChatSideEffectProblems,
   type SavedWorkflowRevisionPayloadV1,
   type V3DagTemplate,
 } from '../src/workflows/v3/library-schema.js';
@@ -112,6 +113,19 @@ describe('v3 Saved Workflow library schema', () => {
     const withoutBot = dagTemplate();
     delete withoutBot.nodes[0]!.bot;
     expect(() => validateDagTemplate(withoutBot)).toThrow(/direct bot selector/);
+  });
+
+  it('rejects chat-facing side effects in saved workflow goal nodes with migration guidance', () => {
+    const unsafeDag = dagTemplate('写入外部系统，然后 botmux send --mention ou_owner "完成"');
+
+    expect(collectSavedWorkflowChatSideEffectProblems(unsafeDag)).toMatchObject([{
+      nodeId: 'research',
+      kind: 'botmux-send',
+    }]);
+    expect(() => validateSavedWorkflowRevisionPayload(payload({
+      dagTemplate: unsafeDag,
+      safety: { gateDigest: computeSavedWorkflowGateDigest(unsafeDag), sideEffects: [] },
+    }))).toThrow(/businessTask.*hostExecutor feishu-send\/feishu-reply/s);
   });
 
   it('produces a stable content hash across object-key order and changes on semantic content', () => {
