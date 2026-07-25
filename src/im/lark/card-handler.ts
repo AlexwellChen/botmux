@@ -104,6 +104,8 @@ export interface CardHandlerDeps {
   /** VC meeting invite/consumer card actions. Implemented in daemon to
    *  keep meeting sessions, tombstones, and listener-group state single-owned. */
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
+  /** Codex 完成通知卡动作。事件存储、App 打开和会话接管由 daemon 单点持有。 */
+  codexNotifierCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
 }
@@ -339,6 +341,17 @@ function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: Project
   return [...dupes];
 }
 
+function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string | undefined): void {
+  if (!larkAppId || !messageId) return;
+  // Let the card-action promise resolve so the SDK can send its callback ACK
+  // before the original card disappears. A microtask is too early here: it may
+  // run before the SDK continuation that serializes and writes the ACK frame.
+  setImmediate(() => {
+    void deleteMessage(larkAppId, messageId)
+      .catch(err => logger.debug(`Repo card withdraw (post-callback) failed: ${err}`));
+  });
+}
+
 /**
  * Commit a resolved working directory onto a repo-select session: pin it, then
  * either fork the pending CLI (first selection) or close + recreate the session
@@ -519,8 +532,9 @@ export async function commitRepoSelection(
       markRepoCardConsumed(ds, cardToWithdraw);
       ds.repoCardMessageId = undefined;
 
-      // Hold the claim through confirmation + best-effort card withdraw so a
-      // concurrent in-flight select still sees pendingRepoCommitInFlight.
+      // Hold the claim through confirmation. Card withdrawal is deferred until
+      // after the callback can ACK; stale clicks are blocked by the local
+      // consume mark above rather than by the network request's lifetime.
       try {
         if (!opts?.suppressConfirmReply) {
           // A card click has no turn of its own — anchor the confirmation to the
@@ -533,9 +547,7 @@ export async function commitRepoSelection(
       } catch (e) {
         logger.warn(`[${tag(ds)}] Confirm reply after pending repo commit failed: ${e instanceof Error ? e.message : e}`);
       }
-      if (cardToWithdraw && larkAppId) {
-        try { await deleteMessage(larkAppId, cardToWithdraw); } catch { /* card may already be gone */ }
-      }
+      deferRepoCardWithdraw(larkAppId, cardToWithdraw);
     } finally {
       ds.pendingRepoCommitInFlight = false;
     }
@@ -641,10 +653,9 @@ export async function commitRepoSelection(
       }
     }
     logger.info(`[${tag(ds)}] Repo switched to ${dirPath}, new session created`);
-    // Best-effort withdraw — card already claimed above.
-    if (claimedCard && larkAppId) {
-      try { await deleteMessage(larkAppId, claimedCard); } catch { /* best-effort */ }
-    }
+    // The card was claimed locally above; withdraw it only after this callback
+    // can return its ACK so the delete request cannot race the callback frame.
+    deferRepoCardWithdraw(larkAppId, claimedCard);
   }
 }
 
@@ -895,6 +906,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data);
+  }
+
+  if (
+    (value?.action === 'codex_notifier_continue' || value?.action === 'codex_notifier_open_app')
+    && larkAppId
+  ) {
+    if (!operatorOpenId) {
+      logger.info(`${value.action} blocked because operator identity is missing`);
+      return { toast: { type: 'error', content: '只有机器人管理员可以操作此 Codex 任务' } };
+    }
+    if (!deps.codexNotifierCardAction) {
+      return { toast: { type: 'error', content: 'Codex 完成通知处理器未启用' } };
+    }
+    return deps.codexNotifierCardAction(data, larkAppId);
   }
 
   if (
@@ -2312,7 +2337,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
       } else {
         await sessionReply(rootId, t('card.action.continue_using_current_repo', { cwd: getSessionWorkingDir(ds) }, locDs));
-        if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+        deferRepoCardWithdraw(larkAppId, cardMessageId);
         ds.repoCardMessageId = undefined;
       }
     }
@@ -2487,8 +2512,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     let selected: { key?: string; source?: string; tmuxTarget?: string; zellijSession?: string; zellijPaneId?: string; cliPid?: number };
     try { selected = JSON.parse(option); } catch { return; }
 
-    // Re-discover to get full session info and validate. Backend determines
-    // which discovery to run (re-confirms the pane + pid are still alive).
+    // Re-discover to get full session info and validate. Keep the same CLI
+    // filter used to build the card so a stale/tampered option cannot switch
+    // this bot to a different agent implementation.
     const botCfg = getBot(ds.larkAppId).config;
     let target: Awaited<ReturnType<typeof resolveAdoptTarget>>;
     async function resolveAdoptTarget() {
@@ -2502,9 +2528,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return discoverAdoptableZellijSessions(botCfg.cliId)
           .find(s => s.zellijSession === selected.zellijSession && s.zellijPaneId === selected.zellijPaneId);
       }
-      const { discoverAdoptableSessions, adoptTargetKey } = await import('../../core/session-discovery.js');
-      return discoverAdoptableSessions(botCfg.cliId)
-        .find(s => selected.key
+      const { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, adoptTargetKey } = await import('../../core/session-discovery.js');
+      const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
+        const target = active.session.persistentBackendTarget;
+        return active.session.status === 'active'
+          && !active.adoptedFrom
+          && target?.backendType === 'herdr'
+          && !!target.agentName
+          ? [{ sessionName: target.sessionName, agentName: target.agentName }]
+          : [];
+      });
+      return excludeOwnedHerdrAdoptTargets(
+        discoverAdoptableSessions(botCfg.cliId),
+        ownedHerdrTargets,
+      ).find(s => selected.key
           ? adoptTargetKey(s) === selected.key
           : s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
     }

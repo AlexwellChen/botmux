@@ -1788,6 +1788,8 @@ describe('handleCommand', () => {
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'Native 同步' });
       expect(killWorker).not.toHaveBeenCalled();
       expect(ds.session.title).toBe('Native 同步');
+      expect(ds.session.nativeSessionTitle).toBe('Native 同步');
+      expect(ds.session.nativeSessionTitleUserDefined).toBe(true);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('已向 codex 发送原生改名请求');
     });
@@ -3006,6 +3008,41 @@ describe('handleCommand', () => {
       const replyArgs = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
       expect(replyArgs[2]).toBe('interactive');
       expect(replyArgs[1] as string).toContain('adopt-select');
+    });
+
+    it('should not adopt a managed Herdr agent that already has an active owner', async () => {
+      vi.mocked(discoverAdoptableSessions).mockReturnValue([
+        {
+          source: 'herdr',
+          herdrSessionName: 'botmux',
+          herdrTarget: 'w1:p1',
+          herdrPaneId: 'w1:p1',
+          herdrAgentName: 'botmux-owned',
+          cliId: 'claude-code',
+          cwd: '/home/testuser/projectA',
+          paneCols: 200,
+          paneRows: 50,
+        },
+      ]);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const owner = makeDaemonSession({
+        session: makeSession({
+          sessionId: 'owned-session',
+          status: 'active',
+          persistentBackendTarget: {
+            backendType: 'herdr',
+            sessionName: 'botmux',
+            agentName: 'botmux-owned',
+          },
+        }),
+      });
+      deps.activeSessions.set('owned-session', owner);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt botmux:w1:p1'), deps, LARK_APP_ID);
+
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toMatch(/未发现|未找到/);
     });
 
     it('should list Codex App threads instead of scanning tmux for codex-app bots', async () => {

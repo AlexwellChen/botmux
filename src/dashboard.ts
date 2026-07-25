@@ -17,8 +17,9 @@ import {
   generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
   loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
 } from './dashboard/auth.js';
-import { DaemonRegistry } from './dashboard/registry.js';
+import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
 import { jsonRes } from './dashboard/http.js';
@@ -32,7 +33,11 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
-import { redactGroupsForPublic, redactSchedulesForPublic } from './dashboard/public-redact.js';
+import {
+  redactGroupsForPublic,
+  redactSchedulesForPublic,
+  redactSettingsForPublic,
+} from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
@@ -92,6 +97,8 @@ import { spawn } from 'node:child_process';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
+  hasResolvedCodexNotifierRecipient,
+  resolveCodexNotifierRecipientView,
 } from './dashboard/settings-write-applier.js';
 import {
   addBotsToGroup,
@@ -119,6 +126,17 @@ import {
 import { redactGitUrlCredentials } from './core/skills/sources.js';
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
+import {
+  emitCodexNotifierOutboxItem,
+  installCodexNotifierHook,
+  isCodexNotifierWorkerStateFresh,
+  isCodexNotifierHookInstalled,
+  listCodexNotifierOutbox,
+  readCodexNotifierWorkerState,
+  resolveCodexNotifierConfig,
+  runCodexSideConversationMonitor,
+  runCodexNotifierWorkerSupervisor,
+} from './features/codex-notifier/index.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
@@ -272,6 +290,20 @@ mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
 
+// 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
+// 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
+const debugTerminalManager = createDebugTerminalManager({
+  getActiveToken: () => activeToken,
+  defaultWorkingDirs: () => {
+    const dirs = new Set<string>();
+    for (const s of aggregator.getSessions()) {
+      const wd = (s as { workingDir?: unknown }).workingDir;
+      if (typeof wd === 'string' && wd.trim()) dirs.add(wd.trim());
+    }
+    return [...dirs];
+  },
+});
+
 /**
  * Resolve which daemon owns a schedule row. For rows with an explicit
  * `larkAppId`, returns that. For legacy rows (no owner stamp), falls back to
@@ -340,8 +372,48 @@ function spawnStartBotLive(appId: string): Promise<{ ok: boolean; message?: stri
   });
 }
 
+function spawnStopBotLive(appId: string): Promise<{ ok: boolean; message?: string }> {
+  return new Promise((resolve) => {
+    let out = '';
+    let err = '';
+    let settled = false;
+    const done = (r: { ok: boolean; message?: string }) => { if (!settled) { settled = true; resolve(r); } };
+    try {
+      const child = spawn(process.execPath, [botmuxCliEntry(), 'stop-bot', appId, '--json'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: process.env,
+        cwd: globalInstallUpdateCwd(),
+      });
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        done({ ok: false, message: 'stop-bot 超时（30s）' });
+      }, 30_000);
+      timer.unref?.();
+      child.stdout?.on('data', (d) => { out += String(d); });
+      child.stderr?.on('data', (d) => { err += String(d); });
+      child.on('error', (e) => {
+        clearTimeout(timer);
+        done({ ok: false, message: e instanceof Error ? e.message : String(e) });
+      });
+      child.on('exit', (code) => {
+        clearTimeout(timer);
+        let parsed: any;
+        try { parsed = JSON.parse(out.trim()); } catch { /* non-JSON */ }
+        if (code === 0) {
+          done({ ok: true, message: parsed?.processName ? `${parsed.processName} 已停止` : undefined });
+        } else {
+          done({ ok: false, message: parsed?.message || err.trim() || `stop-bot 退出码 ${code}` });
+        }
+      });
+    } catch (e) {
+      done({ ok: false, message: e instanceof Error ? e.message : String(e) });
+    }
+  });
+}
+
 const botOnboarding = new BotOnboardingManager({
   botsJsonPath: BOTS_JSON_PATH,
+  stopBotLive: spawnStopBotLive,
   startBotLive: spawnStartBotLive,
 });
 // 飞书 Web 登录态刷新（机器人改名缺登录态时的 dashboard 扫码入口）。机器级单例，
@@ -362,6 +434,25 @@ interface ResolvedDashboardSettings {
    *  source the SPA can offer as a one-click fill; never persisted unless picked. */
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  codexNotifier: {
+    enabled: boolean;
+    targetBotAppId: string | null;
+    notifyWhen: 'locked_only' | 'always';
+    platformSupported: boolean;
+    hookInstalled: boolean;
+    botOptions: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      recipientConfigured: boolean;
+      recipientVerified: boolean;
+      recipientHint: string | null;
+    }>;
+    targetDaemonOnline: boolean;
+    pendingCount: number;
+    workerOnline: boolean;
+    lastError: { at: string; message: string; retryAt: string } | null;
+  };
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -430,6 +521,51 @@ async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: t
   const bot = bots.find(b => b.larkAppId === appId);
   if (!bot) return { ok: false, error: 'vcMeetingAgent_listenerBot_unknown' };
   return { ok: true };
+}
+
+async function validateCodexNotifierTargetBotAppId(
+  appId: string,
+  options: { requireReady?: boolean } = {},
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const bot = loadBotConfigs().find(candidate => candidate.larkAppId === appId);
+    if (!bot) return { ok: false, error: 'codexNotifier_target_unknown' };
+    if (bot.cliId !== 'codex' && bot.cliId !== 'codex-app') {
+      return { ok: false, error: 'codexNotifier_target_cli_unsupported' };
+    }
+    if (!(bot.allowedUsers ?? []).some(user => typeof user === 'string' && user.trim())) {
+      return { ok: false, error: 'codexNotifier_target_owner_missing' };
+    }
+    if (options.requireReady !== true) return { ok: true };
+    const daemon = registry.list().find(candidate => candidate.larkAppId === appId);
+    if (!daemon) return { ok: false, error: 'codexNotifier_target_daemon_offline' };
+    const resolvedOwners = daemon.resolvedAllowedUsers ?? [];
+    if (!hasResolvedCodexNotifierRecipient(resolvedOwners)) {
+      return { ok: false, error: 'codexNotifier_target_owner_unverified' };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'codexNotifier_target_unknown' };
+  }
+}
+
+function codexNotifierBotOptions(): ResolvedDashboardSettings['codexNotifier']['botOptions'] {
+  try {
+    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+    return loadBotConfigs()
+      .filter(bot => bot.cliId === 'codex' || bot.cliId === 'codex-app')
+      .map(bot => {
+        const resolvedOwners = onlineByAppId.get(bot.larkAppId)?.resolvedAllowedUsers ?? [];
+        return {
+          larkAppId: bot.larkAppId,
+          botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
+          cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
+          ...resolveCodexNotifierRecipientView(bot.allowedUsers, resolvedOwners),
+        };
+      });
+  } catch {
+    return [];
+  }
 }
 
 function normalizeVcMeetingAgentRecord(raw: unknown): Record<string, unknown> {
@@ -803,6 +939,9 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
 function resolveDashboardSettings(): ResolvedDashboardSettings {
   const global = readGlobalConfig();
   const dashboard = global.dashboard ?? {};
+  const codexNotifier = resolveCodexNotifierConfig();
+  const codexNotifierBots = codexNotifierBotOptions();
+  const codexNotifierState = readCodexNotifierWorkerState(config.session.dataDir);
   const larkCli = checkLarkCliVersion();
   return {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
@@ -818,6 +957,19 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       recommendedRef: TRAEX_RECOMMENDED_REF,
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
+    codexNotifier: {
+      enabled: codexNotifier.enabled,
+      targetBotAppId: codexNotifier.targetBotAppId ?? null,
+      notifyWhen: codexNotifier.notifyWhen,
+      platformSupported: process.platform === 'darwin',
+      hookInstalled: isCodexNotifierHookInstalled(),
+      botOptions: codexNotifierBots,
+      targetDaemonOnline: !!codexNotifier.targetBotAppId
+        && registry.list().some(bot => bot.larkAppId === codexNotifier.targetBotAppId),
+      pendingCount: listCodexNotifierOutbox(config.session.dataDir).length,
+      workerOnline: isCodexNotifierWorkerStateFresh(codexNotifierState),
+      lastError: codexNotifierState?.lastError ?? null,
+    },
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
@@ -849,6 +1001,7 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
 settingsWriteApplierDeps.syncVcMeetingListenerBotConfig = syncVcMeetingListenerBotConfig;
 settingsWriteApplierDeps.validateVcMeetingListenerBotAppId = validateVcMeetingListenerBotAppId;
+settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 
 /** Helper to render a {status, body} HandlerResult through `res`. */
 function writeHandlerResult(res: import('node:http').ServerResponse, result: GroupsHandlerResult): void {
@@ -1088,6 +1241,29 @@ registry.on(syncSubscriptions);
 // Initial attach for every daemon already known. Run in parallel so a slow
 // daemon doesn't block the others.
 await Promise.all(registry.list().map(attachDaemon));
+
+const codexNotifierAbort = new AbortController();
+if (resolveCodexNotifierConfig().enabled) {
+  try {
+    installCodexNotifierHook();
+  } catch (error) {
+    logger.warn(`[codex-notifier] Hook reconcile failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+void runCodexNotifierWorkerSupervisor({
+  dataDir: config.session.dataDir,
+  signal: codexNotifierAbort.signal,
+  emit: item => emitCodexNotifierOutboxItem(item, { signal: codexNotifierAbort.signal }),
+  runProducer: signal => runCodexSideConversationMonitor({
+    dataDir: config.session.dataDir,
+    signal,
+    logger,
+  }),
+  logger,
+  onLeaseUnavailable: path => {
+    logger.warn(`[codex-notifier] outbox worker 已由另一 Dashboard 持有，等待接管：${path}`);
+  },
+});
 
 const resourceMonitor = createResourceMonitorService({
   intervalMs: 10_000,
@@ -2263,14 +2439,15 @@ const server = createServer(async (req, res) => {
     }
 
     const presentedToken = authedToken(req, url);
-    const dashboardSettings = resolveDashboardSettings();
+    const globalDashboardConfig = readGlobalConfig().dashboard;
     const decision = decideDashboardAuth({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
       presentedToken,
       activeToken: activeToken ?? '',
-      publicReadOnly: dashboardSettings.publicReadOnly,
+      publicReadOnly: globalDashboardConfig?.publicReadOnly
+        ?? config.dashboard.publicReadOnly,
     });
     // `authed` is consumed by route handlers that distinguish the public-read
     // carve-out from a valid management cookie (notably v3 run details).
@@ -2321,6 +2498,18 @@ const server = createServer(async (req, res) => {
     if ((url.pathname === '/api/plugins' || url.pathname.startsWith('/api/plugins/'))
       && await handlePluginManagementApi(req, res, url)) {
       return;
+    }
+
+    // 调试终端（owner-only）：HTTP 路由挂在 auth gate 之后 → 已确保是管理 token。
+    // /api/debug-terminal（创建/关闭）+ /debug-terminal/<id>（xterm 页面）。
+    // WS 升级 /debug-terminal/<id>/ws 在下方 server.on('upgrade') 里由本 manager
+    // 自行校验 cookie（upgrade 不经这段 gate）。
+    if (
+      url.pathname === '/api/debug-terminal'
+      || url.pathname.startsWith('/api/debug-terminal/')
+      || url.pathname.startsWith('/debug-terminal/')
+    ) {
+      if (debugTerminalManager.handleHttp(req, res, url)) return;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/plugins/dashboard') {
@@ -2484,6 +2673,7 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { schedules, timezone: scheduleTimeZone() });
     }
     if (req.method === 'GET' && url.pathname === '/api/settings') {
+      const dashboardSettings = resolveDashboardSettings();
       // `authed` lets the Settings page disable toggles for read-only
       // visitors up front, instead of letting them flip a switch that
       // 401s + rolls back on save.
@@ -2493,7 +2683,7 @@ const server = createServer(async (req, res) => {
       // `bound` reflects central-platform binding; the Settings UI only shows the
       // 远程访问 toggle when bound (the central URLs are meaningless otherwise).
       return jsonRes(res, 200, {
-        settings: dashboardSettings,
+        settings: authed ? dashboardSettings : redactSettingsForPublic(dashboardSettings),
         lang: readGlobalConfig().lang ?? null,
         authed,
         bound: readPlatformBinding() !== null,
@@ -3119,6 +3309,7 @@ const server = createServer(async (req, res) => {
         workingDir?: unknown;
         dirMode?: unknown;
         model?: unknown;
+        requireCriticalScopesBeforeActivation?: unknown;
       };
       try {
         const chunks: Buffer[] = [];
@@ -3190,6 +3381,16 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'missing_expected_identity', message: '免扫码添加前必须确认当前账号与企业' });
       }
       const sessionMode = sessionModeRaw === 'reuse' ? 'reuse' as const : 'qr' as const;
+      if (
+        parsed.requireCriticalScopesBeforeActivation !== undefined
+        && typeof parsed.requireCriticalScopesBeforeActivation !== 'boolean'
+      ) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'invalid_critical_scope_activation_gate',
+          message: 'requireCriticalScopesBeforeActivation 必须是 boolean',
+        });
+      }
       const job = botOnboarding.start({
         appName,
         registrationMode,
@@ -3199,8 +3400,102 @@ const server = createServer(async (req, res) => {
         workingDir,
         dirMode,
         model,
+        ...(parsed.requireCriticalScopesBeforeActivation === true
+          ? { requireCriticalScopesBeforeActivation: true }
+          : {}),
       });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/recover-permissions') {
+      let parsed: {
+        workingDir?: unknown;
+        predecessorJobId?: unknown;
+        expectedAppId?: unknown;
+        priorRecoveryJobId?: unknown;
+        requireCriticalScopesBeforeActivation?: unknown;
+      };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        parsed = raw ? JSON.parse(raw) : {};
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const workingDir = typeof parsed.workingDir === 'string' ? parsed.workingDir.trim() : '';
+      const predecessorJobId = typeof parsed.predecessorJobId === 'string' ? parsed.predecessorJobId.trim() : '';
+      const expectedAppId = typeof parsed.expectedAppId === 'string' ? parsed.expectedAppId.trim() : '';
+      const priorRecoveryJobId = typeof parsed.priorRecoveryJobId === 'string' ? parsed.priorRecoveryJobId.trim() : undefined;
+      if (
+        parsed.requireCriticalScopesBeforeActivation !== undefined
+        && typeof parsed.requireCriticalScopesBeforeActivation !== 'boolean'
+      ) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'invalid_critical_scope_activation_gate',
+          message: 'requireCriticalScopesBeforeActivation 必须是 boolean',
+        });
+      }
+      if (!workingDir || !predecessorJobId || !expectedAppId || invalidWorkingDirs({ workingDir }).length > 0) {
+        return jsonRes(res, 400, { ok: false, error: 'permission_recovery_target_invalid' });
+      }
+      const recovered = botOnboarding.startPermissionRecovery({
+        workingDir,
+        predecessorJobId,
+        expectedAppId,
+        priorRecoveryJobId,
+        ...(parsed.requireCriticalScopesBeforeActivation === true
+          ? { requireCriticalScopesBeforeActivation: true }
+          : {}),
+      });
+      if (!recovered.ok) {
+        const status = recovered.error === 'permission_recovery_target_missing' ? 404
+          : recovered.error === 'permission_recovery_target_ambiguous' ? 409
+            : recovered.error === 'permission_recovery_state_unavailable' ? 503
+            : 400;
+        return jsonRes(res, status, recovered);
+      }
+      return jsonRes(res, 202, { job: botOnboarding.get(recovered.job.id) });
+    }
+    let mScopePropagation: RegExpMatchArray | null;
+    if (
+      req.method === 'POST'
+      && (mScopePropagation = url.pathname.match(
+        /^\/api\/bot-onboarding\/([^/]+)\/complete-scope-propagation$/,
+      ))
+    ) {
+      const onboardingId = decodeURIComponent(mScopePropagation[1]);
+      let parsed: { workingDir?: unknown; expectedAppId?: unknown };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        parsed = raw ? JSON.parse(raw) : {};
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const workingDir = typeof parsed.workingDir === 'string' ? parsed.workingDir.trim() : '';
+      const expectedAppId = typeof parsed.expectedAppId === 'string' ? parsed.expectedAppId.trim() : '';
+      if (!workingDir || !expectedAppId || invalidWorkingDirs({ workingDir }).length > 0) {
+        return jsonRes(res, 400, { ok: false, error: 'permission_recovery_target_invalid' });
+      }
+      const completed = await botOnboarding.completeScopePropagation({
+        jobId: onboardingId,
+        workingDir,
+        expectedAppId,
+      });
+      if (!completed.ok) {
+        const status = completed.error === 'permission_recovery_target_missing' ? 404
+          : completed.error === 'permission_recovery_target_ambiguous' ? 409
+            : completed.error === 'permission_recovery_scopes_pending' ? 425
+              : (
+                  completed.error === 'permission_recovery_state_unavailable'
+                  || completed.error === 'permission_recovery_activation_failed'
+                ) ? 503
+                : 400;
+        return jsonRes(res, status, completed);
+      }
+      return jsonRes(res, 200, { job: botOnboarding.get(onboardingId) });
     }
     let mOwner: RegExpMatchArray | null;
     if (req.method === 'POST' && (mOwner = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)\/owner$/))) {
@@ -3347,6 +3642,18 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/write-link`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Dashboard「复现命令」：透传到 owning daemon 取该 session 的真实 CLI 调用。
+    // 与 write-link 同样只在管理 cookie（写权限）下可达：命令含 token/凭证。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/spawn-command$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/spawn-command`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -4445,7 +4752,19 @@ const server = createServer(async (req, res) => {
       const hb = setInterval(() => {
         res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
       }, 15_000);
-      res.on('close', () => { off(); clearInterval(hb); });
+      // Push a bots.changed frame whenever the online bot roster actually
+      // changes (bot added / removed / renamed / re-indexed) so the Bot 配置
+      // page can auto-refresh without a manual reload. registry.on fires on
+      // every 15s poll and 30s heartbeat rewrite, so gate on a roster signature
+      // that ignores lastHeartbeat — otherwise we'd spam a frame every poll.
+      let lastRoster = botsRosterSignature(registry.list());
+      const offRoster = registry.on(online => {
+        const sig = botsRosterSignature(online);
+        if (sig === lastRoster) return;
+        lastRoster = sig;
+        res.write(`event: bots.changed\ndata: ${JSON.stringify({ body: { signature: sig } })}\n\n`);
+      });
+      res.on('close', () => { off(); offRoster(); clearInterval(hb); });
       return;
     }
 
@@ -4466,6 +4785,10 @@ const server = createServer(async (req, res) => {
 server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
   try {
     const rawUrl = req.url ?? '/';
+    // 调试终端 WS（owner-only）：manager 内部自校验管理 cookie。命中即接管。
+    if (rawUrl.startsWith('/debug-terminal/')) {
+      if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
+    }
     if (!(rawUrl === '/s' || rawUrl.startsWith('/s/') || rawUrl.startsWith('/s?'))) {
       return clientSocket.destroy();
     }
@@ -4753,11 +5076,13 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 
 // Graceful shutdown
 function shutdown(): void {
+  codexNotifierAbort.abort();
   for (const off of subs.values()) off();
   subs.clear();
   registry.stop();
   resourceMonitor.stop();
   platformTunnel?.stop();
+  debugTerminalManager.shutdown();
   server.close(() => process.exit(0));
   // Hard-exit fallback after 5s
   setTimeout(() => process.exit(0), 5_000).unref();

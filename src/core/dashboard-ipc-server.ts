@@ -50,6 +50,7 @@ import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
+import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
 import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
@@ -93,6 +94,11 @@ import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 
+let exactChatGrantHandler: typeof applyExactChatGrantRequest = applyExactChatGrantRequest;
+/** Test seam: replace the exact-grant service without touching live Feishu/config state. */
+export function setExactChatGrantHandler(handler: typeof applyExactChatGrantRequest | null): void {
+  exactChatGrantHandler = handler ?? applyExactChatGrantRequest;
+}
 // 机器人真·改名 renamer，由 daemon 启动时注册（开放平台自动化 + daemon 侧
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
 // 时 PUT /api/bot-rename 降级为仅改 displayName。
@@ -134,6 +140,16 @@ import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPo
 import { sessionAnchorId, type DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
+import {
+  commitDeviceIsolationActivation,
+  DEVICE_ISOLATION_COMMIT_PATH,
+  DEVICE_ISOLATION_PREPARE_PATH,
+  DEVICE_ISOLATION_RELEASE_PATH,
+  logDeviceIsolationActivationError,
+  prepareDeviceIsolationActivation,
+  releaseDeviceIsolationActivation,
+  type DeviceIsolationDaemonResult,
+} from './device-isolation-daemon.js';
 
 export interface IpcServerHandle {
   port: number;
@@ -177,9 +193,142 @@ export function jsonRes(res: ServerResponse, status: number, body: unknown): voi
   res.end(JSON.stringify(body));
 }
 
-export async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T> {
+export class JsonBodyTooLargeError extends Error {
+  constructor(readonly maxBytes: number) {
+    super(`JSON request body exceeds ${maxBytes} bytes`);
+    this.name = 'JsonBodyTooLargeError';
+  }
+}
+
+export class AbortDeadlineError extends Error {
+  constructor(
+    readonly label: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`${label} timed out after ${timeoutMs}ms`);
+    this.name = 'AbortDeadlineError';
+  }
+}
+
+/** 校验跨进程 JSON envelope，只接受普通对象和完整、精确的自有字段集合。 */
+export function hasExactSafeJsonKeys(
+  value: unknown,
+  expectedKeys: readonly string[],
+): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== expectedKeys.length) return false;
+  if (['__proto__', 'prototype', 'constructor'].some(key => Object.hasOwn(value, key))) {
+    return false;
+  }
+  const expected = new Set(expectedKeys);
+  return keys.every(key => expected.has(key));
+}
+
+/**
+ * 为支持 AbortSignal 的底层操作设置硬截止时间。Promise.race 保证调用方按时释放
+ * in-flight 状态，AbortController 同时取消仍在执行的网络或子进程操作。
+ */
+export async function runWithAbortDeadline<T>(
+  label: string,
+  timeoutMs: number,
+  task: (signal: AbortSignal, deadlineAt: number) => Promise<T>,
+): Promise<T> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError('timeoutMs must be a positive safe integer');
+  }
+  const controller = new AbortController();
+  const deadlineAt = Date.now() + timeoutMs;
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new AbortDeadlineError(label, timeoutMs);
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([task(controller.signal, deadlineAt), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export async function readJsonBody<T = unknown>(
+  req: IncomingMessage,
+  maxBytes?: number,
+): Promise<T> {
+  if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)) {
+    throw new RangeError('maxBytes must be a positive safe integer');
+  }
+  if (maxBytes !== undefined) {
+    const declared = req.headers?.['content-length'];
+    const declaredBytes = typeof declared === 'string' && /^\d+$/.test(declared)
+      ? Number(declared)
+      : undefined;
+    if (declaredBytes !== undefined && declaredBytes > maxBytes) {
+      req.once('error', () => {});
+      req.resume();
+      throw new JsonBodyTooLargeError(maxBytes);
+    }
+
+    const body = await new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      let settled = false;
+      const cleanup = () => {
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.off('error', onError);
+        req.off('aborted', onAborted);
+      };
+      const rejectOnce = (error: Error, drain = false) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (drain) {
+          // 不销毁 keep-alive socket，只丢弃剩余正文，让调用方仍能返回 413。
+          req.once('error', () => {});
+          req.resume();
+        }
+        reject(error);
+      };
+      const onData = (raw: Buffer | string) => {
+        if (settled) return;
+        const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+        totalBytes += chunk.byteLength;
+        if (totalBytes > maxBytes) {
+          chunks.length = 0;
+          rejectOnce(new JsonBodyTooLargeError(maxBytes), true);
+          return;
+        }
+        chunks.push(chunk);
+      };
+      const onEnd = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(Buffer.concat(chunks, totalBytes));
+      };
+      const onError = (error: Error) => rejectOnce(error);
+      const onAborted = () => rejectOnce(new Error('request aborted'));
+      req.on('data', onData);
+      req.once('end', onEnd);
+      req.once('error', onError);
+      req.once('aborted', onAborted);
+    });
+    if (body.byteLength === 0) return {} as T;
+    return JSON.parse(body.toString('utf8'));
+  }
+
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  for await (const c of req) {
+    const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+    chunks.push(chunk);
+  }
   if (chunks.length === 0) return {} as T;
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
@@ -206,7 +355,7 @@ function ipcAuthSecret(): string | null {
  * secret. Workflow v3 mutations intentionally use their separate, full-request
  * protocol (`workflows/v3/daemon-ipc-auth`) and must never call this bare
  * ts:nonce verifier. */
-export function ipcHmacAuthorized(req: IncomingMessage): boolean {
+export function ipcHmacAuthorized(req: IncomingMessage, bind?: string): boolean {
   if (trustedHostRequests.has(req)) return true;
   const secret = ipcAuthSecret();
   if (!secret) return false; // fail-closed: no secret on disk → nobody can sign
@@ -214,7 +363,11 @@ export function ipcHmacAuthorized(req: IncomingMessage): boolean {
   const nonce = req.headers['x-botmux-cli-nonce'];
   const sig = req.headers['x-botmux-cli-auth'];
   if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') return false;
-  return verifyHmac(secret, { ts, nonce, sig }, req.socket.remoteAddress ?? '').ok;
+  return verifyHmac(secret, { ts, nonce, sig }, req.socket.remoteAddress ?? '', bind).ok;
+}
+
+function tokenRouteAuthorized(req: IncomingMessage, bind?: string): boolean {
+  return ipcHmacAuthorized(req, bind);
 }
 
 function routeHasPublicAccess(method: string, pathname: string): boolean {
@@ -301,6 +454,34 @@ export function setBotName(name: string): void { setRowsBotName(name); }
 // endpoints below which proxy calls into groups-store on this bot's behalf.
 let cachedLarkAppId = '';
 export function setLarkAppId(id: string): void { cachedLarkAppId = id; }
+
+async function handleDeviceIsolationActivationRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  handler: (body: unknown) => DeviceIsolationDaemonResult | Promise<DeviceIsolationDaemonResult>,
+): Promise<void> {
+  // Keep this explicit even though production enables the server-wide gate:
+  // unit-test/dev servers must not accidentally turn this authority-bearing
+  // transition into a bare-loopback endpoint.
+  if (!ipcHmacAuthorized(req)) {
+    return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  }
+  try {
+    const body = await readJsonBody(req);
+    const result = await handler(body);
+    jsonRes(res, result.status, result.body);
+  } catch (error) {
+    logDeviceIsolationActivationError(error);
+    jsonRes(res, 503, { ok: false, error: 'activation_unavailable' });
+  }
+}
+
+ipcRoute('POST', DEVICE_ISOLATION_PREPARE_PATH, (req, res) =>
+  handleDeviceIsolationActivationRoute(req, res, prepareDeviceIsolationActivation));
+ipcRoute('POST', DEVICE_ISOLATION_COMMIT_PATH, (req, res) =>
+  handleDeviceIsolationActivationRoute(req, res, commitDeviceIsolationActivation));
+ipcRoute('POST', DEVICE_ISOLATION_RELEASE_PATH, (req, res) =>
+  handleDeviceIsolationActivationRoute(req, res, releaseDeviceIsolationActivation));
 
 ipcRoute('GET', '/api/sessions', (_req, res) => {
   // Active first (live state), closed appended (historical)
@@ -936,6 +1117,27 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
 });
 
 /**
+ * Dashboard「复现命令」：返回该 active session 本次冷启的**近似**可复现 CLI 调用
+ * （bin + argv + cwd + 权威注入 env），供用户粘到调试终端改参数复现。命令原样保留
+ * （含 write token / --append-system-prompt / 凭证 env），与 write-link 同一把
+ * loopback-HMAC 锁：匿名浏览器在 dashboard HTTP 边界就 401（该路径不在 allow-list），
+ * 本机知道 ipcPort 的进程也过不了 ipcHmacAuthorized。仅持管理 cookie 的写权限视图能取。
+ *
+ * 只读 active session 的**内存**字段（DaemonSession.spawnCommand）：命令含凭证，
+ * 绝不落盘，也绝不从 closed/持久化 session 取（那既无值也避免误暴露）。daemon 重启后
+ * 到 worker 再次 ready 之前返回 unavailable——可接受。warm reattach 不重算命令，此时
+ * 亦为空。riff 后端无本地 bin/args，worker 侧不产出命令，这里同样 unavailable。
+ */
+ipcRoute('GET', '/api/sessions/:sessionId/spawn-command', (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const cmd = ds.spawnCommand;
+  if (!cmd) return jsonRes(res, 404, { ok: false, error: 'spawn_command_unavailable' });
+  jsonRes(res, 200, { ok: true, command: cmd });
+});
+
+/**
  * Deliver the writable-terminal card privately to the bot's owner(s) — the
  * `botmux term-link <id>` CLI command's backend. Unlike the GET route above
  * (which returns the URL to its single authenticated caller), this POSTs the
@@ -1544,6 +1746,80 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
   } catch (e: any) {
     return jsonRes(res, 500, { ok: false, errorCode: 'trigger_failed', error: e?.message ?? String(e) });
   }
+});
+
+// ─── Exact chat grants (talk-only) ─────────────────────────────────────────
+
+/**
+ * Apply/read/revoke a receiver-scoped chatGrant. The receiver identity comes
+ * from this daemon's cached larkAppId, never from the caller. The body repeats
+ * it only as an anti-misrouting assertion (e.g. a stale daemon descriptor).
+ *
+ * This permission write is loopback-HMAC protected: a sandboxed worker that
+ * merely discovers an ipcPort must not be able to grant itself access.
+ */
+ipcRoute('POST', '/api/grants/chat', async (req, res) => {
+  const localPort = req.socket.localPort;
+  const authBind = localPort ? cliAuthBind('POST', '/api/grants/chat', localPort) : undefined;
+  if (!authBind || !tokenRouteAuthorized(req, authBind)) {
+    return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  }
+  if (!cachedLarkAppId) {
+    return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  }
+  let body: {
+    operation?: unknown;
+    receiverLarkAppId?: unknown;
+    chatId?: unknown;
+    subjectOpenIds?: unknown;
+    subjectLarkAppIds?: unknown;
+  };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (body.receiverLarkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'receiver_mismatch',
+      receiverLarkAppId: cachedLarkAppId,
+    });
+  }
+  const hasSubjectOpenIds = Object.prototype.hasOwnProperty.call(body, 'subjectOpenIds');
+  const hasSubjectLarkAppIds = Object.prototype.hasOwnProperty.call(body, 'subjectLarkAppIds');
+  if (hasSubjectOpenIds === hasSubjectLarkAppIds) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'exactly_one_subject_identity_required',
+      message: 'Provide exactly one of subjectOpenIds or subjectLarkAppIds',
+    });
+  }
+  if (hasSubjectLarkAppIds && body.operation !== 'grant') {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'subject_lark_app_ids_grant_only',
+      message: 'subjectLarkAppIds may only be used with operation=grant',
+    });
+  }
+  const result = hasSubjectLarkAppIds
+    ? await exactChatGrantHandler({
+        operation: body.operation,
+        receiverLarkAppId: cachedLarkAppId,
+        chatId: body.chatId,
+        subjectLarkAppIds: body.subjectLarkAppIds,
+      })
+    : await exactChatGrantHandler({
+        operation: body.operation,
+        receiverLarkAppId: cachedLarkAppId,
+        chatId: body.chatId,
+        subjectOpenIds: body.subjectOpenIds,
+      });
+  if (!result.ok) {
+    const { status, ...responseBody } = result;
+    return jsonRes(res, status, responseBody);
+  }
+  return jsonRes(res, 200, result);
 });
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
