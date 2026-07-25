@@ -130,6 +130,12 @@ function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return env;
 }
 
+/** Fresh workers always start with hidden output, so restore the daemon-owned mode. */
+function syncWorkerDisplayMode(ds: DaemonSession): void {
+  if (!ds.worker || !ds.displayMode || ds.displayMode === 'hidden') return;
+  ds.worker.send({ type: 'set_display_mode', mode: ds.displayMode } as DaemonToWorker);
+}
+
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
 export interface WorkerSessionReplyOptions {
@@ -2607,6 +2613,7 @@ function setupWorkerHandlers(
         // (if any) is left untouched. The next real user turn clears this flag
         // (rememberLastCliInput) and the normal card flow resumes.
         if (ds.suppressRecoveryCard) {
+          syncWorkerDisplayMode(ds);
           logger.info(`[${t}] Restored session — suppressing recovery streaming card (silent restart)`);
           break;
         }
@@ -2659,9 +2666,7 @@ function setupWorkerHandlers(
             }
             persistStreamCardState(ds);
             // Re-sync worker's display mode (it starts fresh in 'hidden')
-            if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
-              ds.worker.send({ type: 'set_display_mode', mode: ds.displayMode } as DaemonToWorker);
-            }
+            syncWorkerDisplayMode(ds);
             // The restored card is now the active one — withdraw any cards
             // frozen before the daemon went down so they don't pile up in the
             // thread on each restart.
@@ -2726,9 +2731,7 @@ function setupWorkerHandlers(
           ds.streamCardPending = false;
           persistStreamCardState(ds);
           // Re-sync worker's display mode (it starts fresh in 'hidden')
-          if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
-            ds.worker.send({ type: 'set_display_mode', mode: ds.displayMode } as DaemonToWorker);
-          }
+          syncWorkerDisplayMode(ds);
           // New card is live — recall any cards frozen by previous turns.
           // Done after `streamCardId` is committed so we never delete the old
           // card without a successor visible to the user.
