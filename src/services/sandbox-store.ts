@@ -88,6 +88,28 @@ function normalizeTier(list: unknown): string[] | undefined {
   return out.length ? out : undefined;
 }
 
+/** Normalize a three-tier sandboxPaths object for storage: per-tier trim/dedup,
+ *  then CROSS-TIER dedup resolving a path listed in >1 tier to the MORE
+ *  RESTRICTIVE tier (deny > readOnly > readWrite) — matching fs-policy's
+ *  mergeFsRules same-source tie-break, so what's stored matches what the sandbox
+ *  (and the dashboard UI/tester) resolve. Returns `{}` when every tier is empty
+ *  (caller treats that as "clear the field"). Pure — unit-tested directly. */
+export function normalizeSandboxPaths(tiers: SandboxPathTiers): SandboxPathTiers {
+  const rw = normalizeTier(tiers.readWrite);
+  const ro = normalizeTier(tiers.readOnly);
+  const deny = normalizeTier(tiers.deny);
+  const normPath = (p: string) => p.replace(/\/+$/, '') || '/';
+  const denySet = new Set((deny ?? []).map(normPath));
+  const roSet = new Set((ro ?? []).map(normPath));
+  const keptRw = (rw ?? []).filter(p => !denySet.has(normPath(p)) && !roSet.has(normPath(p)));
+  const keptRo = (ro ?? []).filter(p => !denySet.has(normPath(p)));
+  const out: SandboxPathTiers = {};
+  if (keptRw.length) out.readWrite = keptRw;
+  if (keptRo.length) out.readOnly = keptRo;
+  if (deny) out.deny = deny;
+  return out;
+}
+
 /** Per-bot sandboxPaths (readWrite/readOnly/deny) persistence. Same contract as
  *  {@link updateBotSandbox}: atomic bots.json write + in-memory sync, so the next
  *  session spawn reads `botCfg.sandboxPaths` without a daemon restart. Passing an
@@ -100,13 +122,7 @@ export async function updateBotSandboxPaths(
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
-  const normalized: SandboxPathTiers = {};
-  const rw = normalizeTier(tiers.readWrite);
-  const ro = normalizeTier(tiers.readOnly);
-  const deny = normalizeTier(tiers.deny);
-  if (rw) normalized.readWrite = rw;
-  if (ro) normalized.readOnly = ro;
-  if (deny) normalized.deny = deny;
+  const normalized = normalizeSandboxPaths(tiers);
   const isEmpty = !normalized.readWrite && !normalized.readOnly && !normalized.deny;
 
   const r = await rmwBotEntry<SandboxPathTiers | undefined>(larkAppId, (entry) => {

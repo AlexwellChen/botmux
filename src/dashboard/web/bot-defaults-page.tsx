@@ -1410,20 +1410,33 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
 type SandboxTier = 'readWrite' | 'readOnly' | 'deny';
 type SandboxTiers = { readWrite: string[]; readOnly: string[]; deny: string[] };
 
+/** Restrictiveness ranking — mirrors fs-policy.ts RESTRICTIVENESS so a same-path
+ *  cross-tier conflict resolves the SAME way the sandbox will (deny > ro > rw). */
+const SBX_RESTRICTIVENESS: Record<SandboxTier, number> = { readWrite: 0, readOnly: 1, deny: 2 };
+
 /** Effective access for `path` under the three tiers: DEEPEST (longest-prefix)
- *  matching rule wins — mirrors fs-policy.ts accessForPath so the UI's live
- *  labels + path tester agree with what the sandbox actually enforces. */
-function effectiveAccess(tiers: SandboxTiers, path: string): { access: SandboxTier | 'none'; rule?: string } {
-  const norm = (p: string) => p.replace(/\/+$/, '') || '/';
+ *  matching rule wins; at equal depth (same path across tiers) the MORE
+ *  RESTRICTIVE tier wins — mirrors fs-policy.ts accessForPath + mergeFsRules so
+ *  the UI's live labels + path tester agree with what the sandbox enforces.
+ *  `home` expands a leading `~` the same way the worker does before matching, so
+ *  recommendation entries like `~/.claude` line up with absolute tree nodes. */
+function effectiveAccess(tiers: SandboxTiers, path: string, home: string): { access: SandboxTier | 'none'; rule?: string } {
+  const expand = (p: string) => (p === '~' || p.startsWith('~/')) ? home.replace(/\/+$/, '') + p.slice(1) : p;
+  const norm = (p: string) => expand(p).replace(/\/+$/, '') || '/';
+  const target = norm(path);
   const covers = (parent: string, child: string) => {
     const a = norm(parent), b = norm(child);
     return a === b || b.startsWith(a === '/' ? '/' : a + '/');
   };
   const depth = (p: string) => norm(p) === '/' ? 0 : norm(p).split('/').filter(Boolean).length;
-  let best: { access: SandboxTier; rule: string } | undefined;
+  let best: { access: SandboxTier; ruleDepth: number; rule: string } | undefined;
   const consider = (access: SandboxTier, rule: string) => {
-    if (!covers(rule, path)) return;
-    if (!best || depth(rule) > depth(best.rule)) best = { access, rule };
+    if (!covers(rule, target)) return;
+    const d = depth(rule);
+    if (!best || d > best.ruleDepth
+      || (d === best.ruleDepth && SBX_RESTRICTIVENESS[access] > SBX_RESTRICTIVENESS[best.access])) {
+      best = { access, ruleDepth: d, rule };
+    }
   };
   for (const p of tiers.readWrite) consider('readWrite', p);
   for (const p of tiers.readOnly) consider('readOnly', p);
@@ -1495,6 +1508,10 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const [children, setChildren] = useState<Record<string, { name: string; path: string }[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [roots, setRoots] = useState<{ name: string; path: string }[]>([]);
+  // Canonical $HOME (first fs-list root) — used to expand `~` in tiers/tester
+  // the SAME way the worker does, so recommendation entries (~/.claude) match
+  // absolute tree nodes and effective-access labels are accurate.
+  const [homeRoot, setHomeRoot] = useState<string>('~');
 
   const saved = useMemo(() => normTiers(bot.sandboxPaths), [bot.sandboxPaths]);
   useEffect(() => { setTiers(normTiers(bot.sandboxPaths)); setText(tiersToText(normTiers(bot.sandboxPaths))); }, [bot.sandboxPaths]);
@@ -1506,8 +1523,12 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       const r = await fetch(`/api/fs/list${q}`);
       const j = await r.json();
       if (!j.ok) return;
-      if (!path) setRoots(j.entries.map((e: any) => ({ name: e.name, path: e.path })));
-      else setChildren(prev => ({ ...prev, [path]: j.entries.map((e: any) => ({ name: e.name, path: e.path })) }));
+      if (!path) {
+        setRoots(j.entries.map((e: any) => ({ name: e.name, path: e.path })));
+        // Root view returns [HOME, "/"] — the first entry is canonical $HOME.
+        const h = j.entries?.[0]?.path;
+        if (typeof h === 'string' && h.startsWith('/')) setHomeRoot(h);
+      } else setChildren(prev => ({ ...prev, [path]: j.entries.map((e: any) => ({ name: e.name, path: e.path })) }));
     } catch { /* listing is best-effort; manual/text entry still works */ }
   }, []);
   useEffect(() => { if (!textMode && roots.length === 0) void loadDir(''); }, [textMode, roots.length, loadDir]);
@@ -1585,7 +1606,7 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     const { name, path, depth } = props;
     const isOpen = expanded.has(path);
     const explicit = explicitTier(path);
-    const eff = effectiveAccess(tiers, path);
+    const eff = effectiveAccess(tiers, path, homeRoot);
     const kids = children[path];
     return (
       <div className="bd-sbx-node">
@@ -1621,7 +1642,7 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     );
   }
 
-  const testResult = testPath.trim() ? effectiveAccess(tiers, testPath.trim().startsWith('~') ? testPath.trim() : testPath.trim()) : null;
+  const testResult = testPath.trim() ? effectiveAccess(tiers, testPath.trim(), homeRoot) : null;
 
   return (
     <section className="bd-section">

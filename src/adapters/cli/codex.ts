@@ -1,4 +1,4 @@
-import { existsSync, statSync, openSync, readSync, closeSync, realpathSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
@@ -194,16 +194,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         baseArgs.push('--model', model.trim());
       }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
-      // Canonicalize the chdir target: on a symlinked-$HOME host
-      // (/home/u → /data00/home/u) the lexical workingDir is what botmux tracks,
-      // but the file sandbox binds only CANONICAL paths — the lexical /home/u
-      // prefix does not exist in the bwrap root, so codex's `-C /home/u/...`
-      // chdir fails with "No such file or directory (os error 2)" and the CLI
-      // aborts before the TUI starts. realpath makes -C point at a bound path.
-      // Off-sandbox this is a no-op (same directory); best-effort if unresolvable.
-      const chdirArg = (() => { try { return realpathSync(workingDir!); } catch { return workingDir!; } })();
+      // NOTE: canonicalization of workingDir for the file sandbox is done ONCE in
+      // worker.ts (only when sandboxRequested), so off-sandbox spawns keep the
+      // lexical path — realpath'ing here unconditionally would desync codex's cwd
+      // semantics vs the worker's lexical bridge/state tracking.
       const freshArgs = workingDir
-        ? [...baseArgs, '-C', chdirArg]
+        ? [...baseArgs, '-C', workingDir]
         : baseArgs;
       const codexSessionId = resume
         ? resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId)
