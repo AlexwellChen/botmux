@@ -6162,6 +6162,23 @@ dialog.onboarding-dialog::backdrop {
   border: 1px solid var(--border-soft);
 }
 
+/* ── Sandbox directory whitelist tree ── */
+.bd-sbx-tree { margin-top: 10px; max-height: 380px; overflow: auto; border: 1px solid var(--border-soft); border-radius: 9px; padding: 8px; font-size: 13px; }
+.bd-sbx-row { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; padding: 2px 0; min-width: 0; }
+.bd-sbx-twisty { cursor: pointer; flex: 0 0 14px; text-align: center; color: var(--muted); user-select: none; }
+.bd-sbx-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono, monospace); }
+.bd-sbx-state { cursor: pointer; flex: 0 0 auto; width: 84px; text-align: center; font-size: 11px; padding: 1px 0; border-radius: 999px; border: 1px solid var(--border-soft); background: transparent; color: var(--muted); }
+.bd-sbx-state-inherit { color: var(--muted); border-style: dashed; }
+.bd-sbx-state-readWrite { color: #1a7f37; background: color-mix(in srgb, #1a7f37 12%, transparent); border-color: color-mix(in srgb, #1a7f37 40%, transparent); }
+.bd-sbx-state-readOnly { color: #9a6700; background: color-mix(in srgb, #9a6700 12%, transparent); border-color: color-mix(in srgb, #9a6700 40%, transparent); }
+.bd-sbx-state-deny { color: #cf222e; background: color-mix(in srgb, #cf222e 12%, transparent); border-color: color-mix(in srgb, #cf222e 40%, transparent); }
+.bd-sbx-state-none { color: var(--muted); }
+.bd-sbx-empty { color: var(--muted); font-size: 12px; padding: 2px 0; }
+.bd-sbx-text { margin-top: 10px; width: 100%; box-sizing: border-box; font-family: var(--mono, monospace); font-size: 13px; padding: 8px; border: 1px solid var(--border-soft); border-radius: 9px; resize: vertical; }
+.bd-sbx-tester { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.bd-sbx-test-input { flex: 1 1 240px; font-family: var(--mono, monospace); font-size: 13px; padding: 6px 9px; border: 1px solid var(--border-soft); border-radius: 8px; }
+.bd-sbx-test-out { font-size: 12px; font-family: var(--mono, monospace); padding: 2px 8px; border-radius: 8px; }
+
 /* ── Version & update card ── */
 .update-version { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
 .update-badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; }

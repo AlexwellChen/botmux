@@ -2230,6 +2230,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
+    sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
     // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
     // disables the toggle wherever the worker would fail-close on it.
@@ -2866,6 +2867,27 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
+});
+
+// Per-bot sandboxPaths (three-tier whitelist: readWrite / readOnly / deny).
+// Body `{ readWrite?: string[]; readOnly?: string[]; deny?: string[] }`. Highest-
+// precedence layer of the FsPolicy — an empty/absent tier falls back to the
+// deny-by-default baseline. Passing all-empty CLEARS the field. next-session
+// 生效：running sessions keep their spawn-time policy, only new spawns re-read it.
+ipcRoute('PUT', '/api/bot-sandbox-paths', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { readWrite?: unknown; readOnly?: unknown; deny?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const asList = (v: unknown): string[] | undefined =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : undefined;
+  const r = await sandboxStore.updateBotSandboxPaths(cachedLarkAppId, {
+    readWrite: asList(body.readWrite),
+    readOnly: asList(body.readOnly),
+    deny: asList(body.deny),
+  });
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, sandboxPaths: r.sandboxPaths ?? null });
 });
 
 // Per-bot read-isolation toggle. Body `{ enabled: boolean }`. When on, this bot's

@@ -3,7 +3,7 @@ import { createServer, get as httpGet, request as httpRequest, type IncomingMess
 import { createServer as createTcpServer, connect as netConnect } from 'node:net';
 import type { Duplex } from 'node:stream';
 import {
-  readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream,
+  readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream, realpathSync,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
@@ -311,6 +311,51 @@ const debugTerminalManager = createDebugTerminalManager({
  * tasks (see scheduler.belongsToOwner). Returns undefined when the row is
  * genuinely unknown or no daemon is online.
  */
+/**
+ * Read-only directory listing for the dashboard sandbox-paths tree picker.
+ * Served locally by the dashboard process (same host as the daemons). Returns
+ * immediate CHILD DIRECTORIES only — never file contents. Trust model matches
+ * validateWorkingDir: the caller is an authed admin and the daemon already runs
+ * prompts with full FS access, so this is a convenience browser, not a security
+ * boundary. Symlinks are realpath-resolved; a raw path is never echoed into an
+ * error the browser renders verbatim.
+ */
+function listDirLocally(rawPath: string): {
+  ok: boolean;
+  path: string | null;
+  parent: string | null;
+  entries: { name: string; path: string; kind: 'dir' }[];
+  error?: string;
+} {
+  const home = homedir();
+  if (!rawPath) {
+    // Root view: HOME first (the common case), then filesystem root.
+    const roots = [...new Set([home, '/'])];
+    return {
+      ok: true, path: null, parent: null,
+      entries: roots.map(p => ({ name: p, path: p, kind: 'dir' as const })),
+    };
+  }
+  const expanded = rawPath.startsWith('~') ? join(home, rawPath.slice(1)) : rawPath;
+  let resolved: string;
+  try { resolved = realpathSync(expanded); }
+  catch { return { ok: false, path: null, parent: null, entries: [], error: 'path_not_found' }; }
+  let entries: { name: string; path: string; kind: 'dir' }[];
+  try {
+    entries = readdirSync(resolved, { withFileTypes: true })
+      .filter(d => {
+        try { return d.isDirectory() || (d.isSymbolicLink() && statSync(join(resolved, d.name)).isDirectory()); }
+        catch { return false; }
+      })
+      .map(d => ({ name: d.name, path: join(resolved, d.name), kind: 'dir' as const }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch (e: any) {
+    return { ok: false, path: resolved, parent: null, entries: [], error: e?.code === 'EACCES' ? 'permission_denied' : 'cannot_read_dir' };
+  }
+  const parent = resolved === '/' ? null : dirname(resolved);
+  return { ok: true, path: resolved, parent, entries };
+}
+
 function resolveScheduleOwner(id: string): string | undefined {
   const explicit = aggregator.scheduleOwnerOf(id);
   if (explicit) return explicit;
@@ -4232,6 +4277,34 @@ const server = createServer(async (req, res) => {
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/sandbox-paths — proxy to that bot's daemon.
+    // Body `{ readWrite?: string[]; readOnly?: string[]; deny?: string[] }`.
+    let mBotSandboxPaths: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSandboxPaths = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox-paths$/))) {
+      const appId = decodeURIComponent(mBotSandboxPaths[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-sandbox-paths`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // GET /api/fs/list?path=… — read-only directory listing for the sandbox-paths
+    // tree picker. Not bot-specific (the filesystem is shared with this host's
+    // daemons — the dashboard process runs on the SAME machine), so serve it
+    // locally instead of proxying. Returns immediate child directories only.
+    if (req.method === 'GET' && url.pathname === '/api/fs/list') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(listDirLocally(url.searchParams.get('path') ?? '')));
       return;
     }
 
