@@ -1868,6 +1868,22 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             : selectedText;
           const finalText = resolveText || selectedText;
           const locDs = localeForBot(ds.larkAppId);
+          // For a stuck-warning card, do NOT clear authority or render success
+          // here. The worker may still reject the keys (stale screen). We show a
+          // "processing" state to block duplicate clicks, and wait for the
+          // worker's tui_keys_delivered (success) or stuck_warning_expired
+          // ("page changed, not sent") ACK before resolving the card.
+          if (isActiveStuckCard) {
+            if (cardMessageId) {
+              const processingCard = buildTuiPromptProcessingCard('处理中…', locDs);
+              updateMessage(ds.larkAppId, cardMessageId, processingCard).catch(err =>
+                logger.debug(`[${tag(ds)}] Failed to set stuck-warning card to processing: ${err}`),
+              );
+            }
+            publishAttentionPatch(ds);
+            try { return JSON.parse(buildTuiPromptProcessingCard('处理中…', locDs)); } catch { /* fall through */ }
+          }
+          // Normal TUI prompt card (ScreenAnalyzer): resolve immediately.
           if (cardMessageId) {
             setTimeout(() => {
               const resolvedCard = buildTuiPromptResolvedCard(finalText, locDs);
@@ -1884,15 +1900,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             ds.tuiPromptOptions = undefined;
             ds.tuiPromptMultiSelect = undefined;
             ds.tuiToggledIndices = undefined;
-          }
-          // If this click resolved a stuck-warning card, clear both the card
-          // marker AND the turn dedup marker so the next review layer can
-          // re-trigger a fresh warning.
-          if (ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId) {
-            ds.stuckWarningCardId = undefined;
-            ds.stuckWarningTurnId = undefined;
-            ds.stuckWarningGeneration = undefined;
-            ds.stuckWarningPageType = undefined;
           }
           publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }

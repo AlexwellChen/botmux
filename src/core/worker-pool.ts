@@ -1298,6 +1298,10 @@ export function killWorker(ds: DaemonSession): void {
   // daemon-side copy synchronously; the worker may never get a chance to send
   // its ordered revoke IPC on close/crash paths.
   ds.managedTurnOrigin = undefined;
+  // The worker/CLI generation is ending — any outstanding stuck-warning card
+  // must be invalidated so a late click cannot inject keys into a replacement
+  // worker (or into nothing, if no replacement comes).
+  invalidateStuckWarning(ds, 'killWorker');
   if (!ds.worker || ds.worker.killed) {
     // No live worker to receive {type:'close'}, so its destroySession() — which
     // tears down the persistent backing session (tmux/herdr/zellij) — never
@@ -1401,6 +1405,10 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   ds.workerToken = null;
   ds.workerViewToken = null;
   ds.managedTurnOrigin = undefined;
+  // The worker is being suspended — the CLI will be destroyed and cold-resumed
+  // later. Invalidate any stuck-warning card so a late click cannot inject keys
+  // after the CLI is gone (or into a different CLI on resume).
+  invalidateStuckWarning(ds, 'suspendWorker');
   // Screen state describes the process we just stopped. Keeping it would make
   // the dashboard hydrate this process-less logical session as idle/working.
   ds.lastScreenStatus = undefined;
@@ -2254,6 +2262,11 @@ function setupWorkerHandlers(
   const t = tag(ds);
   const workerGeneration = (ds.workerGeneration ?? 0) + 1;
   ds.workerGeneration = workerGeneration;
+  // A new worker generation is starting. As a backstop, invalidate any
+  // stuck-warning card posted by the previous generation — explicit kill/suspend/
+  // exit paths should already have done this, but fork/refork/takeover paths
+  // can leave a stale card that would otherwise inject keys into the new CLI.
+  invalidateStuckWarning(ds, 'new_worker_generation');
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -2610,6 +2623,7 @@ function setupWorkerHandlers(
       }
 
       case 'prompt_ready': {
+        if (ds.worker !== worker) break;
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
@@ -2947,6 +2961,9 @@ function setupWorkerHandlers(
       }
 
       case 'stuck_warning': {
+        // Ignore stuck_warning from a stale worker generation — the CLI may have
+        // been replaced and a new worker owns the session now.
+        if (ds.worker !== worker) break;
         // AI-free StuckDetector fired: a written input hasn't produced a
         // completed turn within the timeout AND the PTY has been quiet, AND the
         // snapshot matches a known Codex hook-review screen. The detector only
@@ -3026,20 +3043,51 @@ function setupWorkerHandlers(
           publishAttentionPatch(ds);
         } catch (err: any) {
           logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
-          // Card send failed — clear markers so a retry can post a fresh card.
-          ds.stuckWarningCardId = undefined;
-          ds.stuckWarningTurnId = undefined;
-          ds.stuckWarningGeneration = undefined;
+          // Card send failed — clear markers ONLY if this generation is still
+          // current. A newer warning (gen2) may have started while gen1's POST
+          // was in flight; we must not wipe gen2's state.
+          if (ds.stuckWarningGeneration === msg.generation) {
+            ds.stuckWarningCardId = undefined;
+            ds.stuckWarningTurnId = undefined;
+            ds.stuckWarningGeneration = undefined;
+            ds.stuckWarningPageType = undefined;
+          }
         }
         break;
       }
 
       case 'stuck_warning_expired': {
+        // Ignore from a stale worker generation.
+        if (ds.worker !== worker) break;
         // Worker refused to inject keys from a stuck-warning card because the
         // current screen no longer matches the page type the card was built for.
-        // Resolve the card so the user sees it is no longer actionable.
-        if (ds.stuckWarningGeneration === msg.generation) {
+        // Resolve the card with a "page changed" message so the user knows the
+        // action was NOT performed, then clear the authority.
+        if (ds.stuckWarningGeneration === msg.generation && ds.stuckWarningCardId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard('页面已变化，未发送按键', locDs);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to update stuck-warning card on expired: ${err}`),
+          );
           invalidateStuckWarning(ds, 'stale_card_click');
+        }
+        break;
+      }
+
+      case 'tui_keys_delivered': {
+        // Ignore from a stale worker generation.
+        if (ds.worker !== worker) break;
+        // Worker confirmed the keys were written to the PTY. Clear the card
+        // authority and render success. We only do this AFTER the worker ACK
+        // (not on click), so a rejected click (stuck_warning_expired) does not
+        // falsely report success.
+        if (ds.stuckWarningGeneration === msg.generation && ds.stuckWarningCardId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to resolve stuck-warning card on delivered: ${err}`),
+          );
+          invalidateStuckWarning(ds, 'keys_delivered');
         }
         break;
       }
@@ -3487,6 +3535,9 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;
+      // This worker generation is gone. Invalidate any stuck-warning card it
+      // posted so a late click cannot inject keys into a replacement worker.
+      invalidateStuckWarning(ds, 'worker_exit');
     }
     try {
       const notified = cb.onWorkerExit?.(ds, {

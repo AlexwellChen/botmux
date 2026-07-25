@@ -9139,12 +9139,19 @@ process.on('message', async (raw: unknown) => {
 
     case 'tui_keys': {
       // Stale-card guard: if this key press came from a stuck-warning card,
+      // do a FRESH capture (not the 2s-cached lastAnalyzerSnapshot) and
       // re-verify the current screen still matches the page type the card was
       // built for. The CLI may have recovered (user pressed t in the web
       // terminal, or the turn finished) between card post and click — injecting
       // t/Enter/Esc into a now-idle or working CLI is unsafe.
       if (msg.stuckGeneration !== undefined && msg.stuckPageType) {
-        const currentSnap = lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+        let currentSnap = '';
+        try {
+          const fresh = backend ? await snapshotToText(backend, renderCols, renderRows, { filter: false }) : null;
+          currentSnap = fresh?.content || lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+        } catch {
+          currentSnap = lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+        }
         const currentMatch = matchHookReviewScreen(currentSnap);
         if (currentMatch !== msg.stuckPageType) {
           log(`TUI keys from stale stuck-warning card (gen=${msg.stuckGeneration}, expected=${msg.stuckPageType}, current=${currentMatch ?? 'none'}) — dropped, notifying daemon`);
@@ -9158,6 +9165,19 @@ process.on('message', async (raw: unknown) => {
         }
       }
       handleTuiKeys(msg.keys, msg.isFinal);
+      // If this was a stuck-warning card click, notify the daemon that the keys
+      // were actually written so it can clear the card authority and render
+      // success. The daemon must NOT clear authority on click alone — the fresh
+      // capture above may have dropped the keys (stuck_warning_expired), in which
+      // case the daemon renders "page changed, not sent" instead.
+      if (msg.stuckGeneration !== undefined) {
+        send({
+          type: 'tui_keys_delivered',
+          generation: msg.stuckGeneration,
+          turnId: currentBotmuxTurnId,
+          dispatchAttempt: currentBotmuxDispatchAttempt,
+        });
+      }
       // Re-arm the stuck detector ONLY when the card-handler explicitly flags
       // this as a stuck-warning card's Enter action (advances to the next
       // review layer). t/Esc and all ScreenAnalyzer cards never set this flag.

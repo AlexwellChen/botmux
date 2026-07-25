@@ -23,31 +23,89 @@
  * Level 1 — hooks browser (the screen that actually blocks on startup):
  *   Title:  "Hooks"
  *   State:  "1 hook needs review before it can run."
+ *   Table:  "Event  Installed  Active  Review  Description" header + a row
+ *           whose Review column > 0 (e.g. "PreToolUse  1  0  1  ...")
  *   Footer: "Press t to trust all; enter to review hooks; esc to close"
  *
  * Level 2 — per-hook review (after pressing Enter on level 1):
  *   Title:  "PreToolUse hooks"
  *   State:  "1 hook needs review before it can run."
+ *   Body:   "[!] Hook 1 · new" + "Trust  New hook - review required"
  *   Footer: "Press t to trust; esc to go back"
  *
- * Each match requires the title + pending-review state + control hint to appear
- * together. A keyword alone is not enough: users and model output can legitimately
- * quote the incident text. We use the full official snapshot strings as the
- * source of truth (see OpenAI codex-rs TUI snapshots).
+ * Matching rules (addresses retained-history and pasted-text false positives):
+ *  - Only inspect the bottom VIEWPORT_LINES of the snapshot — the TUI shows the
+ *    active screen at the bottom; stale overview text scrolled off the top must
+ *    not count.
+ *  - The footer (control hint) MUST be present in the viewport and anchors the
+ *    active region. We scan upward from the footer to find the nearest title.
+ *  - Level 2 is checked first: if the nearest title above the footer is
+ *    "PreToolUse hooks" AND the L2 body semantics are present, it is level 2
+ *    even if a stale "Hooks" overview lingers further up.
+ *  - Each level requires its semantic content rows, not just title + footer.
  */
+const VIEWPORT_LINES = 40;
+
 export function matchHookReviewScreen(snapshot: string): 'hook review level 1' | 'hook review level 2' | undefined {
-  const hasPendingReview = /hook needs review|needs review before it can run/i.test(snapshot);
-  if (!hasPendingReview) return undefined;
+  if (!snapshot) return undefined;
+  const lines = snapshot.split('\n');
+  // Only inspect the bottom of the screen — the active viewport. Stale overview
+  // text that scrolled off the top must not trigger a match.
+  const viewport = lines.slice(-VIEWPORT_LINES);
 
-  // Level 1: hooks browser view
-  const hasL1Title = /(^|\n)Hooks\s*\n/i.test(snapshot);
-  const hasL1Controls = /Press t to trust all; enter to review hooks; esc to close/i.test(snapshot);
-  if (hasL1Title && hasL1Controls) return 'hook review level 1';
+  // Find the footer (control hint) — it anchors the active region.
+  let footerIdx = -1;
+  let level: 1 | 2 | undefined;
+  for (let i = viewport.length - 1; i >= 0; i--) {
+    if (/Press t to trust all; enter to review hooks; esc to close/i.test(viewport[i])) {
+      footerIdx = i;
+      level = 1;
+      break;
+    }
+    if (/Press t to trust; esc to go back/i.test(viewport[i])) {
+      footerIdx = i;
+      level = 2;
+      break;
+    }
+  }
+  if (footerIdx < 0 || !level) return undefined;
 
-  // Level 2: per-hook review view
-  const hasL2Title = /PreToolUse hooks/i.test(snapshot);
-  const hasL2Controls = /Press t to trust; esc to go back/i.test(snapshot);
-  if (hasL2Title && hasL2Controls) return 'hook review level 2';
+  // Scan upward from the footer to find the nearest title line. The title must
+  // be within the active region (not separated by too many blank lines / other
+  // content), otherwise the footer may belong to a different screen.
+  let titleIdx = -1;
+  for (let i = footerIdx - 1; i >= 0 && footerIdx - i < 30; i--) {
+    const line = viewport[i].trim();
+    if (line === 'Hooks' || /^PreToolUse hooks$/i.test(line)) {
+      titleIdx = i;
+      break;
+    }
+  }
+  if (titleIdx < 0) return undefined;
+
+  const titleLine = viewport[titleIdx].trim();
+  const region = viewport.slice(titleIdx, footerIdx + 1).join('\n');
+
+  // Require the pending-review state line in the active region.
+  if (!/hook needs review|needs review before it can run/i.test(region)) return undefined;
+
+  // Level 2 (detail) takes priority: if the nearest title is "PreToolUse hooks"
+  // and the L2 body semantics are present, it is level 2 even if a stale "Hooks"
+  // overview lingers above the title.
+  if (/^PreToolUse hooks$/i.test(titleLine)) {
+    // L2 semantic: the "Trust" action line must be present in the region.
+    if (/Trust\s+New hook/i.test(region)) return 'hook review level 2';
+    return undefined;
+  }
+
+  // Level 1 (overview): title is "Hooks". Require the table header + a row with
+  // Review > 0 to confirm this is the active hooks browser, not a pasted snippet.
+  if (titleLine === 'Hooks') {
+    const hasTableHeader = /Event\s+Installed\s+Active\s+Review/i.test(region);
+    const hasReviewRow = /PreToolUse\s+\d+\s+\d+\s+[1-9]/i.test(region);
+    if (hasTableHeader && hasReviewRow) return 'hook review level 1';
+    return undefined;
+  }
 
   return undefined;
 }
