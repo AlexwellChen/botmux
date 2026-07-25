@@ -2230,14 +2230,33 @@ export function forkWorker(
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
 
 /**
- * Resolve any active stuck-warning card and clear its markers. Called from
- * every path where the CLI can recover or be replaced: prompt_ready,
- * claude_exit, worker exit/kill/suspend/refork, and the worker's own
- * stale-card notification. Centralising here avoids missing an exit path and
- * leaving a clickable card that can inject keys into a different CLI.
+ * Clear the stuck-warning authority markers WITHOUT patching the card. Used by
+ * ACK paths (tui_keys_delivered / stuck_warning_expired) where the caller has
+ * already resolved the card to its final state — we only need to drop the
+ * nonce/cardId/turnId so a late duplicate click cannot re-inject keys.
+ */
+function clearStuckWarningAuthority(ds: DaemonSession): void {
+  ds.stuckWarningCardId = undefined;
+  ds.stuckWarningTurnId = undefined;
+  ds.stuckWarningNonce = undefined;
+  ds.stuckWarningPageType = undefined;
+  ds.stuckWarningProcessing = false;
+  ds.stuckWarningCliLifetime = undefined;
+}
+
+/**
+ * Resolve any active stuck-warning card (PATCH it to "done") AND clear its
+ * markers. Called from every path where the CLI can recover or be replaced:
+ * prompt_ready, claude_exit, worker exit/kill/suspend/refork, and the worker's
+ * own stale-card notification. Centralising here avoids missing an exit path
+ * and leaving a clickable card that can inject keys into a different CLI.
+ *
+ * ACK paths (tui_keys_delivered / stuck_warning_expired) do NOT use this —
+ * they patch the card themselves with a context-specific message and then call
+ * clearStuckWarningAuthority() to drop the markers.
  */
 function invalidateStuckWarning(ds: DaemonSession, reason: string): void {
-  if (!ds.stuckWarningCardId && !ds.stuckWarningTurnId && ds.stuckWarningGeneration === undefined) return;
+  if (!ds.stuckWarningCardId && !ds.stuckWarningTurnId && ds.stuckWarningNonce === undefined) return;
   const t = tag(ds);
   if (ds.stuckWarningCardId) {
     const locDs = localeForBot(ds.larkAppId);
@@ -2246,11 +2265,8 @@ function invalidateStuckWarning(ds: DaemonSession, reason: string): void {
       logger.debug(`[${t}] Failed to resolve stuck-warning card (${reason}): ${err}`),
     );
   }
-  logger.debug(`[${t}] invalidateStuckWarning (${reason}): turn=${ds.stuckWarningTurnId ?? 'none'} gen=${ds.stuckWarningGeneration ?? 'none'}`);
-  ds.stuckWarningCardId = undefined;
-  ds.stuckWarningTurnId = undefined;
-  ds.stuckWarningGeneration = undefined;
-  ds.stuckWarningPageType = undefined;
+  logger.debug(`[${t}] invalidateStuckWarning (${reason}): turn=${ds.stuckWarningTurnId ?? 'none'} nonce=${ds.stuckWarningNonce ?? 'none'}`);
+  clearStuckWarningAuthority(ds);
 }
 
 function setupWorkerHandlers(
@@ -2979,17 +2995,20 @@ function setupWorkerHandlers(
           logger.debug(`[${t}] Stuck warning dedup skipped (turn=${msg.turnId ?? 'none'}, activeCard=${hasActiveCard})`);
           break;
         }
-        // Record this warning's generation BEFORE the async card POST. If the
-        // CLI recovers (prompt_ready) or the worker is replaced while the POST
-        // is in flight, invalidateStuckWarning bumps/clears the generation; when
-        // the POST returns we check it is still current and, if not, resolve
-        // the card immediately instead of registering it as active.
-        ds.stuckWarningGeneration = msg.generation;
+        // Allocate a daemon-side nonce for this warning (NOT the worker's
+        // generation — the daemon is the authority on which warning is active).
+        // If the CLI recovers (prompt_ready) or the worker is replaced while the
+        // POST is in flight, invalidateStuckWarning clears the nonce; when the
+        // POST returns we check it is still current and, if not, resolve the card
+        // immediately instead of registering it as active.
+        const nonce = (ds.stuckWarningNonce ?? 0) + 1;
+        ds.stuckWarningNonce = nonce;
         ds.stuckWarningTurnId = msg.turnId;
+        ds.stuckWarningCliLifetime = msg.cliLifetime;
         const pageType = msg.matchedPattern;
         ds.stuckWarningPageType = pageType;
         const secs = Math.round(msg.elapsedMs / 1000);
-        logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s (${pageType}) gen=${msg.generation}`);
+        logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s (${pageType}) nonce=${nonce}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'stuck_warning',
           elapsedMs: msg.elapsedMs,
@@ -3026,12 +3045,14 @@ function setupWorkerHandlers(
             loc,
           );
           const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
-          // Generation check: if the warning was invalidated (prompt_ready,
-          // CLI exit, worker replace) while the POST was in flight, resolve
-          // the card immediately and do NOT register it as active — a late
-          // click would otherwise inject keys into a recovered/replaced CLI.
-          if (ds.stuckWarningGeneration !== msg.generation) {
-            logger.debug(`[${t}] Stuck warning card POSTed but generation stale (got=${msg.generation}, current=${ds.stuckWarningGeneration ?? 'none'}) — resolving`);
+          // Authority check: if the warning was invalidated (prompt_ready,
+          // CLI exit, worker replace) OR the worker was replaced while the POST
+          // was in flight, resolve the card immediately and do NOT register it
+          // as active — a late click would otherwise inject keys into a
+          // recovered/replaced CLI. Verify the full tuple: same worker process,
+          // same worker generation, same nonce.
+          if (ds.worker !== worker || ds.workerGeneration !== workerGeneration || ds.stuckWarningNonce !== nonce) {
+            logger.debug(`[${t}] Stuck warning card POSTed but authority stale (nonce=${nonce}, current=${ds.stuckWarningNonce ?? 'none'}, workerGen=${workerGeneration}) — resolving`);
             const locDs = localeForBot(ds.larkAppId);
             const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
             updateMessage(ds.larkAppId, cardMsgId, resolvedCard).catch(err =>
@@ -3043,14 +3064,12 @@ function setupWorkerHandlers(
           publishAttentionPatch(ds);
         } catch (err: any) {
           logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
-          // Card send failed — clear markers ONLY if this generation is still
-          // current. A newer warning (gen2) may have started while gen1's POST
-          // was in flight; we must not wipe gen2's state.
-          if (ds.stuckWarningGeneration === msg.generation) {
-            ds.stuckWarningCardId = undefined;
-            ds.stuckWarningTurnId = undefined;
-            ds.stuckWarningGeneration = undefined;
-            ds.stuckWarningPageType = undefined;
+          // Card send failed — clear markers ONLY if this nonce is still
+          // current AND we still own the worker. A newer warning (nonce+1) may
+          // have started while this POST was in flight; we must not wipe the
+          // newer state.
+          if (ds.worker === worker && ds.workerGeneration === workerGeneration && ds.stuckWarningNonce === nonce) {
+            clearStuckWarningAuthority(ds);
           }
         }
         break;
@@ -3058,36 +3077,36 @@ function setupWorkerHandlers(
 
       case 'stuck_warning_expired': {
         // Ignore from a stale worker generation.
-        if (ds.worker !== worker) break;
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
         // Worker refused to inject keys from a stuck-warning card because the
         // current screen no longer matches the page type the card was built for.
         // Resolve the card with a "page changed" message so the user knows the
         // action was NOT performed, then clear the authority.
-        if (ds.stuckWarningGeneration === msg.generation && ds.stuckWarningCardId) {
+        if (ds.stuckWarningNonce === msg.nonce && ds.stuckWarningCardId) {
           const locDs = localeForBot(ds.larkAppId);
           const resolvedCard = buildTuiPromptResolvedCard('页面已变化，未发送按键', locDs);
           updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
             logger.debug(`[${t}] Failed to update stuck-warning card on expired: ${err}`),
           );
-          invalidateStuckWarning(ds, 'stale_card_click');
+          clearStuckWarningAuthority(ds);
         }
         break;
       }
 
       case 'tui_keys_delivered': {
         // Ignore from a stale worker generation.
-        if (ds.worker !== worker) break;
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
         // Worker confirmed the keys were written to the PTY. Clear the card
         // authority and render success. We only do this AFTER the worker ACK
         // (not on click), so a rejected click (stuck_warning_expired) does not
         // falsely report success.
-        if (ds.stuckWarningGeneration === msg.generation && ds.stuckWarningCardId) {
+        if (ds.stuckWarningNonce === msg.nonce && ds.stuckWarningCardId) {
           const locDs = localeForBot(ds.larkAppId);
           const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
           updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
             logger.debug(`[${t}] Failed to resolve stuck-warning card on delivered: ${err}`),
           );
-          invalidateStuckWarning(ds, 'keys_delivered');
+          clearStuckWarningAuthority(ds);
         }
         break;
       }

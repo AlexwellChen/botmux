@@ -46,36 +46,46 @@
  */
 const VIEWPORT_LINES = 40;
 
+/** Strip ANSI escape sequences and carriage returns so a line's visible text
+ *  can be matched against plain-text patterns. */
+function stripAnsi(line: string): string {
+  return line.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\r/g, '');
+}
+
 export function matchHookReviewScreen(snapshot: string): 'hook review level 1' | 'hook review level 2' | undefined {
   if (!snapshot) return undefined;
-  const lines = snapshot.split('\n');
+  const rawLines = snapshot.split('\n');
+  // Strip ANSI/CR from every line — the PTY carries color codes and the
+  // renderer can emit \r\n; matching against raw bytes would miss the footer.
+  const lines = rawLines.map(stripAnsi);
   // Only inspect the bottom of the screen — the active viewport. Stale overview
   // text that scrolled off the top must not trigger a match.
   const viewport = lines.slice(-VIEWPORT_LINES);
+  // Trim trailing blank lines: the footer (control hint) must be the LAST
+  // non-empty line of the viewport. If there is content below the footer,
+  // the footer belongs to a scrolled-off screen, not the active one.
+  let end = viewport.length;
+  while (end > 0 && viewport[end - 1].trim() === '') end--;
+  if (end === 0) return undefined;
+  const trimmed = viewport.slice(0, end);
 
-  // Find the footer (control hint) — it anchors the active region.
-  let footerIdx = -1;
+  // The footer MUST be the last non-empty line of the viewport.
+  const lastLine = trimmed[trimmed.length - 1];
   let level: 1 | 2 | undefined;
-  for (let i = viewport.length - 1; i >= 0; i--) {
-    if (/Press t to trust all; enter to review hooks; esc to close/i.test(viewport[i])) {
-      footerIdx = i;
-      level = 1;
-      break;
-    }
-    if (/Press t to trust; esc to go back/i.test(viewport[i])) {
-      footerIdx = i;
-      level = 2;
-      break;
-    }
+  if (/Press t to trust all; enter to review hooks; esc to close/i.test(lastLine)) {
+    level = 1;
+  } else if (/Press t to trust; esc to go back/i.test(lastLine)) {
+    level = 2;
   }
-  if (footerIdx < 0 || !level) return undefined;
+  if (!level) return undefined;
+  const footerIdx = trimmed.length - 1;
 
   // Scan upward from the footer to find the nearest title line. The title must
   // be within the active region (not separated by too many blank lines / other
   // content), otherwise the footer may belong to a different screen.
   let titleIdx = -1;
   for (let i = footerIdx - 1; i >= 0 && footerIdx - i < 30; i--) {
-    const line = viewport[i].trim();
+    const line = trimmed[i].trim();
     if (line === 'Hooks' || /^PreToolUse hooks$/i.test(line)) {
       titleIdx = i;
       break;
@@ -83,8 +93,8 @@ export function matchHookReviewScreen(snapshot: string): 'hook review level 1' |
   }
   if (titleIdx < 0) return undefined;
 
-  const titleLine = viewport[titleIdx].trim();
-  const region = viewport.slice(titleIdx, footerIdx + 1).join('\n');
+  const titleLine = trimmed[titleIdx].trim();
+  const region = trimmed.slice(titleIdx, footerIdx + 1).join('\n');
 
   // Require the pending-review state line in the active region.
   if (!/hook needs review|needs review before it can run/i.test(region)) return undefined;

@@ -3786,10 +3786,11 @@ function stopScreenAnalyzer(): void {
 // ─── Stuck Detector (AI-free fallback for blocked CLI states) ───────────────
 
 let stuckDetector: StuckDetector | null = null;
-// Monotonic counter bumped on every stuck_warning we emit. Paired with the
-// page type so the daemon can discard late card POST results and the worker
-// can discard stale key injections after the CLI recovered or was replaced.
-let stuckWarningGeneration = 0;
+// Monotonic counter bumped on every CLI/backend (re)start within this worker.
+// Paired with the backend object identity, it lets the worker verify that a
+// stuck-warning card click still targets the same CLI instance that was stuck —
+// a restart within the same Node worker must invalidate outstanding cards.
+let cliLifetimeNonce = 0;
 
 function startStuckDetector(): void {
   const sd = config.stuckDetector;
@@ -3823,8 +3824,7 @@ function startStuckDetector(): void {
       // Prefer lastAnalyzerSnapshot (the capture-pane authoritative current
       // screen) over the long-lived renderer, which can drift under tmux.
       const snapshot = lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
-      stuckWarningGeneration += 1;
-      log(`StuckDetector: turn unresolved for ${Math.round(elapsedMs / 1000)}s${matchedLabel ? ` (${matchedLabel})` : ''} gen=${stuckWarningGeneration}`);
+      log(`StuckDetector: turn unresolved for ${Math.round(elapsedMs / 1000)}s${matchedLabel ? ` (${matchedLabel})` : ''}`);
       send({
         type: 'stuck_warning',
         elapsedMs,
@@ -3832,7 +3832,7 @@ function startStuckDetector(): void {
         matchedPattern: matchedLabel,
         turnId: currentBotmuxTurnId,
         dispatchAttempt: currentBotmuxDispatchAttempt,
-        generation: stuckWarningGeneration,
+        cliLifetime: cliLifetimeNonce,
       });
     },
     getSnapshot: () => lastAnalyzerSnapshot || renderer?.rawSnapshot() || '',
@@ -4068,22 +4068,29 @@ const KEY_TO_ANSI: Record<string, string> = {
  * Execute an AI-provided key sequence with delays between each key.
  * @param keys — key names like ["Down","Down","Space","Up","Up"]
  * @param isFinal — if true, this action ends the prompt (clear blocking state)
+ * @returns true if all keys were written successfully; false if backend is gone
+ *          or a write threw (caller must NOT send tui_keys_delivered on false).
  */
-async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<void> {
-  if (!backend || keys.length === 0) return;
+async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean> {
+  if (!backend || keys.length === 0) return false;
 
-  if ('sendSpecialKeys' in backend) {
-    const b = backend as any;
-    // Send each key individually with 100ms delay for TUI state processing
-    for (const key of keys) {
-      b.sendSpecialKeys(key);
-      await new Promise(r => setTimeout(r, 100));
+  try {
+    if ('sendSpecialKeys' in backend) {
+      const b = backend as any;
+      // Send each key individually with 100ms delay for TUI state processing
+      for (const key of keys) {
+        b.sendSpecialKeys(key);
+        await new Promise(r => setTimeout(r, 100));
+      }
+    } else {
+      for (const key of keys) {
+        backend.write(KEY_TO_ANSI[key] ?? key);
+        await new Promise(r => setTimeout(r, 100));
+      }
     }
-  } else {
-    for (const key of keys) {
-      backend.write(KEY_TO_ANSI[key] ?? key);
-      await new Promise(r => setTimeout(r, 100));
-    }
+  } catch (e: any) {
+    logError(`handleTuiKeys write failed: ${e?.message ?? e}`);
+    return false;
   }
 
   if (isFinal) {
@@ -4096,6 +4103,7 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<void> {
   }
 
   log(`TUI keys: ${keys.join(' ')}${isFinal ? ' (final)' : ''}`);
+  return true;
 }
 
 // 待注入的 TUI 命令队列。生命周期绑定当前 CLI 进程：killCli() 会清空它，
@@ -5650,6 +5658,7 @@ async function spawnCli(
     });
     effectiveBackendType = 'herdr';
     backend = herdrBe;
+    cliLifetimeNonce++;
     // Same as tmux/zellij adopt: writeInput (grok preferSessionId via
     // findGrokSessionByPid, claude pid-state) needs cliPid/cliCwd on the
     // PtyHandle. spawn() overwrites cliCwd from opts.cwd — use adoptCwd when
@@ -5712,6 +5721,7 @@ async function spawnCli(
       : new TmuxPipeBackend(cfg.adoptTmuxTarget!, { cliPid: cfg.adoptCliPid });
     effectiveBackendType = cfg.adoptZellijPaneId ? 'zellij' : 'tmux';
     backend = observeBe;
+    cliLifetimeNonce++;
     // writeInput (grok concurrent prompt_history binding, claude pid-state)
     // reads these fields off the PtyHandle — constructor only stores
     // watchCliPid for liveness, so surface them explicitly for adopt.
@@ -5895,6 +5905,11 @@ async function spawnCli(
   isPipeMode = selectedBackend.isPipeMode;
   isZellijMode = selectedBackend.isZellijMode;
   backend = selectedBackend.backend;
+  // Bump the CLI-lifetime nonce: any stuck-warning card posted by a previous
+  // backend instance (within this same worker) must not inject keys into the
+  // new one. The worker echoes this nonce in stuck_warning and re-checks it on
+  // tui_keys, alongside the backend object identity.
+  cliLifetimeNonce++;
   const adapterSessionId = cfg.resume
     ? (cfg.originalSessionId ?? cfg.sessionId)
     : cfg.sessionId;
@@ -9144,39 +9159,74 @@ process.on('message', async (raw: unknown) => {
       // built for. The CLI may have recovered (user pressed t in the web
       // terminal, or the turn finished) between card post and click — injecting
       // t/Enter/Esc into a now-idle or working CLI is unsafe.
-      if (msg.stuckGeneration !== undefined && msg.stuckPageType) {
-        let currentSnap = '';
-        try {
-          const fresh = backend ? await snapshotToText(backend, renderCols, renderRows, { filter: false }) : null;
-          currentSnap = fresh?.content || lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
-        } catch {
-          currentSnap = lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+      //
+      // Fail-closed: if the fresh capture throws OR the backend identity /
+      // cliLifetimeNonce changed between freeze and capture, we treat the card
+      // as expired and drop the keys. We NEVER fall back to the cached
+      // lastAnalyzerSnapshot — a stale cache could match the old page type and
+      // let us inject keys into a recovered CLI.
+      if (msg.stuckNonce !== undefined && msg.stuckPageType) {
+        // Freeze the backend identity + CLI lifetime BEFORE capture. If the
+        // CLI restarts (new backend object / new cliLifetimeNonce) while we
+        // await the capture, the frozen values won't match the live ones and
+        // we drop the keys.
+        const frozenBackend = backend;
+        const frozenLifetime = cliLifetimeNonce;
+        let currentSnap: string | null = null;
+        if (frozenBackend) {
+          try {
+            const fresh = await snapshotToText(frozenBackend, renderCols, renderRows, { filter: false });
+            currentSnap = fresh?.content ?? null;
+          } catch {
+            currentSnap = null;
+          }
+        }
+        // Fail-closed: no fresh snapshot OR backend/lifetime changed → expired.
+        if (!currentSnap || frozenBackend !== backend || frozenLifetime !== cliLifetimeNonce) {
+          log(`TUI keys from stale stuck-warning card (nonce=${msg.stuckNonce}, expected=${msg.stuckPageType}) — fresh capture failed or backend replaced, dropping`);
+          send({
+            type: 'stuck_warning_expired',
+            nonce: msg.stuckNonce,
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+          });
+          break;
         }
         const currentMatch = matchHookReviewScreen(currentSnap);
         if (currentMatch !== msg.stuckPageType) {
-          log(`TUI keys from stale stuck-warning card (gen=${msg.stuckGeneration}, expected=${msg.stuckPageType}, current=${currentMatch ?? 'none'}) — dropped, notifying daemon`);
+          log(`TUI keys from stale stuck-warning card (nonce=${msg.stuckNonce}, expected=${msg.stuckPageType}, current=${currentMatch ?? 'none'}) — dropped, notifying daemon`);
           send({
             type: 'stuck_warning_expired',
-            generation: msg.stuckGeneration,
+            nonce: msg.stuckNonce,
             turnId: currentBotmuxTurnId,
             dispatchAttempt: currentBotmuxDispatchAttempt,
           });
           break;
         }
       }
-      handleTuiKeys(msg.keys, msg.isFinal);
+      const writeOk = await handleTuiKeys(msg.keys, msg.isFinal);
       // If this was a stuck-warning card click, notify the daemon that the keys
       // were actually written so it can clear the card authority and render
       // success. The daemon must NOT clear authority on click alone — the fresh
       // capture above may have dropped the keys (stuck_warning_expired), in which
-      // case the daemon renders "page changed, not sent" instead.
-      if (msg.stuckGeneration !== undefined) {
-        send({
-          type: 'tui_keys_delivered',
-          generation: msg.stuckGeneration,
-          turnId: currentBotmuxTurnId,
-          dispatchAttempt: currentBotmuxDispatchAttempt,
-        });
+      // case the daemon renders "page changed, not sent" instead. We also must
+      // NOT report success if handleTuiKeys threw (backend gone mid-write).
+      if (msg.stuckNonce !== undefined) {
+        if (writeOk) {
+          send({
+            type: 'tui_keys_delivered',
+            nonce: msg.stuckNonce,
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+          });
+        } else {
+          send({
+            type: 'stuck_warning_expired',
+            nonce: msg.stuckNonce,
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+          });
+        }
       }
       // Re-arm the stuck detector ONLY when the card-handler explicitly flags
       // this as a stuck-warning card's Enter action (advances to the next

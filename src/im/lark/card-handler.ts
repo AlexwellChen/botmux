@@ -1826,8 +1826,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
 
       // For a normal TUI confirm: batch all toggled options' keys first.
-      // For a stuck-warning card: use ONLY the button's own keys — never mix
-      // in another concurrently active TUI card's toggle state/options.
+      // For a stuck-warning card: derive the single allowed key from the
+      // page type + selected index — NEVER trust value.keys from the card,
+      // which could be tampered to inject arbitrary keys. The allowlist is
+      // exactly the documented controls for each Codex hook-review screen.
       if (ds.worker) {
         let allKeys: string[] = [];
         if (isActiveTuiCard && ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
@@ -1838,28 +1840,58 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               allKeys.push(...opt.keys);
             }
           }
+          // Then the action's own keys (confirm/select)
+          allKeys.push(...keys);
+        } else if (isActiveStuckCard) {
+          // Allowlist: map (pageType, selectedIndex) → the one safe key.
+          // Level 1: 0=t, 1=Enter, 2=Esc ; Level 2: 0=t, 1=Esc
+          const pt = ds.stuckWarningPageType;
+          let allowedKey: string | undefined;
+          if (pt === 'hook review level 1') {
+            allowedKey = ['t', 'Enter', 'Escape'][selectedIndex];
+          } else if (pt === 'hook review level 2') {
+            allowedKey = ['t', 'Escape'][selectedIndex];
+          }
+          if (!allowedKey) {
+            logger.info(`[${tag(ds)}] Stuck-warning card click with invalid index ${selectedIndex} for pageType=${pt ?? 'none'} — dropped`);
+            return;
+          }
+          allKeys = [allowedKey];
+        } else {
+          // Non-stuck, non-TUI card (shouldn't happen given the active-card
+          // guard above, but fail-closed).
+          allKeys.push(...keys);
         }
-        // Then the action's own keys (confirm/select)
-        allKeys.push(...keys);
 
         if (allKeys.length > 0) {
+          // Atomic processing claim: if a previous click is already in flight
+          // (waiting for tui_keys_delivered / stuck_warning_expired ACK), drop
+          // this duplicate. Without this, two rapid clicks could both pass the
+          // fresh-capture guard and inject keys twice.
+          if (isActiveStuckCard) {
+            if (ds.stuckWarningProcessing) {
+              logger.info(`[${tag(ds)}] Duplicate stuck-warning card click — dropped (processing already in flight)`);
+              return;
+            }
+            ds.stuckWarningProcessing = true;
+          }
           // Only the stuck-warning card's Enter action re-arms the detector
           // (Enter advances from the hook list to a per-hook review). Match by
           // the actual keys sent — NOT by optionType, since t is typed 'confirm'
           // in the card definition. t/Esc and all ScreenAnalyzer cards never
           // set this flag. Also require the source card to be our own.
-          const isStuckWarningEnter = !!ds.stuckWarningCardId
-            && cardMessageId === ds.stuckWarningCardId
-            && keys.length === 1
-            && keys[0] === 'Enter';
-          // If this click is from a stuck-warning card, forward the generation
-          // and page type so the worker can re-verify the current screen still
-          // matches before injecting keys. A stale click (CLI recovered) will be
-          // dropped at the worker boundary.
-          const stuckGen = isActiveStuckCard ? ds.stuckWarningGeneration : undefined;
+          const isStuckWarningEnter = isActiveStuckCard
+            && allKeys.length === 1
+            && allKeys[0] === 'Enter';
+          // If this click is from a stuck-warning card, forward the nonce,
+          // cliLifetime, and page type so the worker can re-verify the current
+          // screen still matches before injecting keys. A stale click (CLI
+          // recovered) will be dropped at the worker boundary.
+          const stuckNonce = isActiveStuckCard ? ds.stuckWarningNonce : undefined;
+          const stuckCliLifetime = isActiveStuckCard ? ds.stuckWarningCliLifetime : undefined;
           const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
-          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal, rearmStuckDetector: isStuckWarningEnter, stuckGeneration: stuckGen, stuckPageType: stuckPage } as DaemonToWorker);
-          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} rearmStuck=${isStuckWarningEnter} stuckGen=${stuckGen ?? 'none'} — "${selectedText}"`);
+          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal, rearmStuckDetector: isStuckWarningEnter, stuckNonce, stuckCliLifetime, stuckPageType: stuckPage } as DaemonToWorker);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} rearmStuck=${isStuckWarningEnter} stuckNonce=${stuckNonce ?? 'none'} — "${selectedText}"`);
         }
 
         if (isFinal) {
