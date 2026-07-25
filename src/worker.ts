@@ -6293,8 +6293,7 @@ async function spawnCli(
     // Preserve that recorded target for compatibility unless this incarnation
     // requires an isolation/MCP boundary that only a Botmux-owned session can
     // safely provide. Fresh tasks use distinct agents in one machine-wide host.
-    reuseRecordedHerdrTarget: !willReadIsolate
-      && !willWriteSandbox
+    reuseRecordedHerdrTarget: !sandboxRequested
       && !hasMcpRuntimeEntries,
   });
   let selectedBackend = selectBackend();
@@ -7376,7 +7375,7 @@ async function spawnCli(
       baseBin: reproduceBaseBin,
       baseArgs: reproduceBaseArgs,
       wrapperCli: cfg.wrapperCli,
-      sandboxOn,
+      sandboxOn: sandboxRequested,
       binResolver: (b) => locateOnPath(b) ?? b,
       ttadkModel: cfg.model,
     });
