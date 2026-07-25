@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { detectCliUsageLimit } from '../src/utils/cli-usage-limit.js';
+import {
+  detectCliUsageLimit,
+  HARD_RATE_LIMIT_COOLDOWN_MS,
+  usageLimitStateKey,
+} from '../src/utils/cli-usage-limit.js';
 
 describe('detectCliUsageLimit', () => {
   it('detects Codex usage limit output with a concrete retry time', () => {
@@ -57,6 +61,47 @@ describe('detectCliUsageLimit', () => {
     if (!result.limited) return;
     expect(result.kind).toBe('rate');
     expect(result.retryLabel).toBe('10:36 PM');
+  });
+
+  it('detects 429 Too Many Requests without a wall-clock retry time', () => {
+    const now = new Date(2026, 4, 19, 17, 30, 12);
+    const result = detectCliUsageLimit(
+      'stream disconnected before completion: exceeded retry limit, last status: 429 Too Many Requests, request id: req_abc123',
+      now,
+    );
+
+    expect(result.limited).toBe(true);
+    if (!result.limited) return;
+    expect(result.kind).toBe('rate');
+    expect(result.retryLabel).toBe('~5 min');
+    expect(result.retryReady).toBe(false);
+    const bucketStart = Math.floor(now.getTime() / HARD_RATE_LIMIT_COOLDOWN_MS) * HARD_RATE_LIMIT_COOLDOWN_MS;
+    expect(result.retryAtMs).toBe(bucketStart + 2 * HARD_RATE_LIMIT_COOLDOWN_MS);
+  });
+
+  it('detects exceeded retry limit text without an explicit 429 token', () => {
+    const now = new Date(2026, 4, 19, 17, 30, 12);
+    const result = detectCliUsageLimit(
+      'Error: exceeded retry limit while contacting the model API',
+      now,
+    );
+
+    expect(result.limited).toBe(true);
+    if (!result.limited) return;
+    expect(result.kind).toBe('rate');
+    expect(result.retryLabel).toBe('~5 min');
+    expect(result.retryReady).toBe(false);
+  });
+
+  it('keeps hard 429 fallback state key stable across screen ticks in the same bucket', () => {
+    const text = 'exceeded retry limit, last status: 429 Too Many Requests, request id: req_stable';
+    const a = detectCliUsageLimit(text, new Date(2026, 4, 19, 17, 30, 0));
+    const b = detectCliUsageLimit(text, new Date(2026, 4, 19, 17, 32, 45));
+
+    expect(a.limited).toBe(true);
+    expect(b.limited).toBe(true);
+    if (!a.limited || !b.limited) return;
+    expect(usageLimitStateKey(a)).toBe(usageLimitStateKey(b));
   });
 
   it('marks a detected limit as retry-ready once the retry time has passed', () => {
