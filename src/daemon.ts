@@ -65,6 +65,7 @@ import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
+import { applyAllowedUsersResolve } from './utils/allowed-users-apply.js';
 import { withFileLock } from './utils/file-lock.js';
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
@@ -2961,6 +2962,94 @@ function removeDaemonDescriptor(larkAppId: string): void {
   if (existsSync(fp)) {
     try { unlinkSync(fp); } catch { /* ignore */ }
   }
+}
+
+/** Last published open_ids from a prior daemon process (dashboard descriptor). */
+function readPreviousResolvedAllowedUsers(larkAppId: string): string[] {
+  try {
+    const fp = join(DAEMON_REGISTRY_DIR, `${larkAppId}.json`);
+    if (!existsSync(fp)) return [];
+    const raw = JSON.parse(readFileSync(fp, 'utf8')) as { resolvedAllowedUsers?: unknown };
+    const arr = raw.resolvedAllowedUsers;
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((u): u is string => typeof u === 'string' && u.startsWith('ou_'));
+  } catch {
+    return [];
+  }
+}
+
+async function notifyAllowedUsersResolveFailure(
+  larkAppId: string,
+  notice: string,
+  recipients: string[],
+): Promise<void> {
+  logger.error(`[${larkAppId}] ${notice}`);
+  const unique = [...new Set(recipients.filter(u => typeof u === 'string' && u.startsWith('ou_')))];
+  for (const openId of unique.slice(0, 5)) {
+    try {
+      await sendUserMessage(
+        larkAppId,
+        openId,
+        `⚠️ Botmux allowedUsers 解析告警\n\n${notice}`,
+        'text',
+      );
+    } catch (err: any) {
+      logger.warn(
+        `[${larkAppId}] failed to DM allowedUsers resolve notice to ${openId.slice(0, 12)}: ${err?.message ?? err}`,
+      );
+    }
+  }
+  if (unique.length === 0) {
+    logger.error(
+      `[${larkAppId}] allowedUsers resolve failed with no open_id recipient available for DM; ` +
+      `check daemon logs and Feishu contact API, then restart this bot.`,
+    );
+  }
+}
+
+function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void {
+  if (attempt > 3) return;
+  const delayMs = attempt === 1 ? 30_000 : attempt === 2 ? 120_000 : 300_000;
+  const timer = setTimeout(() => {
+    void (async () => {
+      let bot: BotState;
+      try {
+        bot = getBot(larkAppId);
+      } catch {
+        return;
+      }
+      const configured = bot.config.allowedUsers ?? [];
+      if (configured.length === 0) return;
+      const previous = bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_'));
+      try {
+        const resolveResult = await resolveAllowedUsersWithMap(larkAppId, configured);
+        const applied = applyAllowedUsersResolve({
+          rawEntries: configured,
+          previousResolvedOpenIds: previous,
+          resolveResult,
+        });
+        bot.resolvedAllowedUsers = applied.resolved;
+        bot.rawAllowedUserResolution = applied.map;
+        if (!applied.failed) {
+          logger.info(
+            `[${larkAppId}] allowedUsers resolve retry succeeded: ${applied.resolved.join(', ')}`,
+          );
+          return;
+        }
+        logger.warn(
+          `[${larkAppId}] allowedUsers resolve retry #${attempt} still unhealthy` +
+          `${applied.usedFallback ? ' (still on cache)' : ' (allowlist empty)'}`,
+        );
+        scheduleAllowedUsersResolveRetry(larkAppId, attempt + 1);
+      } catch (err: any) {
+        logger.warn(
+          `[${larkAppId}] allowedUsers resolve retry #${attempt} threw: ${err?.message ?? err}`,
+        );
+        scheduleAllowedUsersResolveRetry(larkAppId, attempt + 1);
+      }
+    })();
+  }, delayMs);
+  timer.unref?.();
 }
 
 // ─── Version tracking ────────────────────────────────────────────────────────
@@ -17199,21 +17288,55 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     refreshCliVersion(cfg.cliId, cfg.cliPathOverride);
 
     // Resolve allowed users per bot
-    if (bot.resolvedAllowedUsers.length > 0) {
+    if ((bot.config.allowedUsers?.length ?? 0) > 0 || bot.resolvedAllowedUsers.length > 0) {
       // 含邮箱或 union_id(on_) 都要重解析成本 app 的 open_id —— 否则 canTalk/canOperate
       // 拿 sender 的 ou_ 对不上 on_，owner 会被自己的 bot 锁死（PR#72）。
       // literal ou_ 也走 best-effort 校验，用于诊断把其他 app 视角 open_id
       // 误填到本 bot 的配置。
-      const needsResolve = bot.resolvedAllowedUsers.some(u => u.includes('@') || u.startsWith('on_') || u.startsWith('ou_'));
+      //
+      // Transient contact failures must NOT blank the runtime list: an empty
+      // resolved allowlist under a configured allowedUsers is fail-closed and
+      // silently drops even the real owner (@ with no group reply). Keep the
+      // last-known ou_ cache, log loudly, DM owners, and retry.
+      const configured = bot.config.allowedUsers ?? bot.resolvedAllowedUsers;
+      const needsResolve = configured.some(u => u.includes('@') || u.startsWith('on_') || u.startsWith('ou_'));
       if (needsResolve) {
+        const previousOpenIds = [
+          ...bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_')),
+          ...readPreviousResolvedAllowedUsers(cfg.larkAppId),
+        ];
         try {
           // 同时拿到 raw→open_id 映射，供 /revoke 反查删除 email 形式的 raw 条目（R2#2）。
-          const { resolved, map } = await resolveAllowedUsersWithMap(cfg.larkAppId, bot.resolvedAllowedUsers);
-          bot.resolvedAllowedUsers = resolved;
-          bot.rawAllowedUserResolution = map;
+          const resolveResult = await resolveAllowedUsersWithMap(cfg.larkAppId, configured);
+          const applied = applyAllowedUsersResolve({
+            rawEntries: configured,
+            previousResolvedOpenIds: previousOpenIds,
+            resolveResult,
+          });
+          bot.resolvedAllowedUsers = applied.resolved;
+          bot.rawAllowedUserResolution = applied.map;
           logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ')}`);
+          if (applied.failed && applied.notice) {
+            const recipients = applied.resolved.length > 0 ? applied.resolved : previousOpenIds;
+            await notifyAllowedUsersResolveFailure(cfg.larkAppId, applied.notice, recipients);
+            scheduleAllowedUsersResolveRetry(cfg.larkAppId);
+          }
         } catch (err: any) {
-          logger.warn(`[${cfg.larkAppId}] Failed to resolve allowedUsers: ${err.message}`);
+          const applied = applyAllowedUsersResolve({
+            rawEntries: configured,
+            previousResolvedOpenIds: previousOpenIds,
+            resolveResult: { resolved: [], map: new Map(), errored: true },
+          });
+          bot.resolvedAllowedUsers = applied.resolved;
+          bot.rawAllowedUserResolution = applied.map;
+          const notice = applied.notice
+            ?? `Failed to resolve allowedUsers: ${err?.message ?? err}`;
+          await notifyAllowedUsersResolveFailure(
+            cfg.larkAppId,
+            `${notice} (throw: ${err?.message ?? err})`,
+            applied.resolved.length > 0 ? applied.resolved : previousOpenIds,
+          );
+          scheduleAllowedUsersResolveRetry(cfg.larkAppId);
         }
       }
       // Republish the descriptor with the post-resolution open_ids so the
