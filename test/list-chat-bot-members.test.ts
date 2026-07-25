@@ -655,3 +655,123 @@ describe('listChatBotMembers', () => {
     expect(claude).toMatchObject({ openId: 'ou_obs_claude', mentionSource: 'observed' });
   });
 });
+
+describe('resolveSiblingBotBySenderOpenId', () => {
+  afterEach(async () => {
+    if (state.dataDir) {
+      rmSync(state.dataDir, { recursive: true, force: true });
+      state.dataDir = '';
+    }
+    state.listBotsApiItems = undefined;
+    state.listBotsApiError = undefined;
+    state.listBotsApiCode = 0;
+    state.listBotsApiCalls = 0;
+    state.botConfigs = [
+      { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
+      { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
+    ];
+    state.inChatByAppId = {};
+    state.inChatErrorByAppId = {};
+    state.inChatCodeByAppId = {};
+    state.inChatCalls = [];
+    const { __testOnly_resetAllBotClients } = await import('../src/im/lark/client.js');
+    __testOnly_resetAllBotClients();
+  });
+
+  it('resolves a cold sibling by its receiver-scoped sender open_id (unique name + is_in_chat)', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    state.listBotsApiItems = [{ bot_id: 'ou_peer_seen_by_receiver', bot_name: 'BotPeer' }];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer_seen_by_peer', botName: 'BotPeer' },
+    ]));
+    // Cross-ref cold on purpose (not consulted by the resolver).
+    writeFileSync(join(state.dataDir, 'bot-openids-cli_self.json'), JSON.stringify({}));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    await expect(resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_peer_seen_by_receiver'))
+      .resolves.toEqual({ ok: true, larkAppId: 'cli_peer', botName: 'BotPeer', senderOpenId: 'ou_peer_seen_by_receiver' });
+    expect(state.inChatCalls).toEqual(['cli_peer']);
+  });
+
+  it('fails closed for a genuine external sender not backed by any local sibling of that name', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    // Live roster shows a stranger bot whose name matches no configured sibling.
+    state.listBotsApiItems = [{ bot_id: 'ou_stranger', bot_name: 'StrangerBot' }];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+    ]));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    const res = await resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_stranger');
+    expect(res.ok).toBe(false);
+  });
+
+  it('fails closed when the sender open_id is absent from the live roster', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    state.listBotsApiItems = [{ bot_id: 'ou_peer_seen_by_receiver', bot_name: 'BotPeer' }];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+    ]));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    const res = await resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_not_in_roster');
+    expect(res).toEqual({ ok: false, reason: 'sender_not_in_live_roster' });
+  });
+
+  it('fails closed when two configured siblings share the roster name (anti-impersonation)', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    state.botConfigs = [
+      { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
+      { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
+      { larkAppId: 'cli_peer2', larkAppSecret: 's3', cliId: 'codex' },
+    ];
+    state.listBotsApiItems = [{ bot_id: 'ou_peer_seen_by_receiver', bot_name: 'BotPeer' }];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+      { larkAppId: 'cli_peer2', botOpenId: 'ou_peer2', botName: 'BotPeer' },
+    ]));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    const res = await resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_peer_seen_by_receiver');
+    expect(res).toEqual({ ok: false, reason: 'ambiguous_sibling_name' });
+  });
+
+  it('fails closed when the live /members/bots call errors', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    state.listBotsApiError = new Error('gateway unavailable');
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+    ]));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    const res = await resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_peer_seen_by_receiver');
+    expect(res.ok).toBe(false);
+    expect((res as { reason: string }).reason).toContain('live_membership_unavailable');
+  });
+
+  it('returns no_sender_open_id when the sender open_id is missing', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    await expect(resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', undefined))
+      .resolves.toEqual({ ok: false, reason: 'no_sender_open_id' });
+    expect(state.listBotsApiCalls).toBe(0);
+  });
+
+  it('fails closed when the matched sibling is not actually in the chat', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    state.listBotsApiItems = [{ bot_id: 'ou_peer_seen_by_receiver', bot_name: 'BotPeer' }];
+    state.inChatByAppId = { cli_peer: false };
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+    ]));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    const res = await resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_peer_seen_by_receiver');
+    expect(res.ok).toBe(false);
+  });
+});
