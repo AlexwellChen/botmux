@@ -213,6 +213,8 @@ import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
+import { StuckDetector, matchHookReviewScreen } from './utils/stuck-detector.js';
+import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
@@ -4057,6 +4059,7 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   // both when the next message respawns the CLI.
   stopScreenUpdates();
   stopScreenAnalyzer();
+  stopStuckDetector();
   log(`Crash diagnostic tmux session parked at ${TmuxBackend.diagnosticSessionName(sessionId)}`);
   return true;
 }
@@ -4176,6 +4179,67 @@ function stopScreenAnalyzer(): void {
   screenAnalyzer?.dispose();
   screenAnalyzer = null;
   tuiPromptBlocking = false;
+}
+
+// ─── Stuck Detector (AI-free fallback for blocked CLI states) ───────────────
+
+let stuckDetector: StuckDetector | null = null;
+// Monotonic counter bumped on every CLI/backend (re)start within this worker.
+// Paired with the backend object identity, it lets the worker verify that a
+// stuck-warning card click still targets the same CLI instance that was stuck —
+// a restart within the same Node worker must invalidate outstanding cards.
+let cliLifetimeNonce = 0;
+
+function startStuckDetector(): void {
+  const sd = config.stuckDetector;
+  if (!sd.enabled) return;
+  stopStuckDetector();
+  stuckDetector = new StuckDetector(sd.timeoutMs, {
+    isActuallyStuck: () => {
+      // Scope gate: this PR only handles the Codex PreToolUse hook-review
+      // screen. Other CLIs (Claude Code, Gemini, ...) must never see the
+      // Codex-specific t/Enter/Esc card, even if their output happens to
+      // contain the same strings.
+      if (lastInitConfig?.cliId !== 'codex') return false;
+      // Only warn if the CLI is not at its idle prompt AND no TUI prompt card
+      // is already posted. A long legitimate turn (model thinking, tool calls)
+      // must not trigger this.
+      if (isPromptReady) return false;
+      if (tuiPromptBlocking) return false;
+      // Anti-false-positive: if the PTY produced output recently the CLI is
+      // still actively working (model streaming, tool output, spinner) — not
+      // stuck. Require quiescence before firing.
+      const sincePty = Date.now() - lastPtyActivityAtMs;
+      if (sincePty < 15_000) return false;
+      // Do NOT gate on durableTurnInFlight: the original hook-review incident
+      // ran on a non-durable (ordinary IM) turn, and a durable turn's 20s
+      // submit-recheck failure clears durableTurnInFlight before the 45s
+      // detector fires. The PTY-quiescence + !isPromptReady combination is
+      // sufficient to detect a genuinely stalled turn.
+      return true;
+    },
+    onStuck: (elapsedMs, matchedLabel) => {
+      // Prefer lastAnalyzerSnapshot (the capture-pane authoritative current
+      // screen) over the long-lived renderer, which can drift under tmux.
+      const snapshot = lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+      log(`StuckDetector: turn unresolved for ${Math.round(elapsedMs / 1000)}s${matchedLabel ? ` (${matchedLabel})` : ''}`);
+      send({
+        type: 'stuck_warning',
+        elapsedMs,
+        snapshot: snapshot.slice(-3000),
+        matchedPattern: matchedLabel,
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+        cliLifetime: cliLifetimeNonce,
+      });
+    },
+    getSnapshot: () => lastAnalyzerSnapshot || renderer?.rawSnapshot() || '',
+  });
+}
+
+function stopStuckDetector(): void {
+  stuckDetector?.dispose();
+  stuckDetector = null;
 }
 
 // ─── Screenshot Capture (PNG → Feishu image_key) ────────────────────────────
@@ -4402,22 +4466,29 @@ const KEY_TO_ANSI: Record<string, string> = {
  * Execute an AI-provided key sequence with delays between each key.
  * @param keys — key names like ["Down","Down","Space","Up","Up"]
  * @param isFinal — if true, this action ends the prompt (clear blocking state)
+ * @returns true if all keys were written successfully; false if backend is gone
+ *          or a write threw (caller must NOT send tui_keys_delivered on false).
  */
-async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<void> {
-  if (!backend || keys.length === 0) return;
+async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean> {
+  if (!backend || keys.length === 0) return false;
 
-  if ('sendSpecialKeys' in backend) {
-    const b = backend as any;
-    // Send each key individually with 100ms delay for TUI state processing
-    for (const key of keys) {
-      b.sendSpecialKeys(key);
-      await new Promise(r => setTimeout(r, 100));
+  try {
+    if ('sendSpecialKeys' in backend) {
+      const b = backend as any;
+      // Send each key individually with 100ms delay for TUI state processing
+      for (const key of keys) {
+        b.sendSpecialKeys(key);
+        await new Promise(r => setTimeout(r, 100));
+      }
+    } else {
+      for (const key of keys) {
+        backend.write(KEY_TO_ANSI[key] ?? key);
+        await new Promise(r => setTimeout(r, 100));
+      }
     }
-  } else {
-    for (const key of keys) {
-      backend.write(KEY_TO_ANSI[key] ?? key);
-      await new Promise(r => setTimeout(r, 100));
-    }
+  } catch (e: any) {
+    logError(`handleTuiKeys write failed: ${e?.message ?? e}`);
+    return false;
   }
 
   if (isFinal) {
@@ -4430,6 +4501,7 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<void> {
   }
 
   log(`TUI keys: ${keys.join(' ')}${isFinal ? ' (final)' : ''}`);
+  return true;
 }
 
 // 待注入的 TUI 命令队列。生命周期绑定当前 CLI 进程：killCli() 会清空它，
@@ -4948,6 +5020,7 @@ function markPromptReady(): void {
   // CLI exits, onCliExit still reports ambiguous while deliberately declining
   // worker-local replay of the durable attempt.
   if (!durableTurnInFlight) inflightInputs.onTurnComplete();
+  stuckDetector?.disarm();
   maybeEmitWorkflowTranscriptOutput();
   if (awaitingFirstPrompt) {
     awaitingFirstPrompt = false;
@@ -5415,7 +5488,10 @@ async function flushPending(): Promise<void> {
       // auto-re-queued: a lost/late ack surfaces as a submit-failure the user can
       // resend manually, and the stable clientUserMessageId lets codex dedupe a
       // resend (Codex delta P1-1).
-      if (!codexRpcEngine) inflightInputs.onWrite(item);
+      if (!codexRpcEngine) {
+        inflightInputs.onWrite(item);
+        stuckDetector?.arm();
+      }
       const msg = item.content;
       const logicalMsg = item.logicalContent ?? msg;
       currentBotmuxTurnId = item.turnId;
@@ -6048,6 +6124,7 @@ async function spawnCli(
     });
     effectiveBackendType = 'herdr';
     backend = herdrBe;
+    cliLifetimeNonce++;
     // Same as tmux/zellij adopt: writeInput (grok preferSessionId via
     // findGrokSessionByPid, claude pid-state) needs cliPid/cliCwd on the
     // PtyHandle. spawn() overwrites cliCwd from opts.cwd — use adoptCwd when
@@ -6110,6 +6187,7 @@ async function spawnCli(
       : new TmuxPipeBackend(cfg.adoptTmuxTarget!, { cliPid: cfg.adoptCliPid });
     effectiveBackendType = cfg.adoptZellijPaneId ? 'zellij' : 'tmux';
     backend = observeBe;
+    cliLifetimeNonce++;
     // writeInput (grok concurrent prompt_history binding, claude pid-state)
     // reads these fields off the PtyHandle — constructor only stores
     // watchCliPid for liveness, so surface them explicitly for adopt.
@@ -6452,6 +6530,11 @@ async function spawnCli(
   isPipeMode = selectedBackend.isPipeMode;
   isZellijMode = selectedBackend.isZellijMode;
   backend = selectedBackend.backend;
+  // Bump the CLI-lifetime nonce: any stuck-warning card posted by a previous
+  // backend instance (within this same worker) must not inject keys into the
+  // new one. The worker echoes this nonce in stuck_warning and re-checks it on
+  // tui_keys, alongside the backend object identity.
+  cliLifetimeNonce++;
   // Every bot — isolated OR not — gets its own BOT_HOME dir as a ready-made private-
   // storage slot. An isolated sibling denies this path regardless of whether the owner
   // is isolated (deny uses the full bots.json), so a non-isolated bot can drop private
@@ -6552,6 +6635,7 @@ async function spawnCli(
           isPipeMode = selectedBackend.isPipeMode;
           isZellijMode = selectedBackend.isZellijMode;
           backend = selectedBackend.backend;
+          cliLifetimeNonce++;
           persistentSessionName = selectedBackend.persistentSessionName;
         } catch (e) {
           throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: could not kill stale persistent pane (${(e as Error).message})`);
@@ -6578,6 +6662,7 @@ async function spawnCli(
       isPipeMode = selectedBackend.isPipeMode;
       isZellijMode = selectedBackend.isZellijMode;
       backend = selectedBackend.backend;
+      cliLifetimeNonce++;
       persistentSessionName = selectedBackend.persistentSessionName;
       willReattachPersistent = selectedBackend.isReattach === true;
     }
@@ -8145,6 +8230,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   readyPatternSeenDuringHold = false;
   awaitingPostSessionStartPromptEvidence = false;
   stopScreenAnalyzer();
+  stopStuckDetector();
   stopScreenUpdates();
   backend?.kill();
   backend = null;
@@ -8257,6 +8343,7 @@ async function restartCliProcess(
         if (lastInitConfig) {
           startScreenUpdates();
           startScreenAnalyzer();
+          startStuckDetector();
           try {
             const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
             // Re-engage RPC so the new --remote pane binds to the CURRENT app-server
@@ -9576,6 +9663,7 @@ process.on('message', async (raw: unknown) => {
           port = await startWebServer(config.web.workerHost, msg.webPort);
           startScreenUpdates();
           startScreenAnalyzer();
+          startStuckDetector();
         } else {
           // Workflow attempts still expose a read-only web terminal so the
           // workflow dashboard can observe in-flight subagents.  Keep the
@@ -9746,10 +9834,12 @@ process.on('message', async (raw: unknown) => {
         log('Message received after crash-loop stop; retrying CLI start');
         destroyCrashDiagnosticTerminal('retry after message');
         stopScreenAnalyzer();
+        stopStuckDetector();
         stopScreenUpdates();
         awaitingFirstPrompt = true;
         startScreenUpdates();
         startScreenAnalyzer();
+        startStuckDetector();
         try {
           const restartCfg = { ...lastInitConfig, resume: true, prompt: '' };
           await spawnCli(restartCfg);
@@ -10005,7 +10095,50 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'tui_keys': {
-      handleTuiKeys(msg.keys, msg.isFinal);
+      // Stale-card guard: if this key press came from a stuck-warning card,
+      // delegate to processStuckWarningTuiKeys which does a FRESH capture (not
+      // the 2s-cached lastAnalyzerSnapshot) and re-verifies the current screen
+      // still matches the page type the card was built for. Fail-closed: any
+      // mismatch (lifetime, capture, backend, page type, write failure) sends
+      // stuck_warning_expired and drops the keys. ScreenAnalyzer TUI cards
+      // (no stuckNonce) bypass the guard and write keys directly.
+      let wroteKeys = false;
+      if (msg.stuckNonce !== undefined && msg.stuckPageType) {
+        const result = await processStuckWarningTuiKeys(
+          {
+            stuckNonce: msg.stuckNonce,
+            stuckPageType: msg.stuckPageType,
+            stuckCliLifetime: msg.stuckCliLifetime,
+            keys: msg.keys,
+            isFinal: msg.isFinal,
+          },
+          {
+            getBackend: () => backend,
+            getCurrentLifetime: () => cliLifetimeNonce,
+            renderCols,
+            renderRows,
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+            capture: snapshotToText,
+            match: matchHookReviewScreen,
+            writeKeys: handleTuiKeys,
+            sendExpired: (nonce, turnId, dispatchAttempt) => send({ type: 'stuck_warning_expired', nonce, turnId, dispatchAttempt }),
+            sendDelivered: (nonce, turnId, dispatchAttempt) => send({ type: 'tui_keys_delivered', nonce, turnId, dispatchAttempt }),
+            log,
+          },
+        );
+        wroteKeys = result.wroteKeys;
+      } else {
+        await handleTuiKeys(msg.keys, msg.isFinal);
+        wroteKeys = true;
+      }
+      // Re-arm the stuck detector ONLY when the card-handler explicitly flags
+      // this as a stuck-warning card's Enter action (advances to the next
+      // review layer) AND keys were actually written. An expired click (CLI
+      // recovered, page changed) must NOT re-arm — the detector should stay
+      // disarmed until the next real stall. t/Esc and all ScreenAnalyzer cards
+      // never set this flag.
+      if (shouldRearmStuckDetector(!!msg.rearmStuckDetector, wroteKeys)) stuckDetector?.arm();
       break;
     }
 

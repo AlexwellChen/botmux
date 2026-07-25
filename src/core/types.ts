@@ -234,6 +234,33 @@ export interface DaemonSession {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
+  /** turnId of the last stuck_warning posted — dedup so we don't spam the
+   *  thread with repeated warnings for the same unresolved turn. */
+  stuckWarningTurnId?: string;
+  /** message_id of the stuck_warning interactive card (if active) */
+  stuckWarningCardId?: string;
+  /** Daemon-side monotonic counter for stuck_warning nonces. NEVER cleared —
+   *  even when the active warning authority is dropped, the counter keeps
+   *  climbing so a late POST result / ACK from a previous warning (nonce=N)
+   *  can never match a newer warning that happened to reuse N after a clear.
+   *  stuckWarningNonce (below) is the active warning's nonce and may clear. */
+  stuckWarningNonceCounter?: number;
+  /** Daemon-side monotonic nonce for the active stuck_warning. Bumped on every
+   *  new warning so a late POST result or stale card click from a previous
+   *  warning (or a previous worker generation) cannot resurrect authority. */
+  stuckWarningNonce?: number;
+  /** Page type of the active stuck-warning card ('hook review level 1' or
+   *  'hook review level 2') — forwarded to the worker on card click so it can
+   *  re-verify the current screen before injecting keys. */
+  stuckWarningPageType?: string;
+  /** When true, a card click has been dispatched to the worker and we are
+   *  waiting for the tui_keys_delivered / stuck_warning_expired ACK. Blocks
+   *  duplicate clicks from injecting keys twice. */
+  stuckWarningProcessing?: boolean;
+  /** Worker's cliLifetimeNonce at the time the stuck_warning was posted.
+   *  Forwarded back to the worker in tui_keys so it can verify the backend
+   *  hasn't been replaced within the same worker process. */
+  stuckWarningCliLifetime?: number;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;

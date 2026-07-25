@@ -594,7 +594,7 @@ export type DaemonToWorker =
   // diagnostic shell (bmx-diag-<sid>) preserving the last output. Deferred from
   // onExit so transient auto-restarted exits don't park-then-tear-down.
   | { type: 'park_diagnostic' }
-  | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
+  | { type: 'tui_keys'; keys: string[]; isFinal: boolean; rearmStuckDetector?: boolean; stuckNonce?: number; stuckCliLifetime?: number; stuckPageType?: string }
   // updateWorkingDir：会话内 /cd 移动 cwd 后随附的新目录，worker 记入
   // lastInitConfig.workingDir，使内部三条 respawn 路径（claude_exit 自动重启 /
   // IM /restart / dashboard restart）收敛到新目录而非陈旧的初始 cwd。
@@ -645,6 +645,9 @@ export type WorkerToDaemon =
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_resolved'; selectedText?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'stuck_warning'; elapsedMs: number; snapshot: string; matchedPattern?: string; turnId?: string; dispatchAttempt?: number; cliLifetime?: number }
+  | { type: 'stuck_warning_expired'; nonce: number; turnId?: string; dispatchAttempt?: number }
+  | { type: 'tui_keys_delivered'; nonce: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
