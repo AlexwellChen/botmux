@@ -589,7 +589,17 @@ export function prepareDirectSandbox(opts: {
   args.push('--unsetenv', 'BOTS_CONFIG');
   args.push('--unsetenv', 'BOTMUX_HOST_RELAY_AUTHORIZED');
   for (const [k, v] of Object.entries(env)) args.push('--setenv', k, v);
-  args.push('--', opts.cliBin, ...opts.cliArgs);
+  // Canonicalize the CLI binary before execvp: on a symlinked-$HOME host
+  // (e.g. /home/u → /data00/home/u shared-drive mount) the worker hands us the
+  // lexical path (~/.local/bin/claude → /home/u/.local/bin/claude), but the
+  // sandbox only binds CANONICAL exec dirs (/data00/...). The lexical /home/u
+  // prefix does not exist in the fresh bwrap root, so bwrap's execvp fails with
+  // "No such file or directory" and the CLI never starts (pane dies instantly).
+  // realpath makes the exec target land on a bound path. Best-effort: an
+  // unresolvable path falls back to the lexical form (bwrap will fail-closed).
+  let execBin = opts.cliBin;
+  try { execBin = realpathSync(opts.cliBin); } catch { /* keep lexical; spawn fails closed */ }
+  args.push('--', execBin, ...opts.cliArgs);
 
   return {
     bin: 'bwrap',

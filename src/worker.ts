@@ -6820,8 +6820,19 @@ async function spawnCli(
   // already guarantee the pane starts clean, and the CLI's built-in default
   // preserves stock semantics.
   if (isolationBotHome) {
-    if (claudeDataDir) childEnv.CLAUDE_CONFIG_DIR = claudeDataDir; // = <BOT_HOME>/claude
-    else childEnv.CODEX_HOME = isolatedCodexHome!;
+    // In the file sandbox, bwrap binds only CANONICAL paths (the fs-policy
+    // realpaths every rule). On a symlinked-$HOME host (/home/u → /data00/home/u)
+    // the lexical BOT_HOME (/home/u/.botmux/bots/…/claude) does NOT exist in the
+    // fresh bwrap root, so the CLI can't open its own CLAUDE_CONFIG_DIR/CODEX_HOME
+    // → settings.json (with ANTHROPIC_BASE_URL/token) is unreadable → it falls
+    // back to the public endpoint and fails to connect. Canonicalize so the env
+    // points at the same path bwrap bound. Best-effort: keep lexical if unresolved.
+    const canonicalizeForSandbox = (p: string) => {
+      if (!sandboxRequested) return p;
+      try { return realpathSync(p); } catch { return p; }
+    };
+    if (claudeDataDir) childEnv.CLAUDE_CONFIG_DIR = canonicalizeForSandbox(claudeDataDir); // = <BOT_HOME>/claude
+    else childEnv.CODEX_HOME = canonicalizeForSandbox(isolatedCodexHome!);
   }
 
   // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.
@@ -6945,6 +6956,12 @@ async function spawnCli(
     const outbox = process.platform === 'linux'
       ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
       : undefined;
+    // Pre-create the outbox BEFORE buildFsPolicy so it survives the allow-rule
+    // existence-filter below (a not-yet-existing readWrite path is dropped, and
+    // bwrap can't bind a missing source → the sandboxed `botmux send` relay
+    // would EPERM/ENOENT writing its <hash>.content into an unbound dir).
+    // prepareDirectSandbox re-mkdirs it too; recursive make is idempotent.
+    if (outbox) { try { mkdirSync(outbox, { recursive: true }); } catch { /* best-effort; prepareDirectSandbox retries */ } }
 
     // The botmux install/checkout root (dir containing dist/ + node_modules).
     // This module compiles to <checkout>/dist/worker.js, so `../../` from here is

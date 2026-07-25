@@ -10,7 +10,7 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync } from 'node:fs';
 import { buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
@@ -38,6 +38,40 @@ describe('prepareDirectSandbox platform gate', () => {
       chdir: '/x', home: '/home/u', cliBin: '/usr/bin/true', cliArgs: [],
     });
     expect(r).toBeNull();
+  });
+});
+
+// Regression for the symlinked-$HOME execvp bug: the worker hands the sandbox a
+// LEXICAL cli bin (e.g. ~/.local/bin/claude → /home/u/.local/bin/claude on a
+// /home/u → /data00/home/u shared-drive host), but the sandbox only binds
+// CANONICAL exec dirs. bwrap's execvp then can't resolve the lexical /home/u
+// prefix (absent in the fresh root) and the CLI dies instantly (pane gone →
+// tmux pipe-pane fails). prepareDirectSandbox must realpath the bin so the exec
+// target lands on a bound path.
+describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', () => {
+  it('replaces a symlinked cli bin path with its realpath in the bwrap argv', () => {
+    if (process.platform !== 'linux') return; // bwrap path only built on linux
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-binlink-'));
+    // Real target + a symlink pointing at it (models ~/.local/bin/claude → …/claude.exe).
+    const realBin = join(dir, 'real-cli');
+    writeFileSync(realBin, '#!/bin/sh\ntrue\n', { mode: 0o755 });
+    const linkBin = join(dir, 'linked-cli');
+    symlinkSync(realBin, linkBin);
+    const r = prepareDirectSandbox({
+      sessionId: 'binlink', dataDir: tmp(),
+      policy: { rules: [], net: true, writeRegexes: [] },
+      chdir: dir, home: dir, cliBin: linkBin, cliArgs: ['--v'],
+    });
+    // Off-CI without bwrap installed prepareDirectSandbox returns null (dep gate);
+    // only assert the canonicalization when it actually produced a plan.
+    if (!r) return;
+    const dashDash = r.args.lastIndexOf('--');
+    expect(dashDash).toBeGreaterThan(-1);
+    const execTarget = r.args[dashDash + 1];
+    expect(execTarget).toBe(realpathSync(linkBin)); // canonical, not the lexical symlink
+    expect(execTarget).not.toBe(linkBin);
+    expect(r.args.slice(dashDash + 2)).toEqual(['--v']); // cliArgs preserved verbatim
+    r.cleanup();
   });
 });
 
