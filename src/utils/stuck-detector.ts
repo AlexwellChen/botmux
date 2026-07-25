@@ -4,9 +4,9 @@
  *
  * Scope (intentionally narrow): this PR targets the specific Codex PreToolUse
  * hook-review blocking state, where the CLI renders a review screen and waits
- * for t/Enter/Esc. Generic [Y/n]/permission/Press-to-continue prompts are NOT
- * handled here — they require semantic parsing that cannot be safely inferred
- * from a regex, and belong in a follow-up PR.
+ * for t/Enter/Esc (level 1) or t/Esc (level 2). Generic [Y/n]/permission/
+ * Press-to-continue prompts are NOT handled here — they require semantic parsing
+ * that cannot be safely inferred from a regex, and belong in a follow-up PR.
  *
  * The detector does NOT itself decide the CLI is stuck. It only tracks elapsed
  * time since the last write and asks the owner (worker) to confirm via the
@@ -15,18 +15,41 @@
  * quiet. This avoids false positives from legitimately long turns.
  */
 
-/** Identifies the complete Codex PreToolUse hook-review screen. A keyword by
- * itself is not enough: users and model output can legitimately quote the
- * incident text. We require all three contemporaneous UI signals:
- * - the PreToolUse hooks title,
- * - a pending review state, and
- * - the control hint documenting t / Enter / Esc.
+/**
+ * Codex renders two distinct hook-review screens. We match each independently
+ * because their titles and control hints differ, and the safe button set differs
+ * (level 1 has Enter to drill in; level 2 has no Enter).
+ *
+ * Level 1 — hooks browser (the screen that actually blocks on startup):
+ *   Title:  "Hooks"
+ *   State:  "1 hook needs review before it can run."
+ *   Footer: "Press t to trust all; enter to review hooks; esc to close"
+ *
+ * Level 2 — per-hook review (after pressing Enter on level 1):
+ *   Title:  "PreToolUse hooks"
+ *   State:  "1 hook needs review before it can run."
+ *   Footer: "Press t to trust; esc to go back"
+ *
+ * Each match requires the title + pending-review state + control hint to appear
+ * together. A keyword alone is not enough: users and model output can legitimately
+ * quote the incident text. We use the full official snapshot strings as the
+ * source of truth (see OpenAI codex-rs TUI snapshots).
  */
-function isHookReviewScreen(snapshot: string): boolean {
-  const hasTitle = /PreToolUse hooks/i.test(snapshot);
+export function matchHookReviewScreen(snapshot: string): 'hook review level 1' | 'hook review level 2' | undefined {
   const hasPendingReview = /hook needs review|needs review before it can run/i.test(snapshot);
-  const hasControls = /Press t to trust all; enter to review hooks; esc to close/i.test(snapshot);
-  return hasTitle && hasPendingReview && hasControls;
+  if (!hasPendingReview) return undefined;
+
+  // Level 1: hooks browser view
+  const hasL1Title = /(^|\n)Hooks\s*\n/i.test(snapshot);
+  const hasL1Controls = /Press t to trust all; enter to review hooks; esc to close/i.test(snapshot);
+  if (hasL1Title && hasL1Controls) return 'hook review level 1';
+
+  // Level 2: per-hook review view
+  const hasL2Title = /PreToolUse hooks/i.test(snapshot);
+  const hasL2Controls = /Press t to trust; esc to go back/i.test(snapshot);
+  if (hasL2Title && hasL2Controls) return 'hook review level 2';
+
+  return undefined;
 }
 
 export interface StuckDetectorCallbacks {
@@ -102,6 +125,6 @@ export class StuckDetector {
 
   private matchSnapshot(): string | undefined {
     const snap = this.callbacks.getSnapshot?.();
-    return snap && isHookReviewScreen(snap) ? 'hook review prompt' : undefined;
+    return snap ? matchHookReviewScreen(snap) : undefined;
   }
 }

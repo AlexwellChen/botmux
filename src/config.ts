@@ -254,11 +254,13 @@ export const config = {
   stuckDetector: {
     /**
      * Lightweight, AI-free fallback that warns the user when a written input
-     * has not produced a completed turn within `timeoutMs`. Catches blocking
-     * states the ScreenAnalyzer (opt-in, LLM-backed) might miss — e.g. Codex
-     * PreToolUse hook review, a bare [Y/n] prompt, a "Press any key" pause.
-     * Enabled by default because it has no external dependencies and only
-     * fires when the worker confirms inputs are genuinely in flight.
+     * has not produced a completed turn within `timeoutMs`. Currently targets
+     * the Codex PreToolUse hook-review blocking state (level 1 hooks browser
+     * and level 2 per-hook review). Generic [Y/n]/permission/Press-to-continue
+     * prompts are intentionally NOT handled — they cannot be safely inferred
+     * from a regex and belong in a follow-up. Enabled by default because it
+     * has no external dependencies and only fires when the worker confirms the
+     * turn is genuinely stalled AND the snapshot matches a known hook screen.
      */
     enabled: (process.env.STUCK_DETECTOR_ENABLED ?? 'true').toLowerCase() !== 'false',
     /** Milliseconds after a write before the detector checks whether the turn

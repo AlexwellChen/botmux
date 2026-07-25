@@ -1852,8 +1852,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             && cardMessageId === ds.stuckWarningCardId
             && keys.length === 1
             && keys[0] === 'Enter';
-          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal, rearmStuckDetector: isStuckWarningEnter } as DaemonToWorker);
-          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} rearmStuck=${isStuckWarningEnter} — "${selectedText}"`);
+          // If this click is from a stuck-warning card, forward the generation
+          // and page type so the worker can re-verify the current screen still
+          // matches before injecting keys. A stale click (CLI recovered) will be
+          // dropped at the worker boundary.
+          const stuckGen = isActiveStuckCard ? ds.stuckWarningGeneration : undefined;
+          const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
+          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal, rearmStuckDetector: isStuckWarningEnter, stuckGeneration: stuckGen, stuckPageType: stuckPage } as DaemonToWorker);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} rearmStuck=${isStuckWarningEnter} stuckGen=${stuckGen ?? 'none'} — "${selectedText}"`);
         }
 
         if (isFinal) {
@@ -1885,6 +1891,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           if (ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId) {
             ds.stuckWarningCardId = undefined;
             ds.stuckWarningTurnId = undefined;
+            ds.stuckWarningGeneration = undefined;
+            ds.stuckWarningPageType = undefined;
           }
           publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }

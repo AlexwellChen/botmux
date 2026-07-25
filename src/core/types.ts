@@ -224,6 +224,14 @@ export interface DaemonSession {
   stuckWarningTurnId?: string;
   /** message_id of the stuck_warning interactive card (if active) */
   stuckWarningCardId?: string;
+  /** Monotonic generation of the last stuck_warning — used to discard late
+   *  card POST results and stale card clicks after the CLI recovered or the
+   *  worker was replaced. */
+  stuckWarningGeneration?: number;
+  /** Page type of the active stuck-warning card ('hook review level 1' or
+   *  'hook review level 2') — forwarded to the worker on card click so it can
+   *  re-verify the current screen before injecting keys. */
+  stuckWarningPageType?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;

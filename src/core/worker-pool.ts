@@ -2221,6 +2221,30 @@ export function forkWorker(
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
 
+/**
+ * Resolve any active stuck-warning card and clear its markers. Called from
+ * every path where the CLI can recover or be replaced: prompt_ready,
+ * claude_exit, worker exit/kill/suspend/refork, and the worker's own
+ * stale-card notification. Centralising here avoids missing an exit path and
+ * leaving a clickable card that can inject keys into a different CLI.
+ */
+function invalidateStuckWarning(ds: DaemonSession, reason: string): void {
+  if (!ds.stuckWarningCardId && !ds.stuckWarningTurnId && ds.stuckWarningGeneration === undefined) return;
+  const t = tag(ds);
+  if (ds.stuckWarningCardId) {
+    const locDs = localeForBot(ds.larkAppId);
+    const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+    updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+      logger.debug(`[${t}] Failed to resolve stuck-warning card (${reason}): ${err}`),
+    );
+  }
+  logger.debug(`[${t}] invalidateStuckWarning (${reason}): turn=${ds.stuckWarningTurnId ?? 'none'} gen=${ds.stuckWarningGeneration ?? 'none'}`);
+  ds.stuckWarningCardId = undefined;
+  ds.stuckWarningTurnId = undefined;
+  ds.stuckWarningGeneration = undefined;
+  ds.stuckWarningPageType = undefined;
+}
+
 function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
@@ -2628,17 +2652,7 @@ function setupWorkerHandlers(
           }, { codexAppInputAccepted: !!followUpCodexAppInput });
         }
         // CLI reached its prompt — any previously posted stuck warning is stale.
-        // Disable the card first so a late click can't inject keys into the
-        // now-idle CLI, then clear the markers.
-        if (ds.stuckWarningCardId) {
-          const locDs = localeForBot(ds.larkAppId);
-          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
-          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
-            logger.debug(`[${t}] Failed to resolve stale stuck-warning card: ${err}`),
-          );
-        }
-        ds.stuckWarningTurnId = undefined;
-        ds.stuckWarningCardId = undefined;
+        invalidateStuckWarning(ds, 'prompt_ready');
         break;
       }
 
@@ -2934,11 +2948,11 @@ function setupWorkerHandlers(
 
       case 'stuck_warning': {
         // AI-free StuckDetector fired: a written input hasn't produced a
-        // completed turn within the timeout AND the PTY has been quiet.
-        // Scope is intentionally narrow: only the Codex PreToolUse hook-review
-        // screen gets an interactive card with safe, known-good keys (t/Enter/
-        // Esc). Unknown stalls get a plain text warning WITHOUT the terminal
-        // snapshot (to avoid leaking content) and WITHOUT guessed keys.
+        // completed turn within the timeout AND the PTY has been quiet, AND the
+        // snapshot matches a known Codex hook-review screen. The detector only
+        // emits when it matches level 1 or level 2 — there is no "unknown
+        // stall" path, so we always build an interactive card with the exact
+        // keys the screen documents.
         // Dedup: skip if we already posted a warning for THIS turn, OR if a
         // stuck-warning card is already active (covers the no-turnId case where
         // a second stall fires before the first card is resolved).
@@ -2948,52 +2962,84 @@ function setupWorkerHandlers(
           logger.debug(`[${t}] Stuck warning dedup skipped (turn=${msg.turnId ?? 'none'}, activeCard=${hasActiveCard})`);
           break;
         }
+        // Record this warning's generation BEFORE the async card POST. If the
+        // CLI recovers (prompt_ready) or the worker is replaced while the POST
+        // is in flight, invalidateStuckWarning bumps/clears the generation; when
+        // the POST returns we check it is still current and, if not, resolve
+        // the card immediately instead of registering it as active.
+        ds.stuckWarningGeneration = msg.generation;
         ds.stuckWarningTurnId = msg.turnId;
+        const pageType = msg.matchedPattern;
+        ds.stuckWarningPageType = pageType;
         const secs = Math.round(msg.elapsedMs / 1000);
-        logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s${msg.matchedPattern ? ` (${msg.matchedPattern})` : ''}`);
+        logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s (${pageType}) gen=${msg.generation}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'stuck_warning',
           elapsedMs: msg.elapsedMs,
-          matchedPattern: msg.matchedPattern,
+          matchedPattern: pageType,
         });
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
-        if (msg.matchedPattern === 'hook review prompt') {
-          // Codex hook-review screen: t=trust all, Enter=review hooks, Esc=close.
-          // These are the exact keys the screen documents; no guessing.
-          const description = `⚠️ Codex 卡在 PreToolUse hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
-          const options = [
+
+        let description: string;
+        let options: Array<{ label: string; text: string; selected: boolean; type: 'confirm' | 'select'; keys: string[] }>;
+        if (pageType === 'hook review level 2') {
+          // Level 2 — per-hook review: t=trust, Esc=go back. No Enter here.
+          description = `⚠️ Codex 卡在单项 hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
+          options = [
+            { label: 't', text: '信任 (trust)', selected: false, type: 'confirm' as const, keys: ['t'] },
+            { label: 'Esc', text: '返回 (go back)', selected: false, type: 'select' as const, keys: ['Escape'] },
+          ];
+        } else {
+          // Level 1 — hooks browser: t=trust all, Enter=review hooks, Esc=close.
+          description = `⚠️ Codex 卡在 hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
+          options = [
             { label: 't', text: '信任全部 (trust all)', selected: false, type: 'confirm' as const, keys: ['t'] },
             { label: 'Enter', text: '逐项审核 (review hooks)', selected: false, type: 'select' as const, keys: ['Enter'] },
             { label: 'Esc', text: '关闭 (close)', selected: false, type: 'select' as const, keys: ['Escape'] },
           ];
-          try {
-            const cardJson = buildTuiPromptCard(
-              sessionAnchorId(ds),
-              ds.session.sessionId,
-              description,
-              options,
-              false,
-              undefined,
-              loc,
+        }
+        try {
+          const cardJson = buildTuiPromptCard(
+            sessionAnchorId(ds),
+            ds.session.sessionId,
+            description,
+            options,
+            false,
+            undefined,
+            loc,
+          );
+          const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
+          // Generation check: if the warning was invalidated (prompt_ready,
+          // CLI exit, worker replace) while the POST was in flight, resolve
+          // the card immediately and do NOT register it as active — a late
+          // click would otherwise inject keys into a recovered/replaced CLI.
+          if (ds.stuckWarningGeneration !== msg.generation) {
+            logger.debug(`[${t}] Stuck warning card POSTed but generation stale (got=${msg.generation}, current=${ds.stuckWarningGeneration ?? 'none'}) — resolving`);
+            const locDs = localeForBot(ds.larkAppId);
+            const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+            updateMessage(ds.larkAppId, cardMsgId, resolvedCard).catch(err =>
+              logger.debug(`[${t}] Failed to resolve stale stuck-warning card: ${err}`),
             );
-            const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
-            ds.stuckWarningCardId = cardMsgId;
-            publishAttentionPatch(ds);
-          } catch (err: any) {
-            logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
-            // Card send failed — clear markers so a retry can post a fresh card.
-            ds.stuckWarningCardId = undefined;
-            ds.stuckWarningTurnId = undefined;
+            break;
           }
-        } else {
-          // Unknown stall — warn but do NOT leak the terminal snapshot and do
-          // NOT guess keys. The user can open the terminal to investigate.
-          const text = `⚠️ CLI 似乎卡住了——消息已写入但 ${secs}s 未完成处理，且终端无输出。\n\n请打开终端查看具体原因，或直接回复消息继续（会清除此告警）。`;
-          try {
-            await scopedReply(text, 'text', msg.turnId);
-          } catch (err: any) {
-            logger.warn(`[${t}] Failed to post stuck warning: ${err}`);
-          }
+          ds.stuckWarningCardId = cardMsgId;
+          publishAttentionPatch(ds);
+        } catch (err: any) {
+          logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
+          // Card send failed — clear markers so a retry can post a fresh card.
+          ds.stuckWarningCardId = undefined;
+          ds.stuckWarningTurnId = undefined;
+          ds.stuckWarningGeneration = undefined;
+        }
+        break;
+      }
+
+      case 'stuck_warning_expired': {
+        // Worker refused to inject keys from a stuck-warning card because the
+        // current screen no longer matches the page type the card was built for.
+        // Resolve the card so the user sees it is no longer actionable.
+        if (ds.stuckWarningGeneration === msg.generation) {
+          invalidateStuckWarning(ds, 'stale_card_click');
         }
         break;
       }
@@ -3010,15 +3056,7 @@ function setupWorkerHandlers(
         // The worker/CLI generation ended. Disable an outstanding stuck-warning
         // card before any replacement worker can be attached; otherwise a late
         // click could inject its keys into the replacement CLI.
-        if (ds.stuckWarningCardId) {
-          const locDs = localeForBot(ds.larkAppId);
-          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
-          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
-            logger.debug(`[${t}] Failed to resolve stuck-warning card on CLI exit: ${err}`),
-          );
-          ds.stuckWarningCardId = undefined;
-          ds.stuckWarningTurnId = undefined;
-        }
+        invalidateStuckWarning(ds, 'claude_exit');
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {

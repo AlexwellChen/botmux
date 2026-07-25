@@ -177,7 +177,7 @@ import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
-import { StuckDetector } from './utils/stuck-detector.js';
+import { StuckDetector, matchHookReviewScreen } from './utils/stuck-detector.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
@@ -3786,6 +3786,10 @@ function stopScreenAnalyzer(): void {
 // ─── Stuck Detector (AI-free fallback for blocked CLI states) ───────────────
 
 let stuckDetector: StuckDetector | null = null;
+// Monotonic counter bumped on every stuck_warning we emit. Paired with the
+// page type so the daemon can discard late card POST results and the worker
+// can discard stale key injections after the CLI recovered or was replaced.
+let stuckWarningGeneration = 0;
 
 function startStuckDetector(): void {
   const sd = config.stuckDetector;
@@ -3816,8 +3820,11 @@ function startStuckDetector(): void {
       return true;
     },
     onStuck: (elapsedMs, matchedLabel) => {
-      const snapshot = renderer?.rawSnapshot() || lastAnalyzerSnapshot || '';
-      log(`StuckDetector: turn unresolved for ${Math.round(elapsedMs / 1000)}s${matchedLabel ? ` (${matchedLabel})` : ''}`);
+      // Prefer lastAnalyzerSnapshot (the capture-pane authoritative current
+      // screen) over the long-lived renderer, which can drift under tmux.
+      const snapshot = lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+      stuckWarningGeneration += 1;
+      log(`StuckDetector: turn unresolved for ${Math.round(elapsedMs / 1000)}s${matchedLabel ? ` (${matchedLabel})` : ''} gen=${stuckWarningGeneration}`);
       send({
         type: 'stuck_warning',
         elapsedMs,
@@ -3825,9 +3832,10 @@ function startStuckDetector(): void {
         matchedPattern: matchedLabel,
         turnId: currentBotmuxTurnId,
         dispatchAttempt: currentBotmuxDispatchAttempt,
+        generation: stuckWarningGeneration,
       });
     },
-    getSnapshot: () => renderer?.rawSnapshot() || lastAnalyzerSnapshot || '',
+    getSnapshot: () => lastAnalyzerSnapshot || renderer?.rawSnapshot() || '',
   });
 }
 
@@ -9130,6 +9138,25 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'tui_keys': {
+      // Stale-card guard: if this key press came from a stuck-warning card,
+      // re-verify the current screen still matches the page type the card was
+      // built for. The CLI may have recovered (user pressed t in the web
+      // terminal, or the turn finished) between card post and click — injecting
+      // t/Enter/Esc into a now-idle or working CLI is unsafe.
+      if (msg.stuckGeneration !== undefined && msg.stuckPageType) {
+        const currentSnap = lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+        const currentMatch = matchHookReviewScreen(currentSnap);
+        if (currentMatch !== msg.stuckPageType) {
+          log(`TUI keys from stale stuck-warning card (gen=${msg.stuckGeneration}, expected=${msg.stuckPageType}, current=${currentMatch ?? 'none'}) — dropped, notifying daemon`);
+          send({
+            type: 'stuck_warning_expired',
+            generation: msg.stuckGeneration,
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+          });
+          break;
+        }
+      }
       handleTuiKeys(msg.keys, msg.isFinal);
       // Re-arm the stuck detector ONLY when the card-handler explicitly flags
       // this as a stuck-warning card's Enter action (advances to the next
