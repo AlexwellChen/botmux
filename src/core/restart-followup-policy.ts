@@ -76,3 +76,65 @@ export function decideRestartFollowup(input: RestartFollowupInput): RestartFollo
   if (!input.backendAlive) return { kind: 'replacement-recovery', skipRestartBudget: false };
   return { kind: 'none' };
 }
+
+/**
+ * Settle an in-flight durable turn that a restart is about to interrupt —
+ * the P1 ordering, made unit-testable via dependency injection.
+ *
+ * The restart `case` kills the CLI, so a durable turn (VC-meeting delivery /
+ * silent-schedule) that was executing dies with it. We must emit a terminal
+ * receipt or the daemon lease watchdog only settles it after a slow timeout.
+ * But emitting a blind `ambiguous` is a correctness hazard: a `reliableTurnTerminal`
+ * CLI may have durably written its `completed` line microseconds before the
+ * kill, with the fs.watch/1s poller not yet having consumed it. So the ordering
+ * is: drain first (publishing that `completed` claims the worker deduper) →
+ * re-check whether the turn is still in flight → only then emit `ambiguous` →
+ * always release the durable-turn latch so a respawn isn't stranded.
+ *
+ * Callbacks (all injected so tests need no real JSONL / IPC):
+ *  - `drain`: run the reliable-terminal drain (publishes a persisted completed).
+ *  - `isStillInFlight`: read `durableTurnInFlight` AFTER the drain.
+ *  - `emitAmbiguous`: emit the fail-closed ambiguous terminal.
+ *  - `release`: reset the latch + retire the inflight input (fallback path).
+ *
+ * Returns counts so callers/tests can assert exactly how many times each ran.
+ */
+export interface DurableTurnSettleDeps {
+  hasInFlightTurn: boolean;
+  hasCurrentTurnId: boolean;
+  drain: () => void;
+  isStillInFlight: () => boolean;
+  emitAmbiguous: () => void;
+  release: () => void;
+}
+
+export interface DurableTurnSettleResult {
+  drained: boolean;
+  ambiguousEmitted: boolean;
+  released: boolean;
+}
+
+export function settleDurableTurnForRestart(deps: DurableTurnSettleDeps): DurableTurnSettleResult {
+  const result: DurableTurnSettleResult = { drained: false, ambiguousEmitted: false, released: false };
+  if (!deps.hasInFlightTurn) return result;
+  if (deps.hasCurrentTurnId) {
+    // Drain persisted completeds FIRST so a just-finished turn claims the
+    // deduper; a blind ambiguous here would re-dispatch a completed delivery.
+    deps.drain();
+    result.drained = true;
+    // Only emit ambiguous if the drain did NOT already settle this turn.
+    if (deps.isStillInFlight()) {
+      deps.emitAmbiguous();
+      result.ambiguousEmitted = true;
+    }
+  }
+  // Fallback: if nothing settled the latch (no matching turn to emit, or drain
+  // published a completed for a different attempt), still release it so the
+  // respawn isn't blocked by a stuck durableTurnInFlight flag.
+  if (deps.isStillInFlight()) {
+    deps.release();
+    result.released = true;
+  }
+  return result;
+}
+

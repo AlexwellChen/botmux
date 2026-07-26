@@ -19,15 +19,21 @@ function restartCaseBranch(): string {
 }
 
 describe('worker restart P1 — drain reliable terminal before ambiguous emit', () => {
-  it('the restart case drains BEFORE emitting ambiguous for an in-flight durable turn', () => {
+  it('the restart case delegates durable settle to settleDurableTurnForRestart with drain wired before emit', () => {
     const branch = restartCaseBranch();
-    const durableGuard = branch.indexOf('if (durableTurnInFlight)');
-    const drain = branch.indexOf('drainReliableTerminalBeforeInterrupt()', durableGuard);
-    const emit = branch.indexOf("emitTurnTerminal(currentBotmuxTurnId, 'ambiguous'", drain);
-    expect(durableGuard).toBeGreaterThanOrEqual(0);
-    expect(drain).toBeGreaterThan(durableGuard);
-    // drain must precede the ambiguous emit so an already-persisted completed
-    // claims the deduper first (else a just-completed turn is re-dispatchable).
+    const call = branch.indexOf('settleDurableTurnForRestart({');
+    expect(call).toBeGreaterThanOrEqual(0);
+    const deps = branch.slice(call, branch.indexOf('});', call) + 3);
+    // the settle orchestration (unit-tested in restart-followup-policy.test.ts)
+    // enforces drain → re-check → emit; here just pin that the restart case
+    // injects the right callbacks so a just-completed turn claims the deduper.
+    const drain = deps.indexOf('drainReliableTerminalBeforeInterrupt()');
+    const emit = deps.indexOf("emitTurnTerminal(currentBotmuxTurnId!, 'ambiguous'");
+    const isStill = deps.indexOf('isStillInFlight:');
+    expect(drain).toBeGreaterThanOrEqual(0);
+    expect(emit).toBeGreaterThan(0);
+    expect(isStill).toBeGreaterThan(0);
+    // the drain callback is declared before the emitAmbiguous callback in deps.
     expect(emit).toBeGreaterThan(drain);
   });
 

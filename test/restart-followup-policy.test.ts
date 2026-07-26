@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { decideRestartFollowup } from '../src/core/restart-followup-policy.js';
+import { decideRestartFollowup, settleDurableTurnForRestart } from '../src/core/restart-followup-policy.js';
 
 /**
  * Pure decision for whether an in-flight restart must chain another. This is
@@ -77,5 +77,79 @@ describe('decideRestartFollowup', () => {
       currentWorkingDir: undefined,
       backendAlive: false,
     })).toEqual({ kind: 'replacement-recovery', skipRestartBudget: false });
+  });
+});
+
+/**
+ * P1 executable coverage (Codex's suggested DI approach — no real JSONL/IPC):
+ * the drain-before-ambiguous ordering that stops a just-completed durable turn
+ * from being re-dispatched. Stubs stand in for drain / isStillInFlight / emit /
+ * release so we can assert the exact call pattern per scenario.
+ */
+describe('settleDurableTurnForRestart', () => {
+  function harness(opts: {
+    hasInFlightTurn: boolean;
+    hasCurrentTurnId: boolean;
+    // inFlight readings returned by successive isStillInFlight() calls
+    inFlightReadings: boolean[];
+  }) {
+    const drain = vi.fn();
+    const emitAmbiguous = vi.fn();
+    const release = vi.fn();
+    let i = 0;
+    const isStillInFlight = vi.fn(() => opts.inFlightReadings[Math.min(i++, opts.inFlightReadings.length - 1)]);
+    const result = settleDurableTurnForRestart({
+      hasInFlightTurn: opts.hasInFlightTurn,
+      hasCurrentTurnId: opts.hasCurrentTurnId,
+      drain,
+      isStillInFlight,
+      emitAmbiguous,
+      release,
+    });
+    return { result, drain, emitAmbiguous, release };
+  }
+
+  it('no in-flight durable turn → does nothing (no drain / emit / release)', () => {
+    const h = harness({ hasInFlightTurn: false, hasCurrentTurnId: true, inFlightReadings: [true] });
+    expect(h.drain).not.toHaveBeenCalled();
+    expect(h.emitAmbiguous).not.toHaveBeenCalled();
+    expect(h.release).not.toHaveBeenCalled();
+    expect(h.result).toEqual({ drained: false, ambiguousEmitted: false, released: false });
+  });
+
+  it('drain SETTLES the turn (completed won the deduper) → drains, 0 ambiguous, no release', () => {
+    // isStillInFlight: after drain → false (settled). emit skipped; release skipped.
+    const h = harness({ hasInFlightTurn: true, hasCurrentTurnId: true, inFlightReadings: [false, false] });
+    expect(h.drain).toHaveBeenCalledTimes(1);
+    expect(h.emitAmbiguous).not.toHaveBeenCalled();
+    expect(h.release).not.toHaveBeenCalled();
+    expect(h.result).toEqual({ drained: true, ambiguousEmitted: false, released: false });
+  });
+
+  it('turn STILL in flight after drain → drains then emits ambiguous exactly once', () => {
+    // isStillInFlight: after drain → true (emit). emitTurnTerminal itself resets
+    // the latch, so the post-emit reading → false (no redundant release).
+    const h = harness({ hasInFlightTurn: true, hasCurrentTurnId: true, inFlightReadings: [true, false] });
+    expect(h.drain).toHaveBeenCalledTimes(1);
+    expect(h.emitAmbiguous).toHaveBeenCalledTimes(1);
+    expect(h.release).not.toHaveBeenCalled();
+    expect(h.result).toEqual({ drained: true, ambiguousEmitted: true, released: false });
+  });
+
+  it('emit did not clear the latch (mismatched attempt) → fallback release fires', () => {
+    // still in flight after drain (emit), and STILL in flight after emit → release.
+    const h = harness({ hasInFlightTurn: true, hasCurrentTurnId: true, inFlightReadings: [true, true] });
+    expect(h.emitAmbiguous).toHaveBeenCalledTimes(1);
+    expect(h.release).toHaveBeenCalledTimes(1);
+    expect(h.result).toEqual({ drained: true, ambiguousEmitted: true, released: true });
+  });
+
+  it('in-flight but no currentTurnId (nothing to emit) → skip drain+emit, release the latch', () => {
+    // Can't emit without a turn id; still must release so respawn isn't stranded.
+    const h = harness({ hasInFlightTurn: true, hasCurrentTurnId: false, inFlightReadings: [true] });
+    expect(h.drain).not.toHaveBeenCalled();
+    expect(h.emitAmbiguous).not.toHaveBeenCalled();
+    expect(h.release).toHaveBeenCalledTimes(1);
+    expect(h.result).toEqual({ drained: false, ambiguousEmitted: false, released: true });
   });
 });

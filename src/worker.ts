@@ -46,7 +46,7 @@ import {
   shouldWriteNow,
 } from './utils/input-gate.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
-import { decideRestartFollowup } from './core/restart-followup-policy.js';
+import { decideRestartFollowup, settleDurableTurnForRestart } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
@@ -9981,26 +9981,21 @@ process.on('message', async (raw: unknown) => {
       // emitTurnTerminal 自带释放（复位 durableTurnInFlight、退休 inflight input、
       // 撤销 turn-origin relay、丢弃 bridge 尝试）并对后续 CLI-exit 终端去重；它排的
       // flushPending 微任务会因下面 restartCliProcess 同步置位 cliRestartInProgress 而空跑。
-      if (durableTurnInFlight) {
-        if (currentBotmuxTurnId) {
-          // 与 onExit 对齐：emit 'ambiguous' 前先 drain 已落盘的可靠终态，让「刚好在
-          // kill 前完成、watcher 尚未消费」的 durable turn 以 'completed' 抢占 deduper。
-          // 否则无条件 ambiguous 会误标已完成投递 → 同 key 可重派 → 外部副作用执行两次。
-          drainReliableTerminalBeforeInterrupt();
-          // drain 可能已发布 completed 并经 terminalReleasesDurableTurn 复位
-          // durableTurnInFlight——此时该 attempt 已结算，不再补发 ambiguous（emit 的
-          // claim 去重也会兜底，这里显式判断只为语义清晰、少一次空 emit）。
-          if (durableTurnInFlight) {
-            emitTurnTerminal(currentBotmuxTurnId, 'ambiguous', undefined, currentBotmuxDispatchAttempt);
-          }
-        }
-        // 兜底：若无匹配 durable turn 可释放（emit 空操作 / drain 已结算），仍复位，
-        // 避免残留 flag 卡住 respawn。
-        if (durableTurnInFlight) {
-          durableTurnInFlight = false;
-          inflightInputs.onTurnComplete();
-        }
-      }
+      // 结算被 restart 打断的在飞 durable turn（编排见 settleDurableTurnForRestart，
+      // 已单测）：drain 已落盘可靠终态让「刚好在 kill 前完成、watcher 未消费」的 turn
+      // 以 completed 抢占 deduper → 复检仍在飞才补发 ambiguous（否则无条件 ambiguous
+      // 会误标已完成投递 → 同 key 可重派 → 副作用两次）→ 兜底释放 latch 免卡 respawn。
+      // emitTurnTerminal 自带释放（复位 durableTurnInFlight、退休 inflight input、撤销
+      // turn-origin relay、丢弃 bridge 尝试）；它排的 flushPending 微任务会因下面
+      // restartCliProcess 同步置位 cliRestartInProgress 而空跑。
+      settleDurableTurnForRestart({
+        hasInFlightTurn: durableTurnInFlight,
+        hasCurrentTurnId: !!currentBotmuxTurnId,
+        drain: () => drainReliableTerminalBeforeInterrupt(),
+        isStillInFlight: () => durableTurnInFlight,
+        emitAmbiguous: () => emitTurnTerminal(currentBotmuxTurnId!, 'ambiguous', undefined, currentBotmuxDispatchAttempt),
+        release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
+      });
       await restartCliProcess(
         msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : 'daemon request',
         // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制
