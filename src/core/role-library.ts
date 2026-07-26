@@ -23,7 +23,7 @@ function isContainedIn(childReal: string, rootReal: string): boolean {
 }
 
 /**
- * botmux cd 的目标目录硬校验（调用方是模型，不可信）：
+ * `botmux role switch` 的目标目录硬校验（调用方是模型，不可信）：
  * realpath 归一化（防 ../ 与符号链接逃逸）→ 必须位于角色库根之下
  * （文件系统身份 dev+ino 比较，防前缀兄弟目录与大小写变体绕过）→ 必须是已存在的目录。
  */
