@@ -209,4 +209,37 @@ describe('shouldEmitEmptyCompletedBridgeFallback', () => {
       false,
     )).toBe(true);
   });
+
+  // Cross-CLI coverage: the two shipping producers of an empty-final turn that
+  // reach this shared gate. Traex -> empty task_complete with no terminalStatus
+  // (undefined); Grok -> empty end_turn with terminalStatus 'completed'. Both
+  // must surface the diagnostic when no send marker covers the window.
+  it('emits for a Traex-shaped empty task_complete (terminalStatus undefined)', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('emits for a Grok-shaped empty end_turn (terminalStatus completed)', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  // Dependency guard: a Traex cancel is encoded as turn_aborted -> 'ambiguous',
+  // which must NOT surface a "completed but empty" diagnostic.
+  it('does not emit for a Traex-shaped abort (terminalStatus ambiguous)', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'ambiguous' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
 });
