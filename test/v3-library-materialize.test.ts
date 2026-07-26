@@ -179,7 +179,7 @@ describe('Saved Workflow compiler', () => {
               : node),
         },
       };
-      const created = await createSavedWorkflow(join(root, 'data'), {
+      await createSavedWorkflow(join(root, 'data'), {
         displayName: compiled.displayName,
         owner: OWNER,
         scope: { kind: 'chat', chatId: BINDING.chatId },
@@ -195,10 +195,11 @@ describe('Saved Workflow compiler', () => {
       });
       expect(loaded.revision.payload.dagTemplate.nodes[0]).toMatchObject({ type: 'goal' });
 
-      // And it can still be materialized into a run.
+      // And the FROM-DISK revision can still be materialized into a run — this
+      // is the true "load an existing offending workflow then run it" path.
       const run = materializeSavedWorkflowRun({
-        metadata: created.metadata,
-        revision: created.revision,
+        metadata: loaded.metadata,
+        revision: loaded.revision,
         context: { initiatorOpenId: OWNER.openId, chatBinding: BINDING },
         bots: [{ larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/w' } as any],
         baseDir: join(root, 'runs'),
