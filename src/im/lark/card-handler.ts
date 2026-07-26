@@ -97,7 +97,7 @@ import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
-import { resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
+import { isRiffBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
@@ -2124,6 +2124,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (ds.adoptedFrom) {
         logger.warn(`[${tag(ds)}] Rejected restart on adopt session — would kill user's pane`);
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
+        return;
+      }
+      // New Riff cards omit this button, but old/stale cards remain clickable.
+      // Surface the same explicit close-and-recreate guidance as /restart
+      // instead of forwarding an IPC the Riff worker must silently refuse.
+      if (isRiffBackendSession(ds)) {
+        logger.warn(`[${tag(ds)}] Rejected restart on Riff backend session`);
+        const unsupported = t('cmd.restart.riff_unsupported', undefined, locDs);
+        await deliverEphemeralOrReply(
+          ds,
+          operatorOpenId,
+          unsupported,
+          'text',
+          () => sessionReply(rootId, unsupported),
+        );
         return;
       }
       if (isSessionTransferring(ds)) {

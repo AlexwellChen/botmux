@@ -21,6 +21,7 @@ vi.mock('../src/bot-registry.js', () => ({
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 import {
   getSessionPersistentBackendType,
+  isRiffBackendSession,
   killPersistentBackendTarget,
   managedTargetsForCliChange,
   probePersistentBackendTarget,
@@ -244,5 +245,17 @@ describe('killPersistentSession ZMX ownership fence', () => {
       'abcdef12-1111-2222-3333-444444444444',
     );
     kill.mockRestore();
+  });
+});
+
+describe('isRiffBackendSession (restart guard freeze-once)', () => {
+  it('prefers the live worker stamp over a stale persisted backend', () => {
+    expect(isRiffBackendSession(ds({ initBackend: 'riff', sessionBackend: 'tmux' }))).toBe(true);
+    expect(isRiffBackendSession(ds({ initBackend: 'tmux', sessionBackend: 'riff' }))).toBe(false);
+  });
+
+  it('falls back to the persisted backend for a restored worker', () => {
+    expect(isRiffBackendSession(ds({ sessionBackend: 'riff' }))).toBe(true);
+    expect(isRiffBackendSession(ds({ sessionBackend: 'tmux' }))).toBe(false);
   });
 });

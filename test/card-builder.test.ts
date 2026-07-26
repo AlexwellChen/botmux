@@ -666,6 +666,14 @@ describe('buildSessionCard', () => {
       expect(restartBtn.value.session_id).toBe(SID);
     });
 
+    it('should omit restart for Riff management cards', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'riff', true));
+      const actions = findActions(card);
+
+      expect(actions.find((a: any) => a.value?.action === 'restart')).toBeUndefined();
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'close']);
+    });
+
     it('should NOT include "get write link" button', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, undefined, true));
       const actions = findActions(card);

@@ -294,6 +294,7 @@ export const messages: Record<string, string> = {
   'cmd.restart.failed': '❌ Failed to restart {cliName}.',
   'cmd.restart.timed_out': '⌛ {cliName} restart timed out before becoming ready.',
   'cmd.restart.terminated': '{cliName} has been terminated; it will auto-resume on your next message.',
+  'cmd.restart.riff_unsupported': '⚠️ Riff sessions cannot be restarted. Use /close to close the current remote session, then send a new message to create one.',
   'cmd.cd.usage': 'Usage: /cd <path>\nExample: /cd ~/projects/my-app',
   'cmd.cd.switched': 'Working directory switched to {path}. It will resume there on your next message.',
   'cmd.cd.created_switched': '📁 Directory did not exist — created it and switched to {path}. It will resume there on your next message.',
@@ -819,6 +820,7 @@ export const messages: Record<string, string> = {
 
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ Adopted CLI session has exited.',
+  'worker.riff_close_in_progress': '⏳ The remote Riff session is closing. Wait for the close result before sending another message.',
   'worker.crash_loop_stopped': '⚠️ {cliName} crashed {count} times in 1 minute. Auto-restart disabled. Send a message to retry.',
   'worker.crash_diagnostic_terminal': 'The web terminal, where available, preserves the last startup output. Fix the issue, then send a new message to retry.',
   'worker.crash_recent_output': 'Recent terminal output:',

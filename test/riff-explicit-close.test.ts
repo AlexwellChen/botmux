@@ -50,12 +50,14 @@ import {
   closeSession,
   initWorkerPool,
   killWorker,
+  sendWorkerInput,
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 
 let dataDir: string;
 let previousDataDir: string;
+const sessionReplyMock = vi.fn(async () => 'om_reply');
 
 function createFixture(options: {
   liveWorker?: boolean;
@@ -122,7 +124,7 @@ beforeEach(() => {
   });
   cancelRiffTaskMock.mockResolvedValue(true);
   initWorkerPool({
-    sessionReply: vi.fn(async () => 'om_reply'),
+    sessionReply: sessionReplyMock,
     getSessionWorkingDir: () => '/repo',
     getActiveCount: () => 1,
     closeSession: vi.fn(),
@@ -245,6 +247,34 @@ describe('Riff explicit close', () => {
       status: 'active',
       riffParentTaskId: 'task-riff-123',
     });
+  });
+
+  it('shows a localized close-in-progress notice instead of leaking the i18n key', async () => {
+    const fixture = createFixture({ liveWorker: true });
+    fixture.ds.riffCloseState = {
+      phase: 'preparing',
+      requestId: 'close-riff',
+      taskId: 'task-riff-123',
+    };
+
+    expect(sendWorkerInput(fixture.ds, 'late turn', 'om_late_turn')).toBe(false);
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(fixture.worker.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'input' }));
+    expect(sessionReplyMock).toHaveBeenCalledWith(
+      'oc_riff',
+      expect.stringMatching(/Riff.*正在关闭/),
+      'text',
+      'app',
+      'om_late_turn',
+    );
+    expect(sessionReplyMock).not.toHaveBeenCalledWith(
+      expect.anything(),
+      'worker.riff_close_in_progress',
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
   });
 
   it('keeps the newest runtime lineage when its durable save fails', async () => {

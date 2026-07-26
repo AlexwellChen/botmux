@@ -64,7 +64,7 @@ import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isRiffBackendSession, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
@@ -6512,6 +6512,32 @@ function setupWorkerHandlers(
             try {
               await scopedReply(tr('worker.adopted_session_exited', undefined, loc), 'text', undefined);
             } catch { /* best effort */ }
+          }
+          break;
+        }
+
+        // Riff is a remote lineage-owning backend, not a local CLI process.
+        // The worker intentionally refuses restart because tearing it down can
+        // destroy or orphan the remote sandbox. Stop before crash-loop
+        // accounting and tell the user how to recover, rather than logging an
+        // "auto-restart" whose IPC is guaranteed to be a no-op.
+        if (isRiffBackendSession(ds)) {
+          const retirementPhase = riffRetirementAdmissionPhase(ds);
+          logger.warn(
+            `[${t}] Riff backend exited; automatic restart is unsupported`
+            + (retirementPhase ? ` (${retirementPhase})` : ''),
+          );
+          // Explicit /close and daemon shutdown already own the user-visible
+          // lifecycle. Only an unexpected backend exit needs recovery guidance.
+          if (!retirementPhase && !suppressExitUi) {
+            try {
+              await scopedReply(tr('cmd.restart.riff_unsupported', undefined, loc), 'text', undefined);
+            } catch (replyErr) {
+              if (replyErr instanceof MessageWithdrawnError) {
+                logger.warn(`[${t}] Root message withdrawn, closing stale session`);
+                cb.closeSession(ds);
+              }
+            }
           }
           break;
         }

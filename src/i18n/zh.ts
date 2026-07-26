@@ -295,6 +295,7 @@ export const messages: Record<string, string> = {
   'cmd.restart.failed': '❌ {cliName} 重启失败。',
   'cmd.restart.timed_out': '⌛ {cliName} 重启超时，尚未恢复就绪。',
   'cmd.restart.terminated': '{cliName} 进程已终止，下次发消息时将自动恢复。',
+  'cmd.restart.riff_unsupported': '⚠️ Riff 会话不支持重启。请先用 /close 关闭当前远程会话，再发送新消息创建会话。',
   'cmd.cd.usage': '用法：/cd <path>\n例如：/cd ~/projects/my-app',
   'cmd.cd.switched': '工作目录已切换到 {path}，下次发消息时将在新目录下恢复。',
   'cmd.cd.created_switched': '📁 目录不存在，已自动创建并切换到 {path}，下次发消息时将在新目录下恢复。',
@@ -820,6 +821,7 @@ export const messages: Record<string, string> = {
 
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ /adopt的 CLI 会话已断开',
+  'worker.riff_close_in_progress': '⏳ Riff 远程会话正在关闭，请等待关闭结果后再发送消息。',
   'worker.crash_loop_stopped': '⚠️ {cliName} 在 1 分钟内崩溃 {count} 次，已停止自动重启。发消息可触发重新启动。',
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',

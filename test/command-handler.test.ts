@@ -1826,6 +1826,28 @@ describe('handleCommand', () => {
       );
     });
 
+    it('should reject Riff sessions with close-and-recreate guidance', async () => {
+      const workerSend = vi.fn();
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: workerSend } as any,
+      });
+      ds.session.cliId = 'riff';
+      ds.session.backendType = 'riff';
+      const deps = makeDeps(ds);
+
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringMatching(/Riff.*不支持重启.*\/close/),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
     it('should send restart IPC when worker is alive', async () => {
       const workerSend = vi.fn();
       const ds = makeDaemonSession({

@@ -167,6 +167,7 @@ import { requestAgentSessionRename } from './session-rename.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
+import { isRiffBackendSession } from './persistent-backend.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 import {
@@ -711,6 +712,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
   // the user's real tmux/zellij pane. Hard-reject (the worker self-guards too).
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_restart_unsupported' });
+  }
+  // Riff owns a remote task lineage. Its worker deliberately refuses restart
+  // because destroy + respawn would sever or replace that lineage. Reject at
+  // the daemon boundary so the dashboard never reports HTTP 200 for a no-op.
+  if (isRiffBackendSession(ds)) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'riff_restart_unsupported',
+      message: t('cmd.restart.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+    });
   }
   const cliId = ds.session.cliId ?? 'unknown';
   if (ds.worker && !ds.worker.killed) {
