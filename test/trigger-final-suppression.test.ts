@@ -38,4 +38,18 @@ describe('trigger final-output suppression', () => {
     expect(isTriggerFinalSuppressed(ds, 'trg_1', afterTtl)).toBe(false);
     expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
   });
+
+  it('bounds the map at 256 entries — best-effort, evicting the oldest under a storm', () => {
+    const ds = session();
+    const now = 2_000_000;
+    // Arm 300 distinct turns well within TTL. Each arm prunes down to the cap, so
+    // the oldest turns are evicted even though they are not yet TTL-expired.
+    for (let i = 0; i < 300; i++) armTriggerFinalSuppression(ds, `trg_${i}`, now + i);
+    expect(ds.suppressedTriggerFinalTurns!.size).toBeLessThanOrEqual(256);
+    // The earliest turns lost their suppression (final would fire) — the tradeoff
+    // is documented as best-effort, not a strong guarantee.
+    expect(isTriggerFinalSuppressed(ds, 'trg_0', now + 300)).toBe(false);
+    // The most recent turns are still suppressed.
+    expect(isTriggerFinalSuppressed(ds, 'trg_299', now + 300)).toBe(true);
+  });
 });

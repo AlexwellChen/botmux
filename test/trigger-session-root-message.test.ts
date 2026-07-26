@@ -515,3 +515,106 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockCreateSession).not.toHaveBeenCalled();
   });
 });
+
+describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockBotAutoWorktreeEnabled.mockReturnValue(false);
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp' },
+      botName: 'Bot',
+      botOpenId: 'ou_bot',
+    });
+    mockGetMessageChatId.mockResolvedValue(CHAT);
+    mockCreateSession.mockImplementation((chatId: string, rootMessageId: string, title: string, chatType: 'group' | 'p2p') => ({
+      sessionId: 'sess_new', chatId, rootMessageId, title, chatType,
+      status: 'active', createdAt: '2026-06-01T00:00:00.000Z',
+    }));
+  });
+
+  function loudReq(): TriggerRequest {
+    const req = request();
+    req.options = { suppressFinalOutput: true };
+    return req;
+  }
+
+  // Reads the single armed turn id off the session, proving the connector opt-in
+  // actually stamped THIS trigger turn (and only it) into the suppression map.
+  function armedTurnId(ds: DaemonSession): string {
+    const keys = [...(ds.suppressedTriggerFinalTurns?.keys() ?? [])];
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatch(/^trg_/);
+    return keys[0]!;
+  }
+
+  it('path 1 (live worker): arms the trigger turn and stamps it onto sendWorkerInput', async () => {
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any });
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+
+    const res = await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+
+    expect(res).toMatchObject({ ok: true, action: 'delivered' });
+    const turnId = armedTurnId(ds);
+    expect(res.triggerId).toBe(turnId);
+    // The turnId must ride the worker input so the worker echoes it on final_output
+    // and the daemon gate can match it.
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', turnId }));
+  });
+
+  it('path 2 (dormant existing): arms the trigger turn and forks with it as turnId', async () => {
+    const ds = existingDs();
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+
+    const res = await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+
+    expect(res).toMatchObject({ ok: true, action: 'queued' });
+    const turnId = armedTurnId(ds);
+    expect(mockForkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('follow:') }),
+      expect.objectContaining({ resume: true, turnId }),
+    );
+  });
+
+  it('path 3 (auto-worktree staging): arms the trigger turn and defers it via pendingTurnId', async () => {
+    mockBotAutoWorktreeEnabled.mockReturnValue(true);
+    const activeSessions = new Map<string, DaemonSession>();
+
+    await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    const turnId = armedTurnId(ds);
+    // The deferred fork in commitRepoSelection carries pendingTurnId, so the armed
+    // suppression and the eventual fork agree on the turn id.
+    expect(ds.pendingTurnId).toBe(turnId);
+    expect(ds.pendingRepo).toBe(true);
+    expect(mockRunAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({ ds }));
+  });
+
+  it('path 4 (fresh new session): arms the trigger turn and forks with it as turnId', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+
+    const res = await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    const turnId = armedTurnId(ds);
+    expect(res.triggerId).toBe(turnId);
+    expect(mockForkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('new:') }),
+      turnId,
+    );
+  });
+
+  it('does not arm suppression and forks loud when the connector opt-in is absent', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+
+    await triggerSessionTurn(request(), { larkAppId: APP, activeSessions });
+
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
+    // Loud fork keeps the legacy 2-arg shape (no turnId stamped).
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+  });
+});
