@@ -368,15 +368,15 @@ export interface CliAdapter {
   readonly claudeStateJsonPath?: string;
 
   /** Paths (files or dirs) holding THIS CLI's auth / login state that must stay
-   *  REAL + writable inside the file sandbox. The sandbox isolates writes (so the
-   *  agent's project edits are reviewable), but a CLI's token refresh / login
-   *  must PERSIST to the real auth — otherwise the sandboxed CLI loses its login
-   *  (see seed's `bytecloud-auth`). The sandbox binds each existing path rw over
-   *  the isolated overlay so auth reads/refreshes/logins hit the real files.
-   *  `~` is expanded. Default to NARROW (auth only) so session history stays
-   *  isolated — but widen to the CLI's whole state dir when it keeps SQLite DBs
-   *  there (e.g. codex): the overlayfs home lacks the POSIX fcntl locks SQLite
-   *  needs, so a narrow carve-out leaves the CLI unable to start.
+   *  REAL + writable inside the file sandbox. The sandbox isolates the filesystem
+   *  to a deny-by-default whitelist (so the agent only sees the rule paths), but a
+   *  CLI's token refresh / login must PERSIST to the real auth — otherwise the
+   *  sandboxed CLI loses its login (see seed's `bytecloud-auth`). The sandbox binds
+   *  each existing path rw (real host path) so auth reads/refreshes/logins hit the
+   *  real files. `~` is expanded. Default to NARROW (auth only) so session history
+   *  stays out of the sandbox — but widen to the CLI's whole state dir when it keeps
+   *  SQLite DBs there (e.g. codex): only whitelisted paths exist in the sandbox, so
+   *  a narrow carve-out leaves the DB dir absent and the CLI unable to start.
    *  undefined / empty → no carve-out. */
   readonly authPaths?: readonly string[];
 
@@ -392,7 +392,7 @@ export interface CliAdapter {
    *  app-server) is the one that must survive `--tmpfs /run`.
    *
    *  Return ONLY executable paths — never plain path args like the working dir,
-   *  whose parent dir re-bind would shadow the project overlay and widen exposure.
+   *  whose parent dir re-bind would shadow the project bind and widen exposure.
    *  Resolved lazily / read AFTER buildArgs() (so a lazily-resolved bin is cached).
    *  Missing/empty → no extra re-expose. */
   sandboxExtraExecPaths?(): readonly string[];

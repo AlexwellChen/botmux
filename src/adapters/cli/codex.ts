@@ -137,11 +137,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // authPaths — that only feeds the bwrap file sandbox below.)
     supportsReadIsolation: true,
     // Whole ~/.codex kept REAL, not just auth.json: codex opens SQLite state/log
-    // DBs there (state_*.sqlite / logs_*.sqlite). Under the file sandbox the home
-    // is an overlayfs merge, and overlayfs (kernel + fuse) doesn't support the
-    // POSIX fcntl locks SQLite needs — the connection pool blocks ~57s then codex
-    // exits 1 ("pool timed out"). Binding the dir real gives working locks and
-    // keeps login/history persistent (same rationale as auth.json).
+    // DBs there (state_*.sqlite / logs_*.sqlite). The file sandbox is a deny-by-
+    // default whitelist, so a path not in authPaths simply doesn't exist in the
+    // sandbox and codex can't open its DBs — the connection pool blocks ~57s then
+    // codex exits 1 ("pool timed out"). Binding the dir real gives working POSIX
+    // fcntl locks and keeps login/history persistent (same rationale as auth.json).
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 

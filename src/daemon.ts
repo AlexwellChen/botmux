@@ -17874,10 +17874,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   docCommentPollTimer.unref?.();
   void pollWatchedDocComments(cfg.larkAppId);
 
-  // Sweep orphan sandbox overlays left by a previous run's crash/kill: any
+  // Sweep orphan sandbox trees left by a previous run's crash/kill: any
   // <dataDir>/sandboxes/<sid> whose session is no longer active gets its
-  // overlays unmounted and its dirs removed (plus the /var/tmp home scratch).
-  // Active sessions keep theirs — a same-topic worker reuses the upper changeset.
+  // deny-mask mountpoints reclaimed and its dirs removed.
+  // Active sessions keep theirs — a same-topic worker reuses the tree.
   try {
     sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
   } catch (err: any) {
@@ -17891,12 +17891,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   idleWorkerSweepTimer.unref?.();
 
   // Periodic sandbox reconciler: the daemon's SIGKILL straggler-reaper (and any
-  // worker SIGKILL) bypasses worker-side killCli(), so the overlay mounts +
-  // upper/work dirs of a killed-but-still-active sandboxed session would leak for
-  // the rest of this daemon's lifetime (one daemon per bot can run for days). The
-  // startup sweep alone can't catch a session that dies AFTER boot. This re-runs
-  // the sweep on a timer: it reclaims active sessions whose overlays are already
-  // unmounted (= worker/CLI dead) without ever tearing down a live mount.
+  // worker SIGKILL) bypasses worker-side killCli(), so the pre-created deny-mask
+  // mountpoints + per-session tree of a killed-but-still-active sandboxed session
+  // would leak for the rest of this daemon's lifetime (one daemon per bot can run
+  // for days). The startup sweep alone can't catch a session that dies AFTER boot.
+  // This re-runs the sweep on a timer: it reclaims sessions whose worker/CLI is
+  // dead without ever tearing down a live one.
   const sandboxReconcileTimer = setInterval(() => {
     try {
       sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));

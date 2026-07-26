@@ -27,8 +27,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
   let cachedCodexBin: string | undefined;
   return {
     id: 'codex-app',
-    // Whole ~/.codex kept REAL (see codex.ts): its SQLite state/log DBs can't get
-    // fcntl locks on the sandbox home overlay, so codex hangs ~57s then exits 1.
+    // Whole ~/.codex kept REAL (see codex.ts): under the deny-by-default file
+    // sandbox a path not in authPaths doesn't exist, so codex can't open its
+    // SQLite state/log DBs and hangs ~57s then exits 1. Binding the dir real
+    // gives working fcntl locks.
     authPaths: ['~/.codex'],
     resolvedBin: process.execPath,
 

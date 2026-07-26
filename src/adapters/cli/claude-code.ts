@@ -790,7 +790,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
      *  the secondary guard).
      *
      *  The `dataDir` parameter carries the EFFECTIVE data root, i.e. after any
-     *  sandbox overlay redirection — the worker mirrors the same calculation
+     *  sandbox data redirection — the worker mirrors the same calculation
      *  into `(backend).claudeJsonlPath = claudeJsonlPathForSession(...)` so
      *  this probe sees the same filesystem the spawned CLI will write to. */
     checkResumeTargetExists({ sessionId, cliSessionId, workingDir, dataDir }) {

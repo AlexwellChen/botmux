@@ -808,7 +808,7 @@ function armRpcStartupDialogDismiss(): void {
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
 let seatbeltProfilePath: string | null = null;       // per-session Seatbelt .sb profile to rm at exit (external-wrapper read isolation)
 let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
-let sandboxCleanup: (() => void) | null = null;      // unmount overlays + rm the per-session sandbox tree
+let sandboxCleanup: (() => void) | null = null;      // reclaim deny-mask mountpoints + rm the per-session sandbox tree
 let sandboxRelayOutbox: string | null = null;
 let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
@@ -6630,8 +6630,8 @@ async function spawnCli(
   // the full in-memory conversation. In that case the resume-vs-fresh question
   // is moot: we must NOT run the pre-flight fallback (which would drop --resume
   // and post a misleading "started a fresh clean session — context lost" card
-  // on EVERY restart, e.g. for a sandboxed session whose transcript lives in
-  // an ephemeral overlay upper that the probe can't see). Computed here (not at
+  // on EVERY restart, e.g. for a sandboxed session whose transcript lives at a
+  // real host path the probe may not be able to stat). Computed here (not at
   // the spawn site below) so the pre-flight can short-circuit on it.
   let persistentSessionName = selectedBackend.persistentSessionName;
   // [read-isolation] Before we decide to reattach a persistent pane: a pane can
@@ -8241,10 +8241,10 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
     currentBotmuxTurnId,
     currentBotmuxDispatchAttempt,
   );
-  // Stop the sandbox outbox watcher, then unmount the overlays + remove the
-  // per-session sandbox tree. In the overlay model the upper layer (the
-  // changeset) must be landed BEFORE close — `/land` runs while the session is
-  // still active, so by cleanup time anything worth keeping is already applied.
+  // Stop the sandbox outbox watcher, then reclaim the deny-mask mountpoints +
+  // remove the per-session sandbox tree. In the fs-policy model the CLI writes
+  // the project DIRECTLY at real host paths (no upper changeset to land), so by
+  // close time everything worth keeping is already on disk.
   if (sandboxStopWatcher) {
     try { sandboxStopWatcher(); } catch { /* */ }
     sandboxStopWatcher = null;
@@ -10368,15 +10368,16 @@ process.on('message', async (raw: unknown) => {
       } catch { /* best-effort */ }
       backend = null;
       isPromptReady = false;
-      // Suspend INTENDS to resume later: preserve the sandbox overlay mount + the
-      // upper changeset across the suspension (on resume, prepareSandbox re-mounts
-      // over the SAME upper). So we stop the outbox watcher (no live CLI to serve)
-      // but DO NOT run sandboxCleanup (which would unmount + rm the changeset). We
+      // Suspend INTENDS to resume later: keep the per-session sandbox tree (the
+      // outbox + pre-created deny-mask mountpoints) intact across the suspension
+      // (on resume, prepareDirectSandbox re-binds over the SAME tree). So we stop
+      // the outbox watcher (no live CLI to serve) but DO NOT run sandboxCleanup
+      // (which would reclaim the mask mountpoints + rm the tree). We
       // also disarm the exit-time teardown so process.exit(0) below can't reclaim
       // it. (Crash/SIGKILL of a suspended-but-active session is still backstopped
       // by the daemon's periodic sandbox reconciler.)
       if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
-      sandboxCleanup = null;           // drop the ref WITHOUT calling it (keep the mount)
+      sandboxCleanup = null;           // drop the ref WITHOUT calling it (keep the tree)
       sandboxTeardownDone = true;      // make the process.on('exit') hook a no-op
       cleanup();
       process.exit(0);
@@ -10438,15 +10439,15 @@ setInterval(() => {
 }, 30_000).unref();
 
 // ─── Sandbox crash-time teardown ─────────────────────────────────────────────
-// killCli() (which unmounts the overlays + rm's the per-session tree) only runs
-// from the SIGTERM/SIGINT/disconnect/watchdog handlers and the close/suspend IPC
-// cases. An UNCAUGHT exception or unhandled rejection kills the process WITHOUT
-// any of those firing, so without this hook a crashed sandboxed worker would
-// leak BOTH overlay mounts (mount-table growth) + its upper/work dirs (disk leak)
-// per crash. We run a minimal, synchronous, best-effort sandbox teardown here so
-// the overlay/dir residue is reclaimed even on an abnormal exit. (SIGKILL still
-// can't be trapped — the daemon-side sweep + the periodic reconciler below are
-// the backstop for that.)
+// killCli() (which reclaims the deny-mask mountpoints + rm's the per-session
+// tree) only runs from the SIGTERM/SIGINT/disconnect/watchdog handlers and the
+// close/suspend IPC cases. An UNCAUGHT exception or unhandled rejection kills
+// the process WITHOUT any of those firing, so without this hook a crashed
+// sandboxed worker would leak its pre-created host mask mountpoints (empty dirs/
+// files) + the per-session tree (disk leak) per crash. We run a minimal,
+// synchronous, best-effort sandbox teardown here so that residue is reclaimed
+// even on an abnormal exit. (SIGKILL still can't be trapped — the daemon-side
+// sweep + the periodic reconciler below are the backstop for that.)
 function teardownSandboxBestEffort(): void {
   if (sandboxTeardownDone) return;
   sandboxTeardownDone = true;

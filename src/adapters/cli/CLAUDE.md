@@ -14,10 +14,10 @@
 
 ## 文件沙盒（`sandbox: true`）适配三项必查
 
-新 CLI 若要支持文件沙盒，务必逐项核对（经验来自 #356/#357…，即 codex/opencode/mtr/traex/coco 的踩坑）。沙盒把 `$HOME` 挂成 overlayfs（lower=真实 home，写入隔离到 upper），`authPaths` 列出的路径则以真实可写 `--bind` 绕开 overlay：
+新 CLI 若要支持文件沙盒，务必逐项核对（经验来自 #356/#357…，即 codex/opencode/mtr/traex/coco 的踩坑）。沙盒是 **deny-by-default 三档白名单**（fs-policy）：一个全新 tmpfs 根，只把规则里的路径 `--bind`（读写）/`--ro-bind`（只读）进来，白名单之外的路径在沙盒里根本不存在。`authPaths` 列出的路径以真实可写 `--bind` 直达宿主真实文件：
 
-1. **CLI 是否在 `$HOME` 下放 SQLite/DB？** overlayfs（内核 + fuse）不支持 SQLite 需要的 POSIX fcntl 字节范围锁，CLI 会连接池超时（~57s）后 exit 1 起不来。→ 把整个状态目录（而非单个 `auth.json`）加进 `authPaths`。
-2. **daemon 的 transcript bridge 是否按真实路径读该 CLI 的会话/事件文件？** 窄 carve-out 下 CLI 写进 overlay upper，bridge 在真实路径读不到 → 回复桥断链。claude 系有 `sandboxedClaudeDataDir` 的 homeUpper 重定向兜底，其它 CLI 没有。→ 让 bridge 读的目录也真实 `--bind`（如 coco 的 `~/.cache/coco`）。
-3. **`authPaths` 是目录级还是单文件？** 单文件 carve-out 在该文件尚不存在时会被整段跳过（沙盒内首次登录写进 upper、随沙盒销毁丢失），也覆盖不到同目录的 sibling 状态。→ 优先目录级 bind。
+1. **CLI 是否在 `$HOME` 下放 SQLite/DB？** 白名单之外的路径在沙盒里不存在，CLI 打不开自己的 DB（或拿不到 SQLite 需要的 POSIX fcntl 字节范围锁），会连接池超时（~57s）后 exit 1 起不来。→ 把整个状态目录（而非单个 `auth.json`）加进 `authPaths`，让它真实 `--bind`。
+2. **daemon 的 transcript bridge 是否按真实路径读该 CLI 的会话/事件文件？** 窄 carve-out 下 bridge 要读的目录没进白名单 → CLI 写进沙盒内的临时视图、bridge 在真实路径读不到 → 回复桥断链。claude 系有 `sandboxedClaudeDataDir` 的重定向兜底，其它 CLI 没有。→ 让 bridge 读的目录也真实 `--bind`（如 coco 的 `~/.cache/coco`）。
+3. **`authPaths` 是目录级还是单文件？** 单文件 carve-out 在该文件尚不存在时会被存在性过滤整段跳过（沙盒内首次登录写不回、随沙盒销毁丢失），也覆盖不到同目录的 sibling 状态。→ 优先目录级 bind。
 
-验证手段：用 `prepareSandbox` 生成真实 bwrap argv + `node-pty` 拉起真 CLI 跑 ≥90s，观察是否崩、并核对写入是否落到真实目录（见 `test/sandbox.test.ts` 的 symlink 回归用例）。
+验证手段：用 `prepareDirectSandbox` 生成真实 bwrap argv + `node-pty` 拉起真 CLI 跑 ≥90s，观察是否崩、并核对写入是否落到真实目录（见 `test/sandbox.test.ts` 的 symlink 回归用例）。
