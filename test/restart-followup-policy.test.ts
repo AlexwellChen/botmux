@@ -9,47 +9,51 @@ import { decideRestartFollowup } from '../src/core/restart-followup-policy.js';
  *    restartCfg snapshot.
  *  - replacement-exit recovery (Codex P2): the freshly-spawned CLI dying inside
  *    the window cliRestartInProgress still covers (spawnCli +
- *    prepareCodexNativeTitleGeneration) → daemon auto-restart swallowed by the
- *    merge guard → session strands at backend=null without this.
+ *    prepareCodexNativeTitleGeneration) → session strands at backend=null.
+ *
+ * Recovery keys ONLY on `!backendAlive` (onExit nulls backend synchronously) —
+ * NOT on any "a restart was requested during the window" signal, because a
+ * restart message carries no trustworthy source: a healthy duplicate /restart
+ * would otherwise be misread as a crash and force a budget-burning re-restart
+ * that drops --resume (the exact regression Codex's 2nd review caught).
  */
 describe('decideRestartFollowup', () => {
   const healthy = {
     spawnedWorkingDir: '/roles/pm',
     currentWorkingDir: '/roles/pm',
     backendAlive: true,
-    restartRequestedDuringInFlight: false,
   };
 
-  it('no follow-up on a clean restart (backend alive, cwd unchanged, no request)', () => {
+  it('no follow-up on a clean restart (backend alive, cwd unchanged)', () => {
     expect(decideRestartFollowup(healthy)).toEqual({ kind: 'none' });
   });
 
-  it('cwd-move: workingDir diverged after the snapshot → converge, skip FRESH budget', () => {
+  it('a healthy duplicate restart during the window is merged to none (no budget burn)', () => {
+    // The merge guard already swallowed the duplicate; the continuation must
+    // NOT manufacture a second restart on a healthy generation. This is the
+    // Codex-2 regression guard: backend alive + cwd unchanged → none.
+    expect(decideRestartFollowup({ ...healthy })).toEqual({ kind: 'none' });
+  });
+
+  it('cwd-move with a LIVE backend → converge, skip FRESH budget (pure user move)', () => {
     const d = decideRestartFollowup({ ...healthy, currentWorkingDir: '/roles/after-sales' });
     expect(d).toEqual({ kind: 'cwd-move', skipRestartBudget: true });
+  });
+
+  it('cwd-move with a DEAD backend → converge but COUNT budget (crash evidence kept)', () => {
+    // Codex-2 point #2: a replacement that crashed must not hide behind a
+    // concurrent directory change — converge the cwd yet still burn budget.
+    const d = decideRestartFollowup({
+      spawnedWorkingDir: '/roles/pm',
+      currentWorkingDir: '/roles/after-sales',
+      backendAlive: false,
+    });
+    expect(d).toEqual({ kind: 'cwd-move', skipRestartBudget: false });
   });
 
   it('replacement-recovery: backend died in the window → recover, COUNT FRESH budget', () => {
     const d = decideRestartFollowup({ ...healthy, backendAlive: false });
     expect(d).toEqual({ kind: 'replacement-recovery', skipRestartBudget: false });
-  });
-
-  it('replacement-recovery: a restart was requested (merge-guard-armed) during the window', () => {
-    const d = decideRestartFollowup({ ...healthy, restartRequestedDuringInFlight: true });
-    expect(d).toEqual({ kind: 'replacement-recovery', skipRestartBudget: false });
-  });
-
-  it('cwd-move wins over replacement-recovery when both hold (cwd must stay authoritative)', () => {
-    // A cwd-move respawn whose replacement also died: converge cwd FIRST — the
-    // fresh restart it triggers reuses {...lastInitConfig} (new cwd) and its own
-    // continuation re-evaluates a still-dead backend. Ordering is load-bearing.
-    const d = decideRestartFollowup({
-      spawnedWorkingDir: '/roles/pm',
-      currentWorkingDir: '/roles/after-sales',
-      backendAlive: false,
-      restartRequestedDuringInFlight: true,
-    });
-    expect(d).toEqual({ kind: 'cwd-move', skipRestartBudget: true });
   });
 
   it('no cwd-move when lastInitConfig was absent (workingDir undefined on either side)', () => {
@@ -59,13 +63,11 @@ describe('decideRestartFollowup', () => {
       spawnedWorkingDir: undefined,
       currentWorkingDir: '/roles/pm',
       backendAlive: true,
-      restartRequestedDuringInFlight: false,
     })).toEqual({ kind: 'none' });
     expect(decideRestartFollowup({
       spawnedWorkingDir: '/roles/pm',
       currentWorkingDir: undefined,
       backendAlive: true,
-      restartRequestedDuringInFlight: false,
     })).toEqual({ kind: 'none' });
   });
 
@@ -74,7 +76,6 @@ describe('decideRestartFollowup', () => {
       spawnedWorkingDir: undefined,
       currentWorkingDir: undefined,
       backendAlive: false,
-      restartRequestedDuringInFlight: false,
     })).toEqual({ kind: 'replacement-recovery', skipRestartBudget: false });
   });
 });

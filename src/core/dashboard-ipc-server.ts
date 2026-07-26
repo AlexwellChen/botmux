@@ -655,7 +655,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
  *  切换后模型仍拿着旧角色的记忆索引读写（读旧索引、写错桶）。respawn 让「开场」在
  *  新 cwd 重新发生：新角色的 CLAUDE.md/记忆索引开场即注入，--resume 回放对话历史
  *  保留上下文（“换角色外壳、留对话内核”）。旧桶 transcript 由 claude-code 适配器的
- *  resume 预检跨桶迁移接住（rescueOrphanClaudeTranscript），不会探空丢上下文。
+ *  resume 预检 syncClaudeResumeTargetToCwd（worker.ts 每次 resume respawn、probe 之前
+ *  把最新 <sid>.jsonl COPY 进新 cwd 的 project 目录，已在 master）接住，不会探空丢
+ *  上下文。故本改动可独立部署，不硬依赖任何跨桶迁移专项 PR。
  *
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating
  *  capability；目录面由 validateRoleLibraryPath 硬校验承担（realpath 归一 +

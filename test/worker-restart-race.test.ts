@@ -50,34 +50,29 @@ describe('worker restart P1 — drain reliable terminal before ambiguous emit', 
   });
 });
 
-describe('worker restart P2 — merge guard preserves replacement-exit recovery', () => {
-  it('the merge guard arms pendingRestartAfterInFlight instead of silently dropping', () => {
+describe('worker restart P2 — merge guard + replacement-exit recovery (no spurious re-restart)', () => {
+  it('the merge guard plainly breaks — it does NOT arm any "restart requested" flag', () => {
     const branch = restartCaseBranch();
     const guard = branch.indexOf('if (cliRestartInProgress || tmuxRestartTimer)');
-    const arm = branch.indexOf('pendingRestartAfterInFlight = true', guard);
-    const brk = branch.indexOf('break;', arm);
+    const brk = branch.indexOf('break;', guard);
     expect(guard).toBeGreaterThanOrEqual(0);
-    // arm the follow-up flag before breaking out — otherwise a replacement that
-    // died during the in-flight window loses its daemon auto-restart.
-    expect(arm).toBeGreaterThan(guard);
-    expect(brk).toBeGreaterThan(arm);
+    expect(brk).toBeGreaterThan(guard);
+    // Codex-2 regression guard: a source-carrying flag would misread a healthy
+    // duplicate /restart as a crash and force a budget-burning re-restart.
+    expect(workerSource).not.toContain('pendingRestartAfterInFlight');
+    expect(workerSource).not.toContain('restartRequestedDuringInFlight');
   });
 
-  it('restartCliProcess consumes the flag at entry so only in-window requests count', () => {
-    const start = workerSource.indexOf('async function restartCliProcess');
-    const body = workerSource.slice(start, start + 1200);
-    expect(body).toContain('pendingRestartAfterInFlight = false');
-  });
-
-  it('the continuation feeds backend liveness + armed flag into decideRestartFollowup', () => {
+  it('the continuation feeds ONLY backend liveness + cwd into decideRestartFollowup', () => {
     const start = workerSource.indexOf('async function restartCliProcess');
     const end = workerSource.indexOf('// ─── HTTP', start);
     const body = workerSource.slice(start, end);
     const decide = body.indexOf('decideRestartFollowup({');
     expect(decide).toBeGreaterThan(0);
-    const call = body.slice(decide, decide + 320);
+    const call = body.slice(decide, decide + 260);
     expect(call).toContain('backendAlive: !!backend');
-    expect(call).toContain('restartRequestedDuringInFlight: pendingRestartAfterInFlight');
     expect(call).toContain('currentWorkingDir: lastInitConfig?.workingDir');
+    // recovery must NOT depend on any merged-request signal.
+    expect(call).not.toContain('restartRequestedDuringInFlight');
   });
 });

@@ -1194,15 +1194,6 @@ let isFlushing = false;
  * cancellation; this gate prevents new input or an old idle callback from
  * crossing that teardown fence. */
 let cliRestartInProgress = false;
-/** A `restart` IPC that arrived while a restart was already in flight and got
- *  merged (see the merge guard in the `restart` case). The in-flight restart's
- *  continuation checks this after it clears `cliRestartInProgress` and honors
- *  exactly one follow-up restart. Critical for a REPLACEMENT-generation exit:
- *  the new CLI can die during the window `cliRestartInProgress` still covers
- *  (spawnCli + prepareCodexNativeTitleGeneration), firing claude_exit →
- *  daemon auto-restart (bare `restart`); without this its request would be
- *  swallowed by the merge guard and the session would strand at backend=null. */
-let pendingRestartAfterInFlight = false;
 /** Raw slash commands require a real prompt and cannot use the ordinary
  * type-ahead fallback. Keep them fenced across an owned restart until the
  * replacement generation reaches its prompt. */
@@ -8225,10 +8216,6 @@ async function restartCliProcess(
   // remain queued until a replacement backend has been installed.
   cliRestartInProgress = true;
   rawInputRestartGate = true;
-  // Consume any prior arming: from here on, only a `restart` IPC that arrives
-  // DURING this restart should trigger a follow-up. (The continuation re-checks
-  // and re-arms as needed.)
-  pendingRestartAfterInFlight = false;
   // The Node worker stays alive through this restart, so the daemon will see
   // neither claude_exit nor worker-exit. Explicitly revoke the old turn's
   // authority now, before jitter/async teardown leaves a stale-send window.
@@ -8302,26 +8289,27 @@ async function restartCliProcess(
         // Follow-up decision (pure, unit-tested in restart-followup-policy.ts):
         //  - cwd-move: a role-switch restart landed after restartCfg was
         //    snapshotted → CLI came up in the old cwd while daemon repinned to
-        //    the new one. Respawn to converge; user-move, so skip FRESH budget.
+        //    the new one. Respawn to converge (budget skipped only if the
+        //    backend is still alive; a dead one keeps the crash evidence).
         //  - replacement-recovery: the freshly-spawned CLI exited inside the
         //    window cliRestartInProgress still covers (spawnCli +
-        //    prepareCodexNativeTitleGeneration), so its daemon auto-restart was
-        //    swallowed by the merge guard (which armed pendingRestartAfterInFlight)
-        //    and/or onExit nulled `backend`. Recover now or the session strands
-        //    at backend=null needing a manual /restart. Genuine crash recovery →
-        //    COUNTS toward tier-2 FRESH so a persistently-dying replacement
-        //    eventually falls back to FRESH instead of resume-looping.
+        //    prepareCodexNativeTitleGeneration). onExit nulled `backend`
+        //    synchronously, so `!backend` is the ground-truth recovery signal —
+        //    NOT a merged daemon auto-restart (a restart message carries no
+        //    trustworthy source, so a healthy duplicate /restart during the
+        //    window must NOT be misread as a crash and force a budget-burning
+        //    second restart). Recover now or the session strands at
+        //    backend=null needing a manual /restart. Genuine crash recovery →
+        //    COUNTS toward tier-2 FRESH.
         const followup = decideRestartFollowup({
           spawnedWorkingDir,
           currentWorkingDir: lastInitConfig?.workingDir,
           backendAlive: !!backend,
-          restartRequestedDuringInFlight: pendingRestartAfterInFlight,
         });
         if (followup.kind !== 'none') {
-          pendingRestartAfterInFlight = false;
           const reason = followup.kind === 'cwd-move'
             ? `cwd-move follow-up respawn → ${lastInitConfig?.workingDir}`
-            : `replacement-exit follow-up restart (${backend ? 'restart requested during in-flight' : 'replacement exited'})`;
+            : 'replacement-exit follow-up restart (replacement exited during in-flight restart)';
           log(reason);
           void restartCliProcess(reason, { preservePending: true, skipRestartBudget: followup.skipRestartBudget });
           return;
@@ -9965,7 +9953,8 @@ process.on('message', async (raw: unknown) => {
     case 'restart': {
       // 角色切换的 cwd-move respawn：respawn 用 {...lastInitConfig, resume:true}，
       // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
-      // 开场注入）。旧桶 transcript 由 resume 预检的跨桶迁移接住，上下文不丢。
+      // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
+      // （COPY 最新 <sid>.jsonl 进新 cwd 桶，已在 master）接住，上下文不丢。
       if (msg.updateWorkingDir && lastInitConfig) {
         lastInitConfig.workingDir = msg.updateWorkingDir;
       }
@@ -9974,15 +9963,14 @@ process.on('message', async (raw: unknown) => {
       // 把重启预算无故烧到 tier-2 强制 FRESH（丢上下文），非 tmux 路径还会
       // 双 spawn。workingDir 已收敛进 lastInitConfig，pending 的 spawn 展开
       // {...lastInitConfig} 时自然拿到新目录。
+      //
+      // 这里**只 break、不记任何 flag**：restart 消息不带可信来源，无法区分
+      // 「replacement 崩溃触发的 auto-restart」与「用户重复点了一次 restart」。
+      // replacement 真退出时 onExit 已同步把 backend 置 null，续体用 !backend 即可
+      // 补 recovery（见 decideRestartFollowup）；健康的重复 restart 就该被合并掉，
+      // 记 flag 反而会逼健康进程再重启一轮、烧预算丢 --resume（正是合并要防的）。
       if (cliRestartInProgress || tmuxRestartTimer) {
-        // 但不能简单丢弃：replacement generation 可能在续体仍持 cliRestartInProgress
-        // 的窗口内（spawnCli + prepareCodexNativeTitleGeneration）退出 → claude_exit →
-        // daemon auto-restart 发来这条裸 restart。若直接吞掉，续体清 flag 后只会 flush
-        // 到 backend=null 的死会话。置位 pendingRestartAfterInFlight，让续体在清
-        // cliRestartInProgress 后补跑一轮 restart 收敛（cwd-move 的收敛另由
-        // lastInitConfig.workingDir + 续体发散检查覆盖，二者独立不冲突）。
-        pendingRestartAfterInFlight = true;
-        log(`Restart request merged into in-flight restart${msg.updateWorkingDir ? ` (workingDir → ${msg.updateWorkingDir})` : ''} — follow-up armed`);
+        log(`Restart request merged into in-flight restart${msg.updateWorkingDir ? ` (workingDir → ${msg.updateWorkingDir})` : ''}`);
         break;
       }
       // restart 杀死 CLI，在飞的 durable turn 随之死亡。对被杀的那次投递，主动发一个
