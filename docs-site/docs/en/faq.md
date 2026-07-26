@@ -2,17 +2,39 @@
 
 > Compiled from the README and high-frequency questions in the community group, and continuously expanded. For more pitfalls, see [Common Pitfalls](/en/pitfalls).
 
-## The bot receives no messages at all — what do I do?
+## Troubleshooting "the bot doesn't reply" (the #1 question)
+
+Match your **symptom** first — the root cause differs:
+
+| Symptom | Likely cause | Jump |
+|------|-----------|------|
+| **No reaction at all** (not even an emoji) | Event subscription / release / long connection not working | [A. No messages received at all](#a-no-messages-received-at-all) |
+| Only **I (owner)** can trigger it; others get an auth card / no reply | Only operate permission granted, no talk permission | [B. Others can't use it / auth card](#b-others-cant-use-it--auth-card) |
+| Must **@ it** to get a reply / want auto-reply without @ | Group @ policy | [B. Others can't use it / auth card](#b-others-cant-use-it--auth-card) |
+| Shows 🟡 "working" but **the result never comes back** (terminal has output) | Model didn't call `botmux send` | [C. Terminal has output but nothing sent to Lark](#c-terminal-has-output-but-nothing-sent-to-lark) |
+| Session **won't start** / first message errors `zsh: parse error` | Login shell startup file jumps shells | [Session won't start](#sessions-never-start--the-first-message-errors-with-zsh-parse-error-near-n) |
+
+### A. No messages received at all
 
 Check these in order (PersonalAgent comes configured correctly by default; normally you don't need to touch it):
 
-1. **Event subscription**: Open Platform → Events & Callbacks → you should subscribe to `im.message.receive_v1` + `card.action.trigger`, with the delivery method set to "Long connection (WebSocket)", and the daemon must be running.
+1. **Event subscription**: Open Platform → Events & Callbacks → subscribe to `im.message.receive_v1` + `card.action.trigger`, with delivery method "Long connection (WebSocket)", and the daemon must be running.
 2. **Bot capability**: Open Platform → App Features → Bot should already be enabled.
-3. **Release**: The app must have a version created and published (availability "visible only to myself" passes automatically).
-4. **Exclusive long connection**: Confirm this bot isn't having its long connection grabbed by another app at the same time.
+3. **Release**: the app must have a version created and published (availability "visible only to myself" passes automatically). After changing permissions / events you **must re-publish** for them to take effect.
+4. **Exclusive long connection**: confirm this bot isn't having its long connection grabbed by another app.
 5. After confirming, run `botmux restart` (from a clean shell).
 
-## The bot has output in the terminal, but nothing was sent to Lark?
+> To have an agent triage read-only, send it the diagnostic prompt at the top of [Common Pitfalls](/en/pitfalls).
+
+### B. Others can't use it / auth card
+
+botmux has two permission layers (see [permissions](#how-are-permissions-divided-who-can-operate-it)): **talk permission** (who can ask) and **operate permission** (who can `/cd` `/restart` / tap buttons). By default only the owner has talk permission, so others get refused / see an auth card.
+
+- **Let a whole group use it**: give the bot `allowedChatGroups` (everyone in that group can talk), or authorize a specific group with `/grant`.
+- **Group @ policy** (must-@ vs no-@): multi-person groups require @ by default; no-@-in-topic / no-@-whole-group can be configured in the group @ policy. Note a 1-on-1 "you + 1 bot" group is @-free already.
+- **On-call scenario** (a new group per ticket, everyone asks @-free): see [On-Call Mode](/en/oncall).
+
+### C. Terminal has output but nothing sent to Lark
 
 Terminal stdout ≠ sent to Lark. You must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. If the model only `echo`s/`print`s or forgets to call `botmux send`, nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
 
