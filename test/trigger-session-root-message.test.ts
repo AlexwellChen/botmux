@@ -90,6 +90,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({
 
 import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/trigger-session.js';
 import { sessionKey } from '../src/core/types.js';
+import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
 
 const APP = 'app1';
 const CHAT = 'oc_root_chat';
@@ -616,5 +617,52 @@ describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () =>
     expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
     // Loud fork keeps the legacy 2-arg shape (no turnId stamped).
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+  });
+
+  it('N1: waitForFinalOutput never arms suppression even when the option is set', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const req = loudReq();
+    req.options = { suppressFinalOutput: true, waitForFinalOutput: true, timeoutMs: 1000 };
+
+    const promise = triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    await vi.waitFor(() => expect(ds.pendingWaitPromises?.size).toBe(1));
+    // Arming here would starve the HTTP caller: deliverFinalOutput resolves the
+    // wait promise AFTER the suppression gate, so a suppressed final never returns.
+    expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
+    [...ds.pendingWaitPromises!.values()][0]!.resolve('done');
+    await expect(promise).resolves.toMatchObject({ ok: true, action: 'completed' });
+  });
+
+  it('N1: asyncReturnSessionId never arms suppression even when the option is set', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const req = loudReq();
+    req.options = { suppressFinalOutput: true, asyncReturnSessionId: true };
+
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
+  });
+
+  it('P2: a chat-scope session with a fold-back anchor grants the trigger turn that same anchor', async () => {
+    const anchor = { rootMessageId: 'om_shared_topic', turnId: 'om_human', updatedAt: 'x' };
+    const ds = existingDs({
+      scope: 'chat',
+      worker: { killed: false, send: vi.fn() } as any,
+      currentReplyTarget: anchor as any,
+    });
+    ds.session.scope = 'chat';
+    ds.session.currentReplyTarget = anchor as any;
+    ds.session.replyTargets = { om_human: { rootMessageId: 'om_shared_topic', updatedAt: 'x' } };
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+
+    await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+
+    const turnId = armedTurnId(ds);
+    // The synthetic trigger turn inherited the shared-topic anchor, so its
+    // daemon-side sends (streaming card etc.) thread into the topic instead of
+    // leaking to the group top level.
+    expect(ds.session.replyTargets![turnId]).toMatchObject({ rootMessageId: 'om_shared_topic' });
+    expect(resolveSessionReplyTarget(ds, turnId)).toEqual({ mode: 'thread', rootMessageId: 'om_shared_topic' });
   });
 });

@@ -11,7 +11,7 @@ import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
 import { forkWorker, getCurrentCliVersion, sendWorkerInput } from './worker-pool.js';
-import { armTriggerFinalSuppression, disarmTriggerFinalSuppression } from './trigger-final-suppression.js';
+import { armTriggerFinalSuppression, disarmTriggerFinalSuppression, inheritTriggerReplyAnchor } from './trigger-final-suppression.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
@@ -314,10 +314,23 @@ export async function triggerSessionTurn(
   // trigger turn id is stamped onto the fork so the worker echoes it back on
   // final_output and the daemon gate (worker-pool managedFinalOutputSuppressed)
   // matches it. A normal user turn queued on the same session keeps its own id.
-  const suppressLoudFinal = !stableTurnId && req.options?.suppressFinalOutput === true;
+  // wait/async modes are excluded explicitly, not merely by statement order:
+  // their whole contract is to RETURN the final output, and the daemon resolves
+  // `pendingWaitPromises` inside deliverFinalOutput — i.e. AFTER this gate — so
+  // arming there would starve the HTTP caller until its timeout. The generic
+  // /api/trigger endpoint accepts caller-supplied options without the webhook
+  // route's filtering, so the guard belongs here rather than upstream.
+  const suppressLoudFinal = !stableTurnId
+    && !req.options?.waitForFinalOutput
+    && !req.options?.asyncReturnSessionId
+    && req.options?.suppressFinalOutput === true;
   const loudTurnId = suppressLoudFinal ? triggerId : undefined;
   const armLoudFinalSuppression = (target: DaemonSession): void => {
-    if (suppressLoudFinal) armTriggerFinalSuppression(target, triggerId);
+    if (!suppressLoudFinal) return;
+    armTriggerFinalSuppression(target, triggerId);
+    // The synthetic turn id must not cost this turn its chat-scope fold-back
+    // anchor — see inheritTriggerReplyAnchor.
+    inheritTriggerReplyAnchor(target, triggerId);
   };
   const disarmLoudFinalSuppression = (target: DaemonSession): void => {
     if (suppressLoudFinal) disarmTriggerFinalSuppression(target, triggerId);
@@ -603,6 +616,16 @@ export async function triggerSessionTurn(
     newDs.pendingCodexAppMessageContext = codexAppMessageContext;
     // Stamp the trigger turn id so commitRepoSelection's deferred fork carries it
     // and the armed final_output suppression can match this turn.
+    // Known, intentional degradation: if a HUMAN message folds into this pending
+    // turn during the worktree-build window, the router (daemon.ts, "else if
+    // (ds.pendingTurnId)") rewrites pendingTurnId to that human's message id
+    // (same caller) or clears it (mixed caller — webhook never sets pendingSender,
+    // so this is the effective branch). The deferred fork then carries a different
+    // id (or none) than the armed `trg_` key, so suppression no longer matches and
+    // the final_output is delivered. That is the safe direction: a turn a human
+    // actively contributed to should surface its answer, and we never wrongly
+    // suppress a normal turn. The suppression is best-effort for this narrow race,
+    // not a hard guarantee — consistent with the 256/TTL best-effort bound.
     if (loudTurnId) newDs.pendingTurnId = loudTurnId;
     armLoudFinalSuppression(newDs);
     deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
