@@ -32,11 +32,11 @@ echo '{"name": "默认助理"}' > ~/botmux-roles/<bot>/shared/default/.botmux-di
 - 按 `docs/roles/role-protocol-template.md` 写 `~/botmux-roles/<bot>/_role-protocol.md`
   （替换 `<ROLES_ROOT>` 为 `~/botmux-roles/<bot>`）。
 - 按 `docs/roles/role-claude-md-template.md` 写
-  `~/botmux-roles/<bot>/shared/默认助理/CLAUDE.md`（人设段用模板里给的零人设一行：
+  `~/botmux-roles/<bot>/shared/default/CLAUDE.md`（人设段用模板里给的零人设一行：
   「你是通用助理，未设定特定角色人设。」）。
 - **把 `_role-protocol.md` 复制一份进默认角色目录**（每个角色目录都要有自己的副本）：
   ```bash
-  cp ~/botmux-roles/<bot>/_role-protocol.md ~/botmux-roles/<bot>/shared/默认助理/
+  cp ~/botmux-roles/<bot>/_role-protocol.md ~/botmux-roles/<bot>/shared/default/
   ```
   原因：角色 CLAUDE.md 的 `@import` 若指向角色目录之外的文件，Claude Code 会判为
   「外部 include」并弹出交互式批准框（`hasClaudeMdExternalIncludesApproved`），而 botmux
@@ -53,7 +53,7 @@ v0 硬编码约定、不接受配置），每个 bot 在其下各占一个子目
 
 ```jsonc
 {
-  "defaultWorkingDir": "~/botmux-roles/<bot>/shared/默认助理",
+  "defaultWorkingDir": "~/botmux-roles/<bot>/shared/default",
   "brandLabel": "[{cwdName}]({cwdUrl})",
   "tuiSlashAllow": ["/compact"]   // 可选，默认空＝通用 slash 注入通道关闭
 }
