@@ -1,6 +1,8 @@
 # 5 分钟快速接入
 
-> 💡 **TL;DR**：`npm i -g botmux` → `botmux setup` 扫码建应用、选 CLI、填工作目录 → `botmux start` → `botmux autostart enable` → 拉机器人进群开聊。
+> 💡 **TL;DR**：`npm i -g botmux` → `botmux setup`（**一次飞书扫码**连续建应用 + 配全权限 + 发版）→ `botmux start` → `botmux autostart enable` → 拉机器人进群开聊。
+
+**开始前**：先确认 [前置要求](/prerequisites)（Node ≥ 22、目标 CLI 已装并登录）——这里缺件是「装完连不上」最常见的原因。字节内部同学有一行命令接入路径（见交流群 / 内部文档）。
 
 ## Step 1 · 安装
 

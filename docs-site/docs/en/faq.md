@@ -24,7 +24,7 @@ Check these in order (PersonalAgent comes configured correctly by default; norma
 4. **Exclusive long connection**: confirm this bot isn't having its long connection grabbed by another app.
 5. After confirming, run `botmux restart` (from a clean shell).
 
-> To have an agent triage read-only, send it the diagnostic prompt at the top of [Common Pitfalls](/en/pitfalls).
+> To have an agent triage it, see [Common Pitfalls · General troubleshooting approach](/en/pitfalls#general-troubleshooting-approach) (`botmux logs` to find the spawn command and reproduce locally + the web terminal for the real error).
 
 ### B. Others can't use it / auth card
 

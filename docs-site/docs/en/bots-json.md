@@ -2,6 +2,8 @@
 
 Configure bots via `~/.botmux/bots.json`. Run `botmux setup` to create it interactively, or edit it by hand. The file is an array; each element is a bot (in production, one bot maps to one dedicated daemon process).
 
+> **Most fields are optional** — just `larkAppId` / `larkAppSecret` is enough to run; add the rest as needed. **Applies to**: manually tuning CLI / model / working dir / permissions / sandbox, etc.; for everyday config the dashboard's Bot Config page is preferred (it edits the same `bots.json`). Run `botmux restart` to apply changes.
+
 ```json
 [
   {

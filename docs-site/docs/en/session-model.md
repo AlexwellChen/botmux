@@ -1,6 +1,8 @@
 # Session & Topic Model
 
-The key to understanding botmux is figuring out "which session a given message lands in."
+The key to understanding botmux is figuring out "which session a given message lands in" — **confusions like "why does every @ feel like a fresh start that lost my context" and "how does a new group pull in history" all trace back to this**.
+
+**Applies to**: when you're unsure which session a message went to, want to control new-vs-reused sessions, or are configuring in-group permissions.
 
 ## Three group shapes
 
@@ -34,3 +36,11 @@ Each reply creates a **new** streaming card; the previous card freezes at its fi
 | **Owner-only** | `/grant` / `/revoke` to authorize others | owner |
 
 This tiered model lets you confidently add the bot to an on-call group: everyone can ask, but only the owner can change session state, and an external member clicking by mistake won't mess up the session.
+
+## Common confusions
+
+- **"Every @ feels like starting over, losing context"**: in a **topic group**, different topics are different sessions — what feels like a follow-up actually opened a new topic = a new session. To keep going, reply **in the same topic**; to truly reuse one session, see below.
+- **A new group / topic can't pull in earlier chat**: a new session starts clean by default. To have it read group history, just say "look at the earlier chat history" (the bot needs group-message read permission, see [FAQ](/en/faq)).
+- **Switch CLI mid-way but keep context**: see [Relay a Session](/en/relay) and [Adopt a Session](/en/adopt).
+
+**Next**: permission details in [FAQ · permissions](/en/faq); moving a session to another group in [Relay](/en/relay).

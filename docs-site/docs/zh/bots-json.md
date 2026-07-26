@@ -2,6 +2,8 @@
 
 通过 `~/.botmux/bots.json` 配置机器人。运行 `botmux setup` 交互式创建，或手动编辑。文件是一个数组，每个元素是一个 bot（生产环境一个 bot 对应一个独立 daemon 进程）。
 
+> **多数字段可选**——只填 `larkAppId` / `larkAppSecret` 就能跑起来，其余按需增配。**适用**：想手动调 CLI / 模型 / 工作目录 / 权限 / 沙箱等；日常配置更推荐用 dashboard 的 Bot 配置页（改的是同一份 `bots.json`）。改完 `botmux restart` 生效。
+
 ```json
 [
   {

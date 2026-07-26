@@ -24,7 +24,7 @@
 4. **长连接独占**：确认这个 Bot 没被别的应用同时抢长连接。
 5. 确认后 `botmux restart`（在干净 shell 里）。
 
-> 想让 agent 帮你只读排查，把 [常见踩坑](/pitfalls) 顶部的诊断 prompt 发给它。
+> 想让 agent 帮你自查，见 [常见踩坑 · 排查通用手法](/pitfalls#排查通用手法)（`botmux logs` 找 spawn 命令本地复现 + Web 终端看真实报错）。
 
 ### B. 别人不能用 / 弹授权卡
 

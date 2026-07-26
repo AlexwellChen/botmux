@@ -1,5 +1,9 @@
 # Environment Variables and File Locations
 
+Most configuration goes through `bots.json` / the dashboard — you **usually don't need env vars**. Only a few machine-level switches (bind address / port / backend type / external host) live in `~/.botmux/.env`. This page also lists botmux's key file locations for backup / troubleshooting.
+
+**Applies to**: the dashboard / web terminal won't open or you need to change the bind address, pin a port, switch the pty/tmux backend, or find where config / logs / credentials live.
+
 ## Environment variables (set in `~/.botmux/.env`)
 
 | Variable | Default | Description |
