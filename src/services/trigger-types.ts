@@ -47,6 +47,10 @@ export interface TriggerRequest {
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
     timeoutMs?: number;
+    /** Connector-owner opt-in: drop the daemon-rendered final_output reply for
+     * this loud trigger's turn. The streaming card / start notice still show;
+     * only the trailing transcript-driven summary is suppressed. */
+    suppressFinalOutput?: boolean;
   };
 }
 
@@ -173,6 +177,9 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     if (typeof options.timeoutMs !== 'number' || !Number.isFinite(options.timeoutMs) || options.timeoutMs < 1000 || options.timeoutMs > 300_000) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.timeoutMs must be between 1000 and 300000' } };
     }
+  }
+  if (options.suppressFinalOutput !== undefined && typeof options.suppressFinalOutput !== 'boolean') {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.suppressFinalOutput must be a boolean' } };
   }
   return { ok: true, request: raw as unknown as TriggerRequest };
 }

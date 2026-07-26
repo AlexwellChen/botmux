@@ -100,6 +100,7 @@ import {
 import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-output-protocol.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
 import {
@@ -2482,6 +2483,7 @@ function setupWorkerHandlers(
     dispatchAttempt?: number,
   ): boolean => {
     if (isSilentScheduledTurn(ds, turnId)) return true;
+    if (isTriggerFinalSuppressed(ds, turnId)) return true;
     if (!ds.session.vcMeetingReceiver) {
       return ordinaryManagedSuppression(turnId, dispatchAttempt);
     }

@@ -11,6 +11,7 @@ import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
 import { forkWorker, getCurrentCliVersion, sendWorkerInput } from './worker-pool.js';
+import { armTriggerFinalSuppression, disarmTriggerFinalSuppression } from './trigger-final-suppression.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
@@ -307,6 +308,20 @@ export async function triggerSessionTurn(
       if (oldest !== undefined) target.suppressedFinalOutputTurns.delete(oldest);
     }
   };
+  // Loud external triggers (no stableTurnId / no durable ledger) whose connector
+  // opted into suppressFinalOutput. Unlike the durable path above this only drops
+  // the trailing final_output — the streaming card / start notice still show. The
+  // trigger turn id is stamped onto the fork so the worker echoes it back on
+  // final_output and the daemon gate (worker-pool managedFinalOutputSuppressed)
+  // matches it. A normal user turn queued on the same session keeps its own id.
+  const suppressLoudFinal = !stableTurnId && req.options?.suppressFinalOutput === true;
+  const loudTurnId = suppressLoudFinal ? triggerId : undefined;
+  const armLoudFinalSuppression = (target: DaemonSession): void => {
+    if (suppressLoudFinal) armTriggerFinalSuppression(target, triggerId);
+  };
+  const disarmLoudFinalSuppression = (target: DaemonSession): void => {
+    if (suppressLoudFinal) disarmTriggerFinalSuppression(target, triggerId);
+  };
   const rememberInput = (
     target: DaemonSession,
     original: string,
@@ -434,9 +449,12 @@ export async function triggerSessionTurn(
 
     const dispatchAttempt = prepareStableDispatch(ds, false);
     armFinalOutputSuppression(ds, dispatchAttempt);
-    sendWorkerInput(ds, content, stableTurnId ? triggerId : undefined, {
+    armLoudFinalSuppression(ds);
+    if (!sendWorkerInput(ds, content, stableTurnId ? triggerId : loudTurnId, {
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-    });
+    })) {
+      disarmLoudFinalSuppression(ds);
+    }
     return {
       ok: true,
       triggerId,
@@ -501,6 +519,7 @@ export async function triggerSessionTurn(
 
     const dispatchAttempt = prepareStableDispatch(ds, true);
     armFinalOutputSuppression(ds, dispatchAttempt);
+    armLoudFinalSuppression(ds);
     forkWorker(ds, content, {
       resume: ds.hasHistory,
       turnId: triggerId,
@@ -582,6 +601,10 @@ export async function triggerSessionTurn(
     newDs.pendingCodexAppText = codexAppText;
     newDs.pendingCodexAppApplicationContext = codexAppApplicationContext || undefined;
     newDs.pendingCodexAppMessageContext = codexAppMessageContext;
+    // Stamp the trigger turn id so commitRepoSelection's deferred fork carries it
+    // and the armed final_output suppression can match this turn.
+    if (loudTurnId) newDs.pendingTurnId = loudTurnId;
+    armLoudFinalSuppression(newDs);
     deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
@@ -672,6 +695,10 @@ export async function triggerSessionTurn(
     forkWorker(newDs, promptInput, dispatchAttempt === undefined
       ? triggerId
       : { turnId: triggerId, dispatchAttempt });
+  }
+  else if (loudTurnId) {
+    armLoudFinalSuppression(newDs);
+    forkWorker(newDs, promptInput, loudTurnId);
   }
   else forkWorker(newDs, promptInput);
 
