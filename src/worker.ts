@@ -37,7 +37,7 @@ import { killPersistentBackendTarget, killPersistentSession, probePersistentBack
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
   decideHardTimeoutAction,
   decideSettleMarkReady,
@@ -2018,6 +2018,10 @@ function formatHeadlessLocalTurnContent(assistantText: string): string | null {
   return a || null;
 }
 
+function emptyCompletedBridgeFallbackContent(): string {
+  return t('worker.empty_final_completed', { cliName: cliName() });
+}
+
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
 //
 // `botmux send` (cli.ts cmdSend) appends a line
@@ -3721,10 +3725,21 @@ function emitReadyCodexTurns(): void {
     : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
-    if (!turn.finalText) continue;
     const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: turn.finalText }, nextBoundaryMs, markers, adoptMode)) {
+    const gateInput = {
+      markTimeMs: turn.markTimeMs,
+      isLocal: turn.isLocal,
+      finalText: turn.finalText,
+      terminalStatus: turn.terminalStatus,
+    };
+    const content = turn.finalText && turn.finalText.trim()
+      ? turn.finalText
+      : shouldEmitEmptyCompletedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
+        ? emptyCompletedBridgeFallbackContent()
+        : '';
+    if (!content) continue;
+    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       continue;
     }
@@ -3733,7 +3748,7 @@ function emitReadyCodexTurns(): void {
       // so the Lark thread sees a complete exchange instead of an orphan
       // reply. formatLocalTurnFields caps both texts to keep within
       // Lark's per-message limit; daemon owns the card chrome.
-      const fields = formatLocalTurnFields(turn.userText ?? '', turn.finalText);
+      const fields = formatLocalTurnFields(turn.userText ?? '', content);
       if (!fields) continue;
       send({
         type: 'final_output',
@@ -3750,7 +3765,7 @@ function emitReadyCodexTurns(): void {
     send({
       type: 'final_output',
       ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
-      content: turn.finalText,
+      content,
       lastUuid: turn.turnId,
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
