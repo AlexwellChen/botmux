@@ -130,6 +130,41 @@ describe('detectCliUsageLimit', () => {
     expect(result.limited).toBe(false);
   });
 
+  describe('suppressRateKind (structured-authoritative CLIs)', () => {
+    const now = new Date(2026, 4, 19, 17, 30);
+
+    it('suppresses a screen-scan rate verdict when a real rate limit phrase is on screen', () => {
+      // Claude family has an authoritative transcript rate_limit signal, so the
+      // screen scanner must NOT also flag rate — otherwise a dev editing
+      // rate-limit code / the model quoting an error produces a false limit.
+      const text = 'stream disconnected: exceeded retry limit, last status: 429 Too Many Requests';
+      expect(detectCliUsageLimit(text, now).limited).toBe(true); // default (Codex etc.) still flags
+      expect(detectCliUsageLimit(text, now, { suppressRateKind: true }).limited).toBe(false);
+    });
+
+    it('suppresses the exact dev-screen false positive that produced a bogus card', () => {
+      // Real reported FP: developer viewing rate-limit test fixtures on screen.
+      const devScreen = [
+        "  it('detects 429 Too Many Requests without a wall-clock retry time', () => {",
+        "    'exceeded retry limit, last status: 429 Too Many Requests'",
+        "  \"You've hit your session limit · resets 10:40pm\"",
+      ].join('\n');
+      expect(detectCliUsageLimit(devScreen, now, { suppressRateKind: true }).limited).toBe(false);
+    });
+
+    it('still detects a genuine usage/quota limit even when rate is suppressed', () => {
+      // usage (quota) has no structured equivalent yet, so it must survive.
+      const result = detectCliUsageLimit(
+        "You've hit your usage limit. Try again at 10:36 PM.",
+        now,
+        { suppressRateKind: true },
+      );
+      expect(result.limited).toBe(true);
+      if (!result.limited) return;
+      expect(result.kind).toBe('usage');
+    });
+  });
+
   describe('structuredRateLimitState', () => {
     it('parses a wall-clock retry time from the record text when present', () => {
       // Claude Code rate_limit records usually carry a human clock, e.g.

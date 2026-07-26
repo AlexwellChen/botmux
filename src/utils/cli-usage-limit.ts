@@ -106,7 +106,23 @@ function hardRateLimitFallbackTime(now: Date): { retryAtMs: number; retryLabel: 
   };
 }
 
-export function detectCliUsageLimit(text: string, now = new Date()): CliUsageLimitDetection {
+export interface DetectUsageLimitOptions {
+  /**
+   * Suppress the screen-scan `rate` verdict entirely. Set for CLIs that have an
+   * authoritative structured rate-limit signal (Claude family via transcript
+   * `error:"rate_limit"`): there, scraping the screen for "429" / "rate limit"
+   * only produces false positives (the model's own output, or a dev editing
+   * rate-limit code, puts those phrases on screen). `usage` quota detection is
+   * unaffected — it has no structured equivalent yet.
+   */
+  suppressRateKind?: boolean;
+}
+
+export function detectCliUsageLimit(
+  text: string,
+  now = new Date(),
+  opts: DetectUsageLimitOptions = {},
+): CliUsageLimitDetection {
   // Hot path: runs on every screen tick for every active session. Gate heavier
   // regex work behind one cheap scan for the >99% no-limit case.
   // Include 429 / retry-limit tokens — "retry" does not contain "again".
@@ -115,7 +131,7 @@ export function detectCliUsageLimit(text: string, now = new Date()): CliUsageLim
   }
 
   const time = parseMeridiemTime(text, now);
-  const isRate = hasPattern(text, RATE_LIMIT_PATTERNS);
+  const isRate = !opts.suppressRateKind && hasPattern(text, RATE_LIMIT_PATTERNS);
   const isUsage = !isRate && hasPattern(text, USAGE_LIMIT_PATTERNS);
   if (!isRate && !isUsage) return { limited: false };
 

@@ -1800,6 +1800,25 @@ let lastStructuredBridgeActivityAtMs = 0;
 
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
 
+/**
+ * True when this CLI has an authoritative STRUCTURED rate-limit signal in its
+ * transcript (Claude family — `error:"rate_limit"`, surfaced by
+ * maybeEmitStructuredRateLimit). For those CLIs the screen-text `rate`
+ * heuristic is not just redundant but harmful: the model's own output or a dev
+ * editing rate-limit code/tests puts phrases like "429 Too Many Requests" /
+ * "exceeded retry limit" on screen, which the scraper cannot distinguish from a
+ * real limit. So we suppress the screen-scan `rate` verdict and let the
+ * structured path be the sole authority. `usage` (quota "hit your limit …")
+ * has no structured equivalent yet, so it still comes from the screen.
+ *
+ * reliableTurnTerminal is exactly the "transcript-backed" capability flag
+ * (claude-code / seed set it); non-transcript CLIs (Codex, gemini, …) keep the
+ * screen scanner as their only rate-limit signal.
+ */
+function structuredRateLimitAuthoritative(): boolean {
+  return cliAdapter?.reliableTurnTerminal === true;
+}
+
 // Per-turn usage-limit state machine. Owns the turn counter plus the
 // "did this turn hit a limit" / "suppress a stale retry-ready banner" flags, so
 // classify()'s state writes are explicit method calls rather than hidden
@@ -1819,7 +1838,7 @@ function createUsageLimitTracker() {
     beginTurn(snapshot: string): number {
       turnSeq++;
       detectedTurn = undefined;
-      const current = detectCliUsageLimit(snapshot);
+      const current = detectCliUsageLimit(snapshot, undefined, { suppressRateKind: structuredRateLimitAuthoritative() });
       suppressedRetryReadyKey = current.limited && current.retryReady
         ? usageLimitStateKey(current)
         : undefined;
@@ -1831,7 +1850,7 @@ function createUsageLimitTracker() {
       content: string,
       status: RuntimeScreenStatus,
     ): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
-      const detected = detectCliUsageLimit(content);
+      const detected = detectCliUsageLimit(content, undefined, { suppressRateKind: structuredRateLimitAuthoritative() });
       if (!detected.limited) return { status };
 
       const key = usageLimitStateKey(detected);
