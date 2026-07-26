@@ -153,61 +153,33 @@ jobs:
             exit 1
           fi
 
-      - name: Guard — stable release must build on the last published release (monotonic) and stay on the master line
-        # 正式版（latest）两条约束同时成立才放行：
-        #
-        # ① 单调下限：被打 tag 的 commit 必须**包含上一个已发布 stable Release 的 tag**
-        #    （作为祖先）。这道下限随每次成功发布单调抬升，天然挡住「给历史旧 commit 新打一个
-        #    高版本 tag」——旧 commit 不含最近发布，直接拒。（codex review 反例：把 v99.0.0
-        #    指到 v3.4.0 的旧 commit，若只看 commit graph 的双向 ancestry 会被误放行，缺后续
-        #    master 改动的旧代码就发成了 latest。用「含上一个已发布 Release」这条下限即可挡死。）
-        #
-        # ② 不分叉：tag 与 origin/master 在同一主线上——tag 是 master 祖先（打完 tag 后 master
-        #    又前进，常见且无害），或 master 是 tag 祖先（tag 在 master 顶端 / 领先几个已合入
-        #    commit）。二者互不为祖先（真从偏离 master 的分支打 tag）才拒。保留原始防护：曾发生
-        #    v2.47.0 从落后 master 175 commit 的分支发到 latest 丢改动。
-        #
-        # 关键收益：**发的是被打 tag 的那个 commit 本身**，不受打完 tag 后又合入 master 的新
-        # commit 影响。旧实现要求 tag「包含最新 master」，把「打完 tag 后 master 又前进」这种
-        # 无害竞态也误判成 fail（曾让 v3.5.1 发版失败、#593 漏进「tag 已打但 Release 没发」的
-        # 裂缝）。下限用「上一个已发布 Release」而非「最新 master」，既修竞态又堵旧-commit-重打。
+      - name: Guard — stable release must contain the latest master
+        # 正式版（latest）只能从「包含最新 master 的 commit」上发：被打 tag 的 commit
+        # 必须把 origin/master 当作祖先——即直接在 master 上打 tag，或在已 rebase 到最新
+        # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
+        # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
         # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
+        #
+        # 为什么保持 fail-closed、不放宽（codex review 结论）：commit graph 无法区分两种
+        # 形状完全相同的场景——「打完 tag 后 master 才前进」（无害竞态）与「B 已在 master 上
+        # 之后再把 tag 指向历史 A」（真丢改动）。二者的 tag/master/ancestry/版本号全一致，只有
+        # 「tag 创建 vs B 落 master」的墙钟先后能区分，而这不可信地存在于 graph 里。因此在没有
+        # 「tag 创建时 master tip」的可信证明前，放宽这道闸必然引入「把旧 commit 发成 latest」
+        # 的洞。竞态的正确解法是「fetch 最新 master 后在新 HEAD 上重打 tag」（下面的 Fix 提示），
+        # 而 #593 那次真正漏的是 changelog（下一步已把 changelog 锚到「上一个已发布 Release」，
+        # 使失败/无 Release 的 tag 不再截断下一版 changelog）——发版闸本身当时拒得没错。
+        # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
+        # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
         if: steps.dist_tag.outputs.tag == 'latest'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git fetch origin master --quiet
-          git fetch origin --tags --quiet
-          HEAD_SHA=$(git rev-parse --short HEAD)
-          MASTER_SHA=$(git rev-parse --short origin/master)
-
-          # ② 不分叉
-          if git merge-base --is-ancestor HEAD origin/master \
-            || git merge-base --is-ancestor origin/master HEAD; then
-            echo "OK (master line): tagged commit $HEAD_SHA shares the master line (origin/master=$MASTER_SHA)."
-          else
-            echo "REFUSING: tagged commit $HEAD_SHA has diverged from origin/master ($MASTER_SHA)."
-            echo "Stable (latest) releases must be tagged on master, or on a branch fast-forwardable to/from master."
+          if ! git merge-base --is-ancestor origin/master HEAD; then
+            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the latest origin/master ($(git rev-parse --short origin/master))."
+            echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master."
             echo "Fix: rebase/merge onto origin/master then re-tag — or use a -canary/-beta/-rc suffix to publish off-master for testing."
             exit 1
           fi
-
-          # ① 单调下限：含上一个已发布 stable Release
-          PREV_PUBLISHED=$(gh release list --limit 40 \
-            --json tagName,isPrerelease,isDraft,publishedAt \
-            --jq '[.[] | select(.isPrerelease==false and .isDraft==false and .tagName!="'"$GITHUB_REF_NAME"'")]
-                  | sort_by(.publishedAt) | reverse | .[0].tagName // ""' 2>/dev/null || echo "")
-          if [ -z "$PREV_PUBLISHED" ]; then
-            echo "OK (floor): no prior published stable release found — treating $GITHUB_REF_NAME as the first stable release."
-          elif git rev-parse -q --verify "refs/tags/${PREV_PUBLISHED}^{commit}" >/dev/null \
-            && git merge-base --is-ancestor "$PREV_PUBLISHED" HEAD; then
-            echo "OK (floor): tagged commit $HEAD_SHA contains the last published release $PREV_PUBLISHED."
-          else
-            echo "REFUSING: tagged commit $HEAD_SHA does NOT contain the last published release $PREV_PUBLISHED."
-            echo "A stable release must be a descendant of the previous published release (no releasing an older/side commit as latest)."
-            echo "Fix: rebase/merge onto master (which contains $PREV_PUBLISHED) then re-tag — or use a prerelease suffix."
-            exit 1
-          fi
+          echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
 
       - run: pnpm build
 
