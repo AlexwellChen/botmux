@@ -333,7 +333,7 @@ function listDirLocally(rawPath: string): {
   // worker's sandbox binds use. On a symlinked-$HOME host (/home/u →
   // /data00/home/u) the lexical homedir() would make `~/.claude` expand to
   // /home/u/.claude while the tree's child nodes come back as /data00/... — the
-  // picker would then never match its own recommendation entries.
+  // picker would then never match `~`-relative tier entries.
   let home = homedir();
   try { home = realpathSync(home); } catch { /* lexical fallback if unresolvable */ }
   if (!rawPath) {

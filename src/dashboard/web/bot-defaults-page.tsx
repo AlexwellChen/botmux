@@ -1420,7 +1420,7 @@ const SBX_RESTRICTIVENESS: Record<SandboxTier, number> = { readWrite: 0, readOnl
  *  RESTRICTIVE tier wins — mirrors fs-policy.ts accessForPath + mergeFsRules so
  *  the UI's live labels + path tester agree with what the sandbox enforces.
  *  `home` expands a leading `~` the same way the worker does before matching, so
- *  recommendation entries like `~/.claude` line up with absolute tree nodes. */
+ *  `~`-relative entries line up with absolute tree nodes. */
 export function effectiveAccess(tiers: SandboxTiers, path: string, home: string): { access: SandboxTier | 'none'; rule?: string } {
   const expand = (p: string) => (p === '~' || p.startsWith('~/')) ? home.replace(/\/+$/, '') + p.slice(1) : p;
   const norm = (p: string) => expand(p).replace(/\/+$/, '') || '/';
@@ -1443,22 +1443,6 @@ export function effectiveAccess(tiers: SandboxTiers, path: string, home: string)
   for (const p of tiers.readOnly) consider('readOnly', p);
   for (const p of tiers.deny) consider('deny', p);
   return best ? { access: best.access, rule: best.rule } : { access: 'none' };
-}
-
-/** Per-CLI recommended sandbox paths — the "Claude recommends adding ~/.claude"
- *  one-click starters. Keyed by cliId family; falls back to a generic set. */
-function recommendedTiers(cliId: string | undefined): { tiers: SandboxTiers; labelKey: string } {
-  const id = (cliId ?? '').toLowerCase();
-  if (id.includes('claude')) {
-    return { labelKey: 'botDefaults.sbxPathsRecommendClaude', tiers: { readWrite: [], readOnly: ['~/.claude'], deny: [] } };
-  }
-  if (id.includes('codex')) {
-    return { labelKey: 'botDefaults.sbxPathsRecommendCodex', tiers: { readWrite: [], readOnly: ['~/.codex'], deny: [] } };
-  }
-  if (id.includes('gemini')) {
-    return { labelKey: 'botDefaults.sbxPathsRecommendGemini', tiers: { readWrite: [], readOnly: ['~/.gemini'], deny: [] } };
-  }
-  return { labelKey: 'botDefaults.sbxPathsRecommendGeneric', tiers: { readWrite: [], readOnly: [], deny: [] } };
 }
 
 function emptyTiers(): SandboxTiers { return { readWrite: [], readOnly: [], deny: [] }; }
@@ -1510,8 +1494,8 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [roots, setRoots] = useState<{ name: string; path: string }[]>([]);
   // Canonical $HOME (first fs-list root) — used to expand `~` in tiers/tester
-  // the SAME way the worker does, so recommendation entries (~/.claude) match
-  // absolute tree nodes and effective-access labels are accurate.
+  // the SAME way the worker does, so `~`-relative entries match absolute tree
+  // nodes and effective-access labels are accurate.
   const [homeRoot, setHomeRoot] = useState<string>('~');
 
   const saved = useMemo(() => normTiers(bot.sandboxPaths), [bot.sandboxPaths]);
@@ -1558,21 +1542,6 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       return t;
     });
   }, [explicitTier]);
-
-  function applyRecommended() {
-    const rec = recommendedTiers(bot.cliId);
-    setStatus(null);
-    setTiers(prev => {
-      const merge = (base: string[], add: string[]) => [...new Set([...base, ...add])];
-      const t: SandboxTiers = {
-        readWrite: merge(prev.readWrite, rec.tiers.readWrite),
-        readOnly: merge(prev.readOnly, rec.tiers.readOnly),
-        deny: merge(prev.deny, rec.tiers.deny),
-      };
-      setText(tiersToText(t));
-      return t;
-    });
-  }
 
   function syncFromText(next: string) {
     setText(next);
@@ -1650,9 +1619,6 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       <h3 className="bd-section-title">{tr('botDefaults.sectionSandboxPaths')}</h3>
       <p className="bd-section-note">{tr('botDefaults.sbxPathsHelp')}</p>
       <div className="actions" style={{ gap: 8, flexWrap: 'wrap' }}>
-        <button type="button" className="bd-btn" data-action="apply-sandbox-recommended" onClick={applyRecommended}>
-          {tr(recommendedTiers(bot.cliId).labelKey)}
-        </button>
         <button type="button" className="bd-btn" onClick={() => setTextMode(m => !m)}>
           {textMode ? tr('botDefaults.sbxPathsTreeMode') : tr('botDefaults.sbxPathsTextMode')}
         </button>
