@@ -136,14 +136,17 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // per-bot BOT_HOME via CODEX_HOME redirection. (Read isolation does NOT consult
     // authPaths — that only feeds the bwrap file sandbox below.)
     supportsReadIsolation: true,
-    // Whole ~/.codex kept REAL, not just auth.json: codex opens SQLite state/log
-    // DBs there (state_*.sqlite / logs_*.sqlite). The file sandbox is a fresh
-    // tmpfs root where ONLY allow-listed paths are bound in; a single-file
-    // carve-out would leave the dir itself unexposed (codex can't create its
-    // sibling DBs) and, for the DBs, a non-real bind can't carry the POSIX fcntl
-    // byte-range locks SQLite needs — the connection pool blocks ~57s then codex
-    // exits 1 ("pool timed out"). Binding the whole dir real gives working locks
-    // and keeps login/history persistent. NOTE this rationale is for the
+    // Whole ~/.codex kept REAL, not just auth.json: codex writes SQLite state/log
+    // DBs (state_*.sqlite / logs_*.sqlite) + history/sessions there. The file
+    // sandbox is a fresh tmpfs root where ONLY allow-listed paths are bound in.
+    // A single-file carve-out (just auth.json) would technically still let codex
+    // create + fcntl-lock sibling DBs — verified: a fresh tmpfs supports SQLite
+    // byte-range locks and sibling creation just fine — but those live in the
+    // EPHEMERAL tmpfs: they vanish when the sandbox tears down (no persistence)
+    // and the daemon's transcript bridge / resume never sees them (they're not on
+    // the real host path). Binding the whole dir REAL is what keeps login +
+    // history + state persistent across sessions AND visible to the worker's
+    // bridge/resume on the same host path. NOTE this rationale is for the
     // NON-redirected path; when CLI data is redirected to BOT_HOME the worker
     // drops this host authPath (authPathsSurvivingCliDataRedirect) — codex then
     // reads/writes its DBs under CODEX_HOME=BOT_HOME/codex instead, and exposing
