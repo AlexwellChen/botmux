@@ -4380,15 +4380,26 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //     from there (cursor-agent never calls `botmux send`).
   // Other CLIs fall back to legacy screen-capture only.
   const adoptedCliId = adopted.cliId ?? 'claude-code';
-  if (adopted.source === 'herdr' && adoptedCliId === 'claude-code' && !adopted.sessionId) {
+  // Claude adopt needs a sessionId to compute bridgeJsonlPath (the worker's
+  // claude branch starts its transcript bridge ONLY from bridgeJsonlPath — it
+  // has no by-pid fallback like codex/traex/cursor). Discovery resolves the
+  // sessionId up front for the common case, but it can still come back empty:
+  //   • herdr `agent list` exposes no pid, so a claude with no agent_session
+  //     binding has nothing to key ~/.claude/sessions/<pid>.json off;
+  //   • tmux discovery can record a launcher pid (node/ttadk/aiden wrapping
+  //     claude) when the real-CLI-pid resolver hasn't found the child yet.
+  // In BOTH cases fall back to the unique claude session for this cwd. Applies
+  // to every adopt source (not just herdr) since the tmux path hits the same
+  // undefined-sessionId → no-bridge → replies-never-return failure.
+  if (adoptedCliId === 'claude-code' && !adopted.sessionId) {
     const claudeMeta = findUniqueClaudeSessionByCwd(adopted.cwd);
     if (claudeMeta?.sessionId) {
       adopted.sessionId = claudeMeta.sessionId;
       if (ds.session.adoptedFrom) ds.session.adoptedFrom.sessionId = claudeMeta.sessionId;
       sessionStore.updateSession(ds.session);
-      logger.info(`[${t}] Resolved Claude session for adopted herdr target by cwd`);
+      logger.info(`[${t}] Resolved Claude session for adopted ${adopted.source ?? 'tmux'} target by cwd`);
     } else {
-      logger.warn(`[${t}] Cannot resolve unique Claude session for adopted herdr target; final replies may be unavailable`);
+      logger.warn(`[${t}] Cannot resolve unique Claude session for adopted ${adopted.source ?? 'tmux'} target; final replies may be unavailable`);
     }
   }
   const hasCliPid = typeof adopted.originalCliPid === 'number';

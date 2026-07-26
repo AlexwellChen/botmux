@@ -836,14 +836,23 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
       // 3b. Filter by CLI type if requested
       if (filterCliId && match.cliId !== filterCliId) continue;
 
-      // npm's `codex` shim can remain as a Node launcher whose argv matches
-      // before generic discovery reaches the native child. Only follow that
-      // launcher: a process whose comm is already `codex` is the selected CLI
-      // itself and may legitimately have another Codex deeper in its tree.
-      // Other CLIs preserve legacy pid selection; their wrapper behavior is
-      // handled by explicit wrapperCli.
-      const cliPid = match.cliId === 'codex' && !match.matchedByComm
-        ? (findLaunchedCliPid(match.pid, 'codex') ?? match.pid)
+      // If the match came from an argv scan on a COMM_ARGV_LAUNCHER
+      // (node/ttadk/aiden/python… — matchedByComm=false), the matched pid is
+      // the LAUNCHER, not the CLI. The real CLI is a descendant that writes the
+      // session state / owns the transcript (e.g. claude keys
+      // ~/.claude/sessions/<pid>.json to the child, not the wrapper), so
+      // reading meta off the launcher pid misses it and leaves sessionId
+      // undefined → no bridgeJsonlPath → adopted claude's replies never reach
+      // Lark. findLaunchedCliPid does a comm-only BFS from the launcher's
+      // children to find the actual CLI binary. When none exists yet (or this
+      // process legitimately IS the CLI running under a launcher comm, e.g. a
+      // node-based CLI with no renamed process title), fall back to match.pid.
+      //
+      // matchedByComm=true means comm already named the CLI (`claude`/`codex`/…)
+      // — that process IS the selected CLI and may legitimately have another
+      // instance of the same CLI deeper in its tree, so never follow it.
+      const cliPid = !match.matchedByComm
+        ? (findLaunchedCliPid(match.pid, match.cliId) ?? match.pid)
         : match.pid;
 
       // 4. Read CLI working directory (Linux: /proc; macOS: lsof)
