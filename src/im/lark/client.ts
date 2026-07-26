@@ -1106,10 +1106,14 @@ export async function resolveAllowedUsersWithMap(
           data: { emails, include_resigned: false },
         });
         if (res.code !== 0) {
-          errored = true;
-          // Whole batch call failed transiently — every requested email is a
-          // retry candidate, not a definitive miss.
-          for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
+          // Distinguish a DEFINITIVE batch error (permanent 4xx: invalid arg /
+          // not visible / cross-app — classifyContactErrorCode) from a TRANSIENT
+          // one (network / rate-limit / 5xx). Only transient failures may fall
+          // back to cache + arm the retry; a permanent 4xx marks every requested
+          // email definitive so we don't spin retries or revive a stale owner.
+          const definitive = !!classifyContactErrorCode(res.code);
+          if (!definitive) errored = true;
+          for (const rawEmail of emails) entryStatus.set(rawEmail, definitive ? 'definitive' : 'transient');
           logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
         } else {
           const userList: any[] = res.data?.user_list ?? [];
@@ -1135,8 +1139,12 @@ export async function resolveAllowedUsersWithMap(
           }
         }
       } catch (err: any) {
-        errored = true;
-        for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
+        // A throw with a definitive contact code (permanent 4xx surfaced as an
+        // AxiosError/SDK error) is a definitive miss; anything else (network /
+        // timeout / 5xx) is transient and retry-eligible.
+        const definitive = !!classifyContactErrorCode(getLarkErrorCode(err));
+        if (!definitive) errored = true;
+        for (const rawEmail of emails) entryStatus.set(rawEmail, definitive ? 'definitive' : 'transient');
         logger.warn(`resolveAllowedUsers failed: ${err.message}`);
       }
     }

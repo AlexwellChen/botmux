@@ -1444,6 +1444,22 @@ export function getDashboardAdminOpenIds(larkAppId: string): string[] {
   return [...(bots.get(larkAppId)?.resolvedAllowedUsers ?? [])];
 }
 
+/**
+ * Hook the daemon registers so runtime allowedUsers mutations (set / revoke)
+ * can republish the dashboard descriptor's `resolvedAllowedUsers` without the
+ * services layer importing daemon internals. No-op until the daemon registers
+ * it (e.g. in one-shot CLI paths that never publish a descriptor).
+ */
+let republishResolvedAllowedUsersHook: ((larkAppId: string, resolved: string[]) => void) | undefined;
+export function setResolvedAllowedUsersRepublishHook(
+  fn: (larkAppId: string, resolved: string[]) => void,
+): void {
+  republishResolvedAllowedUsersHook = fn;
+}
+export function republishResolvedAllowedUsersDescriptor(larkAppId: string, resolved: string[]): void {
+  try { republishResolvedAllowedUsersHook?.(larkAppId, resolved); } catch { /* best effort */ }
+}
+
 /** Bot 自身的 open_id（用于在 mention 解析时排除自己）。 */
 export function getBotOpenId(larkAppId: string): string | undefined {
   return bots.get(larkAppId)?.botOpenId;

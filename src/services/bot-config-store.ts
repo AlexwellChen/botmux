@@ -10,6 +10,9 @@
  */
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, readBotSkillPolicy } from '../bot-registry.js';
+import { republishResolvedAllowedUsersDescriptor } from '../bot-registry.js';
+import { config } from '../config.js';
+import { writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { CLI_OPTIONS, resolveCliId } from '../setup/bot-config-editor.js';
@@ -276,6 +279,14 @@ export async function setBotAllowedUsers(
   bot.config.allowedUsers = rawEntries;
   bot.resolvedAllowedUsers = resolved;
   bot.rawAllowedUserResolution = map;
+  // Keep the last-known-good sidecar + dashboard descriptor in lockstep with the
+  // live allowlist. Without this, a hot `set allowedUsers` (e.g. owner switches
+  // from email to on_ while contact API is healthy) leaves the new raw key out
+  // of the cache; the next clean restart during an API blip would then resolve
+  // empty and fail-closed lock the owner out — the exact bug this feature fixes.
+  // retainKeys prunes stale keys (old email/union no longer configured).
+  writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, { map, retainKeys: rawEntries });
+  republishResolvedAllowedUsersDescriptor(larkAppId, resolved);
   logger.info(`[config:${larkAppId}] allowedUsers updated: ${rawEntries.length} entries, ${resolved.length} resolved`);
   return { ok: true, raw: rawEntries, resolved };
 }

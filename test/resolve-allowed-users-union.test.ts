@@ -159,5 +159,36 @@ describe('resolveAllowedUsersWithMap — entryStatus classification (PR#590)', (
     expect(entryStatus.get('b@corp.com')).toBe('transient');
     expect(errored).toBe(true);
   });
-});
 
+  it('email batch permanent 4xx (40001 invalid arg) → definitive, NOT transient; does not flag errored', async () => {
+    // codex delta finding: a permanent 4xx must not spin retries or revive a
+    // cached owner. classifyContactErrorCode(40001)==='invalid_id' → definitive.
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 40001, msg: 'invalid argument' }),
+    );
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['bad@corp.com']);
+    expect(entryStatus.get('bad@corp.com')).toBe('definitive');
+    expect(errored).toBeFalsy();
+  });
+
+  it('email batch throw with definitive code → definitive; plain network throw → transient', async () => {
+    // Definitive: thrown SDK error carrying code 41050.
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => { const e: any = new Error('not visible'); e.response = { data: { code: 41050 } }; throw e; },
+    );
+    const def = await resolveAllowedUsersWithMap(APP, ['hidden@corp.com']);
+    expect(def.entryStatus.get('hidden@corp.com')).toBe('definitive');
+    expect(def.errored).toBeFalsy();
+
+    // Transient: plain network throw, no contact code.
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => { throw new Error('ECONNRESET'); },
+    );
+    const tr = await resolveAllowedUsersWithMap(APP, ['flaky@corp.com']);
+    expect(tr.entryStatus.get('flaky@corp.com')).toBe('transient');
+    expect(tr.errored).toBe(true);
+  });
+});
