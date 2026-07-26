@@ -28,7 +28,7 @@ An adopted session's lifecycle lives **on your machine**, outside botmux's contr
 - **Cannot resume**: an adopted session doesn't support `--resume` rebuild.
 - **Ends when the CLI exits**: in adopt mode botmux does **not** auto-restart — once the adopted CLI exits on its own, the session ends with it (card frozen, worker reaped) rather than respawning like a persistent session.
 - **Sandbox bots can't adopt**: a sandbox has to wrap a CLI it starts from scratch and can't wrap an already-running process (fail-closed rejection).
-- **Restore after a daemon restart is careful**: on restart botmux first re-validates whether the adopted host CLI is still alive — it only closes the session if the target is confirmed gone; on an inconclusive (transient) probe it keeps the session closed until the next wake-up and re-validates, using debouncing so a single network hiccup doesn't spuriously declare "the CLI disconnected" and kill a live process.
+- **Restore after a daemon restart is careful**: on restart botmux first re-validates whether the adopted host CLI is still alive — it only closes the session if the target is confirmed gone; on an inconclusive (transient) probe it keeps the session closed and **re-validates on the next restore pass (e.g. another daemon restart)**, not automatically when the next message arrives.
 
 ## Typical usage
 

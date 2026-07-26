@@ -7,7 +7,7 @@ botmux dashboard
 # 输出: http://<lan-ip>:7891/?t=<token>
 ```
 
-> 每次跑都换一个 token，老 URL 立即失效——一次一密的取链方式（分享链接 = 分享一次性登录态）。默认端口 `7891`，可用 `BOTMUX_DASHBOARD_PORT` 改。
+> 这是**轮换式登录 token**：一条 URL 有效到下次运行 `botmux dashboard`（那时才轮换、让旧 URL 失效）；token 会持久化、`botmux restart` 后仍有效。成功访问 `?t=` 只是把同一 token 写进 cookie，不消费/作废它，轮换前同一 URL 可重复登录——所以分享链接≈分享登录态，注意保管。默认端口 `7891`，可用 `BOTMUX_DASHBOARD_PORT` 改。
 
 ![Dashboard Groups 面板](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033300739_dash-groups.png)
 <p class="cap">Groups 面板：chat × bot 矩阵，一眼看清哪个群里有哪些机器人</p>
@@ -24,4 +24,4 @@ botmux dashboard
 
 ## 部署细节
 
-dashboard 走单独 pm2 进程 `botmux-dashboard`，跟 daemon 一起起停。每个 daemon 在 `127.0.0.1` 暴露内部 IPC（仅本机），dashboard 进程做反向代理 + HMAC 鉴权：密钥文件 `~/.botmux/.dashboard-secret`（mode 0600），是 daemon↔dashboard 的内部签名密钥，**不下发给浏览器**（浏览器另拿一次性 token）。
+dashboard 走单独 pm2 进程 `botmux-dashboard`，跟 daemon 一起起停。每个 daemon 在 `127.0.0.1` 暴露内部 IPC（仅本机），dashboard 进程做反向代理 + HMAC 鉴权：密钥文件 `~/.botmux/.dashboard-secret`（mode 0600），是 daemon↔dashboard 的内部签名密钥，**不下发给浏览器**（浏览器侧走上面的轮换登录 token）。

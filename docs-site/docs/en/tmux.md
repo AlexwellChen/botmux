@@ -37,7 +37,7 @@ Once you attach, what you see is a terminal exactly identical to your local deve
 
 ## Other backends and explicit pty
 
-Only tmux (default) and pty (emergency) are relevant day to day; `zellij` / `herdr` / `riff` are also available backends, opted into explicitly via `BACKEND_TYPE` or a per-bot `backendType`, and don't change the default.
+Only tmux (default) and pty (emergency) are relevant day to day; `zellij` / `herdr` are also available backends, opted into explicitly via `BACKEND_TYPE` or a per-bot `backendType`, and don't change the default. `riff` is different — it is **enabled paired with the riff CLI** (`cliId===riff ⇔ backendType===riff`, a forced binding) and can't be selected for an ordinary CLI the way zellij/herdr can.
 
 ```bash
 # Force pure pty mode (without using tmux) — emergency only

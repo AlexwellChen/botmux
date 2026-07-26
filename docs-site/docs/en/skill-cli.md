@@ -14,11 +14,11 @@ Inside a session the agent can call these `botmux` subcommands directly (session
 | `botmux bots list` | List the bots in the current group and their open_id (for `--mention`) |
 | `botmux schedule` | Create, list, update, and delete scheduled tasks |
 
-> These are the most-used set; the real command surface is larger (e.g. `botmux ask` for interactive questions, `botmux handoff` to hand off to another bot, workflow / orchestrate commands) — see `botmux --help` and the injected Skill catalog for the full list.
+> These are the most-used set; the real command surface is larger (e.g. `botmux ask` for interactive questions, and workflow / goal / dispatch orchestration entry points) — see `botmux --help` and the injected Skill catalog for the full list. Handoff / orchestration are separate **Skills** (`botmux-handoff` / `botmux-orchestrate`), which are Skills, not executable subcommands.
 
 ### The @-decision hard gate on `botmux send`
 
-A top-level `botmux send` **must carry an @-decision**, or it refuses to send: `--mention <openId>` (name someone), `--mention-back` (@ the triggerer), or `--no-mention` (don't @). `--no-mention` is mutually exclusive with the other two; non-top-level cases like quote/topic replies are auto-exempt. This gate ensures "the ones that should be @-ed aren't missed, and the ones that shouldn't don't spam the group."
+A `botmux send` **must carry an @-decision**, or it refuses to send: `--mention <openId>` (name someone), `--mention-back` (@ the triggerer), or `--no-mention` (don't @). `--no-mention` is mutually exclusive with the other two. Only the explicit `--top-level` flag (or globally disabling the gate) is exempt — **ordinary topic / quote replies still have to pick one of the three**. This gate ensures "the ones that should be @-ed aren't missed, and the ones that shouldn't don't spam the group."
 
 ## Wrapper Mechanism
 
@@ -32,8 +32,10 @@ The channel through which routing guidance and the Skill catalog are **injected 
 
 - **Claude family (claude-code / seed / relay)**: routing / identity via `--append-system-prompt`; Skills via `--plugin-dir` (not stuffed into the system prompt).
 - **genius**: both routing and the Skill catalog go through `--append-system-prompt`; **grok** uses its equivalent flag `--rules`.
-- **Most other CLIs** (codex / gemini / opencode / cursor / coco / traex, etc.): routing and the Skill catalog are **inlined into the first prompt**, consuming no system-prompt flag.
+- **Most other CLIs** (codex / gemini / opencode / cursor / coco / traex, etc.): under the default `skillInjection=prompt` mode, routing and the Skill catalog are **inlined into the first prompt**, consuming no system-prompt flag.
 
+> Skill catalog injection is governed by the per-bot `skillInjection` mode (genius/grok too): `prompt` (default) inlines a compact catalog into the prompt and pulls full text on demand via `botmux skill show <name>`; `global` installs the skill files into the CLI's shared skills dir (your hand-run CLI sees them too); `off` installs no catalog, leaving only routing guidance + `botmux --help`. The `global`/`off` mechanics differ from the "inline" case above.
+>
 > Injected guidance is generated dynamically per the current locale, so it respects your configured language.
 
 ## Why Skill + CLI Instead of MCP

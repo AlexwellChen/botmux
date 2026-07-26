@@ -14,11 +14,11 @@ CLI 进入 botmux 会话时，自动获得 `~/.botmux/bin` 在 PATH 中，以及
 | `botmux bots list` | 查当前群里的机器人及 open_id（供 `--mention`） |
 | `botmux schedule` | 增删改查定时任务 |
 
-> 这些是最常用的一组；实际可用命令更多（如 `botmux ask` 交互提问、`botmux handoff` 交棒、workflow / orchestrate 编排等），以 `botmux --help` 与注入的 Skill 目录为准。
+> 这些是最常用的一组；实际可用命令更多（如 `botmux ask` 交互提问、workflow / goal / dispatch 编排入口等），以 `botmux --help` 与注入的 Skill 目录为准。交棒 / 编排另有 `botmux-handoff` / `botmux-orchestrate` 等 **Skill**（是 Skill、不是可执行子命令）。
 
 ### `botmux send` 的 @ 决策硬门
 
-`botmux send` 顶层发送时**必须带一个 @ 决策**，否则拒发：`--mention <openId>`（点名）/ `--mention-back`（@ 回触发者）/ `--no-mention`（不 @）。其中 `--no-mention` 与前两者互斥；引用/话题回复等非顶层场景自动豁免。这道门确保「该 @ 的没漏、不该 @ 的不炸群」。
+`botmux send` **必须带一个 @ 决策**，否则拒发：`--mention <openId>`（点名）/ `--mention-back`（@ 回触发者）/ `--no-mention`（不 @）。其中 `--no-mention` 与前两者互斥。仅显式 `--top-level` 旗标（或全局关闭硬门）豁免——**普通话题 / 引用回复照样要三选一**。这道门确保「该 @ 的没漏、不该 @ 的不炸群」。
 
 ## wrapper 机制
 
@@ -32,8 +32,10 @@ session 信息通过**祖先进程标记**自动推断：worker 启动 CLI 时�
 
 - **Claude 家族（claude-code / seed / relay）**：路由 / 身份走 `--append-system-prompt`；Skill 走 `--plugin-dir`（不是塞进 system prompt）。
 - **genius**：路由 + Skill 目录都走 `--append-system-prompt`；**grok** 用它的等价开关 `--rules`。
-- **其余大多数 CLI**（codex / gemini / opencode / cursor / coco / traex 等）：路由与 Skill 目录**内联进首条 prompt**，不占任何 system-prompt 旗标。
+- **其余大多数 CLI**（codex / gemini / opencode / cursor / coco / traex 等）：默认 `skillInjection=prompt` 模式下，路由与 Skill 目录**内联进首条 prompt**，不占任何 system-prompt 旗标。
 
+> Skill catalog 的注入受 per-bot `skillInjection` 模式影响（genius/grok 同样）：`prompt`（默认）内联精简目录进 prompt、按需 `botmux skill show <name>` 拉全文；`global` 把 skill 文件装进 CLI 共享 skills 目录（你手跑的 CLI 也会看到）；`off` 则不装目录、只留路由指引 + `botmux --help`。配过 `global`/`off` 的机制与上面「内联」不同。
+>
 > 注入指引按当前 locale 动态生成，因此会尊重你设的语言。
 
 ## 为什么是 Skill + CLI，而不是 MCP

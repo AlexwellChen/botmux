@@ -37,7 +37,7 @@ attach 进去后你看到的就是和本地开发完全一致的终端——这�
 
 ## 其它后端与显式 pty
 
-默认只有 tmux（默认）与 pty（应急）与你日常相关；`zellij` / `herdr` / `riff` 也是可选后端，按需通过 `BACKEND_TYPE` 或 per-bot `backendType` 显式启用，不影响默认。
+默认只有 tmux（默认）与 pty（应急）与你日常相关；`zellij` / `herdr` 也是可选后端，按需通过 `BACKEND_TYPE` 或 per-bot `backendType` 显式启用，不影响默认。`riff` 则不同——它**随 riff CLI 配对启用**（`cliId===riff ⇔ backendType===riff`，强制绑定），不能像 zellij/herdr 那样给普通 CLI 单独选。
 
 ```bash
 # 显式用纯 pty 模式（不使用 tmux）——仅应急
