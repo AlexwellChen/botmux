@@ -129,6 +129,73 @@ export function coversPath(p: string, child: string): boolean {
   return child.startsWith(prefix);
 }
 
+/**
+ * Which adapter `authPaths` survive a CLI-data redirect into BOT_HOME.
+ *
+ * When a bot redirects its CLI data (CLAUDE_CONFIG_DIR/CODEX_HOME → BOT_HOME),
+ * the adapter's REAL host data dir is rehomed: the isolated copy under BOT_HOME
+ * is what the CLI reads/writes, and the host dir is denied-by-default (its
+ * exposure was the whole point of read isolation). Any authPath that lives
+ * INSIDE such a rehomed host root is therefore either (a) redundant — its
+ * BOT_HOME equivalent is provisioned + covered readWrite by the botHome rule
+ * (claude `.credentials.json`), or (b) an active leak we must NOT expose (codex's
+ * whole `~/.codex`: history.jsonl, sessions/, state_*.sqlite). Both are dropped.
+ *
+ * But authPaths that live OUTSIDE every rehomed root are external login sources
+ * the redirect does NOT rehome — e.g. Seed/Relay's `~/.local/share/bytedcli` SSO
+ * dir (bytedcli login reuse). Dropping those regresses login (a fresh BOT_HOME /
+ * expired token cold-start would have no credential source). They MUST survive.
+ *
+ * NOTE this is a SUPPRESSION-vs-KEEP decision only. A path inside a rehomed root
+ * whose BOT_HOME copy is NOT provisioned (e.g. `<dataDir>/byted-cloud-auth.json`
+ * — never seeded, and never the redirected read location since the CLI resolves
+ * it under $CLAUDE_CONFIG_DIR=BOT_HOME) is still dropped: keeping the host path
+ * would not help the redirected read anyway. Provisioning such files into
+ * BOT_HOME is a separate concern (see provisionIsolatedBotHome), orthogonal to
+ * closing the host-dir leak this filter exists for.
+ *
+ * @param authPaths     adapter authPaths, already `~`-expanded + normalized absolute
+ * @param rehomedRoots  host data roots being redirected to BOT_HOME, normalized
+ *                      (claude family: the host claudeDataDir; codex: `~/.codex`)
+ */
+export function authPathsSurvivingCliDataRedirect(
+  authPaths: readonly string[],
+  rehomedRoots: readonly string[],
+): string[] {
+  const roots = rehomedRoots.map(normalizeFsPath).filter((r): r is string => !!r);
+  return authPaths.filter((raw) => {
+    const p = normalizeFsPath(raw);
+    if (!p) return false;
+    // Keep iff NOT inside any rehomed host root.
+    return !roots.some((root) => coversPath(root, p));
+  });
+}
+
+/**
+ * The COMPLETE authPaths the fs-policy should expose for a (possibly redirecting)
+ * adapter. This is the single source of truth the worker calls — extracted so the
+ * worker's call site and the tests exercise the SAME code, not a re-implementation
+ * (a test that recomputes the rule would stay green if the worker stopped calling
+ * this, which is exactly the wiring blind spot this avoids).
+ *
+ * - not redirected → expose the adapter's declared authPaths verbatim.
+ * - redirected     → drop the ones inside a rehomed host data root
+ *                    (authPathsSurvivingCliDataRedirect), keeping data-root-external
+ *                    login sources (Seed/Relay bytedcli SSO).
+ *
+ * rehomedHostRoots is assembled from the adapter's ORIGINAL host data dir
+ * (claude family) + the codex host root when applicable — passed in by the worker
+ * (it owns `~`-expansion / existence-filter / canonicalization); this fn is pure.
+ */
+export function resolveRedirectedAdapterAuthPaths(input: {
+  declaredAuthPaths: readonly string[];
+  willRedirectCliData: boolean;
+  rehomedHostRoots: readonly string[];
+}): string[] {
+  if (!input.willRedirectCliData) return [...input.declaredAuthPaths];
+  return authPathsSurvivingCliDataRedirect(input.declaredAuthPaths, input.rehomedHostRoots);
+}
+
 const SOURCE_RANK: Record<FsRuleSource, number> = {
   baseline: 0,
   adapter: 1,
@@ -488,9 +555,12 @@ export interface CompileBwrapOpts {
   /** A single MODE-000 EMPTY directory (worker-created, kept empty) ro-bound
    *  over DIRECTORY-shaped deny rules. `--ro-bind emptyDir <deny>` masks the
    *  real contents, makes the mountpoint read-only (unlike `--tmpfs <deny>`,
-   *  which left a WRITABLE tmpfs), AND — because the source is mode 000 — makes
-   *  the mask itself unreadable (`ls`/`cat` on it fail, not just "returns
-   *  empty"). A real deny is neither readable, listable, nor writable. */
+   *  which left a WRITABLE tmpfs), AND — because the source is mode 000 — a
+   *  non-root process can't even list it (`ls`/`cat` fail, not just "returns
+   *  empty"). Root bypasses DAC and can traverse it, but the source is EMPTY, so
+   *  no real content leaks regardless of uid — emptiness is the guarantee, the
+   *  000 mode only hardens listing for non-root. A real deny is neither readable
+   *  (content), listable (non-root), nor writable. */
   emptyDir: string;
   /** Directory that will hold MODE-000 empty placeholder files for FILE-shaped
    *  deny rules (dirs are masked with the empty ro-bind above; files need an

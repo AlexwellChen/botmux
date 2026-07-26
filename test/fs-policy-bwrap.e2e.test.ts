@@ -118,7 +118,7 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     expect(run(args, `echo x > ${JSON.stringify(join(S, 'ref/hack'))}`).status).not.toBe(0);
   });
 
-  it('deny DIR (existing): real content unreadable AND the mask itself is unreadable (mode 000)', () => {
+  it('deny DIR (existing): real content unreadable, and mask empty/unlistable for non-root (root may list but sees nothing real)', () => {
     const dir = join(S, 'proj/secrets');
     const { args } = build({ deny: [dir] });
     const read = run(args, `cat ${JSON.stringify(join(dir, 'key.txt'))}`);
@@ -131,9 +131,10 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     // host dir with an empty one, so key.txt must be absent regardless of ls status.
     const ls = run(args, `ls -A ${JSON.stringify(dir)}`);
     if (process.getuid?.() === 0) {
-      expect(ls.out).not.toContain('key.txt');
+      expect(ls.status).toBe(0);            // root traverses the 000 mask…
+      expect(ls.out).not.toContain('key.txt'); // …but the mask is empty — no real content
     } else {
-      expect(ls.status).not.toBe(0);
+      expect(ls.status).not.toBe(0);        // non-root: DAC blocks listing the 000 dir
     }
   });
 

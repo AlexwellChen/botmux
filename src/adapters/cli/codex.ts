@@ -137,11 +137,17 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // authPaths — that only feeds the bwrap file sandbox below.)
     supportsReadIsolation: true,
     // Whole ~/.codex kept REAL, not just auth.json: codex opens SQLite state/log
-    // DBs there (state_*.sqlite / logs_*.sqlite). Under the file sandbox the home
-    // is an overlayfs merge, and overlayfs (kernel + fuse) doesn't support the
-    // POSIX fcntl locks SQLite needs — the connection pool blocks ~57s then codex
-    // exits 1 ("pool timed out"). Binding the dir real gives working locks and
-    // keeps login/history persistent (same rationale as auth.json).
+    // DBs there (state_*.sqlite / logs_*.sqlite). The file sandbox is a fresh
+    // tmpfs root where ONLY allow-listed paths are bound in; a single-file
+    // carve-out would leave the dir itself unexposed (codex can't create its
+    // sibling DBs) and, for the DBs, a non-real bind can't carry the POSIX fcntl
+    // byte-range locks SQLite needs — the connection pool blocks ~57s then codex
+    // exits 1 ("pool timed out"). Binding the whole dir real gives working locks
+    // and keeps login/history persistent. NOTE this rationale is for the
+    // NON-redirected path; when CLI data is redirected to BOT_HOME the worker
+    // drops this host authPath (authPathsSurvivingCliDataRedirect) — codex then
+    // reads/writes its DBs under CODEX_HOME=BOT_HOME/codex instead, and exposing
+    // the host ~/.codex would only leak history/sessions it never touches.
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 

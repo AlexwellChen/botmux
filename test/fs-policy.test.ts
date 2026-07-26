@@ -1,10 +1,14 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   buildFsPolicy,
   mergeFsRules,
   accessForPath,
   normalizeFsPath,
   coversPath,
+  authPathsSurvivingCliDataRedirect,
+  resolveRedirectedAdapterAuthPaths,
   ancestorsNeedingTraverse,
   compileToSeatbelt,
   compileToBwrap,
@@ -212,43 +216,95 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(redirected.rules, '/Users/u/.claude/projects/x.jsonl').access).toBe('none');
   });
 
-  it('authPaths are exposed rw at the policy layer (the worker gates them off under redirect)', () => {
-    // The policy itself always exposes authPaths readWrite — it does not know
-    // about redirect for auth. The redirect gate lives in worker.ts, which
-    // passes authPaths=[] when CLI data is redirected to BOT_HOME (auth is
-    // provisioned there instead). This asserts BOTH halves of that contract so a
-    // future refactor can't silently re-leak the host dir: (1) when authPaths IS
-    // passed it is rw (non-redirect path), (2) when the worker passes [] under
-    // redirect nothing from the host auth dir is exposed. See worker.ts authPaths
-    // gate + the codex ~/.codex whole-dir leak this closes.
-    const nonRedirect = buildFsPolicy(ctx({
-      platform: 'linux', homeDir: '/home/u',
-      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
-      workingDir: '/home/u/proj', botHome: '/home/u/.botmux/bots/cli_self',
-      redirectedCliData: false,
-      authPaths: ['/home/u/.codex'], // codex authPaths = whole dir
-    }));
-    // codex reads/writes state DBs, history, sessions under ~/.codex → rw.
-    expect(accessForPath(nonRedirect.rules, '/home/u/.codex/state_5.sqlite').access).toBe('readWrite');
-    expect(accessForPath(nonRedirect.rules, '/home/u/.codex/history.jsonl').access).toBe('readWrite');
-
-    // Redirect path: worker passes authPaths=[] → the host ~/.codex is NOT bound.
-    // Its transcripts/state/history must be inaccessible; the live root is
-    // BOT_HOME/codex, covered rw by the botHome internal rule instead.
-    const redirected = buildFsPolicy(ctx({
+  it('authPaths at the policy layer are always rw (redirect suppression happens upstream in the worker)', () => {
+    // The policy builder itself does NOT know about redirect for auth — whatever
+    // authPaths it's handed become rw. The redirect-aware SUPPRESSION is the
+    // worker's job (authPathsSurvivingCliDataRedirect, asserted separately below).
+    // This just pins that a non-suppressed authPath is rw so the two layers compose.
+    const p = buildFsPolicy(ctx({
       platform: 'linux', homeDir: '/home/u',
       botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
       workingDir: '/home/u/proj', botHome: '/home/u/.botmux/bots/cli_self',
       redirectedCliData: true,
-      authPaths: [], // <- what worker.ts passes under redirect
+      authPaths: ['/home/u/.local/share/bytedcli'], // a survivor the worker kept
     }));
-    expect(accessForPath(redirected.rules, '/home/u/.codex/history.jsonl').access).toBe('none');
-    expect(accessForPath(redirected.rules, '/home/u/.codex/sessions/a/b.jsonl').access).toBe('none');
-    expect(accessForPath(redirected.rules, '/home/u/.codex/state_5.sqlite').access).toBe('none');
-    // …while the isolated per-bot codex home stays rw (its live data root).
-    expect(accessForPath(redirected.rules, '/home/u/.botmux/bots/cli_self/codex/auth.json').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/home/u/.local/share/bytedcli/data/sso_session.json').access).toBe('readWrite');
+  });
+});
+
+describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', () => {
+  // The four redirect-eligible adapters (supportsReadIsolation===true): claude-code,
+  // codex, seed, relay. Rule: drop authPaths INSIDE a rehomed host data root; keep
+  // authPaths OUTSIDE it. rehomed roots = claude-family host claudeDataDir + codex ~/.codex.
+  // These call the SAME resolver the worker calls (not a re-implementation).
+  const resolve4 = (declaredAuthPaths: string[], rehomedHostRoots: string[]) =>
+    resolveRedirectedAdapterAuthPaths({ declaredAuthPaths, willRedirectCliData: true, rehomedHostRoots });
+
+  it('not redirected → declared authPaths pass through verbatim', () => {
+    expect(resolveRedirectedAdapterAuthPaths({
+      declaredAuthPaths: ['/home/u/.codex', '/home/u/.local/share/bytedcli'],
+      willRedirectCliData: false,
+      rehomedHostRoots: ['/home/u/.codex'], // ignored when not redirecting
+    })).toEqual(['/home/u/.codex', '/home/u/.local/share/bytedcli']);
   });
 
+  it('claude-code: ~/.claude/.credentials.json is inside ~/.claude → dropped (BOT_HOME copy is provisioned)', () => {
+    expect(resolve4(['/home/u/.claude/.credentials.json'], ['/home/u/.claude'])).toEqual([]);
+  });
+
+  it('codex: ~/.codex is the rehomed root itself → dropped (this is the host-dir leak fix)', () => {
+    expect(resolve4(['/home/u/.codex'], ['/home/u/.codex'])).toEqual([]);
+  });
+
+  it('seed/relay: ~/.local/share/bytedcli is OUTSIDE the data root → kept (external SSO login source)', () => {
+    // relay: dataDir ~/.relay; seed: dataDir <pkg>/.claude-runtime. bytedcli is
+    // outside both → must survive or cold-start login regresses. byted-cloud-auth
+    // (inside the data root) is dropped — it is never the redirected read location
+    // anyway (CLI reads $CLAUDE_CONFIG_DIR/byted-cloud-auth.json = BOT_HOME/claude).
+    expect(resolve4(
+      ['/home/u/.local/share/bytedcli', '/home/u/.relay/byted-cloud-auth.json'],
+      ['/home/u/.relay'],
+    )).toEqual(['/home/u/.local/share/bytedcli']);
+    expect(resolve4(
+      ['/home/u/.local/share/bytedcli', '/opt/relay/.claude-runtime/byted-cloud-auth.json'],
+      ['/opt/relay/.claude-runtime'],
+    )).toEqual(['/home/u/.local/share/bytedcli']);
+  });
+
+  it('path boundary: a sibling like ~/.relay2 is NOT judged inside ~/.relay', () => {
+    // coversPath requires exact match or a `${root}/` prefix, so a lexical
+    // prefix that is not a real ancestor must survive.
+    expect(resolve4(['/home/u/.relay2/x'], ['/home/u/.relay'])).toEqual(['/home/u/.relay2/x']);
+    expect(resolve4(['/home/u/.codexvault'], ['/home/u/.codex'])).toEqual(['/home/u/.codexvault']);
+  });
+
+  it('multiple rehomed roots + normalization (trailing slash, empty entries)', () => {
+    expect(resolve4(
+      ['/home/u/.claude/.credentials.json', '/home/u/.local/share/bytedcli', '/home/u/.codex/auth.json'],
+      ['/home/u/.claude/', '/home/u/.codex'], // trailing slash normalized
+    )).toEqual(['/home/u/.local/share/bytedcli']);
+    // empty / unusable entries are filtered, not crashing
+    expect(authPathsSurvivingCliDataRedirect(['', '/home/u/x'], [''])).toEqual(['/home/u/x']);
+  });
+
+  it('WIRING GUARD: worker.ts assembles authPaths via resolveRedirectedAdapterAuthPaths with the right roots', () => {
+    // A pure-fn test alone can't catch the worker dropping/reverting the call or
+    // passing wrong roots (the blind spot that let the first cut miss Seed/Relay).
+    // Assert the actual call site in worker.ts source: it must (a) invoke the
+    // resolver for authPaths, (b) feed willRedirectCliData, and (c) build
+    // rehomedHostRoots from cliAdapter.claudeDataDir + the codex host ~/.codex.
+    const src = readFileSync(resolve('src/worker.ts'), 'utf8');
+    // (a) authPaths is produced by the resolver, not a raw keepExisting / [].
+    expect(src).toMatch(/authPaths:\s*resolveRedirectedAdapterAuthPaths\(\{/);
+    // (b) the redirect flag is threaded in.
+    expect(src).toMatch(/resolveRedirectedAdapterAuthPaths\(\{[\s\S]*?willRedirectCliData,/);
+    // (c) rehomed roots come from the adapter's host data dir + codex host root.
+    expect(src).toMatch(/resolveRedirectedAdapterAuthPaths\(\{[\s\S]*?rehomedHostRoots:[\s\S]*?cliAdapter\.claudeDataDir/);
+    expect(src).toMatch(/resolveRedirectedAdapterAuthPaths\(\{[\s\S]*?rehomedHostRoots:[\s\S]*?isolatedCodexHome\s*\?\s*`\$\{sandboxHome\}\/\.codex`/);
+  });
+});
+
+describe('buildFsPolicy (baseline + net)', () => {
   it('linux baseline: toolchain ro, no darwin paths', () => {
     const p = buildFsPolicy(ctx({ platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self', botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj' }));
     expect(accessForPath(p.rules, '/usr/lib/x.so').access).toBe('readOnly');

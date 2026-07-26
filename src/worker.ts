@@ -32,7 +32,7 @@ import {
   isolationPaneMarkerContent,
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
-import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields } from './adapters/cli/fs-policy.js';
+import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
@@ -7266,18 +7266,24 @@ async function spawnCli(
         claudeDataDir ? `${sandboxHome}/.claude.lock` : undefined,
         claudeDataDir ? `${sandboxHome}/.local/state/claude` : undefined,
       ]),
-      // authPaths carries the CLI's REAL login/data dir (claude:
-      // ~/.claude/.credentials.json; codex/codex-app: the WHOLE ~/.codex). When
-      // NOT redirected we must expose it readWrite so token refresh + codex's
-      // SQLite state/log DBs persist. But when CLI data IS redirected to
-      // BOT_HOME (CLAUDE_CONFIG_DIR/CODEX_HOME), the isolated home lives under
-      // `botHome` — already pushed readWrite/internal — and provisionIsolatedBotHome
-      // seeds auth/config there from the host copy (in the WORKER, outside the
-      // sandbox). Passing the host authPaths then adds nothing but a leak: codex's
-      // whole ~/.codex (history.jsonl, sessions/, state_*.sqlite, skills/) would be
-      // bound readWrite into every redirected codex sandbox despite BOT_HOME being
-      // the live root. Gate it OFF under redirect, mirroring cliDataPaths above.
-      authPaths: willRedirectCliData ? [] : keepExisting([...(cliAdapter.authPaths ?? [])]),
+      // authPaths carries the CLI's REAL login/data surfaces (claude:
+      // ~/.claude/.credentials.json; codex/codex-app: the WHOLE ~/.codex;
+      // Seed/Relay: ~/.local/share/bytedcli SSO + <dataDir>/byted-cloud-auth.json).
+      // resolveRedirectedAdapterAuthPaths is the single source of truth (also unit-
+      // tested directly): not redirected → expose all; redirected → drop authPaths
+      // inside a rehomed host data root (their BOT_HOME copy is provisioned+covered,
+      // or — codex's whole ~/.codex — an active leak), keep data-root-external
+      // login sources (Seed/Relay bytedcli SSO) so cold-start login doesn't regress.
+      // rehomedHostRoots = the ORIGINAL host claudeDataDir (cliAdapter's, NOT the
+      // BOT_HOME value claudeDataDir was reassigned to above) + codex host ~/.codex.
+      authPaths: resolveRedirectedAdapterAuthPaths({
+        declaredAuthPaths: keepExisting([...(cliAdapter.authPaths ?? [])]),
+        willRedirectCliData,
+        rehomedHostRoots: keepExisting([
+          cliAdapter.claudeDataDir,                                 // claude family: ~/.claude, ~/.relay, seed .claude-runtime
+          isolatedCodexHome ? `${sandboxHome}/.codex` : undefined,  // codex: host ~/.codex (isolatedCodexHome set ⇒ codex family)
+        ]),
+      }),
       execPaths: keepExisting([...execDirs, ...execCarve]),
       readonlyRoots: keepExisting([
         ...(cfg.skillReadonlyRoots ?? []),
