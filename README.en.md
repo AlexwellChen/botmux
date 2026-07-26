@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <img src="gif/fold&unfold.gif" width="640" alt="Lark streaming card relaying CLI output in real time">
+  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux product panorama: Lark topics, live cards, web terminal, multi-agent orchestration, and 20+ CLI / agent adapters">
 </p>
 
 ---
