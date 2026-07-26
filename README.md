@@ -36,7 +36,7 @@ Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话
 
 ## 5 分钟接入
 
-> 约 5 分钟：`botmux setup` 一次飞书扫码就连续建好应用、配全权限、发版（`--no-open-platform-auto` 可跳过自动配置改手动建应用）。
+> 约 5 分钟：`botmux setup` 一次飞书扫码就连续建好应用、配全权限、发版（加 `--no-open-platform-auto` 则只建应用、跳过权限与发版的自动配置，之后需手动完成；手动创建 / 粘贴凭证是 setup 里的另一个选项）。
 
 ```bash
 npm install -g botmux        # 需要 Node >= 22
@@ -56,7 +56,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 - **[定时任务](https://deepcoldy.github.io/botmux/schedule) & [外部触发](https://deepcoldy.github.io/botmux/webhook)** — 自然语言配周期任务（报警分析 / 群总结）；从外部系统编程式触发用 [Webhook](https://deepcoldy.github.io/botmux/webhook) 或 [API 任务触发](https://deepcoldy.github.io/botmux/api-task-trigger)。
 - **[Oncall 模式](https://deepcoldy.github.io/botmux/oncall) & [语音总结](https://deepcoldy.github.io/botmux/voice)** — 拉进 oncall 群，任何成员 @ 即在项目目录排查；配好 TTS 后每张卡片页脚会多一个 🔊 语音总结按钮，让模型「说人话」。
 
-更多：[角色与团队](https://deepcoldy.github.io/botmux/roles) · [文件沙盒](https://deepcoldy.github.io/botmux/sandbox) · [Dashboard 管控面](https://deepcoldy.github.io/botmux/dashboard) · [tmux 会话常驻](https://deepcoldy.github.io/botmux/tmux) · [飞书会议智能体](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)。
+更多：[角色与团队](https://deepcoldy.github.io/botmux/roles) · [文件沙盒](https://deepcoldy.github.io/botmux/sandbox) · [Dashboard 管控面](https://deepcoldy.github.io/botmux/dashboard) · [tmux 会话常驻](https://deepcoldy.github.io/botmux/tmux) · [飞书会议智能体（效果展示）](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)。
 
 ## 支持的 CLI / Agent
 
@@ -64,30 +64,29 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 `claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `aiden` · `coco`(TRAE) · `hermes` · `mira` · `riff`(云 Agent) …
 
-完整清单与接入方式（含套 wrapper / 网关）以 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters) 为准。
+当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 
 ## 设计理念：直接桥接 CLI，不做 SDK wrapper
 
-botmux 不重新实现记忆、上下文管理、工具调用、权限体系——这些能力 CLI 本身都在快速迭代。botmux 直接桥接完整的 CLI 进程，站在这个进化之上：**CLI 每次升级，botmux 零适配自动受益**。用户照常发人话，daemon 在后台把上下文封装成结构化 prompt 再喂给 CLI。
+botmux 不重新实现记忆、上下文管理、工具调用、权限体系——**多数 CLI 原生能力无需 botmux 重造，CLI 升级通常直接受益**（接口 / 参数 / 输出格式 / resume 语义有变时，adapter 仍可能要跟进）。用户照常发人话，daemon 在后台把上下文封装成结构化 prompt 再喂给 CLI。基于 Agent SDK 的方案则相反：能力取决于 SDK 暴露的接口面与你自己的集成实现。
 
-与基于 Agent SDK 重造一套的方案相比：
+下表只对比**可核验的集成边界**，不对其它方案下「必然缺失」的结论：
 
-| 维度 | botmux | 基于 Agent SDK 的方案 |
+| 集成边界 | botmux | 基于 Agent SDK 的方案 |
 |------|--------|----------------------|
-| 底层架构 | 直接桥接完整 CLI 进程 | 基于 SDK 重新构建 |
-| CLI 能力 | 完整运行时（hooks / memory / plan mode / MCP / `/` 命令） | SDK API 子集，缺失功能需手动补 |
-| CLI 升级 | 零适配自动受益 | 需跟进 SDK 版本变更 |
-| 记忆 / 上下文 | 直接复用 CLI 内建，随 CLI 迭代增强 | 需自建，与 CLI 原生能力重复 |
-| 多 CLI | 20+ CLI / Agent 一键切换 | 通常绑定单一 SDK |
-| 多机器人 | 同群多 bot @mention 路由 | 通常单机器人 |
-| 终端直连 | `tmux attach` 进真进程，与本地开发一致 | 通常无法直接操作底层终端 |
+| 桥接对象 | 完整 CLI 进程（含 hooks / memory / plan mode / MCP / `/` 命令等 CLI 自带运行时） | SDK 暴露的接口面 |
+| CLI 升级 | 多数直接受益；接口 / resume 有变时 adapter 跟进 | 取决于 SDK 版本与集成实现 |
+| 记忆 / 上下文 | 直接复用 CLI 内建 | 取决于 SDK / 自建 |
+| 多 CLI / Agent | 20+ 适配器一键切换 | 取决于 SDK 覆盖面 |
+| 多机器人 | 同群多 bot @mention 路由 | 取决于实现 |
+| 终端直连 | 本地 CLI 可 `tmux attach` 进真进程 | 取决于实现 |
 
 ## 文档 · 社区 · 贡献
 
 - 📖 **完整文档**（命令 / 配置 / 最佳实践 / 排错）：**<https://deepcoldy.github.io/botmux/>**
 - ✨ **效果展示**（图文 + 视频演示）：[《5 分钟创建一个真正好用的飞书助理》](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)
 - ❓ **常见问题 / 排错**：[FAQ](https://deepcoldy.github.io/botmux/faq) · [常见踩坑](https://deepcoldy.github.io/botmux/pitfalls)
-- 💬 **交流群**：见 [效果展示文档](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg) 底部的内部 / 外部「Botmux 交流群」群卡片。
+- 💬 **交流群**：[关于 & 资源](https://deepcoldy.github.io/botmux/about) 页有内部 / 外部「Botmux 交流群」的扫码入群入口。
 - 🤝 **贡献**：欢迎 issue / PR。新增适配器见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 - 📄 **License**：[MIT](LICENSE)
 
