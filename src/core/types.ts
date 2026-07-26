@@ -212,6 +212,19 @@ export interface DaemonSession {
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the
    *  worker on each task. */
   riffAccessUrl?: string;
+  /** Explicit-close transaction: while present, no new Riff input may be
+   * admitted until cancellation commits or admission restoration is ACKed. */
+  riffCloseState?: {
+    phase: 'preparing' | 'prepared' | 'uncertain';
+    requestId: string;
+    taskId?: string;
+  };
+  /** Graceful-shutdown transaction for the exact Riff worker generation. */
+  riffShutdownState?: {
+    phase: 'preparing' | 'prepared';
+    requestId: string;
+    taskId?: string | null;
+  };
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
@@ -348,6 +361,14 @@ export interface DaemonSession {
     paneCols?: number;        // pane width at adopt time
     paneRows?: number;        // pane height at adopt time
   };
+}
+
+/** A non-null value means this Riff generation is deliberately rejecting new
+ * input until a close/shutdown commit or an ACKed admission restore. */
+export function riffRetirementAdmissionPhase(ds: DaemonSession): string | null {
+  if (ds.riffShutdownState) return `shutdown-${ds.riffShutdownState.phase}`;
+  if (ds.riffCloseState) return `close-${ds.riffCloseState.phase}`;
+  return null;
 }
 
 /** Composite key for activeSessions — allows multiple bots to have independent

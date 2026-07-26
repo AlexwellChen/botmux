@@ -73,6 +73,7 @@ import {
   terminalReleasesDurableTurn,
   type PendingCliInput,
 } from './utils/pending-input-queue.js';
+import { riffWorkerShutdownInputBlocker } from './core/riff-worker-shutdown-readiness.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
@@ -251,7 +252,13 @@ import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
 } from './platform/device-paths.js';
-import type { BackendType, SessionBackend, SessionProbe } from './adapters/backend/types.js';
+import type {
+  BackendType,
+  SessionBackend,
+  SessionDestroyResult,
+  SessionProbe,
+  SessionShutdownDetachResult,
+} from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { probeZmxVersion } from './setup/ensure-zmx.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
@@ -1234,6 +1241,13 @@ function backendScreenEvidenceIsAuthoritativeForMutation(): boolean {
  * generation. The daemon receives this over private IPC; child-writable PID
  * marker files remain diagnostics only. */
 let currentCliCredentialIsolated = false;
+/** Successful Riff close prepare awaiting durable daemon commit. */
+let preparedCloseRequestId: string | null = null;
+let closeRequestInFlightId: string | null = null;
+let lastAbortedCloseRequestId: string | null = null;
+/** Graceful daemon-shutdown detach stays alive until lineage commit. */
+let shutdownDetachRequestId: string | null = null;
+let shutdownDetachPhase: 'preparing' | 'prepared' | null = null;
 /** pty-under-zellij backend (BACKEND_TYPE=zellij). Behaves like the non-tmux
  *  pty path for the worker (renderer screenshots, relay web terminal) but owns
  *  a persistent zellij session that survives daemon restart. */
@@ -1691,6 +1705,8 @@ function rememberBoundedMap(map: Map<string, string>, key: string, value: string
 function shortCorrelationId(value: string | undefined): string {
   return value?.slice(0, 12) ?? '-';
 }
+/** Async init must materialize its opening input before shutdown may fence. */
+let initPromptMaterialized = false;
 /** Literal commands that arrived while native /rename owned the TUI or while
  * an owned CLI restart was fenced. Normal raw_input commands are still
  * delivered immediately (including while busy). */
@@ -12069,6 +12085,7 @@ process.on('message', async (raw: unknown) => {
         // follow-ups that arrived while init was awaiting slow startup work.
         initialInputOwnershipPending = false;
         if (initialInputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
+        initPromptMaterialized = true;
 
         // A backend may become prompt-ready before spawnCli() returns. The
         // initial prompt is queued only afterwards, so the earlier
@@ -12491,6 +12508,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'restart': {
+      if (effectiveBackendType === 'riff') {
+        log('Refused Riff generation restart; the existing lineage-owning worker is retained');
+        break;
+      }
       // 角色切换的 cwd-move respawn：respawn 用 {...lastInitConfig, resume:true}，
       // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
       // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
@@ -12869,20 +12890,76 @@ process.on('message', async (raw: unknown) => {
 
     case 'close': {
       log('Close requested');
+      // destroySession kills tmux session permanently; kill() only detaches.
+      // riff 的 destroySession 是异步远端取消——必须有界 await：紧跟着的
+      // process.exit 会掐断未发出的 fetch，让已关闭话题的远端 agent 继续跑。
+      if (effectiveBackendType === 'riff') {
+        if (!msg.requestId) {
+          log('Refused unsafe request-less Riff close; explicit close requires prepare/commit');
+          break;
+        }
+
+        let result: SessionDestroyResult;
+        let attemptedPrepare = false;
+        if (shutdownDetachRequestId) {
+          result = {
+            ok: false,
+            error: `shutdown detach already ${shutdownDetachPhase ?? 'active'} as ${shutdownDetachRequestId}`,
+          };
+        } else if (preparedCloseRequestId) {
+          result = {
+            ok: false,
+            error: `close already prepared as ${preparedCloseRequestId}`,
+          };
+        } else if (closeRequestInFlightId) {
+          result = {
+            ok: false,
+            error: `close prepare already in flight as ${closeRequestInFlightId}`,
+          };
+        } else {
+          attemptedPrepare = true;
+          lastAbortedCloseRequestId = null;
+          closeRequestInFlightId = msg.requestId;
+          try {
+            const raw = await backend?.destroySession?.();
+            result = raw && typeof raw === 'object' && 'ok' in raw
+              ? raw as SessionDestroyResult
+              : { ok: true };
+          } catch (err) {
+            result = { ok: false, error: err instanceof Error ? err.message : String(err) };
+          }
+        }
+        if (result.ok) {
+          preparedCloseRequestId = msg.requestId;
+        } else if (attemptedPrepare) {
+          await backend?.abortDestroySession?.();
+          lastAbortedCloseRequestId = msg.requestId;
+        }
+        if (closeRequestInFlightId === msg.requestId) closeRequestInFlightId = null;
+        send({
+          type: 'close_result',
+          requestId: msg.requestId,
+          ok: result.ok,
+          ...(result.taskId ? { taskId: result.taskId } : {}),
+          ...(result.error ? { error: result.error } : {}),
+        });
+        if (!result.ok) {
+          log(`Riff close prepare failed (${result.error ?? 'cancel failed'}); session stays active for retry`);
+        }
+        break;
+      }
+
       closeRequested = true;
       send({ type: 'session_close_ready', sessionId });
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
-      // destroySession kills tmux session permanently; kill() only detaches.
-      // riff 的 destroySession 是异步远端取消——必须有界 await：紧跟着的
-      // process.exit 会掐断未发出的 fetch，让已关闭话题的远端 agent 继续跑。
+      // Local close: destroySession kills persistent owned sessions. Riff has
+      // already been handled above and cannot enter this request-less path.
       const closeTeardown = backend?.destroySession?.();
       if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
-        try {
-          // 预算层级见 RiffBackend.destroySession（总 deadline 20s）——这里 22s 只作兜底。
-          await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]);
-        } catch { /* logged inside destroySession */ }
+        try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
+        catch { /* logged by backend */ }
       }
       killCli();
       // Bridge marker file outlives a single CLI process (we keep it across
@@ -12916,7 +12993,188 @@ process.on('message', async (raw: unknown) => {
       process.exit(0);
     }
 
+    case 'riff_shutdown_prepare': {
+      if (effectiveBackendType !== 'riff') {
+        send({
+          type: 'riff_shutdown_result',
+          requestId: msg.requestId,
+          phase: 'prepare',
+          ok: false,
+          taskId: null,
+          error: 'not_riff_backend',
+        });
+        break;
+      }
+      let result: SessionShutdownDetachResult;
+      const inputBlocker = riffWorkerShutdownInputBlocker({
+        initPromptMaterialized,
+        isFlushing,
+        pendingMessages: pendingMessages.length,
+        pendingRawInputs: pendingRawInputs.length,
+        pendingSessionRename: pendingSessionRename !== null,
+        sessionRenameInFlight,
+        commandLineWritesPending,
+      });
+      if (preparedCloseRequestId || closeRequestInFlightId) {
+        result = { ok: false, taskId: null, error: 'explicit_close_in_progress' };
+      } else if (shutdownDetachRequestId) {
+        result = {
+          ok: false,
+          taskId: null,
+          error: `shutdown detach already ${shutdownDetachPhase ?? 'active'} as ${shutdownDetachRequestId}`,
+        };
+      } else if (inputBlocker) {
+        result = {
+          ok: false,
+          taskId: null,
+          error: `worker_inputs_not_drained:${inputBlocker}`,
+        };
+      } else {
+        shutdownDetachRequestId = msg.requestId;
+        shutdownDetachPhase = 'preparing';
+        try {
+          result = await backend?.prepareShutdownDetach?.()
+            ?? { ok: false, taskId: null, error: 'shutdown_detach_unsupported' };
+        } catch (err) {
+          result = {
+            ok: false,
+            taskId: null,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+        if (shutdownDetachRequestId === msg.requestId && result.ok) {
+          shutdownDetachPhase = 'prepared';
+        }
+      }
+      send({
+        type: 'riff_shutdown_result',
+        requestId: msg.requestId,
+        phase: 'prepare',
+        ok: result.ok,
+        taskId: result.taskId,
+        ...(result.error ? { error: result.error } : {}),
+      });
+      break;
+    }
+
+    case 'riff_shutdown_commit': {
+      if (effectiveBackendType !== 'riff'
+          || shutdownDetachRequestId !== msg.requestId
+          || shutdownDetachPhase !== 'prepared') {
+        log(`Ignoring stale Riff shutdown commit ${msg.requestId}`);
+        break;
+      }
+      log(`Riff shutdown detach committed (${msg.requestId})`);
+      shutdownDetachRequestId = null;
+      shutdownDetachPhase = null;
+      backend?.commitShutdownDetach?.();
+      intentionalRestartBackend = backend;
+      stopScreenshotLoop();
+      killCli();
+      cleanup();
+      process.exit(0);
+    }
+
+    case 'riff_shutdown_abort': {
+      if (shutdownDetachRequestId !== msg.requestId) {
+        log(`Ignoring stale Riff shutdown abort ${msg.requestId}`);
+        send({
+          type: 'riff_shutdown_result',
+          requestId: msg.requestId,
+          phase: 'abort',
+          ok: false,
+          taskId: null,
+          error: 'shutdown_detach_not_active',
+        });
+        break;
+      }
+      log(`Riff shutdown detach aborted (${msg.requestId})`);
+      let result: SessionShutdownDetachResult;
+      try {
+        result = await backend?.abortShutdownDetach?.()
+          ?? { ok: false, taskId: null, error: 'shutdown_abort_unsupported' };
+      } catch (err) {
+        result = {
+          ok: false,
+          taskId: null,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+      if (result.ok && shutdownDetachRequestId === msg.requestId) {
+        shutdownDetachRequestId = null;
+        shutdownDetachPhase = null;
+      }
+      send({
+        type: 'riff_shutdown_result',
+        requestId: msg.requestId,
+        phase: 'abort',
+        ok: result.ok,
+        taskId: result.taskId,
+        ...(result.error ? { error: result.error } : {}),
+      });
+      break;
+    }
+
+    case 'close_commit': {
+      if (!preparedCloseRequestId || preparedCloseRequestId !== msg.requestId) {
+        log(`Ignoring stale close_commit ${msg.requestId}`);
+        break;
+      }
+      log(`Close committed (${msg.requestId})`);
+      preparedCloseRequestId = null;
+      closeRequestInFlightId = null;
+      lastAbortedCloseRequestId = null;
+      backend?.commitDestroySession?.();
+      closeRequested = true;
+      send({ type: 'session_close_ready', sessionId });
+      stopScreenshotLoop();
+      stopBridgeWatcher();
+      stopCodexBridge();
+      killCli();
+      clearSendMarkers();
+      cleanup();
+      process.exit(0);
+    }
+
+    case 'close_abort': {
+      const alreadyRestored = lastAbortedCloseRequestId === msg.requestId;
+      if (!alreadyRestored
+          && preparedCloseRequestId !== msg.requestId
+          && closeRequestInFlightId !== msg.requestId) {
+        log(`Ignoring stale close_abort ${msg.requestId}`);
+        send({
+          type: 'close_abort_result',
+          requestId: msg.requestId,
+          ok: false,
+          error: 'close_abort_not_active',
+        });
+        break;
+      }
+      log(`Close aborted (${msg.requestId}); Riff admission restored`);
+      let abortError: string | null = null;
+      if (!alreadyRestored) {
+        try { await backend?.abortDestroySession?.(); }
+        catch (err) { abortError = err instanceof Error ? err.message : String(err); }
+      }
+      if (!abortError) {
+        preparedCloseRequestId = null;
+        closeRequestInFlightId = null;
+        lastAbortedCloseRequestId = null;
+      }
+      send({
+        type: 'close_abort_result',
+        requestId: msg.requestId,
+        ok: abortError === null,
+        ...(abortError ? { error: abortError } : {}),
+      });
+      break;
+    }
+
     case 'suspend': {
+      if (effectiveBackendType === 'riff') {
+        log('Refused unsafe Riff suspend; explicit close requires prepare/commit');
+        break;
+      }
       log('Suspend requested');
       stopScreenshotLoop();
       stopBridgeWatcher();
@@ -12935,10 +13193,7 @@ process.on('message', async (raw: unknown) => {
       // uses to recover sessions after a reboot kills the tmux server).
       revokeManagedTurnOriginForRestart();
       try {
-        // riff：suspend 语义是「休眠待续」——绝不能 cancel 远端任务（血缘已持久化，
-        // 恢复时 follow-up 续上）；只断流 detach。
-        if (effectiveBackendType === 'riff') backend?.kill();
-        else (backend?.destroySession ?? backend?.kill)?.call(backend);
+        (backend?.destroySession ?? backend?.kill)?.call(backend);
       } catch { /* best-effort */ }
       backend = null;
       isPromptReady = false;
