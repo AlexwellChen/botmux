@@ -1,5 +1,5 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname } from 'node:path';
@@ -15,9 +15,10 @@ import {
   isVcMeetingAgentGloballyEnabled,
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
-import { repoPickerScanOptions } from './global-config.js';
+import { readGlobalConfig, repoPickerScanOptions } from './global-config.js';
 import { buildDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
@@ -28,10 +29,12 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { addReaction, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
+  loadBotConfigAtIndex,
   loadBotConfigs,
+  isManagedActivationStartingAtIndex,
   registerBot,
   getBot,
   getAllBots,
@@ -49,6 +52,7 @@ import {
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
+import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -104,7 +108,12 @@ import {
   getDaemonBootId,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
-import { ipcRoute, isTrustedHostIpcRequest, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
+import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
+import {
+  cancelSessionReadyAck,
+  waitForSessionReadyAck,
+} from './core/session-ready-handshake.js';
 import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
 import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
@@ -144,6 +153,10 @@ import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './co
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
+import {
+  buildBotmuxLarkNativeSessionTitle,
+  extractBotmuxLarkNativeSessionTitlePrompt,
+} from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -152,12 +165,15 @@ import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   getSessionPersistentBackendType,
+  killPersistentBackendTarget,
   killPersistentSession,
-  persistentSessionName,
+  probePersistentBackendTarget,
   probePersistentSession,
+  resolvePersistentBackendTarget,
   resolvePairedSpawnBackendType,
   type PersistentBackendType,
 } from './core/persistent-backend.js';
+import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
 import {
@@ -233,6 +249,23 @@ import {
 } from './workflows/v3/daemon-ipc-body.js';
 import type { WorkflowDaemonMutation } from './workflows/v3/daemon-ipc-client.js';
 import type { SavedWorkflowActorContext } from './workflows/v3/library-service.js';
+import { resolveEffectivePluginIds } from './core/plugins/effective.js';
+import {
+  buildCodexCompletionCard,
+  buildCodexNotifierResultCard,
+  CODEX_NOTIFIER_PLUGIN_ID,
+  CodexNotifierEventStore,
+  CodexNotifierEventValidationError,
+  codexNotifierMessageUuid,
+  createCodexNotifierCardActionHandler,
+  materializeCodexNotifierOutboxEvent,
+  openCodexAppThread,
+  parseCodexNotifierEvent,
+  parseCodexNotifierPluginEvent,
+  parseCodexNotifierOutboxItem,
+  startCodexNotifierAdoptionSession,
+  type CodexTaskCompletedEvent,
+} from './features/codex-notifier/index.js';
 
 /** This daemon process's bot larkAppId (set in startDaemon).  Used to scope v3
  *  humanGate cold-attach + start to runs this bot owns (codex blocker #1). */
@@ -242,7 +275,7 @@ let selfV3BootInstanceId: string | undefined;
  *  VC listener switch, every agent daemon may receive a fenced membership. */
 let selfDaemonLarkAppId: string | undefined;
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
@@ -537,7 +570,8 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
     }
   }
   const liveBackend = ds ? getSessionPersistentBackendType(ds) : undefined;
-  const persistedBackend = liveBackend ?? sessionStore.getSession(sessionId)?.backendType;
+  const persistedSession = ds?.session ?? sessionStore.getSession(sessionId);
+  const persistedBackend = liveBackend ?? persistedSession?.backendType;
   if (persistedBackend === 'pty') return true;
   const backendTypes: readonly PersistentBackendType[] =
     persistedBackend === 'tmux' || persistedBackend === 'herdr' || persistedBackend === 'zellij'
@@ -545,9 +579,14 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
       : VC_MEETING_PERSISTENT_BACKENDS.filter(vcMeetingPersistentBackendAvailable);
   let allMissing = true;
   for (const backendType of backendTypes) {
-    const name = persistentSessionName(backendType, sessionId);
+    const target = resolvePersistentBackendTarget(
+      backendType,
+      sessionId,
+      persistedSession?.persistentBackendTarget,
+    );
+    const name = target.sessionName;
     if (destroy) {
-      try { killPersistentSession(backendType, name); }
+      try { killPersistentBackendTarget(target); }
       catch (err) {
         logger.warn(
           `[vc-delivery] boot recovery backing kill failed backend=${backendType} `
@@ -556,7 +595,7 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
       }
     }
     let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
-    try { probe = probePersistentSession(backendType, name); }
+    try { probe = probePersistentBackendTarget(target); }
     catch { probe = 'unknown'; }
     if (probe !== 'missing') {
       allMissing = false;
@@ -706,9 +745,10 @@ type VcMeetingRuntimeLeaseRecoveryDeps = {
   killWorker: (ds: DaemonSession) => void;
   resolvePersistentScope: (ds: DaemonSession) => VcMeetingRuntimePersistentScope;
   resolveMissingPersistentScope: (sessionId: string) => VcMeetingRuntimePersistentScope;
+  resolvePersistentTarget?: (sessionId: string, ds?: DaemonSession) => PersistentBackendTarget | undefined;
   backendAvailable: (backendType: PersistentBackendType) => boolean;
-  killPersistent: (backendType: PersistentBackendType, sessionName: string) => void;
-  probePersistent: (backendType: PersistentBackendType, sessionName: string) => 'exists' | 'missing' | 'unknown';
+  killPersistent: (backendType: PersistentBackendType, sessionName: string, target?: PersistentBackendTarget) => void;
+  probePersistent: (backendType: PersistentBackendType, sessionName: string, target?: PersistentBackendTarget) => 'exists' | 'missing' | 'unknown';
   warn: (message: string) => void;
   error: (message: string) => void;
 };
@@ -783,9 +823,15 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
         ? VC_MEETING_PERSISTENT_BACKENDS.filter(deps.backendAvailable)
         : [persistentScope];
     let allMissing = true;
+    const persistedTarget = deps.resolvePersistentTarget?.(fence.receiverSessionId, ds);
     for (const backendType of backendTypes) {
-      const name = persistentSessionName(backendType, fence.receiverSessionId);
-      try { deps.killPersistent(backendType, name); }
+      const target = resolvePersistentBackendTarget(
+        backendType,
+        fence.receiverSessionId,
+        persistedTarget,
+      );
+      const name = target.sessionName;
+      try { deps.killPersistent(backendType, name, target); }
       catch (err) {
         deps.warn(
           `[vc-delivery] runtime lease backing kill failed backend=${backendType} `
@@ -793,7 +839,7 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
         );
       }
       let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
-      try { probe = deps.probePersistent(backendType, name); }
+      try { probe = deps.probePersistent(backendType, name, target); }
       catch { probe = 'unknown'; }
       if (probe !== 'missing') {
         allMissing = false;
@@ -980,10 +1026,16 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       return false;
     }
     let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
+    const target = resolvePersistentBackendTarget(
+      persistentScope,
+      fence.receiverSessionId,
+      ds.session.persistentBackendTarget,
+    );
     try {
       probe = deps.probePersistent(
         persistentScope,
-        persistentSessionName(persistentScope, fence.receiverSessionId),
+        target.sessionName,
+        target,
       );
     } catch { probe = 'unknown'; }
     if (probe === 'missing') {
@@ -1052,9 +1104,17 @@ const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
     }
     return backendType === 'pty' ? 'none' : 'unknown';
   },
+  resolvePersistentTarget(sessionId, ds) {
+    return ds?.session.persistentBackendTarget
+      ?? sessionStore.getSession(sessionId)?.persistentBackendTarget;
+  },
   backendAvailable: vcMeetingPersistentBackendAvailable,
-  killPersistent: killPersistentSession,
-  probePersistent: probePersistentSession,
+  killPersistent: (backendType, sessionName, target) => target
+    ? killPersistentBackendTarget(target)
+    : killPersistentSession(backendType, sessionName),
+  probePersistent: (backendType, sessionName, target) => target
+    ? probePersistentBackendTarget(target)
+    : probePersistentSession(backendType, sessionName),
   warn: message => logger.warn(message),
   error: message => logger.error(message),
 });
@@ -2314,6 +2374,39 @@ function setDirectChatDisplayNameFromSender(
   if (chatType !== 'p2p' || sender?.type !== 'user') return;
   const name = String(sender.name ?? '').trim();
   if (name) session.chatDisplayName = name;
+}
+
+const NATIVE_TITLE_CHAT_NAME_TIMEOUT_MS = 800;
+
+/** 首条只有机器人 mention 时，尽力取群名作为原生会话标题兜底。 */
+async function resolveGroupChatNameForNativeTitle(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p' | undefined,
+  cliId: string,
+  rawContent: unknown,
+  mentions?: readonly { name: string }[],
+): Promise<string | undefined> {
+  if (
+    chatType !== 'group'
+    || cliId !== 'codex'
+    || extractBotmuxLarkNativeSessionTitlePrompt(rawContent, mentions)
+  ) {
+    return undefined;
+  }
+
+  let timer: number | undefined;
+  const timeout = new Promise<undefined>(resolve => {
+    timer = setTimeout(resolve, NATIVE_TITLE_CHAT_NAME_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([
+      getChatNameAndMode(larkAppId, chatId).then(info => info.name ?? undefined),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 // Cache last /repo scan results per chat for /repo <number> fallback.
 // Bounded: this is a transient picker cache keyed by chatId (unbounded over a
@@ -3615,11 +3708,261 @@ const v3GateRunner = createV3GateRunner({
 // key = larkAppId，在 startLarkEventDispatcher 调用时写入。
 const botHandlers = new Map<string, EventHandlers>();
 
+const codexNotifierStores = new Map<string, CodexNotifierEventStore>();
+const codexNotifierDeliveries = new Map<string, Promise<{ status: 'accepted'; messageId: string }>>();
+const CODEX_NOTIFIER_INGRESS_MAX_BYTES = 128 * 1024;
+const CODEX_NOTIFIER_DELIVERY_TIMEOUT_MS = 10_000;
+const CODEX_NOTIFIER_ADOPTION_TIMEOUT_MS = 2_200;
+const CODEX_NOTIFIER_MESSAGE_LOOKUP_TIMEOUT_MS = 1_200;
+
+function remainingCodexNotifierDeadline(deadlineAt: number, capMs: number): number {
+  return Math.max(1, Math.min(capMs, deadlineAt - Date.now()));
+}
+
+function codexNotifierStore(larkAppId: string): CodexNotifierEventStore {
+  const existing = codexNotifierStores.get(larkAppId);
+  if (existing) return existing;
+  const suffix = createHash('sha256').update(larkAppId).digest('hex').slice(0, 16);
+  const store = new CodexNotifierEventStore(
+    join(config.session.dataDir, 'plugin-events', `codex-notifier-${suffix}.json`),
+  );
+  codexNotifierStores.set(larkAppId, store);
+  return store;
+}
+
+function codexNotifierIngressEnabled(larkAppId: string, legacyPlugin = false): boolean {
+  const global = readGlobalConfig();
+  if (global.codexNotifier !== undefined || !legacyPlugin) {
+    return global.codexNotifier?.enabled === true;
+  }
+  try {
+    return resolveEffectivePluginIds(getBot(larkAppId).config, global)
+      .includes(CODEX_NOTIFIER_PLUGIN_ID);
+  } catch {
+    return false;
+  }
+}
+
+/** 用 Codex 原生线程名补全通知标题；失败时保留插件事件里的安全兜底信息。 */
+async function enrichCodexNotifierEvent(
+  larkAppId: string,
+  event: CodexTaskCompletedEvent,
+): Promise<CodexTaskCompletedEvent> {
+  if (event.title) return event;
+  try {
+    const { readCodexAppThreadMetadata } = await import('./services/codex-app-threads.js');
+    const metadata = await readCodexAppThreadMetadata({
+      threadId: event.threadId,
+      codexBin: getBot(larkAppId).config.cliPathOverride,
+      cwd: event.cwd,
+      timeoutMs: 3_000,
+    });
+    const title = metadata.name?.trim();
+    return title ? { ...event, title: Array.from(title).slice(0, 300).join('') } : event;
+  } catch (error) {
+    logger.warn(`[codex-notifier] thread title lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+    return event;
+  }
+}
+
+async function deliverCodexNotifierEvent(
+  larkAppId: string,
+  event: CodexTaskCompletedEvent,
+): Promise<{ status: 'accepted' | 'duplicate'; messageId: string }> {
+  const store = codexNotifierStore(larkAppId);
+  const enrichedEvent = store.get(event.eventId) ? event : await enrichCodexNotifierEvent(larkAppId, event);
+  const recorded = store.record(enrichedEvent);
+  const deliveryEvent = recorded.record.event;
+  if (!recorded.inserted) {
+    if (
+      deliveryEvent.type !== event.type
+      || deliveryEvent.source !== event.source
+      || deliveryEvent.threadId !== event.threadId
+      || deliveryEvent.nativeTurnId !== event.nativeTurnId
+      || deliveryEvent.status !== event.status
+    ) {
+      throw new Error('codex_notifier_event_id_conflict');
+    }
+    if (recorded.record.delivery.status === 'delivered' && recorded.record.delivery.messageId) {
+      return { status: 'duplicate', messageId: recorded.record.delivery.messageId };
+    }
+  }
+
+  const deliveryKey = `${larkAppId}:${event.eventId}`;
+  const current = codexNotifierDeliveries.get(deliveryKey);
+  if (current) return current;
+
+  const delivery = (async (): Promise<{ status: 'accepted'; messageId: string }> => {
+    const ownerOpenId = getOwnerOpenId(larkAppId) ?? resolvePrimaryOwnerOpenId(larkAppId);
+    if (!ownerOpenId) throw new Error('codex_notifier_owner_unavailable');
+    store.updateDelivery(event.eventId, { status: 'pending' });
+    try {
+      const messageId = await runWithAbortDeadline(
+        'codex_notifier_delivery',
+        CODEX_NOTIFIER_DELIVERY_TIMEOUT_MS,
+        signal => sendUserMessage(
+          larkAppId,
+          ownerOpenId,
+          buildCodexCompletionCard(deliveryEvent),
+          'interactive',
+          codexNotifierMessageUuid(event.eventId),
+          {
+            timeoutMs: CODEX_NOTIFIER_DELIVERY_TIMEOUT_MS,
+            signal,
+          },
+        ),
+      );
+      store.updateDelivery(event.eventId, { status: 'delivered', messageId, incrementAttempts: false });
+      return { status: 'accepted', messageId };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      store.updateDelivery(event.eventId, {
+        status: 'failed',
+        lastError: detail,
+        incrementAttempts: false,
+      });
+      throw error;
+    }
+  })();
+  codexNotifierDeliveries.set(deliveryKey, delivery);
+  try {
+    return await delivery;
+  } finally {
+    codexNotifierDeliveries.delete(deliveryKey);
+  }
+}
+
+async function adoptCodexNotifierEvent(
+  larkAppId: string,
+  event: CodexTaskCompletedEvent,
+  cardMessageId: string,
+  ownerOpenId: string,
+  signal: AbortSignal,
+  deadlineAt: number,
+): Promise<Record<string, unknown>> {
+  signal.throwIfAborted();
+  const chatId = await getMessageChatId(larkAppId, cardMessageId, {
+    timeoutMs: remainingCodexNotifierDeadline(
+      deadlineAt,
+      CODEX_NOTIFIER_MESSAGE_LOOKUP_TIMEOUT_MS,
+    ),
+    signal,
+  });
+  if (!chatId) throw new Error('无法定位完成通知所在的飞书私聊');
+  signal.throwIfAborted();
+
+  const botCfg = getBot(larkAppId).config;
+  const scope: 'thread' | 'chat' = botCfg.p2pMode === 'chat' ? 'chat' : 'thread';
+  const anchor = scope === 'chat' ? chatId : cardMessageId;
+  const activeKey = sessionKey(anchor, larkAppId);
+  let ds = activeSessions.get(activeKey);
+
+  if (!ds) {
+    const fallbackTitle = event.cwd.split(/[\\/]/).filter(Boolean).pop() ?? 'Codex App';
+    const title = (event.title || `Codex App: ${fallbackTitle}`).slice(0, 50);
+    const session = sessionStore.createSession(chatId, cardMessageId, title, 'p2p');
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.scope = scope;
+    session.ownerOpenId = ownerOpenId;
+    session.lastCallerOpenId = ownerOpenId;
+    session.lastMessageAt = new Date(now).toISOString();
+    session.workingDir = event.cwd;
+    session.cliId = 'codex-app';
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+    ds = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType: 'p2p',
+      scope,
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: event.cwd,
+      ownerOpenId,
+    };
+    activeSessions.set(activeKey, ds);
+  }
+
+  if (ds.session.cliSessionId !== event.threadId || !ds.worker || ds.worker.killed) {
+    // 接管原生 Codex App 线程时固定为纯 codex-app 启动，不能继承通知 Bot 的
+    // wrapper/model；这些配置针对普通 CLI，会错误包装 app-server runner。
+    ds.session.cliId = 'codex-app';
+    ds.session.cliPathOverride = botCfg.cliPathOverride;
+    delete ds.session.wrapperCli;
+    delete ds.session.model;
+    ds.session.agentFrozen = true;
+    sessionStore.updateSession(ds.session);
+    ds.pendingRepo = false;
+    ds.pendingPrompt = undefined;
+    ds.pendingTurnId = undefined;
+    ds.pendingCodexAppText = undefined;
+    ds.pendingCodexAppApplicationContext = undefined;
+    ds.pendingCodexAppMessageContext = undefined;
+
+    // 完成事件已经携带恢复所需的原生 threadId/cwd。按钮回调不再额外启动一次
+    // app-server 做非必要的元数据刷新，避免子进程把飞书回调拖过截止时间。
+    const target = {
+      threadId: event.threadId,
+      name: event.title,
+      preview: event.finalPreview ?? '',
+      cwd: event.cwd,
+      status: event.status,
+    };
+
+    const { startCodexAppThreadSession } = await import('./core/command-handler.js');
+    signal.throwIfAborted();
+    await startCodexNotifierAdoptionSession(
+      startCodexAppThreadSession,
+      target,
+      ds,
+      {
+        activeSessions,
+        sessionReply,
+        getActiveCount,
+        lastRepoScan,
+      },
+      larkAppId,
+      cardMessageId,
+    );
+  }
+
+  return buildCodexNotifierResultCard(
+    '已接管 Codex App 任务',
+    scope === 'chat'
+      ? '现在可以直接在当前私聊继续发送指令；需要操作终端时，请点击会话卡内的「获取操作链接」。'
+      : '请在本卡片的话题中继续发送指令；需要操作终端时，请点击话题会话卡内的「获取操作链接」。',
+    'green',
+  );
+}
+
+const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
+  getExpectedOwnerOpenId: larkAppId =>
+    getOwnerOpenId(larkAppId) ?? resolvePrimaryOwnerOpenId(larkAppId),
+  getEventRecord: (larkAppId, eventId) => codexNotifierStore(larkAppId).get(eventId),
+  readConfig: () => readGlobalConfig().codexNotifier,
+  openAppThread: openCodexAppThread,
+  adoptEvent: adoptCodexNotifierEvent,
+  runWithAbortDeadline,
+  isAbortDeadlineError: error => error instanceof AbortDeadlineError,
+  adoptionTimeoutMs: CODEX_NOTIFIER_ADOPTION_TIMEOUT_MS,
+  logInfo: message => logger.info(message),
+  logWarn: message => logger.warn(message),
+  logError: message => logger.error(message),
+});
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
+  codexNotifierCardAction: (data, appId) => handleCodexNotifierCardAction(data, appId),
   v3GateDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     // 审批权限：复用 canOperate（话题 owner / allowedUsers / oncall）。无 binding（corrupt /
@@ -4275,14 +4618,122 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
     }
   }
   if (ds?.worker) {
+    const requestId = randomUUID();
+    const ack = waitForSessionReadyAck(requestId, 2_000);
     try {
-      ds.worker.send({ type: 'session_ready', source } as DaemonToWorker);
+      ds.worker.send({ type: 'session_ready', source, requestId } as DaemonToWorker);
       logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
     } catch (err) {
+      cancelSessionReadyAck(requestId);
       logger.warn(`session-ready forward failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const acknowledged = await ack;
+    if (!acknowledged) {
+      logger.warn(`[${sessionId.slice(0, 8)}] session-ready worker ACK timed out; allowing hook to continue`);
     }
   }
   return jsonRes(res, 200, { ok: true });
+});
+
+async function respondCodexNotifierIngress(
+  res: import('node:http').ServerResponse,
+  larkAppId: string,
+  rawEvent: unknown,
+  pluginId?: string,
+): Promise<void> {
+  if (!codexNotifierIngressEnabled(larkAppId, pluginId === CODEX_NOTIFIER_PLUGIN_ID)) {
+    return jsonRes(res, 403, { ok: false, error: 'codex_notifier_disabled' });
+  }
+  let event: CodexTaskCompletedEvent;
+  try {
+    event = pluginId === undefined
+      ? parseCodexNotifierEvent(rawEvent)
+      : parseCodexNotifierPluginEvent(pluginId, rawEvent);
+  } catch (error) {
+    const code = error instanceof CodexNotifierEventValidationError
+      ? error.code
+      : 'invalid_event';
+    return jsonRes(res, 400, { ok: false, error: code });
+  }
+
+  try {
+    const result = await deliverCodexNotifierEvent(larkAppId, event);
+    return jsonRes(res, 200, { ok: true, status: result.status, messageId: result.messageId });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (detail === 'codex_notifier_event_id_conflict') {
+      return jsonRes(res, 409, { ok: false, error: 'event_id_conflict' });
+    }
+    logger.warn(`[codex-notifier] delivery failed event=${event.eventId.slice(0, 12)}: ${detail}`);
+    return jsonRes(res, 502, { ok: false, error: 'delivery_failed' });
+  }
+}
+
+// ─── 内建 Codex 完成事件入口 ────────────────────────────────────────────────
+// Dashboard 单例 worker 持有可靠 outbox，通过 host HMAC 投递到入队时选定的 Bot。
+ipcRoute('POST', '/api/codex-notifier/events', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  const larkAppId = selfDaemonLarkAppId;
+  if (!larkAppId) {
+    return jsonRes(res, 503, { ok: false, error: 'daemon_not_ready' });
+  }
+
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, CODEX_NOTIFIER_INGRESS_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'payload_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  let item;
+  try {
+    item = parseCodexNotifierOutboxItem(raw);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_outbox_item' });
+  }
+  if (item.targetBotAppId !== larkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'target_bot_mismatch' });
+  }
+  return respondCodexNotifierIngress(res, larkAppId, materializeCodexNotifierOutboxEvent(item));
+});
+
+// 旧独立插件的兼容入口保留一个迁移周期，只负责排空已经落盘的历史 outbox。
+ipcRoute('POST', '/api/plugin-events', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  const larkAppId = selfDaemonLarkAppId;
+  if (!larkAppId) {
+    return jsonRes(res, 503, { ok: false, error: 'daemon_not_ready' });
+  }
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, CODEX_NOTIFIER_INGRESS_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'payload_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!hasExactSafeJsonKeys(raw, ['pluginId', 'targetBotAppId', 'event'])) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_body' });
+  }
+  const {
+    pluginId,
+    targetBotAppId,
+    event: rawEvent,
+  } = raw;
+  if (pluginId !== CODEX_NOTIFIER_PLUGIN_ID) {
+    return jsonRes(res, 400, { ok: false, error: 'unsupported_plugin' });
+  }
+  if (targetBotAppId !== larkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'target_bot_mismatch' });
+  }
+  return respondCodexNotifierIngress(res, larkAppId, rawEvent, pluginId);
 });
 
 // ─── hooks emit 转发端点 ────────────────────────────────────────────────────
@@ -14479,7 +14930,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // chat-granted users (who only pass canTalk) management commands like
       // /cd /restart /oncall bind. Previously this gate only fired in oncall chats,
       // which left a hole once per-chat grants flow through canTalk.
-      if (!canOperate(larkAppId, chatId, senderOpenId, teamTrustUnionId)) {
+      // canRunDaemonCommand = canOperate ∪（cmd ∈ canTalkDaemonCommands && canTalk）：
+      // bot 可通过名单把选定命令（如 /status）降到 canTalk；未配置时与 canOperate 全等。
+      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType)) {
         await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -14595,6 +15048,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
   // short budget; subsequent calls hit the cache and are sync-fast.
+  const groupChatNamePromise = resolveGroupChatNameForNativeTitle(
+    larkAppId,
+    chatId,
+    chatType,
+    botCfg.cliId,
+    parsed.content,
+    parsed.mentions,
+  );
   const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType);
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
@@ -14620,6 +15081,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
+  const groupChatName = await groupChatNamePromise;
+  if (groupChatName) session.chatDisplayName = groupChatName;
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
   session.ownerUnionId = senderUnionId;
@@ -14633,6 +15096,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
+  session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+    parsed.content,
+    parsed.mentions,
+    groupChatName,
+  );
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
@@ -15285,7 +15753,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       }
       // canOperate gate for thread-reply daemon commands — required in every chat
       // (see spawn-path gate above). Denies chat-granted users management commands.
-      if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId)) {
+      // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
+      // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
+      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType)) {
         sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -15569,6 +16039,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const autoCreateChatId: string = ctxChatId ?? data?.message?.chat_id ?? '';
     const autoCreateChatType = ctxChatType ?? (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
     const botCfg = getBot(larkAppId).config;
+    const groupChatNamePromise = resolveGroupChatNameForNativeTitle(
+      larkAppId,
+      autoCreateChatId,
+      autoCreateChatType,
+      botCfg.cliId,
+      parsed.content,
+      parsed.mentions,
+    );
     logger.info(`No active session for ${scope}-scope ${anchor}, auto-creating new session...`);
     refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
     const senderOId = data.sender?.sender_id?.open_id;
@@ -15596,6 +16074,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
+    const groupChatName = await groupChatNamePromise;
+    if (groupChatName) session.chatDisplayName = groupChatName;
+    session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+      parsed.content,
+      parsed.mentions,
+      groupChatName,
+    );
     sessionStore.updateSession(session);
 
     // chat-scope only — see the handleNewTopic twin above (topic substitute
@@ -16237,6 +16722,25 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
   }
 }
 
+async function waitForManagedActivationCommit(index: number, appId: string): Promise<void> {
+  const activationAppId = process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID;
+  if (activationAppId === undefined) return;
+  if (activationAppId !== appId) {
+    throw new Error(`Managed activation App drifted at BOTMUX_BOT_INDEX=${index}`);
+  }
+  const activationJobId = process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID;
+  if (!activationJobId) {
+    throw new Error(`Managed activation receipt is missing at BOTMUX_BOT_INDEX=${index}`);
+  }
+  while (isManagedActivationStartingAtIndex(index, appId, activationJobId)) {
+    await new Promise<void>(resolve => setTimeout(resolve, 100));
+  }
+  const committed = loadBotConfigAtIndex(index);
+  if (committed.larkAppId !== appId) {
+    throw new Error(`Managed activation target drifted at BOTMUX_BOT_INDEX=${index}`);
+  }
+}
+
 export async function startDaemon(botIndex?: number): Promise<void> {
   // Repair a shared tmux server polluted by an older botmux immediately on
   // daemon startup. This must not depend on restoring/spawning a bmx-* session:
@@ -16254,27 +16758,37 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 不阻塞：首张截图可能仍是豆腐块，装完重启 daemon 即可正常。
   ensureCjkFontsInstalled();
 
+  // Auto-migrate legacy sandbox fields (readIsolation / sandboxHidePaths /
+  // sandboxReadonlyPaths / readDenyExtraPaths → sandbox + sandboxPaths) BEFORE
+  // loading, so the parsed configs below already carry the new model. Writes
+  // new fields, keeps old ones (downgrade = zero-op), backs up once. Idempotent.
+  await migrateSandboxConfigAtStartup();
+
   // Load the assigned bot (one daemon per bot)
   let botConfigs = loadBotConfigs();
   const idx = botIndex ?? 0;
-  if (idx < 0 || idx >= botConfigs.length) {
-    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} bot(s) configured`);
+  let cfg = botIndex === undefined
+    ? botConfigs[idx]
+    : loadBotConfigAtIndex(idx);
+  if (!cfg) {
+    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} active bot(s) configured`);
   }
-  let cfg = botConfigs[idx];
+  if (botIndex !== undefined) {
+    // During managed activation PM2 may report this process online before it
+    // is allowed to register a bot or receive traffic. The dashboard clears
+    // the exact startup marker only after it has re-read the PM2 receipt ACK.
+    await waitForManagedActivationCommit(idx, cfg.larkAppId);
+    botConfigs = loadBotConfigs();
+    cfg = loadBotConfigAtIndex(idx);
+  }
   // One-time, lock-protected catalog bootstrap. This runs only after the
   // complete bots.json has parsed successfully, and the helper re-reads the
   // latest file under its lock before deciding. Explicit [] and legacy agent
   // policy are durable opt-outs. Reload the selected config after a write so
   // this daemon exposes the seeded selection card immediately on the same boot.
-  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(cfg.larkAppId);
+  const selectedAppId = cfg.larkAppId;
+  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(selectedAppId);
   if (profileBootstrap.ok) {
-    const selectedAppId = cfg.larkAppId;
-    // Reload even when another concurrent daemon won the one-time write. Both
-    // processes may have loaded the old file before taking the config lock;
-    // the loser still needs the winner's catalog on this boot.
-    botConfigs = loadBotConfigs();
-    cfg = botConfigs.find(candidate => candidate.larkAppId === selectedAppId)
-      ?? botConfigs[idx];
     if (profileBootstrap.seeded) {
       logger.info(
         `[vc-agent] seeded default meeting minutes profile listener=${selectedAppId} `
@@ -16286,6 +16800,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       `[vc-agent] default consumer profile bootstrap skipped: ${profileBootstrap.reason}`
       + `${profileBootstrap.error ? ` (${profileBootstrap.error})` : ''}`,
     );
+  }
+  // A bootstrap failure is not authority to keep an earlier in-memory config.
+  // Every explicit PM2 daemon must prove its same raw slot and App identity
+  // immediately before registerBot, regardless of the bootstrap result.
+  if (botIndex !== undefined) {
+    cfg = reloadExactDaemonBotConfig(idx, selectedAppId, loadBotConfigAtIndex);
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
@@ -16564,6 +17084,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // SessionRow.botName.
   setBotName(cfg.displayName ?? cfg.larkAppId);
   setLarkAppId(cfg.larkAppId);
+  setDeviceIsolationDaemonIdentity({
+    larkAppId: cfg.larkAppId,
+    bootInstanceId: desc.bootInstanceId,
+  });
   selfV3LarkAppId = cfg.larkAppId; // scope v3 humanGate cold-attach / start to this bot
   selfV3BootInstanceId = desc.bootInstanceId;
 

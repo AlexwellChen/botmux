@@ -60,6 +60,8 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
+const mockResolveSiblingBot = vi.fn(async () => ({ ok: false, reason: 'default_no_sibling' } as
+  { ok: true; larkAppId: string; botName: string; senderOpenId: string } | { ok: false; reason: string }));
 const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
 const mockGetCachedChatMode = vi.fn(() => undefined as 'group' | 'topic' | 'p2p' | undefined);
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
@@ -77,6 +79,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
   getCachedChatMode: (...args: any[]) => mockGetCachedChatMode(...args),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
+  resolveSiblingBotBySenderOpenId: (...args: any[]) => mockResolveSiblingBot(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
   getMessageDetail: (...args: any[]) => mockGetMessageDetail(...args),
@@ -1435,6 +1438,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     __resetEventClaimsForTest();
     _resetGrantPending();
     mockReplyMessage.mockClear();
+    mockResolveSiblingBot.mockReset();
+    mockResolveSiblingBot.mockResolvedValue({ ok: false, reason: 'default_no_sibling' });
     mockGetOwnerOpenId.mockReset();
     mockGetOwnerOpenId.mockReturnValue(undefined);
     mockGetCachedChatMode.mockReset();
@@ -1620,6 +1625,189 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       expect.stringContaining(OTHER_BOT_OPEN_ID),
       'interactive',
     );
+  });
+
+  it('blocks an unknown bot in an owned native topic and sends an exact grant request card', async () => {
+    // Session ownership is conversational state, not authorization. A cold bot
+    // must not be able to enter a restricted daemon merely because the target
+    // already owns the native Lark topic it @mentions into. This is the path
+    // that previously skipped the outer gate, then got silently dropped by the
+    // daemon's second evaluateTalk check (so the owner never saw a grant card).
+    setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: true });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'root-cold-native-topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      chatId: 'chat-cold-native-topic',
+      rootId: 'root-cold-native-topic',
+      threadId: 'root-cold-native-topic',
+      messageId: 'msg-cold-native-topic',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.isSessionOwner).toHaveBeenCalledWith('root-cold-native-topic', MY_APP_ID);
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-cold-native-topic',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('routes a cold same-deployment sibling (cross-ref not yet learned) after live /members/bots self-heal, and backfills the cross-ref', async () => {
+    // Regression for ec146a49: a same-machine sibling's FIRST direct @ can
+    // arrive before the receiver has learned that sibling's receiver-scoped
+    // open_id (Lark open_id is per-app), so isKnownPeerBot is momentarily
+    // false and it raced into the "unknown external bot" grant-card branch.
+    // The live /members/bots resolver confirms it's a locally-configured
+    // sibling → route through, no grant card, and persist the mapping.
+    setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: true });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    // Cold cross-ref (bot-openids-*.json empty); bots-info.json knows the
+    // sibling name so the backfill write validates and persists.
+    mockReadFileSync.mockImplementation((path: any) =>
+      String(path).includes('bots-info.json')
+        ? JSON.stringify([{ larkAppId: 'app-sibling', botOpenId: null, botName: 'SiblingBot' }])
+        : '{}');
+    mockResolveSiblingBot.mockResolvedValue({
+      ok: true, larkAppId: 'app-sibling', botName: 'SiblingBot', senderOpenId: OTHER_BOT_OPEN_ID,
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'root-cold-sibling-topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      chatId: 'chat-cold-sibling-topic',
+      rootId: 'root-cold-sibling-topic',
+      threadId: 'root-cold-sibling-topic',
+      messageId: 'msg-cold-sibling-topic',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockResolveSiblingBot).toHaveBeenCalledWith(MY_APP_ID, 'chat-cold-sibling-topic', OTHER_BOT_OPEN_ID);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'root-cold-sibling-topic',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    // Cross-ref backfilled so subsequent @s skip the live roundtrip.
+    expect(mockWriteFileSync).toHaveBeenCalled();
+  });
+
+  it('still sends the grant card for a genuine external bot the live resolver rejects', async () => {
+    // Negative control: the resolver fails closed (no locally-configured
+    // sibling of that unique name / API error / name collision), so the
+    // /grant card path is preserved for real external bots.
+    setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: true });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockReadFileSync.mockReturnValue('{}');
+    mockResolveSiblingBot.mockResolvedValue({ ok: false, reason: 'no_sibling_with_name' });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'root-real-external-topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      chatId: 'chat-real-external-topic',
+      rootId: 'root-real-external-topic',
+      threadId: 'root-real-external-topic',
+      messageId: 'msg-real-external-topic',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockResolveSiblingBot).toHaveBeenCalledWith(MY_APP_ID, 'chat-real-external-topic', OTHER_BOT_OPEN_ID);
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-real-external-topic',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('does NOT consult the live resolver when the bot is already a known peer (no wasted API roundtrip)', async () => {
+    // Fast path: an already-learned sibling (cross-ref hit) routes straight
+    // through without the live /members/bots call.
+    setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: true });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    // Cross-ref already contains the sibling → isKnownPeerBot true.
+    mockReadFileSync.mockReturnValue(JSON.stringify({ SiblingBot: OTHER_BOT_OPEN_ID }));
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'root-known-peer-topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      chatId: 'chat-known-peer-topic',
+      rootId: 'root-known-peer-topic',
+      threadId: 'root-known-peer-topic',
+      messageId: 'msg-known-peer-topic',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockResolveSiblingBot).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'root-known-peer-topic',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('routes a chat-granted bot through an owned native topic', async () => {
+    // Positive control for the same native-topic + existing-session shape:
+    // an exact per-chat talk grant remains sufficient to continue the topic.
+    setupBotState({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { 'chat-granted-native-topic': [OTHER_BOT_OPEN_ID] },
+      autoGrantRequestCards: true,
+    });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'root-granted-native-topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      chatId: 'chat-granted-native-topic',
+      rootId: 'root-granted-native-topic',
+      threadId: 'root-granted-native-topic',
+      messageId: 'msg-granted-native-topic',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'root-granted-native-topic',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
   });
 
   it('keeps the unknown external bot @blocked path silent when auto grant cards are disabled', async () => {
@@ -5391,6 +5579,7 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     __resetAnchorQueues();
     __resetEventClaimsForTest();
     mockUpdateMessage.mockClear();
+    vi.mocked(logger.error).mockClear();
     setupBotState();
     handlers = makeHandlers();
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
@@ -5406,6 +5595,33 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     });
 
     expect(result).toEqual({ card: { type: 'raw', data: { type: 'updated-card' } } });
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('returns a valid empty ACK when a fast card handler has no payload', async () => {
+    handlers.handleCardAction.mockResolvedValue(undefined);
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'repo_switch', root_id: 'root-empty' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_empty_card' },
+    });
+
+    expect(result).toEqual({});
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('still returns a valid empty ACK when a card handler rejects', async () => {
+    handlers.handleCardAction.mockRejectedValue(new Error('handler boom'));
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'repo_switch', root_id: 'root-error' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_error_card' },
+    });
+
+    expect(result).toEqual({});
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('handler boom'));
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 

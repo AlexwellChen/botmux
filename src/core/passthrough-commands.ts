@@ -10,7 +10,7 @@
  * chat) rather than relayed to the CLI. Used both for routing and to reject
  * `customPassthroughCommands` entries that would shadow a daemon command.
  */
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -71,6 +71,24 @@ export function parseCustomPassthroughInput(raw: string): string[] {
     const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
     const norm = normalizePassthroughCommand(withSlash);
     if (norm) out.push(norm);
+  }
+  return [...new Set(out)];
+}
+
+/**
+ * Parse free-text input for `canTalkDaemonCommands` — the inverse filter of
+ * {@link parseCustomPassthroughInput}: after the same normalization (lowercase,
+ * auto `/`), keep ONLY entries that ARE daemon commands. The default stringList
+ * parser (parseCustomPassthroughInput) rejects every daemon command, so wiring
+ * it to this field would silently drop all valid input.
+ */
+export function parseCanTalkDaemonCommandsInput(raw: string): string[] {
+  const out: string[] = [];
+  for (const tok of String(raw ?? '').split(/[\s,]+/)) {
+    const trimmed = tok.trim().toLowerCase();
+    if (!trimmed) continue;
+    const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+    if (DAEMON_COMMANDS.has(withSlash)) out.push(withSlash);
   }
   return [...new Set(out)];
 }

@@ -45,6 +45,13 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     autoboundChatCount: j?.autoboundChatCount ?? 0,
     brandLabel: j?.brandLabel ?? null,
     sandbox: j?.sandbox === true,
+    sandboxPaths: (j?.sandboxPaths && typeof j.sandboxPaths === 'object' && !Array.isArray(j.sandboxPaths))
+      ? {
+          readWrite: Array.isArray(j.sandboxPaths.readWrite) ? j.sandboxPaths.readWrite.filter((x: unknown) => typeof x === 'string') : [],
+          readOnly: Array.isArray(j.sandboxPaths.readOnly) ? j.sandboxPaths.readOnly.filter((x: unknown) => typeof x === 'string') : [],
+          deny: Array.isArray(j.sandboxPaths.deny) ? j.sandboxPaths.deny.filter((x: unknown) => typeof x === 'string') : [],
+        }
+      : null,
     readIsolation: j?.readIsolation === true,
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,

@@ -773,7 +773,7 @@ describe('pi buildArgs', () => {
     expect(args).not.toContain('--tools');
     expect(args.at(-1)).toBe('hello pi');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
-    expect(adapter.maxInitialPromptArgBytes).toBe(4096);
+    expect(adapter.maxInitialPromptArgBytes).toBeUndefined();
     expect(adapter.altScreen).toBe(true);
   });
 });
@@ -1031,6 +1031,22 @@ describe('hermes buildArgs', () => {
   it('resume session passes --resume with botmux session id', () => {
     const args = adapter.buildArgs({ sessionId: 'bm-hermes-1', resume: true });
     expect(args).toEqual(['--resume', 'bm-hermes-1', '--yolo', '--accept-hooks', '--pass-session-id']);
+  });
+
+  it('resume session prefers persisted Hermes native session id', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'bm-hermes-1',
+      resume: true,
+      resumeSessionId: '20260716_163643_7782fd',
+    });
+    expect(args).toEqual(['--resume', '20260716_163643_7782fd', '--yolo', '--accept-hooks', '--pass-session-id']);
+  });
+
+  it('buildResumeCommand prefers persisted Hermes native session id', () => {
+    expect(adapter.buildResumeCommand?.({
+      sessionId: 'bm-hermes-1',
+      cliSessionId: '20260716_163643_7782fd',
+    })).toBe('hermes --resume 20260716_163643_7782fd');
   });
 
   it('omits yolo and hook acceptance when disableCliBypass is true', () => {
@@ -1565,9 +1581,11 @@ describe('buildResumeCommand', () => {
       .toBe('mtr --session ses_001122334455abcdefABCDEF12');
   });
 
-  it('hermes emits `hermes --resume <sessionId>`', () => {
+  it('hermes emits `hermes --resume <cliSessionId>` when known', () => {
     const a = createHermesAdapter('/bin/hermes');
     expect(a.buildResumeCommand?.({ sessionId: 'bm-hermes', cliSessionId: 'ignored' }))
+      .toBe('hermes --resume ignored');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-hermes' }))
       .toBe('hermes --resume bm-hermes');
   });
 

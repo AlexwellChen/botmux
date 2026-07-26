@@ -273,6 +273,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   suspendWorker: vi.fn(() => false),
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
+  adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
@@ -596,7 +597,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -629,9 +630,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 31 = current master command set plus /vc. /subscribe-lark-doc remains
+    // 30 = current master command set without the removed /land command.
+    // /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(31);
+    expect(DAEMON_COMMANDS.size).toBe(30);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -776,6 +778,53 @@ describe('/botconfig skills JSON text command', () => {
       expect(stored.skills).toEqual({ include: ['skill:deploy-runbook'] });
       expect(typeof stored.skills).toBe('object');
       expect(bot.config.skills).toEqual({ include: ['skill:deploy-runbook'] });
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
+describe('/botconfig canTalkDaemonCommands uses the field parser (not the passthrough one)', () => {
+  it('persists daemon commands via the text command path', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-ctdc-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+
+    try {
+      await handleCommand(
+        '/botconfig',
+        ROOT_ID,
+        // 默认 stringList 解析器（parseCustomPassthroughInput）会拒绝一切 daemon
+        // 命令——本字段必须走 spec.parseList，否则这里被当成"空值"拒绝。
+        makeLarkMessage('/botconfig set canTalkDaemonCommands status /Help', { senderId: 'ou_sender' }),
+        makeDeps(),
+        'app-1',
+      );
+
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored.canTalkDaemonCommands).toEqual(['/status', '/help']);
+      expect((bot.config as any).canTalkDaemonCommands).toEqual(['/status', '/help']);
     } finally {
       delete process.env.BOTS_CONFIG;
       rmSync(dir, { recursive: true, force: true });
@@ -1788,6 +1837,8 @@ describe('handleCommand', () => {
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'Native 同步' });
       expect(killWorker).not.toHaveBeenCalled();
       expect(ds.session.title).toBe('Native 同步');
+      expect(ds.session.nativeSessionTitle).toBe('Native 同步');
+      expect(ds.session.nativeSessionTitleUserDefined).toBe(true);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('已向 codex 发送原生改名请求');
     });
@@ -3006,6 +3057,41 @@ describe('handleCommand', () => {
       const replyArgs = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
       expect(replyArgs[2]).toBe('interactive');
       expect(replyArgs[1] as string).toContain('adopt-select');
+    });
+
+    it('should not adopt a managed Herdr agent that already has an active owner', async () => {
+      vi.mocked(discoverAdoptableSessions).mockReturnValue([
+        {
+          source: 'herdr',
+          herdrSessionName: 'botmux',
+          herdrTarget: 'w1:p1',
+          herdrPaneId: 'w1:p1',
+          herdrAgentName: 'botmux-owned',
+          cliId: 'claude-code',
+          cwd: '/home/testuser/projectA',
+          paneCols: 200,
+          paneRows: 50,
+        },
+      ]);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const owner = makeDaemonSession({
+        session: makeSession({
+          sessionId: 'owned-session',
+          status: 'active',
+          persistentBackendTarget: {
+            backendType: 'herdr',
+            sessionName: 'botmux',
+            agentName: 'botmux-owned',
+          },
+        }),
+      });
+      deps.activeSessions.set('owned-session', owner);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt botmux:w1:p1'), deps, LARK_APP_ID);
+
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toMatch(/未发现|未找到/);
     });
 
     it('should list Codex App threads instead of scanning tmux for codex-app bots', async () => {

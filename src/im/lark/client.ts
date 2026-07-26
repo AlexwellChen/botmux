@@ -16,6 +16,26 @@ import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.j
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
+export interface LarkRequestOptions {
+  /** Axios 层的真实请求超时；不设置时保持 SDK 原有行为。 */
+  timeoutMs?: number;
+  /** 透传给 Axios，用于在上层截止时间到达时主动取消网络请求。 */
+  signal?: AbortSignal;
+}
+
+function larkRequestDeadline(options?: LarkRequestOptions): {
+  timeout?: number;
+  signal?: AbortSignal;
+} {
+  const timeout = options?.timeoutMs;
+  return {
+    ...(typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
+      ? { timeout: Math.max(1, Math.floor(timeout)) }
+      : {}),
+    ...(options?.signal ? { signal: options.signal } : {}),
+  };
+}
+
 /**
  * Call a Feishu GET endpoint without a request body.
  *
@@ -31,8 +51,18 @@ type LarkRequestParams = Record<string, string | number | boolean | undefined>;
  * already be interpolated by the caller. Returns the parsed JSON body
  * (`{ code, msg, data }`), identical to the generated method's resolved value.
  */
-export async function larkGet(c: any, url: string, params: LarkRequestParams = {}): Promise<any> {
-  return c.request({ method: 'GET', url, params });
+export async function larkGet(
+  c: any,
+  url: string,
+  params: LarkRequestParams = {},
+  options?: LarkRequestOptions,
+): Promise<any> {
+  return c.request({
+    method: 'GET',
+    url,
+    params,
+    ...larkRequestDeadline(options),
+  });
 }
 
 // Cached lightweight Lark clients for all configured bots (for isInChat checks).
@@ -57,23 +87,48 @@ const probeLarkLogger = {
   trace: (..._msg: any[]) => { /* dropped */ },
 };
 let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<typeof Client> }> | null = null;
-function getAllBotClients() {
-  if (!allBotClients) {
-    let cfgs: Array<{ larkAppId: string; larkAppSecret: string; cliId: string; brand?: string }>;
-    try {
-      cfgs = loadBotConfigs();
-    } catch {
-      // riff sandbox：没有 bots.json，只有经 env 合成注册进 registry 的 bot——
-      // 降级用注册表里的配置，`botmux bots list` 等只读探测照常可用。
-      cfgs = getAllBots().map((b) => b.config);
+let allBotClientsFingerprint: string | null = null;
+
+function loadAllBotClientConfigs(): Array<{ larkAppId: string; larkAppSecret: string; cliId: string; brand?: string }> {
+  try {
+    return loadBotConfigs();
+  } catch {
+    // riff sandbox：没有 bots.json，只有经 env 合成注册进 registry 的 bot——
+    // 降级用注册表里的配置，`botmux bots list` 等只读探测照常可用。
+    return getAllBots().map((b) => b.config);
+  }
+}
+
+function getAllBotClients(opts: { refresh?: boolean } = {}) {
+  if (!allBotClients || opts.refresh) {
+    const cfgs = loadAllBotClientConfigs();
+    // The strict stable-App resolver is an authorization boundary and must see
+    // bots appended after this process started. Reload the controlled config on
+    // every strict resolution, while retaining Client instances when the exact
+    // credential/domain tuple is unchanged. Discovery callers keep the cheap
+    // process cache.
+    const fingerprint = JSON.stringify(cfgs.map(cfg => [
+      cfg.larkAppId,
+      cfg.cliId,
+      cfg.larkAppSecret,
+      normalizeBrand(cfg.brand as any),
+    ]));
+    if (!allBotClients || allBotClientsFingerprint !== fingerprint) {
+      allBotClients = cfgs.map((cfg) => ({
+        appId: cfg.larkAppId,
+        cliId: cfg.cliId,
+        client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand as any)), logger: probeLarkLogger }),
+      }));
+      allBotClientsFingerprint = fingerprint;
     }
-    allBotClients = cfgs.map((cfg) => ({
-      appId: cfg.larkAppId,
-      cliId: cfg.cliId,
-      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand as any)), logger: probeLarkLogger }),
-    }));
   }
   return allBotClients;
+}
+
+/** Test seam for suites that replace the configured bot set at runtime. */
+export function __testOnly_resetAllBotClients(): void {
+  allBotClients = null;
+  allBotClientsFingerprint = null;
 }
 
 // ─── Error types ──────────────────────────────────────────────────────────────
@@ -419,18 +474,35 @@ export async function isHumanOpenId(larkAppId: string, openId: string): Promise<
   }
 }
 
-export async function sendUserMessage(larkAppId: string, openId: string, content: string, msgType: string = 'text'): Promise<string> {
+export async function sendUserMessage(
+  larkAppId: string,
+  openId: string,
+  content: string,
+  msgType: string = 'text',
+  uuid?: string,
+  requestOptions?: LarkRequestOptions,
+): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  const data = {
+    receive_id: openId,
+    msg_type: msgType as any,
+    content: body,
+    ...(uuid ? { uuid } : {}),
+  };
 
-  const res = await c.im.v1.message.create({
-    params: { receive_id_type: 'open_id' },
-    data: {
-      receive_id: openId,
-      msg_type: msgType as any,
-      content: body,
-    },
-  });
+  const res = requestOptions
+    ? await c.request({
+      method: 'POST',
+      url: '/open-apis/im/v1/messages',
+      params: { receive_id_type: 'open_id' },
+      data,
+      ...larkRequestDeadline(requestOptions),
+    })
+    : await c.im.v1.message.create({
+      params: { receive_id_type: 'open_id' },
+      data,
+    });
 
   if (res.code !== 0) {
     throw new Error(`Failed to send user message: ${res.msg} (code: ${res.code})`);
@@ -741,7 +813,7 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
 export async function getMessageDetail(
   larkAppId: string,
   messageId: string,
-  options: { userCardContent?: boolean } = {},
+  options: { userCardContent?: boolean } & LarkRequestOptions = {},
 ): Promise<any> {
   const c = getBotClient(larkAppId);
   // card_msg_content_type=user_card_content returns the original card JSON
@@ -758,16 +830,23 @@ export async function getMessageDetail(
     // user AND bot senders); without it the server omits them. Matters here for
     // merge_forward sub-messages, whose senders appear nowhere else.
     with_sender_name: 'true',
-  });
+  }, options);
   if (res.code !== 0) {
     throw new Error(`Failed to get message: ${res.msg} (code: ${res.code})`);
   }
   return res.data;
 }
 
-export async function getMessageChatId(larkAppId: string, messageId: string): Promise<string | null> {
+export async function getMessageChatId(
+  larkAppId: string,
+  messageId: string,
+  options?: LarkRequestOptions,
+): Promise<string | null> {
   try {
-    const detail = await getMessageDetail(larkAppId, messageId, { userCardContent: false });
+    const detail = await getMessageDetail(larkAppId, messageId, {
+      userCardContent: false,
+      ...options,
+    });
     const candidates = [
       detail?.items?.[0]?.chat_id,
       detail?.chat_id,
@@ -778,6 +857,9 @@ export async function getMessageChatId(larkAppId: string, messageId: string): Pr
     }
     return null;
   } catch (err) {
+    if (options?.signal?.aborted) {
+      throw options.signal.reason instanceof Error ? options.signal.reason : err;
+    }
     logger.debug(`[message] failed to resolve chat_id for ${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
     return null;
   }
@@ -1354,6 +1436,40 @@ type ChatBotListApiResult =
   | { ok: true; items: ChatBotListApiItem[] }
   | { ok: false; reason: string; cacheable: boolean };
 
+/**
+ * A bot row returned directly by Feishu's live `/members/bots` endpoint.
+ * Unlike {@link ChatBotMember}, this type deliberately carries no botmux-local
+ * identity/provenance: `openId` is exactly the observer-scoped handle returned
+ * to `larkAppId` for the current chat.
+ */
+export type CurrentChatBotMember = {
+  openId: string;
+  displayName: string;
+};
+
+/**
+ * A stable configured app identity bound to the receiver-scoped open_id that
+ * Feishu returned for that bot in the current chat.
+ */
+export type CurrentChatBotAppMapping = {
+  larkAppId: string;
+  subjectOpenId: string;
+};
+
+export type CurrentChatBotAppResolution =
+  | { ok: true; mappings: CurrentChatBotAppMapping[] }
+  | {
+      ok: false;
+      error:
+        | 'live_membership_unavailable'
+        | 'subject_lark_app_not_configured'
+        | 'subject_lark_app_name_unavailable'
+        | 'subject_lark_app_not_in_chat'
+        | 'subject_lark_app_ambiguous';
+      message: string;
+      invalidSubjectLarkAppIds?: string[];
+    };
+
 function promiseWithTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return p;
   let timer: NodeJS.Timeout | undefined;
@@ -1390,6 +1506,265 @@ async function listChatBotsViaMembersBots(
   } catch (err: any) {
     return { ok: false, reason: err?.message ?? String(err), cacheable: true };
   }
+}
+
+/**
+ * Read the current chat's bot members from Feishu and fail closed on any API
+ * error. This is the authorization-grade counterpart to
+ * {@link listChatBotMembers}: it NEVER consults the 30-day observed/cross-ref
+ * fallback and NEVER treats a cached capability failure as membership truth.
+ *
+ * Keep this separate from the user-facing discovery helper. `/members/bots`
+ * is still an undocumented endpoint, so discovery may degrade gracefully; a
+ * permission mutation must not.
+ */
+export async function listCurrentChatBotMembers(
+  larkAppId: string,
+  chatId: string,
+): Promise<CurrentChatBotMember[]> {
+  const timeoutMs = config.chatBotDiscovery?.listBotsApiTimeoutMs ?? 3_000;
+  const result = await listChatBotsViaMembersBots(larkAppId, chatId, timeoutMs);
+  if (!result.ok) {
+    throw new Error(`live_chat_bot_members_unavailable: ${result.reason}`);
+  }
+  return result.items.map(item => ({ openId: item.botId, displayName: item.botName }));
+}
+
+/**
+ * Resolve stable configured Lark app ids to the receiver-scoped open_ids that
+ * may be written to the receiver's exact chatGrant.
+ *
+ * This is deliberately stricter than bot discovery. Identity is accepted only
+ * when all three current signals agree: the receiver's live `/members/bots`
+ * row, the subject app's own `is_in_chat` result, and one exact, unique
+ * `bot_name` binding from bots-info.json. Cross-reference and observed-bot
+ * stores are never consulted, because either can be stale or scoped to another
+ * app.
+ */
+export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
+  receiverLarkAppId: string,
+  chatId: string,
+  subjectLarkAppIds: string[],
+): Promise<CurrentChatBotAppResolution> {
+  const timeoutMs = config.chatBotDiscovery?.listBotsApiTimeoutMs ?? 3_000;
+  const live = await listChatBotsViaMembersBots(receiverLarkAppId, chatId, timeoutMs);
+  if (!live.ok) {
+    return {
+      ok: false,
+      error: 'live_membership_unavailable',
+      message: `live_chat_bot_members_unavailable: ${live.reason}`,
+    };
+  }
+
+  const configured = getAllBotClients({ refresh: true });
+  const configuredByAppId = new Map(configured.map(entry => [entry.appId, entry]));
+  const namesByAppId = new Map<string, string[]>();
+  try {
+    const raw = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf-8'));
+    if (!Array.isArray(raw)) throw new Error('bots-info.json must contain an array');
+    for (const entry of raw) {
+      const appId = typeof entry?.larkAppId === 'string' ? entry.larkAppId.trim() : '';
+      const botName = typeof entry?.botName === 'string' ? entry.botName.trim() : '';
+      if (!appId || !botName) continue;
+      const names = namesByAppId.get(appId);
+      if (names) names.push(botName);
+      else namesByAppId.set(appId, [botName]);
+    }
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: 'subject_lark_app_name_unavailable',
+      message: `Unable to read a strict bot_name binding: ${err?.message ?? String(err)}`,
+      invalidSubjectLarkAppIds: subjectLarkAppIds,
+    };
+  }
+
+  const subjectNames = new Map<string, string>();
+  for (const subjectLarkAppId of subjectLarkAppIds) {
+    if (!configuredByAppId.has(subjectLarkAppId)) {
+      return {
+        ok: false,
+        error: 'subject_lark_app_not_configured',
+        message: 'Every subject app must be configured in this botmux runtime',
+        invalidSubjectLarkAppIds: [subjectLarkAppId],
+      };
+    }
+    const names = namesByAppId.get(subjectLarkAppId) ?? [];
+    if (names.length !== 1) {
+      return {
+        ok: false,
+        error: names.length === 0 ? 'subject_lark_app_name_unavailable' : 'subject_lark_app_ambiguous',
+        message: names.length === 0
+          ? 'Every subject app must have one non-empty bot_name in bots-info.json'
+          : 'A subject app has multiple bot_name bindings in bots-info.json',
+        invalidSubjectLarkAppIds: [subjectLarkAppId],
+      };
+    }
+    subjectNames.set(subjectLarkAppId, names[0]);
+  }
+
+  // If multiple configured apps claim the requested name, probe every claimant.
+  // A strict name is safe only when exactly one claimant is currently in chat
+  // and it is the requested subject app.
+  const candidateAppIds = new Set<string>();
+  const requestedNames = new Set(subjectNames.values());
+  for (const entry of configured) {
+    const names = namesByAppId.get(entry.appId) ?? [];
+    if (names.length === 1 && requestedNames.has(names[0])) candidateAppIds.add(entry.appId);
+  }
+
+  const inChatByAppId = new Map<string, boolean>();
+  for (const appId of candidateAppIds) {
+    const entry = configuredByAppId.get(appId)!;
+    try {
+      const res = await promiseWithTimeout(
+        larkGet(entry.client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`),
+        timeoutMs,
+        `is_in_chat for ${appId}`,
+      );
+      if (res?.code !== 0 || typeof res?.data?.is_in_chat !== 'boolean') {
+        return {
+          ok: false,
+          error: 'live_membership_unavailable',
+          message: `is_in_chat failed for ${appId}: code=${res?.code ?? 'unknown'} msg=${res?.msg ?? ''}`,
+          invalidSubjectLarkAppIds: subjectLarkAppIds.includes(appId) ? [appId] : undefined,
+        };
+      }
+      inChatByAppId.set(appId, res.data.is_in_chat);
+    } catch (err: any) {
+      return {
+        ok: false,
+        error: 'live_membership_unavailable',
+        message: `is_in_chat failed for ${appId}: ${err?.message ?? String(err)}`,
+        invalidSubjectLarkAppIds: subjectLarkAppIds.includes(appId) ? [appId] : undefined,
+      };
+    }
+  }
+
+  const mappings: CurrentChatBotAppMapping[] = [];
+  const mappedOpenIds = new Set<string>();
+  for (const subjectLarkAppId of subjectLarkAppIds) {
+    const botName = subjectNames.get(subjectLarkAppId)!;
+    if (inChatByAppId.get(subjectLarkAppId) !== true) {
+      return {
+        ok: false,
+        error: 'subject_lark_app_not_in_chat',
+        message: 'Every subject app must independently confirm it is in the current chat',
+        invalidSubjectLarkAppIds: [subjectLarkAppId],
+      };
+    }
+    const configuredInChatWithName = configured.filter(entry => {
+      const names = namesByAppId.get(entry.appId) ?? [];
+      return names.length === 1 && names[0] === botName && inChatByAppId.get(entry.appId) === true;
+    });
+    const liveRows = live.items.filter(item => item.botName === botName);
+    if (
+      configuredInChatWithName.length !== 1
+      || configuredInChatWithName[0].appId !== subjectLarkAppId
+      || liveRows.length !== 1
+      || mappedOpenIds.has(liveRows[0]?.botId)
+    ) {
+      return {
+        ok: false,
+        error: 'subject_lark_app_ambiguous',
+        message: 'Stable app identity did not bind to exactly one live bot_name row',
+        invalidSubjectLarkAppIds: [subjectLarkAppId],
+      };
+    }
+    mappings.push({ larkAppId: subjectLarkAppId, subjectOpenId: liveRows[0].botId });
+    mappedOpenIds.add(liveRows[0].botId);
+  }
+
+  return { ok: true, mappings };
+}
+
+/**
+ * A resolved same-deployment sibling identity: the receiver-scoped open_id
+ * `senderOpenId`, proven to belong to a locally-configured bot whose stable
+ * `larkAppId` and unique `botName` are returned so the caller can persist the
+ * receiver's cross-ref (botName → receiver-scoped open_id).
+ */
+export type SiblingBotResolution =
+  | { ok: true; larkAppId: string; botName: string; senderOpenId: string }
+  | { ok: false; reason: string };
+
+/**
+ * Resolve a foreign-bot SENDER open_id (receiver-scoped) to a same-deployment
+ * sibling, using only live authorization-grade signals — never the possibly
+ * stale/uninitialized cross-ref or observed stores. This closes the cold-start
+ * window where a same-machine sibling @s a receiver whose cross-ref has not yet
+ * learned that sibling's receiver-scoped open_id (Lark open_id is per-app).
+ *
+ * Identity is accepted only when all signals agree, mirroring
+ * {@link resolveCurrentChatBotOpenIdsByLarkAppIds}:
+ *  1. the receiver's live `/members/bots` row carries `bot_id === senderOpenId`;
+ *  2. exactly one locally-configured bot (other than the receiver) has that
+ *     exact `bot_name` in bots-info.json — a unique name binding;
+ *  3. that candidate app independently confirms `is_in_chat` and binds to
+ *     exactly one live row for its name (the strict resolver's own re-check).
+ *
+ * Fails closed (returns `{ ok: false }`) on any API error, ambiguity, or name
+ * collision, so the caller falls back to the `/grant` request card. Never
+ * authorizes a genuine external bot: an external sender's open_id has no
+ * locally-configured app of the same unique name, so step 2 fails.
+ */
+export async function resolveSiblingBotBySenderOpenId(
+  receiverLarkAppId: string,
+  chatId: string,
+  senderOpenId: string | undefined,
+): Promise<SiblingBotResolution> {
+  if (!senderOpenId) return { ok: false, reason: 'no_sender_open_id' };
+
+  const timeoutMs = config.chatBotDiscovery?.listBotsApiTimeoutMs ?? 3_000;
+  const live = await listChatBotsViaMembersBots(receiverLarkAppId, chatId, timeoutMs);
+  if (!live.ok) return { ok: false, reason: `live_membership_unavailable: ${live.reason}` };
+
+  // 1. The sender must appear in the receiver's live bot roster by open_id.
+  const liveRow = live.items.find(item => item.botId === senderOpenId);
+  if (!liveRow) return { ok: false, reason: 'sender_not_in_live_roster' };
+  const botName = liveRow.botName;
+
+  // 2. Exactly one locally-configured sibling (≠ receiver) must claim that
+  //    exact name. Read the controlled config fresh — a sibling appended after
+  //    this process started must still be recognized (auth boundary).
+  let candidateAppIds: string[] = [];
+  try {
+    const raw = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf-8'));
+    if (!Array.isArray(raw)) throw new Error('bots-info.json must contain an array');
+    const namesByAppId = new Map<string, string[]>();
+    for (const entry of raw) {
+      const appId = typeof entry?.larkAppId === 'string' ? entry.larkAppId.trim() : '';
+      const name = typeof entry?.botName === 'string' ? entry.botName.trim() : '';
+      if (!appId || !name) continue;
+      const names = namesByAppId.get(appId);
+      if (names) names.push(name);
+      else namesByAppId.set(appId, [name]);
+    }
+    for (const [appId, names] of namesByAppId) {
+      if (appId === receiverLarkAppId) continue;
+      // Require a unique name binding for the app — an app with multiple names
+      // is ambiguous and must not shortcut vetting.
+      if (names.length === 1 && names[0] === botName) candidateAppIds.push(appId);
+    }
+  } catch (err: any) {
+    return { ok: false, reason: `bots_info_unavailable: ${err?.message ?? String(err)}` };
+  }
+  if (candidateAppIds.length !== 1) {
+    return { ok: false, reason: candidateAppIds.length === 0 ? 'no_sibling_with_name' : 'ambiguous_sibling_name' };
+  }
+  const candidateAppId = candidateAppIds[0];
+
+  // 3. Delegate the strict re-check (is_in_chat + unique name + unique live
+  //    row) to the auth-grade resolver, then require it to bind back to exactly
+  //    the sender's open_id.
+  const resolved = await resolveCurrentChatBotOpenIdsByLarkAppIds(receiverLarkAppId, chatId, [candidateAppId]);
+  if (!resolved.ok) return { ok: false, reason: `strict_resolve_failed: ${resolved.error}` };
+  const mapping = resolved.mappings.find(m => m.larkAppId === candidateAppId);
+  if (!mapping || mapping.subjectOpenId !== senderOpenId) {
+    return { ok: false, reason: 'strict_resolve_open_id_mismatch' };
+  }
+
+  return { ok: true, larkAppId: candidateAppId, botName, senderOpenId };
 }
 
 // `/members/bots` returns the observer-scoped mention handle (`bot_id`) and

@@ -11,6 +11,7 @@ import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
+import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
@@ -897,25 +898,29 @@ export interface BotConfig {
    */
   codexRpcInput?: boolean;
   /**
-   * Run this bot's CLI inside a per-session file sandbox (bubblewrap, Linux):
-   * the agent sees only a clone of the project + a de-identified config dir,
-   * never the host home/secrets/other sessions. Intended for oncall bots shared
-   * with semi-trusted users. Linux-only; ignored elsewhere. Env BOTMUX_SANDBOX=1
-   * forces it on regardless (testing).
+   * Run this bot's CLI inside a per-session file sandbox (unified three-tier
+   * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
+   * semantics — see adapters/cli/fs-policy.ts). The agent can read/write the
+   * project + its own BOT_HOME, read the system toolchain baseline, and touch
+   * NOTHING else. Env BOTMUX_SANDBOX=1 forces it on regardless (testing).
    */
   sandbox?: boolean;
   /**
-   * Per-bot privacy masks for the sandbox: absolute paths blanked inside the
-   * overlay sandbox (dirs → empty tmpfs; files → empty placeholder). OPT-IN with
-   * NO defaults — the agent reads the entire real fs natively unless a path is
-   * listed here. Only meaningful when `sandbox` is true. Linux-only.
+   * User增量 three-tier path lists layered ON TOP of the baseline preset
+   * (never replacing it). Deepest matching rule wins, so nested black/white
+   * lists work (readOnly a tree, deny a subdir inside it). Same semantics on
+   * Linux and macOS. Absent → pure baseline.
+   */
+  sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] };
+  /**
+   * LEGACY (pre fs-policy, kept for downgrade only): privacy masks under the
+   * old read-everything model. Auto-migrated into sandboxPaths.deny at daemon
+   * startup (old fields are kept on disk so a downgraded daemon still reads
+   * them); no longer consulted by the new spawn path.
    */
   sandboxHidePaths?: string[];
-  /**
-   * Extra paths to expose read-only inside the sandbox. Useful when a bot should
-   * inspect sibling/source repos without being able to write to them. Only
-   * meaningful when `sandbox` is true. Linux-only.
-   */
+  /** LEGACY: extra read-only paths — auto-migrated into sandboxPaths.readOnly
+   *  (see sandboxHidePaths note). */
   sandboxReadonlyPaths?: string[];
   /**
    * Whether the sandbox keeps network access. Missing/true preserves the existing
@@ -924,18 +929,13 @@ export interface BotConfig {
    */
   sandboxNetwork?: boolean;
   /**
-   * Per-bot LOCAL READ ISOLATION (distinct from the Linux bwrap `sandbox`
-   * above). When true, the bot's CLI data is redirected into its own BOT_HOME
-   * and the whole CLI process is wrapped in a macOS Seatbelt sandbox, so its
-   * agent cannot read OTHER bots' session data / lark-cli credentials / the
-   * full bots.json / common host credentials. Only honored on CLIs whose
-   * adapter reports `supportsReadIsolation` and on macOS; a bot that sets this
-   * where it cannot be enforced is fail-closed (refused) rather than run
-   * unisolated. Default false → no behavior change.
+   * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
+   * deny-by-default, so cross-bot read isolation is inherent — this flag is
+   * auto-migrated to `sandbox: true` at daemon startup and kept on disk only
+   * for downgrade. No longer consulted by the new spawn path.
    */
   readIsolation?: boolean;
-  /** Extra absolute paths to deny reading, appended to the built-in default
-   *  credential set. Only meaningful when `readIsolation` is true. */
+  /** LEGACY: extra read-deny paths — auto-migrated into sandboxPaths.deny. */
   readDenyExtraPaths?: string[];
   backendType?: BackendType;
   /**
@@ -1068,6 +1068,19 @@ export interface BotConfig {
    * 未配置（undefined）→ 仅用内置白名单（保持现状）。
    */
   customPassthroughCommands?: string[];
+  /**
+   * Daemon 命令的权限例外名单：列出的命令把权限闸从 canOperate（仅 allowedUsers）降到
+   * canTalk（oncall 群成员 / allowedChatGroups / chatGrant / globalGrant / p2pOpen 私聊
+   * 等对话放行腿）。与 passthrough 无关——命令仍由 daemon 自己处理，只是准入门槛不同。
+   * 解析时归一化（转小写、自动补 `/`、去重），且**只接受 DAEMON_COMMANDS 内的命令**，
+   * 其余条目丢弃并 warn。带 handler 内部第二道 owner 闸的命令（/card /term /insight /land）
+   * 即使列入也仍会被内部闸拒绝（fail-closed，不视为本字段的适用对象）。
+   * ⚠️ 与 `restrictGrantCommands` 的组合：那个开关在路由里先于本名单生效——开着时
+   * chatGrant/globalGrant 被授权人发任何 slash 命令都被更早的限制闸挡下，本名单
+   * 对他们不生效（oncall / allowedChatGroups / p2pOpen 等其余 canTalk 腿不受影响）。
+   * 未配置（undefined）→ 全部 daemon 命令保持 owner-only（现状）。
+   */
+  canTalkDaemonCommands?: string[];
   /**
    * Optional per-bot startup commands: slash-command lines the worker types into
    * a freshly spawned CLI right after it's ready, BEFORE the user's first prompt
@@ -1560,6 +1573,15 @@ function botsConfigDiskPath(): string | null {
  * result into {@link brandFooterSegment} for the unset→default / ''→off rule.
  */
 export function resolveBrandLabel(larkAppId: string): string | undefined {
+  // A sandboxed one-shot `botmux send` can't read bots.json (deny-by-default),
+  // so it has no in-memory registry and would fall through to a bots.json read
+  // that EPERMs → role footer lost. The worker injects THIS bot's resolved
+  // brandLabel via env; honour it first (gated on the own appId). Present-but-
+  // empty ('') = suppress; absent → fall through. brandLabel is a cosmetic
+  // markdown template, not a secret, so env-passing is safe.
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId && 'BOTMUX_BRAND_LABEL' in process.env) {
+    return process.env.BOTMUX_BRAND_LABEL;
+  }
   const inMem = bots.get(larkAppId);
   if (inMem) return inMem.config.brandLabel;
   const path = loadedConfigPath ?? botsConfigDiskPath();
@@ -1599,6 +1621,10 @@ export function getBotTuiSlashAllow(larkAppId: string): string[] | undefined {
  * 2. ~/.botmux/bots.json — default config path
  */
 export function loadBotConfigs(): BotConfig[] {
+  return parseBotConfigFile(resolveBotConfigPath());
+}
+
+function resolveBotConfigPath(): string {
   // 1. BOTS_CONFIG env var
   const botsConfigPath = process.env.BOTS_CONFIG;
   if (botsConfigPath) {
@@ -1607,19 +1633,132 @@ export function loadBotConfigs(): BotConfig[] {
       throw new Error(`BOTS_CONFIG file not found: ${resolved}`);
     }
     loadedConfigPath = resolved;
-    return parseBotConfigFile(resolved);
+    return resolved;
   }
 
   // 2. ~/.botmux/bots.json
   const defaultPath = resolve(homedir(), '.botmux', 'bots.json');
   if (existsSync(defaultPath)) {
     loadedConfigPath = defaultPath;
-    return parseBotConfigFile(defaultPath);
+    return defaultPath;
   }
 
   throw new Error(
     'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
   );
+}
+
+/**
+ * Resolve one daemon's exact raw bots.json slot without compacting earlier
+ * activation-pending entries. PM2 assigns BOTMUX_BOT_INDEX from the durable
+ * array index; filtering the array first would make a later ready bot load a
+ * different App whenever concurrent onboarding left an earlier slot pending.
+ */
+export function loadBotConfigAtIndex(index: number): BotConfig {
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error(`Invalid bot config index: ${index}`);
+  }
+  const filePath = resolveBotConfigPath();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(filePath, 'utf-8'));
+  } catch (err: any) {
+    throw new Error(`Invalid JSON in bot config file (file: ${filePath}): ${err?.message ?? String(err)}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Bot config file must contain a JSON array (file: ${filePath})`);
+  }
+  const entry = parsed[index];
+  if (!entry || typeof entry !== 'object') {
+    throw new Error(`Bot config [${index}] does not exist (file: ${filePath})`);
+  }
+  if ((entry as Record<string, unknown>).activationPending === true) {
+    throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
+  }
+  if ((entry as Record<string, unknown>).activationDeactivating !== undefined) {
+    throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
+  }
+  const activationStarting = (entry as Record<string, unknown>).activationStarting;
+  const activationCommitted = (entry as Record<string, unknown>).activationCommitted;
+  if (activationStarting !== undefined && activationCommitted !== undefined) {
+    throw new Error(`Bot config [${index}] has conflicting managed activation markers (file: ${filePath})`);
+  }
+  const managedActivation = activationStarting ?? activationCommitted;
+  if (managedActivation !== undefined) {
+    if (
+      !managedActivation
+      || typeof managedActivation !== 'object'
+      || Array.isArray(managedActivation)
+      || typeof (managedActivation as Record<string, unknown>).appId !== 'string'
+      || (managedActivation as Record<string, unknown>).appId !== (entry as Record<string, unknown>).larkAppId
+      || typeof (managedActivation as Record<string, unknown>).jobId !== 'string'
+      || !(managedActivation as Record<string, unknown>).jobId
+    ) {
+      throw new Error(`Bot config [${index}] has an invalid managed activation marker (file: ${filePath})`);
+    }
+    if (process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID !== (entry as Record<string, unknown>).larkAppId) {
+      throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
+    }
+    if (
+      process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID
+      !== (managedActivation as Record<string, unknown>).jobId
+    ) {
+      throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
+    }
+  }
+  const entryForDaemon = { ...(entry as Record<string, unknown>) };
+  delete entryForDaemon.activationStarting;
+  delete entryForDaemon.activationCommitted;
+  const exact = parseBotConfigsFromText(JSON.stringify([entryForDaemon]));
+  if (exact.length !== 1) {
+    throw new Error(`Bot config [${index}] could not be resolved exactly (file: ${filePath})`);
+  }
+  return exact[0];
+}
+
+/**
+ * Direct managed activation daemons are allowed to boot only while their
+ * exact raw config row carries a matching startup marker. They wait before
+ * registering until the dashboard records the exact PM2 identity ACK.
+ */
+export function isManagedActivationStartingAtIndex(
+  index: number,
+  appId: string,
+  jobId: string,
+): boolean {
+  if (!Number.isInteger(index) || index < 0 || !appId || !jobId) {
+    throw new Error('Invalid managed activation lookup');
+  }
+  const filePath = resolveBotConfigPath();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(filePath, 'utf-8'));
+  } catch (err: any) {
+    throw new Error(`Invalid JSON in bot config file (file: ${filePath}): ${err?.message ?? String(err)}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Bot config file must contain a JSON array (file: ${filePath})`);
+  }
+  const entry = parsed[index];
+  if (!entry || typeof entry !== 'object') {
+    throw new Error(`Bot config [${index}] does not exist (file: ${filePath})`);
+  }
+  const record = entry as Record<string, unknown>;
+  const marker = record.activationStarting;
+  if (marker === undefined) return false;
+  if (
+    record.activationPending === true
+    || !marker
+    || typeof marker !== 'object'
+    || Array.isArray(marker)
+    || record.larkAppId !== appId
+    || (marker as Record<string, unknown>).appId !== appId
+    || typeof (marker as Record<string, unknown>).jobId !== 'string'
+    || (marker as Record<string, unknown>).jobId !== jobId
+  ) {
+    throw new Error(`Bot config [${index}] managed activation marker drifted (file: ${filePath})`);
+  }
+  return true;
 }
 
 function parseBotConfigFile(filePath: string): BotConfig[] {
@@ -1653,6 +1792,17 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     }
     if (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppSecret is required and must be a string`);
+    }
+    // MOSA-managed onboarding persists the exact App/secret/owner binding so
+    // the same App can resume permission recovery, but a daemon must not load
+    // it before the recovery job has read back every critical scope.
+    if (
+      entry.activationPending === true
+      || entry.activationDeactivating !== undefined
+      || entry.activationStarting !== undefined
+      || entry.activationCommitted !== undefined
+    ) {
+      continue;
     }
 
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set
@@ -1778,6 +1928,25 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (uniq.length > 0) customPassthroughCommands = uniq;
     }
 
+    // canTalkDaemonCommands：daemon 命令的权限例外名单（canOperate → canTalk）。
+    // 归一化同 customPassthroughCommands（小写、补 `/`、去重），但语义相反——
+    // **只接受 DAEMON_COMMANDS 内的命令**（这里列的是 daemon 自己处理的命令，
+    // 不是透传）；不在集合内的条目（passthrough、拼错的）丢弃并 warn——丢弃是
+    // fail-closed 安全的，但静默会让配错的 owner 以为已生效。
+    let canTalkDaemonCommands: string[] | undefined;
+    if (Array.isArray(entry.canTalkDaemonCommands)) {
+      const strs = entry.canTalkDaemonCommands
+        .filter((x: any): x is string => typeof x === 'string')
+        .map((x: string) => x.trim().toLowerCase())
+        .map((x: string) => (x.startsWith('/') ? x : `/${x}`));
+      const dropped = strs.filter((x: string) => !DAEMON_COMMANDS.has(x));
+      if (dropped.length > 0) {
+        logger.warn(`[bot-registry:${entry.larkAppId}] canTalkDaemonCommands 丢弃非 daemon 命令条目: ${[...new Set(dropped)].join(' ')}（仅接受 daemon 命令，透传命令写 customPassthroughCommands）`);
+      }
+      const uniq = [...new Set<string>(strs.filter((x: string) => DAEMON_COMMANDS.has(x)))];
+      if (uniq.length > 0) canTalkDaemonCommands = uniq;
+    }
+
     // tuiSlashAllow：botmux 通用 slash 注入通道（inject_command，见
     // core/slash-inject.ts）的 CLI 原生命令 allowlist。归一化规则与
     // customPassthroughCommands 同款：转小写、自动补前导 `/`、按
@@ -1859,6 +2028,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexRpcInput: entry.codexRpcInput === true,
       sandbox: entry.sandbox === true,
+      sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
+        ? {
+            readWrite: normalizeStringList(entry.sandboxPaths.readWrite),
+            readOnly: normalizeStringList(entry.sandboxPaths.readOnly),
+            deny: normalizeStringList(entry.sandboxPaths.deny),
+          }
+        : undefined,
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
@@ -1896,6 +2072,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
       customPassthroughCommands,
+      canTalkDaemonCommands,
       tuiSlashAllow,
       startupCommands,
       env,

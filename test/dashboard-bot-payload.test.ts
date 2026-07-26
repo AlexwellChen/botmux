@@ -61,6 +61,20 @@ describe('dashboard bot payload helpers', () => {
       .toMatchObject({ codexAppCleanInput: true });
   });
 
+  it('projects sandboxPaths three tiers, defaulting to null when absent or malformed', () => {
+    const daemon = { larkAppId: 'app_sbx', botName: 'Sbx', cliId: 'claude-code' };
+    // Absent → null (pure deny-by-default baseline, no rules to render).
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ sandboxPaths: null });
+    // Present → normalized to three string arrays, non-strings filtered out.
+    expect(botDefaultsPayload(daemon, {
+      sandboxPaths: { readWrite: ['~/my-data', 123], readOnly: ['~/.claude'], deny: ['~/my-data/secrets'] },
+    })).toMatchObject({
+      sandboxPaths: { readWrite: ['~/my-data'], readOnly: ['~/.claude'], deny: ['~/my-data/secrets'] },
+    });
+    // Malformed (array instead of object) → null, never a crash.
+    expect(botDefaultsPayload(daemon, { sandboxPaths: ['nope'] as any })).toMatchObject({ sandboxPaths: null });
+  });
+
   it('derives agentSelectionKey from cliId + wrapperCli so the 修改CLI dropdown highlights wrapper gateways', () => {
     // 裸 CLI：选择键 = cliId。
     expect(botDefaultsPayload(

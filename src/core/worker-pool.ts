@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
-import { installHook } from '../adapters/hook-installer.js';
+import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
@@ -25,6 +25,7 @@ import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.
 import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
@@ -35,7 +36,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -93,6 +94,13 @@ import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
+import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
+import {
+  buildBotmuxLarkNativeSessionTitle,
+  extractBotmuxLarkNativeSessionTitlePrompt,
+} from './session-title.js';
+import { acknowledgeSessionReady } from './session-ready-handshake.js';
+import { recordDispatchInputCommit } from './dispatch.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -839,13 +847,13 @@ export async function postPrivateSnapshotCard(
  * Deliver the write-enabled session card (the "🔑 获取操作链接" card, which carries
  * a write-token terminal URL + manage buttons) privately to a single operator.
  *
- * Prefers an in-chat "visible-to-you" ephemeral card so the operator never has
- * to leave the conversation. Feishu's ephemeral API only works in plain `group`
- * chats — topic / thread groups reject with {@link LARK_CODE_EPHEMERAL_NOT_GROUP}
- * (18053) and p2p chats are unsupported — and chatType can't distinguish a topic
- * group from a regular one (both record 'group'), so we attempt ephemeral for any
- * non-p2p chat and fall back to a private DM on ANY failure. p2p chats skip the
- * doomed ephemeral attempt and DM directly (the DM lands in that same 1:1 chat).
+ * Prefers an in-chat "visible-to-you" ephemeral card in a flat group so the
+ * operator never has to leave the conversation. Thread-scope sessions and
+ * chat-scope sessions currently folded into a thread go straight to DM:
+ * Feishu may accept their ephemeral message without rendering it in the topic
+ * panel. p2p chats also DM directly (the DM lands in that same 1:1 chat).
+ *
+ * Other group chats attempt ephemeral first and fall back to DM on ANY failure.
  *
  * Both channels are private, so the DM fallback never leaks the write token —
  * unlike the private /card snapshot (which fails closed), here we fail OVER.
@@ -858,7 +866,10 @@ export async function deliverWriteLinkCard(
   cardJson: string,
 ): Promise<'ephemeral' | 'dm' | 'failed'> {
   const who = operatorOpenId.substring(0, 8);
-  if (ds.chatType !== 'p2p') {
+  const replyTarget = ds.currentReplyTarget ?? ds.session.currentReplyTarget;
+  const isThreaded = ds.scope === 'thread'
+    || (!!replyTarget?.rootMessageId && replyTarget.quoteOnly !== true);
+  if (ds.chatType !== 'p2p' && !isThreaded) {
     try {
       await sendEphemeralCard(ds.larkAppId, ds.chatId, operatorOpenId, cardJson);
       logger.info(`[${tag(ds)}] write link delivered via ephemeral card to ${who}…`);
@@ -1146,6 +1157,12 @@ const skillsInstalledCliIds = new Set<string>();
  */
 export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
+  if (cliId === 'traex') {
+    cleanupTraexAskHooks([
+      join(traeHome(), 'hooks.json'),
+      join(traeHome(), 'cli', 'hooks.json'),
+    ]);
+  }
 
   // Claude-family CLIs deliver skills per-session via `--plugin-dir` (no global
   // leak), so they always materialise their plugin dir — the builtin-injection
@@ -1293,11 +1310,16 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 export function killWorker(ds: DaemonSession): void {
   clearUsageLimitState(ds);
+  ds.localProcessAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
   // Retiring (or observing the absence of) that generation must revoke the
   // daemon-side copy synchronously; the worker may never get a chance to send
   // its ordered revoke IPC on close/crash paths.
   ds.managedTurnOrigin = undefined;
+  // The worker/CLI generation is ending — any outstanding stuck-warning card
+  // must be invalidated so a late click cannot inject keys into a replacement
+  // worker (or into nothing, if no replacement comes).
+  invalidateStuckWarning(ds, 'killWorker');
   if (!ds.worker || ds.worker.killed) {
     // No live worker to receive {type:'close'}, so its destroySession() — which
     // tears down the persistent backing session (tmux/herdr/zellij) — never
@@ -1359,7 +1381,7 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
   try {
-    killPersistentSession(backendType, persistentSessionName(backendType, ds.session.sessionId));
+    killPersistentBackendTarget(persistentBackendTargetForSession(ds)!);
     logger.info(`[${tag(ds)}] killWorker: no live worker — destroyed orphaned ${backendType} backing session`);
   } catch (err) {
     logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
@@ -1397,10 +1419,15 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   armWorkerKillBackstop(w, tag(ds));
 
   ds.worker = null;
+  ds.localProcessAttestation = undefined;
   ds.workerPort = null;
   ds.workerToken = null;
   ds.workerViewToken = null;
   ds.managedTurnOrigin = undefined;
+  // The worker is being suspended — the CLI will be destroyed and cold-resumed
+  // later. Invalidate any stuck-warning card so a late click cannot inject keys
+  // after the CLI is gone (or into a different CLI on resume).
+  invalidateStuckWarning(ds, 'suspendWorker');
   // Screen state describes the process we just stopped. Keeping it would make
   // the dashboard hydrate this process-less logical session as idle/working.
   ds.lastScreenStatus = undefined;
@@ -1854,11 +1881,35 @@ export function sendWorkerInput(
   if (!ds.worker || ds.worker.killed) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
   const codexAppInput = codexAppInputForSession(ds, normalized.codexAppInput, turnId);
+  let nativeSessionTitlePrompt: string | undefined;
+  let nativeSessionTitle: string | undefined;
+  if (ds.session.nativeSessionTitleAwaitingContent && !ds.session.nativeSessionTitleUserDefined && !ds.adoptedFrom) {
+    const bot = getBot(ds.larkAppId);
+    const effectiveCliId = ds.session.cliId ?? bot.config.cliId;
+    if (effectiveCliId === 'codex') {
+      nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
+        normalized.codexAppInput?.text ?? normalized.content,
+        bot.botName ? [{ name: bot.botName }] : undefined,
+      );
+      if (nativeSessionTitlePrompt) {
+        nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(nativeSessionTitlePrompt);
+        ds.session.nativeSessionTitle = nativeSessionTitle;
+        ds.session.nativeSessionTitleAwaitingContent = undefined;
+        if (ds.initConfig) {
+          ds.initConfig.nativeSessionTitle = nativeSessionTitle;
+          ds.initConfig.nativeSessionTitlePrompt = nativeSessionTitlePrompt;
+        }
+        sessionStore.updateSession(ds.session);
+      }
+    }
+  }
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, turnId);
   ds.worker.send({
     type: 'message',
     content: normalized.content,
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
+    ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(turnId ? { turnId } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(vcMeetingImTurnOrigin
@@ -1877,6 +1928,19 @@ export function forkWorker(
     dispatchAttempt?: number;
   } = false,
 ): void {
+  // Device enrollment briefly freezes every daemon before the one-way host
+  // marker is installed and legacy local CLIs are torn down. Do this before
+  // ANY session mutation or child fork. One deferred spawn per logical session
+  // is replayed after the exact freeze lease is released; a session closed by
+  // the activation transaction is deliberately not revived.
+  if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
+    if (findActiveBySessionId(ds.session.sessionId) === ds) {
+      forkWorker(ds, promptInput, resumeOrTurnId);
+    }
+  })) {
+    logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
+    return;
+  }
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
@@ -1895,6 +1959,7 @@ export function forkWorker(
   // worker.js lives in the same directory as daemon.js (src/)
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
+  ds.localProcessAttestation = undefined;
 
   let resume = false;
   let initTurnId: string | undefined;
@@ -1960,6 +2025,7 @@ export function forkWorker(
   if (ds.session.sandbox === undefined) {
     if (!resume) {
       ds.session.sandbox = botCfg.sandbox === true;
+      ds.session.sandboxPaths = botCfg.sandboxPaths;
       ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
       ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
       ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
@@ -1971,6 +2037,11 @@ export function forkWorker(
     }
     sessionStore.updateSession(ds.session);
   }
+
+  // Reserve and durably publish the replacement lifetime before killing an
+  // existing worker. A failed reservation leaves the old worker untouched;
+  // a successful reservation immediately invalidates any late old-worker ACK.
+  const workerGeneration = reserveWorkerGeneration(ds);
 
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
@@ -2000,6 +2071,49 @@ export function forkWorker(
 
   const agentCfg = sessionAgentConfig(ds, botCfg);
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
+  let nativeSessionTitle: string | undefined;
+  let nativeSessionTitlePrompt: string | undefined;
+  if (agentCfg.cliId === 'codex' && !ds.adoptedFrom) {
+    const isFreshNativeSession = !resume && !ds.session.cliSessionId;
+    const titlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
+      promptPayload.codexAppInput?.text ?? prompt,
+      bot.botName ? [{ name: bot.botName }] : undefined,
+    );
+    if (isFreshNativeSession && !ds.session.nativeSessionTitleUserDefined) {
+      ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+        titlePrompt ? ds.session.title : undefined,
+        bot.botName ? [{ name: bot.botName }] : undefined,
+        ds.chatType === 'group' ? ds.session.chatDisplayName : undefined,
+      );
+      ds.session.nativeSessionTitleAwaitingContent = titlePrompt ? undefined : true;
+      nativeSessionTitlePrompt = titlePrompt;
+      sessionStore.updateSession(ds.session);
+    } else if (
+      ds.session.nativeSessionTitleAwaitingContent
+      && !ds.session.nativeSessionTitleUserDefined
+      && titlePrompt
+    ) {
+      ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(titlePrompt);
+      ds.session.nativeSessionTitleAwaitingContent = undefined;
+      nativeSessionTitlePrompt = titlePrompt;
+      sessionStore.updateSession(ds.session);
+    } else if (isFreshNativeSession && !ds.session.nativeSessionTitle) {
+      ds.session.nativeSessionTitle = ds.session.title;
+      sessionStore.updateSession(ds.session);
+    }
+    if (
+      isFreshNativeSession
+      || (resume && !!ds.session.cliSessionId && !!ds.session.nativeSessionTitle)
+      || (
+        resume
+        && !!ds.session.nativeSessionTitleAwaitingContent
+        && !!ds.session.nativeSessionTitle
+      )
+      || (!!nativeSessionTitlePrompt && !!ds.session.nativeSessionTitle)
+    ) {
+      nativeSessionTitle = ds.session.nativeSessionTitle;
+    }
+  }
   // Claude Code blocks on the interactive folder-trust dialog the first time
   // it runs in an untrusted workingDir; pre-accept it so the spawn doesn't hang.
   // Seed CLI (Claude Code fork) has the same dialog — drive both off the
@@ -2120,6 +2234,7 @@ export function forkWorker(
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,
+    sandboxPaths: ds.session.sandboxPaths ?? botCfg.sandboxPaths,
     sandboxHidePaths: ds.session.sandboxHidePaths ?? [],
     sandboxReadonlyPaths: ds.session.sandboxReadonlyPaths ?? [],
     sandboxNetwork: ds.session.sandboxNetwork !== false,
@@ -2139,10 +2254,15 @@ export function forkWorker(
     // getSessionPersistentBackendType). A brand-new session (no stamp) resolves
     // from live config, so a dashboard backend switch only affects NEW sessions.
     backendType: resolvePairedSpawnBackendType(agentCfg.cliId, ds.session.backendType, botCfg.backendType, config.daemon.backendType),
+    // Shared Herdr is not derivable from sessionId: preserve the exact host +
+    // managed-agent affinity across daemon/worker replacement.
+    persistentBackendTarget: ds.session.persistentBackendTarget,
     backendConfig: botCfg.riff,
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
+    ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
+    ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
     resume,
@@ -2189,7 +2309,7 @@ export function forkWorker(
   }
 
   // Use shared handler for IPC messages and exit
-  setupWorkerHandlers(ds, worker, startupState);
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
   ds.spawnedAt = Date.now();
@@ -2221,15 +2341,67 @@ export function forkWorker(
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
 
+/**
+ * Clear the stuck-warning authority markers WITHOUT patching the card. Used by
+ * ACK paths (tui_keys_delivered / stuck_warning_expired) where the caller has
+ * already resolved the card to its final state — we only need to drop the
+ * nonce/cardId/turnId so a late duplicate click cannot re-inject keys.
+ */
+export function clearStuckWarningAuthority(ds: DaemonSession): void {
+  ds.stuckWarningCardId = undefined;
+  ds.stuckWarningTurnId = undefined;
+  ds.stuckWarningNonce = undefined;
+  ds.stuckWarningPageType = undefined;
+  ds.stuckWarningProcessing = false;
+  ds.stuckWarningCliLifetime = undefined;
+}
+
+/**
+ * Resolve any active stuck-warning card (PATCH it to "done") AND clear its
+ * markers. Called from every path where the CLI can recover or be replaced:
+ * prompt_ready, claude_exit, worker exit/kill/suspend/refork, and the worker's
+ * own stale-card notification. Centralising here avoids missing an exit path
+ * and leaving a clickable card that can inject keys into a different CLI.
+ *
+ * ACK paths (tui_keys_delivered / stuck_warning_expired) do NOT use this —
+ * they patch the card themselves with a context-specific message and then call
+ * clearStuckWarningAuthority() to drop the markers.
+ */
+export function invalidateStuckWarning(ds: DaemonSession, reason: string): void {
+  if (!ds.stuckWarningCardId && !ds.stuckWarningTurnId && ds.stuckWarningNonce === undefined) return;
+  const t = tag(ds);
+  if (ds.stuckWarningCardId) {
+    const locDs = localeForBot(ds.larkAppId);
+    const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+    updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+      logger.debug(`[${t}] Failed to resolve stuck-warning card (${reason}): ${err}`),
+    );
+  }
+  logger.debug(`[${t}] invalidateStuckWarning (${reason}): turn=${ds.stuckWarningTurnId ?? 'none'} nonce=${ds.stuckWarningNonce ?? 'none'}`);
+  clearStuckWarningAuthority(ds);
+}
+
 function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
   startupState: WorkerStartupState = { ready: false, failureNotified: false },
+  reservedWorkerGeneration?: number,
 ): void {
   const cb = requireCallbacks();
   const t = tag(ds);
-  const workerGeneration = (ds.workerGeneration ?? 0) + 1;
-  ds.workerGeneration = workerGeneration;
+  const workerGeneration = reservedWorkerGeneration
+    ?? reserveWorkerGeneration(ds);
+  if (
+    ds.workerGeneration !== workerGeneration
+    || ds.session.workerGeneration !== workerGeneration
+  ) {
+    throw new Error('worker generation reservation changed before IPC setup');
+  }
+  // A new worker generation is starting. As a backstop, invalidate any
+  // stuck-warning card posted by the previous generation — explicit kill/suspend/
+  // exit paths should already have done this, but fork/refork/takeover paths
+  // can leave a stale card that would otherwise inject keys into the new CLI.
+  invalidateStuckWarning(ds, 'new_worker_generation');
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -2342,6 +2514,55 @@ function setupWorkerHandlers(
   worker.on('message', async (msg: WorkerToDaemon) => {
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'persistent_backend_target': {
+        ds.session.persistentBackendTarget = msg.target;
+        sessionStore.updateSession(ds.session);
+        break;
+      }
+      case 'turn_input_committed': {
+        // Bind the receipt to the exact live worker generation. A late ACK
+        // from a replaced worker cannot make the replacement appear to have
+        // accepted this dispatch turn.
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored turn_input_committed from stale worker generation`);
+          break;
+        }
+        if (recordDispatchInputCommit(ds.session, msg.turnId, workerGeneration)) {
+          sessionStore.updateSession(ds.session);
+        } else {
+          logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
+        }
+        break;
+      }
+      case 'session_ready_ack': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored session_ready_ack from stale worker generation`);
+          break;
+        }
+        acknowledgeSessionReady(msg.requestId);
+        break;
+      }
+      case 'local_process_attestation': {
+        // This message arrives over the private parent<->worker IPC channel;
+        // unlike .botmux-cli-pids it cannot be forged or deleted by the CLI.
+        // Bind it to the daemon's current worker generation so a late message
+        // from a replaced worker never attests the replacement process.
+        if (ds.worker !== worker) break;
+        ds.localProcessAttestation = {
+          backendType: msg.backendType,
+          credentialIsolated: msg.credentialIsolated,
+          ...(msg.cliPid !== undefined ? { cliPid: msg.cliPid } : {}),
+          ...(msg.cliProcStart !== undefined ? { cliProcStart: msg.cliProcStart } : {}),
+          ...(ds.workerGeneration !== undefined
+            ? { workerGeneration: ds.workerGeneration }
+            : {}),
+        };
+        break;
+      }
       case 'ready': {
         startupState.ready = true;
         ds.workerPort = msg.port;
@@ -2349,6 +2570,10 @@ function setupWorkerHandlers(
         ds.workerViewToken = msg.viewToken ?? null;
         // Persist port so it can be reused after daemon restart
         ds.session.webPort = msg.port;
+        // Dashboard「复现命令」：worker 上报本次冷启的近似复现命令。只存内存字段、
+        // 绝不落盘（含凭证）；warm reattach 时 worker 不重算，故为空——这是有意的
+        // （reattach 不代表本次新算命令真的执行了）。worker 每次 ready 会重报。
+        ds.spawnCommand = msg.spawnCommand;
         sessionStore.updateSession(ds.session);
         const readOnlyUrl = buildTerminalUrl(ds);
         const writeUrl = buildTerminalUrl(ds, { write: true });
@@ -2376,6 +2601,19 @@ function setupWorkerHandlers(
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           logger.info(`[${t}] Managed/silent turn — suppressing ready/streaming card output`);
+          break;
+        }
+
+        // Pi can finish a very fast startup turn through `botmux send` before
+        // Herdr reports idle and the worker emits ready. Posting the initial
+        // card now would put a stale "Starting" card *after* the final reply,
+        // with no later transcript output to withdraw it (the explicit send
+        // intentionally suppresses bridge fallback). Keep the terminal/runtime
+        // state above, but suppress this already-completed turn's card.
+        if (msg.replyAlreadySent) {
+          ds.streamCardPending = false;
+          persistStreamCardState(ds);
+          logger.info(`[${t}] Explicit reply landed before worker ready — skipping stale starting card`);
           break;
         }
 
@@ -2586,6 +2824,7 @@ function setupWorkerHandlers(
       }
 
       case 'prompt_ready': {
+        if (ds.worker !== worker) break;
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
@@ -2627,6 +2866,8 @@ function setupWorkerHandlers(
             ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
           }, { codexAppInputAccepted: !!followUpCodexAppInput });
         }
+        // CLI reached its prompt — any previously posted stuck warning is stale.
+        invalidateStuckWarning(ds, 'prompt_ready');
         break;
       }
 
@@ -2645,6 +2886,20 @@ function setupWorkerHandlers(
           && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
           scheduleLocalCliOpenReadinessPatch(ds);
         }
+        break;
+      }
+
+      case 'native_session_title_generated': {
+        if (ds.worker !== worker || ds.session.nativeSessionTitleUserDefined) break;
+        const title = msg.title.trim();
+        if (!title) break;
+        ds.session.nativeSessionTitle = title;
+        ds.session.nativeSessionTitleAwaitingContent = undefined;
+        if (ds.initConfig) {
+          ds.initConfig.nativeSessionTitle = title;
+          ds.initConfig.nativeSessionTitlePrompt = undefined;
+        }
+        sessionStore.updateSession(ds.session);
         break;
       }
 
@@ -2920,6 +3175,149 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'stuck_warning': {
+        // Ignore stuck_warning from a stale worker generation — the CLI may have
+        // been replaced and a new worker owns the session now.
+        if (ds.worker !== worker) break;
+        // AI-free StuckDetector fired: a written input hasn't produced a
+        // completed turn within the timeout AND the PTY has been quiet, AND the
+        // snapshot matches a known Codex hook-review screen. The detector only
+        // emits when it matches level 1 or level 2 — there is no "unknown
+        // stall" path, so we always build an interactive card with the exact
+        // keys the screen documents.
+        // Dedup: skip if we already posted a warning for THIS turn, OR if a
+        // stuck-warning card is already active (covers the no-turnId case where
+        // a second stall fires before the first card is resolved).
+        const isDuplicateTurn = msg.turnId !== undefined && ds.stuckWarningTurnId === msg.turnId;
+        const hasActiveCard = !!ds.stuckWarningCardId;
+        if (isDuplicateTurn || hasActiveCard) {
+          logger.debug(`[${t}] Stuck warning dedup skipped (turn=${msg.turnId ?? 'none'}, activeCard=${hasActiveCard})`);
+          break;
+        }
+        // Allocate a daemon-side nonce for this warning (NOT the worker's
+        // generation — the daemon is the authority on which warning is active).
+        // If the CLI recovers (prompt_ready) or the worker is replaced while the
+        // POST is in flight, invalidateStuckWarning clears the nonce; when the
+        // POST returns we check it is still current and, if not, resolve the card
+        // immediately instead of registering it as active.
+        // Allocate a daemon-side nonce for this warning from a monotonic
+        // counter that is NEVER cleared (even when the active authority is
+        // dropped). This prevents the nonce-reuse race: warning nonce=1 POST
+        // awaits → prompt_ready clears active nonce → warning nonce=1 again
+        // would let the old POST register against the new authority. With a
+        // monotonic counter the second warning gets nonce=2, and the old
+        // POST's nonce=1 check fails.
+        const nonce = (ds.stuckWarningNonceCounter ?? 0) + 1;
+        ds.stuckWarningNonceCounter = nonce;
+        ds.stuckWarningNonce = nonce;
+        ds.stuckWarningTurnId = msg.turnId;
+        ds.stuckWarningCliLifetime = msg.cliLifetime;
+        const pageType = msg.matchedPattern;
+        ds.stuckWarningPageType = pageType;
+        const secs = Math.round(msg.elapsedMs / 1000);
+        logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s (${pageType}) nonce=${nonce}`);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'stuck_warning',
+          elapsedMs: msg.elapsedMs,
+          matchedPattern: pageType,
+        });
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+
+        let description: string;
+        let options: Array<{ label: string; text: string; selected: boolean; type: 'confirm' | 'select'; keys: string[] }>;
+        if (pageType === 'hook review level 2') {
+          // Level 2 — per-hook review: t=trust, Esc=go back. No Enter here.
+          description = `⚠️ Codex 卡在单项 hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
+          options = [
+            { label: 't', text: '信任 (trust)', selected: false, type: 'confirm' as const, keys: ['t'] },
+            { label: 'Esc', text: '返回 (go back)', selected: false, type: 'select' as const, keys: ['Escape'] },
+          ];
+        } else {
+          // Level 1 — hooks browser: t=trust all, Enter=review hooks, Esc=close.
+          description = `⚠️ Codex 卡在 hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
+          options = [
+            { label: 't', text: '信任全部 (trust all)', selected: false, type: 'confirm' as const, keys: ['t'] },
+            { label: 'Enter', text: '逐项审核 (review hooks)', selected: false, type: 'select' as const, keys: ['Enter'] },
+            { label: 'Esc', text: '关闭 (close)', selected: false, type: 'select' as const, keys: ['Escape'] },
+          ];
+        }
+        try {
+          const cardJson = buildTuiPromptCard(
+            sessionAnchorId(ds),
+            ds.session.sessionId,
+            description,
+            options,
+            false,
+            undefined,
+            loc,
+          );
+          const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
+          // Authority check: if the warning was invalidated (prompt_ready,
+          // CLI exit, worker replace) OR the worker was replaced while the POST
+          // was in flight, resolve the card immediately and do NOT register it
+          // as active — a late click would otherwise inject keys into a
+          // recovered/replaced CLI. Verify the full tuple: same worker process,
+          // same worker generation, same nonce.
+          if (ds.worker !== worker || ds.workerGeneration !== workerGeneration || ds.stuckWarningNonce !== nonce) {
+            logger.debug(`[${t}] Stuck warning card POSTed but authority stale (nonce=${nonce}, current=${ds.stuckWarningNonce ?? 'none'}, workerGen=${workerGeneration}) — resolving`);
+            const locDs = localeForBot(ds.larkAppId);
+            const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+            updateMessage(ds.larkAppId, cardMsgId, resolvedCard).catch(err =>
+              logger.debug(`[${t}] Failed to resolve stale stuck-warning card: ${err}`),
+            );
+            break;
+          }
+          ds.stuckWarningCardId = cardMsgId;
+          publishAttentionPatch(ds);
+        } catch (err: any) {
+          logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
+          // Card send failed — clear markers ONLY if this nonce is still
+          // current AND we still own the worker. A newer warning (nonce+1) may
+          // have started while this POST was in flight; we must not wipe the
+          // newer state.
+          if (ds.worker === worker && ds.workerGeneration === workerGeneration && ds.stuckWarningNonce === nonce) {
+            clearStuckWarningAuthority(ds);
+          }
+        }
+        break;
+      }
+
+      case 'stuck_warning_expired': {
+        // Ignore from a stale worker generation.
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        // Worker refused to inject keys from a stuck-warning card because the
+        // current screen no longer matches the page type the card was built for.
+        // Resolve the card with a "page changed" message so the user knows the
+        // action was NOT performed, then clear the authority.
+        if (ds.stuckWarningNonce === msg.nonce && ds.stuckWarningCardId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard('页面已变化，未发送按键', locDs);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to update stuck-warning card on expired: ${err}`),
+          );
+          clearStuckWarningAuthority(ds);
+        }
+        break;
+      }
+
+      case 'tui_keys_delivered': {
+        // Ignore from a stale worker generation.
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        // Worker confirmed the keys were written to the PTY. Clear the card
+        // authority and render success. We only do this AFTER the worker ACK
+        // (not on click), so a rejected click (stuck_warning_expired) does not
+        // falsely report success.
+        if (ds.stuckWarningNonce === msg.nonce && ds.stuckWarningCardId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to resolve stuck-warning card on delivered: ${err}`),
+          );
+          clearStuckWarningAuthority(ds);
+        }
+        break;
+      }
+
       case 'claude_exit': {
         // CLI-generation authority must not outlive the concrete worker/CLI
         // pair that issued it. A delayed message from a replaced Node worker
@@ -2929,6 +3327,10 @@ function setupWorkerHandlers(
           break;
         }
         ds.managedTurnOrigin = undefined;
+        // The worker/CLI generation ended. Disable an outstanding stuck-warning
+        // card before any replacement worker can be attached; otherwise a late
+        // click could inject its keys into the replacement CLI.
+        invalidateStuckWarning(ds, 'claude_exit');
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {
@@ -3359,6 +3761,23 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;
+      // This worker generation is gone. Invalidate any stuck-warning card it
+      // posted so a late click cannot inject keys into a replacement worker.
+      invalidateStuckWarning(ds, 'worker_exit');
+      // Fence this lifetime before a polling dispatcher can observe its last
+      // ACK. Keeping the old receipt is useful audit evidence, but the
+      // persisted current generation advances immediately so it cannot count
+      // as acceptance after the worker has died. A stale takeover worker never
+      // enters this branch and therefore cannot fence the replacement.
+      const fencedGeneration = Math.max(
+        workerGeneration,
+        ds.workerGeneration ?? 0,
+        ds.session.workerGeneration ?? 0,
+      ) + 1;
+      ds.workerGeneration = fencedGeneration;
+      ds.session.workerGeneration = fencedGeneration;
+      ds.session.pid = undefined;
+      sessionStore.updateSession(ds.session);
     }
     try {
       const notified = cb.onWorkerExit?.(ds, {
@@ -3782,6 +4201,55 @@ export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
+function reserveWorkerGeneration(ds: DaemonSession): number {
+  const previousDaemonGeneration = ds.workerGeneration;
+  const previousSessionGeneration = ds.session.workerGeneration;
+  const workerGeneration = Math.max(
+    previousDaemonGeneration ?? 0,
+    previousSessionGeneration ?? 0,
+  ) + 1;
+  ds.workerGeneration = workerGeneration;
+  ds.session.workerGeneration = workerGeneration;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    if (previousDaemonGeneration === undefined) delete ds.workerGeneration;
+    else ds.workerGeneration = previousDaemonGeneration;
+    if (previousSessionGeneration === undefined) delete ds.session.workerGeneration;
+    else ds.session.workerGeneration = previousSessionGeneration;
+    throw error;
+  }
+  return workerGeneration;
+}
+
+/**
+ * Is the file sandbox active such that /adopt must be refused? A sandbox can
+ * only be established at spawn time (bwrap wrap / Seatbelt profile); adopt
+ * attaches to an ALREADY-running host process, so it could only ever run
+ * UNsandboxed. From-strict UNION of every source that can require isolation:
+ *  - live per-bot `sandbox` / legacy `readIsolation`,
+ *  - the global `BOTMUX_SANDBOX=1` (sandboxEnabled()),
+ *  - the session's FROZEN sandbox decision (`session.sandbox`, recorded at
+ *    creation). forkWorker treats the frozen decision as authoritative, so a
+ *    session created sandboxed must stay un-adoptable even if the admin later
+ *    toggles the bot's global flag OFF — otherwise its `/adopt` would attach to
+ *    an unsandboxed live process. The reverse (bot=true / session=false) is
+ *    also caught by the union, which is the safe direction.
+ * Callers reject at the ENTRY point (before persisting `adoptedFrom` / replying
+ * "adopted") — see command-handler's `/adopt`, the adopt_select card, and the
+ * session-manager restore branch. Resume/cold-start is unaffected: those spawn
+ * a fresh CLI, which the sandbox wraps normally.
+ */
+export function adoptSandboxBlocked(
+  botCfg: { sandbox?: boolean; readIsolation?: boolean },
+  session?: { sandbox?: boolean },
+): boolean {
+  return botCfg.sandbox === true
+    || botCfg.readIsolation === true
+    || session?.sandbox === true
+    || sandboxEnabled();
+}
+
 export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean }): void {
   const cb = requireCallbacks();
   const workerPath = join(__dirname, '..', 'worker.js');
@@ -3792,14 +4260,33 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
 
-  // Read isolation cannot be applied to an already-running CLI (adopt attaches
-  // to an existing pane; we can't inject --settings into it). Refuse to adopt an
-  // isolated bot rather than run it unisolated — it will cold-start (isolated)
-  // via forkWorker on the next message instead. (Codex review #2, fail-closed.)
-  if (botCfg.readIsolation === true) {
-    logger.warn(`[${t}] read-isolation bot: refusing to adopt existing CLI (would run unisolated); will cold-start isolated on next message`);
+  // A file sandbox cannot be applied to an already-running CLI: adopt ATTACHES
+  // to an existing host pane/process, and confinement (bwrap wrap on Linux /
+  // Seatbelt profile on macOS) can only be established at spawn time — there is
+  // no way to retro-fit a sandbox around a live process. Refuse to adopt when
+  // the sandbox is active (live bot flag OR the session's FROZEN decision)
+  // rather than run it UNsandboxed. Real adopt entry points (`/adopt`, the
+  // adopt_select card) reject BEFORE persisting `adoptedFrom`, and the
+  // session-manager restore branch converts a sandbox adopt to a cold-start
+  // before it ever reaches here; this is the last-line fail-closed backstop,
+  // which also strips any stale adopt metadata it is handed.
+  if (adoptSandboxBlocked(botCfg, ds.session)) {
+    logger.warn(`[${t}] sandbox-enabled session: refusing to adopt existing CLI (would run unsandboxed)`);
+    // Strip stale adopt state so the session doesn't linger as a worker=null
+    // pseudo-adopt whose NEXT message
+    // would still be routed as a bridge/adopt session. It cold-starts sandboxed
+    // via the normal resume path instead.
+    ds.adoptedFrom = undefined;
+    if (ds.session.adoptedFrom) {
+      ds.session.adoptedFrom = undefined;
+      try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
+    }
     return;
   }
+
+  // Reserve before replacing an existing bridge worker for the same reason as
+  // forkWorker: persistence failure must leave the old lifetime untouched.
+  const workerGeneration = reserveWorkerGeneration(ds);
 
   // Guard against double-fork
   if (ds.worker && !ds.worker.killed) {
@@ -3983,7 +4470,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   }
 
   // Use shared handler
-  setupWorkerHandlers(ds, worker, startupState);
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
   ds.spawnedAt = Date.now();
@@ -4152,8 +4639,16 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
 
   if (!multiBot && lastCliId && lastCliId !== currentCliId) {
     logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all ${backendType} sessions`);
+    // Legacy per-topic hosts are still enumerable by bmx-* name.
     for (const name of backend.listBotmuxSessions()) {
       backend.killSession(name);
+    }
+    // Machine-wide Herdr agents are not separate bmx-* sessions. Tear down
+    // each persisted managed target precisely so a CLI switch cannot reattach
+    // the old executable, while never stopping the shared `botmux` host or an
+    // explicitly adopted user pane.
+    for (const target of managedTargetsForCliChange(backendType, activeSessions_)) {
+      killPersistentBackendTarget(target);
     }
   } else {
     const activeNames = new Set(
@@ -4174,9 +4669,16 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
       let botCliId: CliId | undefined;
       try { botCliId = getBot(session.larkAppId).config.cliId; } catch { continue; }
       if (botCliId && sessionCliId !== botCliId) {
-        const name = backend.sessionName(session.sessionId);
-        logger.info(`CLI mismatch for ${session.sessionId.substring(0, 8)} (session=${sessionCliId}, bot=${botCliId}), killing ${backendType} ${name}`);
-        backend.killSession(name);
+        const target = resolvePersistentBackendTarget(
+          backendType,
+          session.sessionId,
+          session.persistentBackendTarget,
+        );
+        const label = target.backendType === 'herdr' && target.agentName
+          ? `${target.sessionName}/${target.agentName}`
+          : target.sessionName;
+        logger.info(`CLI mismatch for ${session.sessionId.substring(0, 8)} (session=${sessionCliId}, bot=${botCliId}), killing ${backendType} ${label}`);
+        killPersistentBackendTarget(target);
       }
     }
   }

@@ -1,4 +1,4 @@
-import type { BackendType } from './adapters/backend/types.js';
+import type { BackendType, PersistentBackendTarget } from './adapters/backend/types.js';
 import type { BotSkillPolicy } from './core/skills/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
@@ -142,6 +142,12 @@ export interface Session {
     memberEpoch: number;
   };
   title: string;
+  /** 同步给 CLI 原生会话列表的标题；与 Dashboard 展示标题分开持久化。 */
+  nativeSessionTitle?: string;
+  /** 用户显式改名后，不再用首次话题内容覆盖原生标题。 */
+  nativeSessionTitleUserDefined?: boolean;
+  /** 首轮只有机器人 mention 时，等待第一条有效正文生成原生标题。 */
+  nativeSessionTitleAwaitingContent?: boolean;
   status: 'active' | 'closed';
   /** Dashboard 看板视图的手动放置：列 id（backlog/todo/in_progress/in_review/done）。
    *  未设置时前端按运行状态推导默认列；一旦用户拖拽过就以此为准。 */
@@ -186,9 +192,8 @@ export interface Session {
   riffRepoDirs?: string[];
   larkAppId?: string;
   ownerOpenId?: string;       // topic creator's open_id — for @mention in replies
-  /** Best-effort human-readable title for direct/p2p chats. Lark chat APIs
-   *  often return an empty chat name for p2p, so dashboard rows carry the
-   *  initiating user's display name here when we can resolve it. */
+  /** Best-effort human-readable chat name. Group sessions use the Lark group
+   *  name when available; p2p sessions fall back to the initiating user name. */
   chatDisplayName?: string;
   /** open_id of whoever created this session (the first sender), app-scoped to
    *  this bot. UNLIKE ownerOpenId, this is set even for bot-started (foreign-bot)
@@ -245,6 +250,23 @@ export interface Session {
    * back to the single-slot behavior.
    */
   replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+  /**
+   * Durable receiver acknowledgement keyed by the exact inbound Lark
+   * message_id. A receipt is written only after the worker has committed that
+   * turn to its CLI input queue (or an adopt backend accepted the write).
+   * Dispatch acceptance binds this turn id, its immutable topic root, and the
+   * currently persisted worker generation; fresh aliases/timestamps or a
+   * replacement worker can never reuse an older receipt.
+   */
+  dispatchInputReceipts?: Record<string, {
+    rootMessageId: string;
+    committedAt: string;
+    workerGeneration: number;
+  }>;
+  /** Monotonic worker lifetime for this session. Persisted before worker IPC is
+   * accepted so daemon restarts and replacement workers invalidate receipts
+   * emitted by an earlier lifetime. */
+  workerGeneration?: number;
   /** True once a substitute-mode control card has been DM'd to the owner(s). Persisted to avoid re-sends on worker restart or daemon recovery. */
   substituteControlCardSent?: boolean;
   /**
@@ -322,6 +344,8 @@ export interface Session {
    * conservatively (see getSessionPersistentBackendType).
    */
   backendType?: BackendType;
+  /** Exact persistent host/agent selected by the worker for restore and cleanup. */
+  persistentBackendTarget?: PersistentBackendTarget;
   /**
    * Sandbox decision RECORDED AT SESSION CREATION (overlay file-isolation). The
    * live bot flag (BotConfig.sandbox) can be toggled later, but a session's
@@ -330,7 +354,10 @@ export interface Session {
    * sessions created before this field existed → treated as not sandboxed.
    */
   sandbox?: boolean;
-  /** Per-bot privacy masks recorded alongside `sandbox` at session creation. */
+  /** User three-tier path lists (fs-policy) recorded alongside `sandbox` at
+   *  session creation. */
+  sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] };
+  /** LEGACY privacy masks (pre fs-policy) recorded at session creation. */
   sandboxHidePaths?: string[];
   /** Extra read-only paths recorded alongside `sandbox` at session creation. */
   sandboxReadonlyPaths?: string[];
@@ -542,8 +569,8 @@ export interface CliTurnPayload {
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; prompt: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
-  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
    *  IPCs would race: process.on('message') handlers don't serialize, and the
@@ -570,7 +597,7 @@ export type DaemonToWorker =
   // diagnostic shell (bmx-diag-<sid>) preserving the last output. Deferred from
   // onExit so transient auto-restarted exits don't park-then-tear-down.
   | { type: 'park_diagnostic' }
-  | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
+  | { type: 'tui_keys'; keys: string[]; isFinal: boolean; rearmStuckDetector?: boolean; stuckNonce?: number; stuckCliLifetime?: number; stuckPageType?: string }
   // updateWorkingDir：会话内 /cd 移动 cwd 后随附的新目录，worker 记入
   // lastInitConfig.workingDir，使内部三条 respawn 路径（claude_exit 自动重启 /
   // IM /restart / dashboard restart）收敛到新目录而非陈旧的初始 cwd。
@@ -586,22 +613,44 @@ export type DaemonToWorker =
   | { type: 'set_locale'; locale: 'zh' | 'en' }
   | { type: 'term_action'; key: TermActionKey }
   | { type: 'refresh_screen' }
-  // Claude-family「真就绪」信号：CLI 的 SessionStart hook 经 `botmux session-ready`
-  // 调到 daemon，daemon 转发给本会话 worker，放行被 ready-gate 门控的首条 prompt
-  // （绕开 cjadk 启动选择器吞首条消息）。source = SessionStart 的 startup/resume/… 。
-  | { type: 'session_ready'; source?: string };
+  // Claude-family SessionStart 信号：CLI hook 经 `botmux session-ready` 调到
+  // daemon。requestId 让 daemon 等到 worker 已清掉启动选择器留下的旧 prompt
+  // 证据再回复 hook，避免 Claude 在 worker 重置前继续渲染真正输入框。
+  // source = SessionStart 的 startup/resume/… 。
+  | { type: 'session_ready'; source?: string; requestId?: string };
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
-  | { type: 'ready'; port: number; token: string; viewToken?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'ready'; port: number; token: string; viewToken?: string; spawnCommand?: string; replyAlreadySent?: boolean; turnId?: string; dispatchAttempt?: number }
+  | { type: 'persistent_backend_target'; target?: PersistentBackendTarget }
+  /** The exact inbound turn is now durably owned by this worker generation's
+   * CLI input queue. The daemon persists a root-bound receipt only after this
+   * acknowledgement; IPC arrival alone is not acceptance. */
+  | { type: 'turn_input_committed'; turnId: string }
+  /** Trusted worker observation used only by the host activation transaction.
+   * PID markers are child-writable diagnostics and are never security proof. */
+  | {
+      type: 'local_process_attestation';
+      backendType: BackendType;
+      credentialIsolated: boolean;
+      cliPid?: number;
+      cliProcStart?: string;
+    }
   | { type: 'cli_session_id'; cliSessionId: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'native_session_title_generated'; title: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'prompt_ready' }
+  /** Worker 已处理 SessionStart 信号并建立 post-hook prompt evidence fence。
+   *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
+  | { type: 'session_ready_ack'; requestId: string }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_resolved'; selectedText?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'stuck_warning'; elapsedMs: number; snapshot: string; matchedPattern?: string; turnId?: string; dispatchAttempt?: number; cliLifetime?: number }
+  | { type: 'stuck_warning_expired'; nonce: number; turnId?: string; dispatchAttempt?: number }
+  | { type: 'tui_keys_delivered'; nonce: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }

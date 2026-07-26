@@ -51,6 +51,9 @@ export type BotDefaultsRow = {
   autoboundChatCount?: number;
   brandLabel?: string | null;
   sandbox?: boolean;
+  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
+   *  null/absent = none configured (pure deny-by-default baseline). */
+  sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
@@ -137,6 +140,26 @@ export function selectedCliOption(options: CliOption[], key: string): CliOption 
 export function modelSuggestionsForOption(opt: CliOption | undefined, cliState: CliOptionsState): string[] {
   if (opt?.gateway === 'ttadk' && opt.acceptsModel !== false) return cliState.ttadkModelSuggestions;
   return [];
+}
+
+/**
+ * Latest-wins guard for overlapping async refreshes. The Bot 配置 page fires an
+ * initial refresh on mount and another on every `bots.changed` SSE event; these
+ * can overlap, and a slow earlier `/api/bots` response arriving *after* a newer
+ * one ("后发先回") would otherwise clobber the fresher roster and re-hide a
+ * just-added bot. Each call bumps a monotonic counter and hands back a `commit`
+ * predicate that is only true while this call is still the newest — the caller
+ * gates BOTH its state write and its `loading=false` on it. Kept as a tiny
+ * pure factory so the race is unit-testable without a DOM.
+ */
+export function createRefreshGate(): { begin(): { commit(): boolean } } {
+  let latest = 0;
+  return {
+    begin() {
+      const seq = ++latest;
+      return { commit: () => seq === latest };
+    },
+  };
 }
 
 export async function fetchBotDefaults(): Promise<LoadBotsResult> {

@@ -3,6 +3,7 @@ import { openBotOnboarding } from './bot-onboarding.js';
 import {
   agentSelectionKey,
   cliIdOf,
+  createRefreshGate,
   displayCliId,
   fallbackCliOptionsState,
   fetchBotDefaults,
@@ -19,6 +20,7 @@ import {
 } from './bot-defaults.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import { store } from './store.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -268,9 +270,13 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
   };
 }
 
-function BotDefaultsPage() {
+export function BotDefaultsPage() {
   const tr = useT();
   const mountedRef = useRef(true);
+  // Latest-wins guard: mount's first refresh() and bots.changed-triggered
+  // refresh()es can overlap, so a slow earlier response must not clobber a
+  // newer roster ("后发先回"). Only the latest in-flight request commits.
+  const refreshGateRef = useRef(createRefreshGate());
   const [bots, setBots] = useState<BotDefaultsRow[]>([]);
   const [cliState, setCliState] = useState<CliOptionsState>(fallbackCliOptionsState);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -284,15 +290,21 @@ function BotDefaultsPage() {
 
   const refresh = useCallback(async (clearProfileRoles = false) => {
     if (clearProfileRoles) setProfileRoleVersion(version => version + 1);
+    const req = refreshGateRef.current.begin();
     setLoading(true);
     try {
       const [nextBots, nextCli] = await Promise.all([fetchBotDefaults(), fetchCliOptions()]);
-      if (!mountedRef.current) return;
+      // Drop a stale response: a newer refresh() started after us (e.g. a
+      // bots.changed fired while this request was in flight) — committing here
+      // would overwrite the fresher roster and re-hide the new bot.
+      if (!mountedRef.current || !req.commit()) return;
       setBots(nextBots.bots);
       setLoadError(nextBots.error);
       setCliState(nextCli);
     } finally {
-      if (mountedRef.current) setLoading(false);
+      // Only the latest request owns the loading flag — an out-of-order earlier
+      // response must not flip loading off while the newest is still pending.
+      if (mountedRef.current && req.commit()) setLoading(false);
     }
   }, []);
 
@@ -302,7 +314,14 @@ function BotDefaultsPage() {
     void loadNameMaps().then(() => {
       if (mountedRef.current) setAvatarVersion(value => value + 1);
     });
-    return () => { mountedRef.current = false; };
+    // Auto-refresh the roster when a bot is added / removed / renamed on the
+    // daemon side (SSE bots.changed), so the list stays live without a manual
+    // reload. The bot rows carry their own botName/cliId from /api/bots, so a
+    // plain refresh() is enough to surface a freshly-added bot.
+    const offBots = store.onBotsChanged(() => {
+      if (mountedRef.current) void refresh();
+    });
+    return () => { mountedRef.current = false; offBots(); };
   }, [refresh]);
 
   const filtered = useMemo(() => {
@@ -504,6 +523,7 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
             <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
             {bot.cliId !== 'riff' && <SandboxSection bot={bot} patchBot={patchBot} />}
+            {bot.cliId !== 'riff' && bot.sandbox === true && <SandboxPathsSection bot={bot} patchBot={patchBot} />}
             {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
                 手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
             {bot.cliId !== 'riff' && <BackendTypeSection bot={bot} patchBot={patchBot} />}
@@ -1359,11 +1379,11 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     }
   }
 
-  // Read isolation rides the SAME toggle: it applies additionally wherever the
-  // CLI + platform can enforce it (claude/codex on macOS/Linux, no wrapper). Show a
-  // capability line so the owner sees whether THIS bot's sandbox also read-isolates
-  // (the "labelled separately" requirement) — best-effort: write protection always
-  // applies; read isolation only where supported.
+  // The unified fs-policy always provides deny-by-default file read/write
+  // isolation. This capability line is narrower: whether the CLI's global data
+  // root can additionally be redirected into this bot's private BOT_HOME
+  // (claude/codex, no wrapper), keeping CLI credentials/config/history separate
+  // from sibling bots. Keep that distinction explicit in the UI copy.
   const readIsoSupported = bot.readIsolationSupported === true;
   return (
     <section className="bd-section">
@@ -1381,6 +1401,298 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       </p>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-sandbox-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+// ── Sandbox paths (three-tier whitelist) ──────────────────────────────────────
+type SandboxTier = 'readWrite' | 'readOnly' | 'deny';
+type SandboxTiers = { readWrite: string[]; readOnly: string[]; deny: string[] };
+
+/** Restrictiveness ranking — mirrors fs-policy.ts RESTRICTIVENESS so a same-path
+ *  cross-tier conflict resolves the SAME way the sandbox will (deny > ro > rw). */
+const SBX_RESTRICTIVENESS: Record<SandboxTier, number> = { readWrite: 0, readOnly: 1, deny: 2 };
+
+/** Effective access for `path` under the three tiers: DEEPEST (longest-prefix)
+ *  matching rule wins; at equal depth (same path across tiers) the MORE
+ *  RESTRICTIVE tier wins — mirrors fs-policy.ts accessForPath + mergeFsRules so
+ *  the UI's live labels + path tester agree with what the sandbox enforces.
+ *  `home` expands a leading `~` the same way the worker does before matching, so
+ *  recommendation entries like `~/.claude` line up with absolute tree nodes. */
+export function effectiveAccess(tiers: SandboxTiers, path: string, home: string): { access: SandboxTier | 'none'; rule?: string } {
+  const expand = (p: string) => (p === '~' || p.startsWith('~/')) ? home.replace(/\/+$/, '') + p.slice(1) : p;
+  const norm = (p: string) => expand(p).replace(/\/+$/, '') || '/';
+  const target = norm(path);
+  const covers = (parent: string, child: string) => {
+    const a = norm(parent), b = norm(child);
+    return a === b || b.startsWith(a === '/' ? '/' : a + '/');
+  };
+  const depth = (p: string) => norm(p) === '/' ? 0 : norm(p).split('/').filter(Boolean).length;
+  let best: { access: SandboxTier; ruleDepth: number; rule: string } | undefined;
+  const consider = (access: SandboxTier, rule: string) => {
+    if (!covers(rule, target)) return;
+    const d = depth(rule);
+    if (!best || d > best.ruleDepth
+      || (d === best.ruleDepth && SBX_RESTRICTIVENESS[access] > SBX_RESTRICTIVENESS[best.access])) {
+      best = { access, ruleDepth: d, rule };
+    }
+  };
+  for (const p of tiers.readWrite) consider('readWrite', p);
+  for (const p of tiers.readOnly) consider('readOnly', p);
+  for (const p of tiers.deny) consider('deny', p);
+  return best ? { access: best.access, rule: best.rule } : { access: 'none' };
+}
+
+/** Per-CLI recommended sandbox paths — the "Claude recommends adding ~/.claude"
+ *  one-click starters. Keyed by cliId family; falls back to a generic set. */
+function recommendedTiers(cliId: string | undefined): { tiers: SandboxTiers; labelKey: string } {
+  const id = (cliId ?? '').toLowerCase();
+  if (id.includes('claude')) {
+    return { labelKey: 'botDefaults.sbxPathsRecommendClaude', tiers: { readWrite: [], readOnly: ['~/.claude'], deny: [] } };
+  }
+  if (id.includes('codex')) {
+    return { labelKey: 'botDefaults.sbxPathsRecommendCodex', tiers: { readWrite: [], readOnly: ['~/.codex'], deny: [] } };
+  }
+  if (id.includes('gemini')) {
+    return { labelKey: 'botDefaults.sbxPathsRecommendGemini', tiers: { readWrite: [], readOnly: ['~/.gemini'], deny: [] } };
+  }
+  return { labelKey: 'botDefaults.sbxPathsRecommendGeneric', tiers: { readWrite: [], readOnly: [], deny: [] } };
+}
+
+function emptyTiers(): SandboxTiers { return { readWrite: [], readOnly: [], deny: [] }; }
+function normTiers(t?: BotDefaultsRow['sandboxPaths']): SandboxTiers {
+  if (!t) return emptyTiers();
+  return { readWrite: [...(t.readWrite ?? [])], readOnly: [...(t.readOnly ?? [])], deny: [...(t.deny ?? [])] };
+}
+function tiersEqual(a: SandboxTiers, b: SandboxTiers): boolean {
+  const k = (x: string[]) => [...x].sort().join('\n');
+  return k(a.readWrite) === k(b.readWrite) && k(a.readOnly) === k(b.readOnly) && k(a.deny) === k(b.deny);
+}
+/** Serialize tiers to the copy-paste text form (one path per line, tier-tagged). */
+function tiersToText(t: SandboxTiers): string {
+  const lines: string[] = [];
+  for (const p of t.readWrite) lines.push(`rw  ${p}`);
+  for (const p of t.readOnly) lines.push(`ro  ${p}`);
+  for (const p of t.deny) lines.push(`deny ${p}`);
+  return lines.join('\n');
+}
+/** Parse the copy-paste text form back into tiers. Tolerates `rw`/`readWrite`,
+ *  `ro`/`readOnly`, `deny`/`-`; blank lines and `#` comments are ignored. */
+function textToTiers(text: string): SandboxTiers {
+  const t = emptyTiers();
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = /^(\S+)\s+(.+)$/.exec(line);
+    if (!m) continue;
+    const tag = m[1].toLowerCase();
+    const path = m[2].trim();
+    if (tag === 'rw' || tag === 'readwrite' || tag === 'rw:') t.readWrite.push(path);
+    else if (tag === 'ro' || tag === 'readonly' || tag === 'ro:') t.readOnly.push(path);
+    else if (tag === 'deny' || tag === '-' || tag === 'deny:') t.deny.push(path);
+  }
+  return t;
+}
+
+function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const [tiers, setTiers] = useState<SandboxTiers>(() => normTiers(bot.sandboxPaths));
+  const [text, setText] = useState<string>(() => tiersToText(normTiers(bot.sandboxPaths)));
+  const [textMode, setTextMode] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const [testPath, setTestPath] = useState('');
+  // Lazy directory tree: path → child dir list (undefined = not yet loaded).
+  const [children, setChildren] = useState<Record<string, { name: string; path: string }[]>>({});
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [roots, setRoots] = useState<{ name: string; path: string }[]>([]);
+  // Canonical $HOME (first fs-list root) — used to expand `~` in tiers/tester
+  // the SAME way the worker does, so recommendation entries (~/.claude) match
+  // absolute tree nodes and effective-access labels are accurate.
+  const [homeRoot, setHomeRoot] = useState<string>('~');
+
+  const saved = useMemo(() => normTiers(bot.sandboxPaths), [bot.sandboxPaths]);
+  useEffect(() => { setTiers(normTiers(bot.sandboxPaths)); setText(tiersToText(normTiers(bot.sandboxPaths))); }, [bot.sandboxPaths]);
+  const dirty = !tiersEqual(tiers, saved);
+
+  const loadDir = useCallback(async (path: string) => {
+    try {
+      const q = path ? `?path=${encodeURIComponent(path)}` : '';
+      const r = await fetch(`/api/fs/list${q}`);
+      const j = await r.json();
+      if (!j.ok) return;
+      if (!path) {
+        setRoots(j.entries.map((e: any) => ({ name: e.name, path: e.path })));
+        // Backend returns canonical $HOME explicitly (realpath'd) so `~` expansion
+        // here matches the realpath'd child nodes + the worker's sandbox binds.
+        if (typeof j.home === 'string' && j.home.startsWith('/')) setHomeRoot(j.home);
+      } else setChildren(prev => ({ ...prev, [path]: j.entries.map((e: any) => ({ name: e.name, path: e.path })) }));
+    } catch { /* listing is best-effort; manual/text entry still works */ }
+  }, []);
+  useEffect(() => { if (!textMode && roots.length === 0) void loadDir(''); }, [textMode, roots.length, loadDir]);
+
+  // The tier a path is EXPLICITLY set to (undefined = inherits from ancestor).
+  const explicitTier = useCallback((path: string): SandboxTier | undefined => {
+    const n = path.replace(/\/+$/, '') || '/';
+    if (tiers.readWrite.some(p => (p.replace(/\/+$/, '') || '/') === n)) return 'readWrite';
+    if (tiers.readOnly.some(p => (p.replace(/\/+$/, '') || '/') === n)) return 'readOnly';
+    if (tiers.deny.some(p => (p.replace(/\/+$/, '') || '/') === n)) return 'deny';
+    return undefined;
+  }, [tiers]);
+
+  // Cycle a node: inherit → readWrite → readOnly → deny → inherit.
+  const cycleNode = useCallback((path: string) => {
+    setStatus(null);
+    const n = path.replace(/\/+$/, '') || '/';
+    const cur = explicitTier(path);
+    const next: SandboxTier | undefined =
+      cur === undefined ? 'readWrite' : cur === 'readWrite' ? 'readOnly' : cur === 'readOnly' ? 'deny' : undefined;
+    setTiers(prev => {
+      const strip = (arr: string[]) => arr.filter(p => (p.replace(/\/+$/, '') || '/') !== n);
+      const t: SandboxTiers = { readWrite: strip(prev.readWrite), readOnly: strip(prev.readOnly), deny: strip(prev.deny) };
+      if (next) t[next].push(path);
+      setText(tiersToText(t));
+      return t;
+    });
+  }, [explicitTier]);
+
+  function applyRecommended() {
+    const rec = recommendedTiers(bot.cliId);
+    setStatus(null);
+    setTiers(prev => {
+      const merge = (base: string[], add: string[]) => [...new Set([...base, ...add])];
+      const t: SandboxTiers = {
+        readWrite: merge(prev.readWrite, rec.tiers.readWrite),
+        readOnly: merge(prev.readOnly, rec.tiers.readOnly),
+        deny: merge(prev.deny, rec.tiers.deny),
+      };
+      setText(tiersToText(t));
+      return t;
+    });
+  }
+
+  function syncFromText(next: string) {
+    setText(next);
+    setTiers(textToTiers(next));
+    setStatus(null);
+  }
+
+  async function save() {
+    setBusy(true); setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox-paths`, tiers);
+      if (res.ok && res.body.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.sbxPathsSaved')}`, ok: true });
+        patchBot(bot.larkAppId, { sandboxPaths: res.body.sandboxPaths ?? { readWrite: [], readOnly: [], deny: [] } });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const tierBadge = (a: SandboxTier | 'none') =>
+    a === 'readWrite' ? tr('botDefaults.sbxRw')
+    : a === 'readOnly' ? tr('botDefaults.sbxRo')
+    : a === 'deny' ? tr('botDefaults.sbxDeny')
+    : tr('botDefaults.sbxNone');
+
+  function TreeNode(props: { name: string; path: string; depth: number }): ReactNode {
+    const { name, path, depth } = props;
+    const isOpen = expanded.has(path);
+    const explicit = explicitTier(path);
+    const eff = effectiveAccess(tiers, path, homeRoot);
+    const kids = children[path];
+    return (
+      <div className="bd-sbx-node">
+        <div className="bd-sbx-row" style={{ paddingLeft: depth * 16 }}>
+          <span
+            className="bd-sbx-twisty"
+            onClick={() => {
+              setExpanded(prev => { const s = new Set(prev); s.has(path) ? s.delete(path) : s.add(path); return s; });
+              if (!kids) void loadDir(path);
+            }}
+          >{isOpen ? '▾' : '▸'}</span>
+          <span className="bd-sbx-name" title={path}>{name}</span>
+          <button
+            type="button"
+            className={`bd-sbx-state bd-sbx-state-${explicit ?? 'inherit'}`}
+            data-action="cycle-sandbox-path"
+            data-path={path}
+            title={explicit ? undefined : `${tr('botDefaults.sbxInherit')}: ${tierBadge(eff.access)}`}
+            onClick={() => cycleNode(path)}
+          >
+            {explicit ? tierBadge(explicit) : `↳ ${tierBadge(eff.access)}`}
+          </button>
+        </div>
+        {isOpen && (
+          <div className="bd-sbx-kids">
+            {kids?.map(c => <TreeNode key={c.path} name={c.name} path={c.path} depth={depth + 1} />)}
+            {kids && kids.length === 0 && (
+              <div className="bd-sbx-empty" style={{ paddingLeft: (depth + 1) * 16 + 20 }}>{tr('botDefaults.sbxNoSubdirs')}</div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  const testResult = testPath.trim() ? effectiveAccess(tiers, testPath.trim(), homeRoot) : null;
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionSandboxPaths')}</h3>
+      <p className="bd-section-note">{tr('botDefaults.sbxPathsHelp')}</p>
+      <div className="actions" style={{ gap: 8, flexWrap: 'wrap' }}>
+        <button type="button" className="bd-btn" data-action="apply-sandbox-recommended" onClick={applyRecommended}>
+          {tr(recommendedTiers(bot.cliId).labelKey)}
+        </button>
+        <button type="button" className="bd-btn" onClick={() => setTextMode(m => !m)}>
+          {textMode ? tr('botDefaults.sbxPathsTreeMode') : tr('botDefaults.sbxPathsTextMode')}
+        </button>
+      </div>
+
+      {textMode ? (
+        <textarea
+          className="bd-sbx-text"
+          data-field="sandbox-paths-text"
+          rows={8}
+          value={text}
+          spellCheck={false}
+          placeholder={'rw  ~/my-data\nro  ~/reference-repos\ndeny ~/my-data/secrets'}
+          onChange={e => syncFromText(e.target.value)}
+        />
+      ) : (
+        <div className="bd-sbx-tree" data-field="sandbox-paths-tree">
+          {roots.map(r => <TreeNode key={r.path} name={r.name} path={r.path} depth={0} />)}
+        </div>
+      )}
+
+      <div className="bd-sbx-tester">
+        <input
+          className="bd-sbx-test-input"
+          data-field="sandbox-path-test"
+          placeholder={tr('botDefaults.sbxTestPlaceholder')}
+          value={testPath}
+          onChange={e => setTestPath(e.target.value)}
+        />
+        {testResult && (
+          <span className={`bd-sbx-test-out bd-sbx-state-${testResult.access}`} data-test-access={testResult.access}>
+            {tierBadge(testResult.access)}{testResult.rule ? ` ← ${testResult.rule}` : ''}
+          </span>
+        )}
+      </div>
+
+      <div className="actions">
+        <button type="button" className="bd-btn bd-btn-primary" data-action="save-sandbox-paths" disabled={busy || !dirty} onClick={() => void save()}>
+          {tr('botDefaults.sbxPathsSave')}
+        </button>
+        <StatusSpan status={status} attr={{ 'data-sandbox-paths-status': '' }} />
       </div>
     </section>
   );
