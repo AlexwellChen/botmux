@@ -4235,6 +4235,42 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/custom-passthrough — proxy to that bot's daemon. Body
+    // `{ customPassthroughCommands: string }` (raw text, comma/space separated; '' = clear).
+    let mBotPassthrough: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotPassthrough = url.pathname.match(/^\/api\/bots\/([^/]+)\/custom-passthrough$/))) {
+      const appId = decodeURIComponent(mBotPassthrough[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-custom-passthrough`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/cantalk-daemon-commands — proxy to that bot's daemon. Body
+    // `{ canTalkDaemonCommands: string }` (raw text, comma/space separated; '' = clear).
+    let mBotCanTalk: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotCanTalk = url.pathname.match(/^\/api\/bots\/([^/]+)\/cantalk-daemon-commands$/))) {
+      const appId = decodeURIComponent(mBotCanTalk[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-cantalk-daemon-commands`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/launch-shell — proxy to that bot's daemon. Body
     // `{ launchShell: string }` (shell name or absolute path; '' = clear → $SHELL).
     let mBotLaunchShell: RegExpMatchArray | null;

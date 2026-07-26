@@ -2188,6 +2188,19 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const sc = getBot(cachedLarkAppId).config.startupCommands;
     if (Array.isArray(sc) && sc.length) startupCommands = sc.join('\n');
   } catch { /* none */ }
+  // customPassthroughCommands / canTalkDaemonCommands → space-joined for the
+  // dashboard slash-command editors. Empty string = not configured (回默认).
+  let customPassthroughCommands = '';
+  let canTalkDaemonCommands = '';
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    if (Array.isArray(cfg.customPassthroughCommands) && cfg.customPassthroughCommands.length) {
+      customPassthroughCommands = cfg.customPassthroughCommands.join(' ');
+    }
+    if (Array.isArray(cfg.canTalkDaemonCommands) && cfg.canTalkDaemonCommands.length) {
+      canTalkDaemonCommands = cfg.canTalkDaemonCommands.join(' ');
+    }
+  } catch { /* none */ }
   // Per-bot env → pretty JSON for the dashboard textarea. The dashboard is
   // owner-authenticated, so showing the real values here is acceptable (same
   // as editing bots.json directly); the chat-facing /config get masks them.
@@ -2263,6 +2276,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     residentSessionCount,
     dormantSessionCount,
     startupCommands,
+    customPassthroughCommands,
+    canTalkDaemonCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
     riff: redactRiffForClient(getBot(cachedLarkAppId).config.riff),
@@ -2675,6 +2690,58 @@ ipcRoute('PUT', '/api/bot-startup-commands', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, startupCommands: (value ?? []).join('\n') });
+});
+
+// Per-bot 透传 slash 命令 customPassthroughCommands。Body `{ customPassthroughCommands: string }`
+// （原始文本，逗号/空格分隔；空白＝清除→回仅内置白名单）。走 stringList 的
+// coerceConfigValue（用字段自带 parseList，与 /botconfig 同口径）+ applyConfigField
+// （写盘 + 内存热更新），immediate 生效。回包 space-joined 供输入框回填。
+ipcRoute('PUT', '/api/bot-custom-passthrough', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { customPassthroughCommands?: unknown };
+  try { body = await readJsonBody<{ customPassthroughCommands?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('customPassthroughCommands');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.customPassthroughCommands === 'string' ? body.customPassthroughCommands : '';
+  let value: string[] | null;
+  if (!raw.trim()) {
+    value = null;  // 清除 → 回仅内置白名单
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string[];
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, customPassthroughCommands: (value ?? []).join(' ') });
+});
+
+// Per-bot daemon 命令降权名单 canTalkDaemonCommands。Body
+// `{ canTalkDaemonCommands: string }`（原始文本，逗号/空格分隔；空白＝清除→回全部
+// 仅管理员）。走 stringList 的 coerceConfigValue（字段自带 parseList 只认 daemon
+// 命令，透传/拼错条目被滤掉）+ applyConfigField（写盘 + 内存热更新），immediate 生效。
+ipcRoute('PUT', '/api/bot-cantalk-daemon-commands', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { canTalkDaemonCommands?: unknown };
+  try { body = await readJsonBody<{ canTalkDaemonCommands?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('canTalkDaemonCommands');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.canTalkDaemonCommands === 'string' ? body.canTalkDaemonCommands : '';
+  let value: string[] | null;
+  if (!raw.trim()) {
+    value = null;  // 清除 → 回全部仅管理员
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string[];
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, canTalkDaemonCommands: (value ?? []).join(' ') });
 });
 
 // Per-bot launch-shell override launchShell。Body `{ launchShell: string }`：
