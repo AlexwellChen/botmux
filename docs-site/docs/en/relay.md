@@ -39,4 +39,4 @@ The streaming card in the source group freezes into an archive (buttons removed,
 - Only the **session initiator (owner)** can relay their own session.
 - A session **that is processing (mid-turn) cannot be relayed**; wait until the current turn is idle, then send.
 - An external tmux session brought in via `/adopt` cannot be relayed (the CLI lives on your computer and botmux doesn't control its lifecycle).
-- If the target **anchor** already has an active session for that bot, you must `/close` it first, then relay (judged by the landing anchor: a chat-scope group means the whole group, a topic group means that specific topic — different topics in the same group don't collide).
+- If the target **anchor** already has an active session for that bot, you must `/close` it first, then relay (judged by the landing anchor: chat-scope is the whole group / whole flat DM, while thread-scope is that specific topic — different topics in the same group don't collide).
