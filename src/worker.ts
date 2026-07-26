@@ -165,7 +165,14 @@ import {
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
-import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
+import {
+  findLaunchedCliPid,
+  scheduleWrapperRealCliPid,
+  readComm,
+  isBareShellComm,
+  bareShellLaunchKind,
+  settleLaunchComm,
+} from './core/session-discovery.js';
 import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
@@ -1216,6 +1223,17 @@ let bareShellLaunchBlocked = false;
  *  one-shot so it also covers a reattach onto a pane that degraded to a bare
  *  shell. Reset per spawn in spawnCli. */
 let bareShellChecked = false;
+/** True only while detectBareShellLaunch() is inside its async launch-settle
+ *  window (settleLaunchComm's bounded ≤2s poll for a wrapper's final `exec
+ *  <cli>`). The message/injection flush paths already hold the isFlushing /
+ *  injectionFlushing mutexes across that await, but raw_input (passthrough
+ *  slash commands: /compact, /model, /btw) deliberately bypasses those to
+ *  preserve busy-delivery — so it would otherwise type into a pane whose leaf
+ *  is still the transient shell (or a shell already about to be blocked). This
+ *  latch lets raw_input defer for exactly that window without borrowing the
+ *  general isFlushing mutex (which would wrongly also block busy-delivery when
+ *  no settle is in progress). Reset per spawn in spawnCli. */
+let bareShellCheckInProgress = false;
 /** Ready-gate (Claude-family): holds the first prompt until the SessionStart
  *  hook proves a cjadk-style startup selector is behind us. Claude then needs
  *  fresh post-hook prompt evidence because sibling hooks may still be running.
@@ -4591,8 +4609,16 @@ async function flushPendingInjections(): Promise<void> {
       // path sends first runs the detection.
       if (!bareShellChecked) {
         bareShellChecked = true;
-        if (detectBareShellLaunch()) return;  // finally{} releases the mutex; queue stays
+        if (await detectBareShellLaunch()) return;  // finally{} releases the mutex; queue stays
       }
+      // The detector's settle await can span a restart's tmux jitter window
+      // (cliRestartInProgress true, old backend still alive). Re-check the fence
+      // before shift()/write so a queued injection never lands in a CLI already
+      // being torn down. The pending injections are then handled by killCli's
+      // restart policy — which drops them (barrier /cd is already durable in
+      // workingDir; non-barrier injects are best-effort and not replayed
+      // cross-process), unlike pendingMessages which killCli preserves.
+      if (cliRestartInProgress) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
       isPromptReady = false;
@@ -5313,15 +5339,36 @@ function scheduleSubmitFailureNotify(
  * and the pty/herdr backends (which `exec` the CLI directly — getChildPid is the
  * CLI itself, never a shell).
  *
- * Returns true when a bare-shell launch was detected (caller must NOT flush).
+ * Returns true when a persistent bare-shell launch was detected (caller must
+ * NOT flush). A transient wrapper shell gets a bounded chance to exec the CLI.
  */
-function detectBareShellLaunch(): boolean {
+async function detectBareShellLaunch(): Promise<boolean> {
   if (bareShellLaunchBlocked) return true;
   if (lastInitConfig?.adoptMode) return false;       // observing an existing pane, not launching
   if (lastInitConfig?.wrapperCli) return false;      // launcher legitimately wraps the CLI (transient shell shim)
-  const pid = backend?.getChildPid?.();
-  if (!pid) return false;
-  const comm = readComm(pid);
+  // Hold the raw_input passthrough latch across the bounded settle poll: the
+  // await below yields the event loop for up to 2s, and a concurrent raw_input
+  // IPC handler (which bypasses isFlushing to preserve busy-delivery) must not
+  // type into the pane while its leaf is still the unsettled shell.
+  bareShellCheckInProgress = true;
+  let comm: string | undefined;
+  try {
+    comm = await settleLaunchComm(() => {
+      const pid = backend?.getChildPid?.();
+      return pid ? readComm(pid) : undefined;
+    });
+  } finally {
+    bareShellCheckInProgress = false;
+  }
+  // A restart can begin while we're suspended in the settle await: tmux staggers
+  // teardown behind a 250–1999ms jitter, so cliRestartInProgress is already true
+  // but the old backend is still alive. Do NOT classify that torn-down pane as a
+  // failed launch — it would set the persistent bareShellLaunchBlocked and emit a
+  // misdiagnosis card for a CLI that's about to be replaced. Return healthy; the
+  // caller's own post-await restart fence keeps the queue intact for the
+  // replacement generation (whose spawnCli resets bareShellChecked and re-runs
+  // this check).
+  if (cliRestartInProgress) return false;
   if (!isBareShellComm(comm)) return false;          // CLI (rust/go/node) is running — healthy launch
 
   // Bare shell is the pane leaf → the CLI never launched. Tier the message on
@@ -5472,10 +5519,18 @@ async function flushPending(): Promise<void> {
     // doesn't get them typed into the bare shell first.
     if (!bareShellChecked) {
       bareShellChecked = true;
-      if (detectBareShellLaunch()) {
+      if (await detectBareShellLaunch()) {
         return;  // finally{} releases the mutex; pendingMessages stay queued, untouched
       }
     }
+    // detectBareShellLaunch() awaits a bounded settle poll; a restart can begin
+    // during that yield (tmux staggers teardown behind a 250–1999ms jitter, so
+    // cliRestartInProgress flips true while the old backend is still alive). Do
+    // not write startup commands / rename / user prompts into a CLI already
+    // promised to teardown — re-check the restart fence now, before any shift or
+    // write. The queue is untouched; the replacement generation's markPromptReady
+    // re-invokes flushPending.
+    if (cliRestartInProgress) return;  // finally{} releases the mutex; queue stays
     // One-shot per spawn: type the bot's startup commands (e.g. `/effort
     // ultracode`) into the CLI before the first user prompt drains. Both ready
     // paths funnel through flushPending — the ready-gate settle for Claude-family
@@ -6673,6 +6728,7 @@ async function spawnCli(
   // diagnostic instead of having the prompt typed into it.
   bareShellLaunchBlocked = false;
   bareShellChecked = false;
+  bareShellCheckInProgress = false;
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false
@@ -8339,7 +8395,10 @@ async function restartCliProcess(
         // intentionally held by the restart gate above. Release its raw-input
         // fence now; other backends keep it until their later markPromptReady().
         if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();
-        void flushPending();
+        // A local replacement process can exist before its TUI input box does.
+        // Only re-kick a prompt that became ready while the restart fence was
+        // still armed; otherwise markPromptReady() owns the first flush.
+        if (isPromptReady) void flushPending();
       }, 500);
     } catch (err) {
       cliRestartInProgress = false;
@@ -9931,8 +9990,16 @@ process.on('message', async (raw: unknown) => {
       // barrier（shouldDeferUserFlush——/cd 未落地前任何用户输入都不得写入，
       // 否则 passthrough 会执行在旧 cwd 的 CLI 里）时入队。注入排空后由
       // flushPendingInjections 的 finally 补踢 flushPending 送达。
+      // 第四个例外是启动稳定窗口：detectBareShellLaunch() 采到裸 shell 时会
+      // await settleLaunchComm() 最长 2s 等 wrapper 完成 `exec <cli>`——这段
+      // await 让出事件循环，而 IPC handler 不串行（见 raw-input-followup-
+      // atomicity.test.ts），若此刻放行 passthrough 就会打进尚未 exec 的临时
+      // shell。bareShellCheckInProgress 覆盖"检查进行中"、bareShellLaunchBlocked
+      // 覆盖"已确认裸 shell 启动失败"两种状态,一并入队。裸 shell 确认失败后
+      // 这些 pending 不会再被 flush（与 pendingMessages 同款处理），符合预期。
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight
-        || injectionFlushing || shouldDeferUserFlush(pendingInjections)) {
+        || injectionFlushing || shouldDeferUserFlush(pendingInjections)
+        || bareShellCheckInProgress || bareShellLaunchBlocked) {
         pendingRawInputs.push(msg);
         log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
       } else {
