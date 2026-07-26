@@ -1,6 +1,6 @@
 # Prerequisites
 
-Before installing botmux, make sure these are in place — **90% of "installed but won't connect / sessions won't start" issues trace back to a missing prerequisite here** (Node version, CLI not logged in, not on PATH).
+Before installing botmux, make sure these are in place — **many "installed but won't connect / sessions won't start" issues trace back to a missing prerequisite here** (Node version, CLI not logged in, not on PATH).
 
 **Applies to**: any machine that will run the botmux daemon (dev machine / devbox / server).
 **Doesn't apply**: if you only @ a bot in a group someone else already set up — you don't need to install anything locally.
@@ -11,7 +11,7 @@ Before installing botmux, make sure these are in place — **90% of "installed b
 - **AI coding CLI / local agent app**: at least one **installed and authenticated**, with the executable on your `PATH`:
   - `claude` (Claude Code), `codex`, `cursor-agent` (Cursor), `gemini`, `opencode`, `coco` (Trae / CoCo), `agy` (Antigravity), `hermes`, etc. (full `cliId` list in [CLI Adapters](/en/adapters)).
   - ⚠️ botmux is only a bridge — it doesn't manage login. **Run the CLI once in a terminal to confirm it can chat** before wiring it into botmux.
-- **tmux ≥ 3.x** (optional, strongly recommended): once installed, session persistence is enabled automatically — restarting the daemon doesn't interrupt the CLI (see [tmux Session Persistence](/en/tmux)).
+- **tmux ≥ 3.x** (**the default backend — strongly recommended to install**): tmux is the default session backend, so you need it to start sessions — when tmux isn't available botmux **no longer silently downgrades to pty**; it hard-gates the session and posts a card asking you to install tmux (see [tmux Session Persistence](/en/tmux)). Only use `BACKEND_TYPE=pty` as an explicit fallback if you truly need a tmux-free environment (pty doesn't survive daemon restarts).
 
 ## Recommended deployment
 

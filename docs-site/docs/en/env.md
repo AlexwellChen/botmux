@@ -13,7 +13,7 @@ Most configuration goes through `bots.json` / the dashboard — you **usually do
 | `WEB_EXTERNAL_HOST` | _(auto-detect LAN IP)_ | External hostname/IP used in terminal links (for public/intranet-domain access, see [Web Terminal](/en/web-terminal)) |
 | `WEB_EXTERNAL_PORT` | _(local proxy port)_ | External port used in terminal links, overriding the local proxy port (`8800 + botIndex`) so a relay host can listen on a different port number; in a multi-bot setup it's the base port, with the actual port being `WEB_EXTERNAL_PORT + botIndex` (see [Web Terminal](/en/web-terminal)) |
 | `SESSION_DATA_DIR` | `~/.botmux/data` | Session and queue storage directory |
-| `BACKEND_TYPE` | _(auto-detect)_ | `pty` forces a downgrade to pure pty mode |
+| `BACKEND_TYPE` | _(default tmux)_ | Explicitly set `pty` to fall back to a pure pty backend (the default is always tmux — no auto-fallback to pty; an unavailable tmux hard-gates with a card). pty doesn't survive daemon restarts |
 | `BOTMUX_FORWARD_FOLLOWUP_WAIT_MS` | `1500` | Milliseconds to hold a new topic for a root-linked clarification from the same user in the same chat; `0` disables it, maximum `10000` |
 | `DEBUG` | _(unset)_ | Set to `1` to enable debug logging |
 | `GITHUB_TOKEN` | _(unset)_ | Auth token for GitHub Releases API requests made by botmux itself, including dashboard changelog, update checks, and restart-report. Takes precedence over `GH_TOKEN`. |

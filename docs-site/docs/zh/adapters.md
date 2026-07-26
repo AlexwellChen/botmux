@@ -1,6 +1,6 @@
 # 多 CLI 适配器
 
-botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选择，一键切换。**本地 CLI 各自独立进程、`tmux attach` 可直连**；也有少数通过 API / 远端接入的 Agent（如 Mira、riff），不是本地进程。
+botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选择，一键切换。**本地适配器各自运行进程**（默认 tmux 后端下可 `tmux attach` 进真进程；显式 pty/zellij/herdr 后端另说）；也有少数通过 API / 远端接入的 Agent（如 Mira、riff），不是本地进程。
 
 **适用**：想换底层 CLI、或接一个新工具时查 `cliId` 和它是否吃 `model` 参数。
 **不适用**：套 wrapper / 网关（ccr、aiden x claude 等）不需要新适配器——见下方 [套 wrapper / 网关接入](#套-wrapper--网关接入)。
@@ -13,23 +13,23 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 |---------|-----|-----|:--:|
 | `claude-code` | Claude Code（默认） | 本地进程 | ✅ |
 | `codex` | Codex CLI | 本地进程 | ✅ |
-| `codex-app` | Codex App | 本地 App | |
+| `codex-app` | Codex App | 本地进程（app-server 协议） | |
 | `gemini` | Gemini | 本地进程 | ✅ |
 | `cursor` | Cursor（cursor-agent） | 本地进程 | ✅ |
 | `opencode` | OpenCode | 本地进程 | ✅ |
 | `antigravity` | Antigravity（agy） | 本地进程 | |
 | `copilot` | GitHub Copilot | 本地进程 | ✅ |
 | `grok` | Grok（grok-cli） | 本地进程 | ✅ |
-| `kimi` | Kimi Code | 本地进程 | |
+| `kimi` | Kimi Code | 本地进程 | ✅ |
 | `kiro-cli` | Kiro | 本地进程 | |
 | `pi` | Pi | 本地进程 | |
-| `oh-my-pi` | Oh-My-Pi（Pi fork） | 本地进程 | |
+| `oh-my-pi` | Oh-My-Pi（Pi fork） | 本地进程 | ✅ |
 | `aiden` | Aiden | 本地进程 | |
 | `coco` | CoCo / Trae（需 ≥ 0.120.32） | 本地进程 | ✅ |
-| `traex` | TRAE CLI（traex） | 本地进程 | |
+| `traex` | TRAE CLI（traex） | 本地进程 | ✅ |
 | `mtr` | MTR | 本地进程 | |
 | `hermes` | Hermes | 本地进程 | |
-| `genius` | Genius | 本地进程 | |
+| `genius` | Genius | 本地进程 | ✅ |
 | `seed` | Seed（Claude Code fork） | 本地进程 | |
 | `relay` | Relay（Seed 新版） | 本地进程 | |
 | `mira` | Mira APP | API / 远端 | |

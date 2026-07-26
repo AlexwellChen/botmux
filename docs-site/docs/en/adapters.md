@@ -1,6 +1,6 @@
 # Multi-CLI Adapters
 
-botmux bridges different CLIs / agents through adapters, selected via `cliId` in `bots.json` — one-click switching. **Local CLIs each run as their own process and can be reached via `tmux attach`**; a few are integrated over API / remotely (e.g. Mira, riff) and are not local processes.
+botmux bridges different CLIs / agents through adapters, selected via `cliId` in `bots.json` — one-click switching. **Local adapters each run as their own process** (under the default tmux backend you can `tmux attach` into the real process; explicit pty/zellij/herdr backends differ); a few are integrated over API / remotely (e.g. Mira, riff) and are not local processes.
 
 **Applies to**: when you want to switch the underlying CLI, or wire up a new tool, and need its `cliId` and whether it takes a `model` param.
 **Doesn't apply**: wrappers / gateways (ccr, aiden x claude, …) don't need a new adapter — see [Wrapper / gateway integration](#wrapper--gateway-integration) below.
@@ -13,23 +13,23 @@ The table lists the current built-in adapters (the **authoritative source** for 
 |---------|-----|-----|:--:|
 | `claude-code` | Claude Code (default) | local process | ✅ |
 | `codex` | Codex CLI | local process | ✅ |
-| `codex-app` | Codex App | local app | |
+| `codex-app` | Codex App | local process (app-server protocol) | |
 | `gemini` | Gemini | local process | ✅ |
 | `cursor` | Cursor (cursor-agent) | local process | ✅ |
 | `opencode` | OpenCode | local process | ✅ |
 | `antigravity` | Antigravity (agy) | local process | |
 | `copilot` | GitHub Copilot | local process | ✅ |
 | `grok` | Grok (grok-cli) | local process | ✅ |
-| `kimi` | Kimi Code | local process | |
+| `kimi` | Kimi Code | local process | ✅ |
 | `kiro-cli` | Kiro | local process | |
 | `pi` | Pi | local process | |
-| `oh-my-pi` | Oh-My-Pi (Pi fork) | local process | |
+| `oh-my-pi` | Oh-My-Pi (Pi fork) | local process | ✅ |
 | `aiden` | Aiden | local process | |
 | `coco` | CoCo / Trae (requires ≥ 0.120.32) | local process | ✅ |
-| `traex` | TRAE CLI (traex) | local process | |
+| `traex` | TRAE CLI (traex) | local process | ✅ |
 | `mtr` | MTR | local process | |
 | `hermes` | Hermes | local process | |
-| `genius` | Genius | local process | |
+| `genius` | Genius | local process | ✅ |
 | `seed` | Seed (Claude Code fork) | local process | |
 | `relay` | Relay (new release of Seed) | local process | |
 | `mira` | Mira APP | API / remote | |

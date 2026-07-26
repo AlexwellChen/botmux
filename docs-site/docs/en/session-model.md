@@ -41,6 +41,6 @@ This tiered model lets you confidently add the bot to an on-call group: everyone
 
 - **"Every @ feels like starting over, losing context"**: in a **topic group**, different topics are different sessions — what feels like a follow-up actually opened a new topic = a new session. To keep going, reply **in the same topic**; to truly reuse one session, see below.
 - **A new group / topic can't pull in earlier chat**: a new session starts clean by default. To have it read group history, just say "look at the earlier chat history" (the bot needs group-message read permission, see [FAQ](/en/faq)).
-- **Switch CLI mid-way but keep context**: see [Relay a Session](/en/relay) and [Adopt a Session](/en/adopt).
+- **Switch the underlying CLI while keeping context**: not possible today — there's **no lossless hot-swap across CLIs**; native session history isn't translated into another CLI. To switch CLIs, start a new bot / session and have the old bot emit a handoff summary. ([`/relay`](/en/relay) moves the **same session** to another group without changing the CLI; [`/adopt`](/en/adopt) attaches an existing local tmux/zellij / resumable session into Lark, also without changing the CLI.)
 
 **Next**: permission details in [FAQ · permissions](/en/faq); moving a session to another group in [Relay](/en/relay).

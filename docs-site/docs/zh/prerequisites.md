@@ -1,6 +1,6 @@
 # 前置要求
 
-装 botmux 之前，先确认这几样齐了——**90% 的「装完连不上 / 会话起不来」都是这里缺件**（Node 版本、CLI 没登录、PATH 里找不到）。
+装 botmux 之前，先确认这几样齐了——**「装完连不上 / 会话起不来」很多都是这里缺件**（Node 版本、CLI 没登录、PATH 里找不到）。
 
 **适用**：任何要跑 botmux daemon 的机器（开发机 / devbox / 服务器）。
 **不适用**：你只是在别人已部署好的群里 @ 机器人用——那不需要本机装任何东西。
@@ -11,7 +11,7 @@
 - **AI 编程 CLI / 本地 Agent 应用**：至少一种**已安装并完成认证**、可执行文件在 `PATH` 中：
   - `claude`（Claude Code）、`codex`、`cursor-agent`（Cursor）、`gemini`、`opencode`、`coco`（Trae / CoCo）、`agy`（Antigravity）、`hermes` 等（完整 `cliId` 见 [多 CLI 适配器](/adapters)）。
   - ⚠️ botmux 只是桥接层，不代管登录——**先在终端里手动跑一次该 CLI 确认能对话**，再接 botmux。
-- **tmux ≥ 3.x**（可选，强烈推荐）：安装后自动启用会话常驻——daemon 重启不中断 CLI（见 [tmux 会话常驻](/tmux)）。
+- **tmux ≥ 3.x**（**默认后端，强烈建议装**）：默认会话后端就是 tmux，装了才能起会话——tmux 不可用时 botmux **不再静默降级 pty**，而是硬拦截并弹卡提示装 tmux（见 [tmux 会话常驻](/tmux)）。确需无 tmux 环境才用 `BACKEND_TYPE=pty` 显式兜底（pty 不跨 daemon 重启存活）。
 
 ## 推荐部署形态
 

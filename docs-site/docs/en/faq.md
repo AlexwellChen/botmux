@@ -36,7 +36,9 @@ botmux has two permission layers (see [permissions](#how-are-permissions-divided
 
 ### C. Terminal has output but nothing sent to Lark
 
-Terminal stdout ≠ sent to Lark. You must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. If the model only `echo`s/`print`s or forgets to call `botmux send`, nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
+**This applies only to terminal CLI sessions that require explicit sending** (Claude Code / Codex CLI / Gemini / CoCo, etc.): terminal stdout ≠ sent to Lark, so the model must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. Just `echo`ing/`print`ing or forgetting `botmux send` means nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
+
+> ⚠️ **Exception: `codex-app` (Codex App app-server protocol)** — its final assistant message is **auto-forwarded** back to Lark by botmux, so **don't call `botmux send` for normal replies** (that would double-send); use it only for mid-turn pushes / attachments / cross-bot @mentions.
 
 ## `botmux history` reports 400 / Lark gateway 411?
 
@@ -73,7 +75,7 @@ Use `botmux bots list` or the `<available_bots>` block to find the target bot's 
 
 ## Does restarting the daemon lose context?
 
-With **tmux** installed, no — the CLI process stays resident in a tmux session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. Without tmux, it runs in pty mode, and a restart reloads everything.
+With **tmux** installed, no — tmux is the default backend, the CLI process stays resident in a tmux session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. ⚠️ Without tmux it does **not** silently downgrade to pty; it hard-gates and posts a card asking you to install tmux. Only an explicit `BACKEND_TYPE=pty` (or per-bot `backendType:"pty"`) uses pty, and pty sessions **do not survive daemon restarts** — a restart reloads everything.
 
 ## Does a session keep running if I don't close it? Is there automatic reclamation?
 

@@ -36,7 +36,9 @@ botmux 权限分两层（详见 [权限怎么分](#权限怎么分谁能操作)�
 
 ### C. 终端有输出但没发飞书
 
-终端 stdout ≠ 已发飞书。必须显式执行 `botmux send`（并带 `--mention-back` / `--mention` / `--no-mention` 之一），群里才看得到。模型只 `echo`/`print` 或忘了调 `botmux send` 就不会发出。多行内容用 heredoc，别写成 `"第一行\n第二行"`。
+**这条只针对需要显式发送的终端 CLI 会话**（Claude Code / Codex CLI / Gemini / CoCo 等）：终端 stdout ≠ 已发飞书，模型必须显式执行 `botmux send`（并带 `--mention-back` / `--mention` / `--no-mention` 之一），群里才看得到。只 `echo`/`print` 或忘调 `botmux send` 就不会发出。多行内容用 heredoc，别写成 `"第一行\n第二行"`。
+
+> ⚠️ **例外：`codex-app`（Codex App app-server 协议）**——它的最终 assistant message 由 botmux **自动转发**回飞书，**常规回复不要调 `botmux send`**（否则会重复发送），仅在中途主动推送 / 发附件 / 跨 bot @ 时才用。
 
 ## `botmux history` 报 400 / 飞书网关 411？
 
@@ -73,7 +75,7 @@ botmux 权限分两层（详见 [权限怎么分](#权限怎么分谁能操作)�
 
 ## daemon 重启会丢上下文吗？
 
-装了 **tmux** 就不会——CLI 进程常驻 tmux session，`botmux restart` 后下次消息自动 re-attach，无需 `--resume`。没装 tmux 则走 pty 模式，重启会重载。
+装了 **tmux** 就不会——tmux 是默认后端，CLI 进程常驻 tmux session，`botmux restart` 后下次消息自动 re-attach，无需 `--resume`。⚠️ 没装 tmux **不会自动降级 pty**，而是硬拦截弹卡让你装 tmux；只有显式 `BACKEND_TYPE=pty`（或 per-bot `backendType:"pty"`）才用 pty，且 pty 会话**不跨 daemon 重启存活**、重启会重载。
 
 ## 会话不关会一直跑吗？有自动回收吗？
 
