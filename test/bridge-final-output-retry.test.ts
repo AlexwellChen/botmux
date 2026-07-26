@@ -1446,6 +1446,49 @@ describe('Worker turn_terminal routing', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
   });
 
+  it('drops only the final_output of a suppressed trigger turn while other turns and its aux UI stay loud', async () => {
+    const ds = makeDs();
+    // A loud connector opted into suppressFinalOutput; trigger-session armed this
+    // exact turn id (parallel to silentScheduledTurns but final-only).
+    ds.suppressedTriggerFinalTurns = new Map([['trg_alert', Date.now()]]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // The suppressed turn's final_output must be dropped …
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'trigger summary that must not be posted', lastUuid: 'trg-uuid', turnId: 'trg_alert',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    // … but its auxiliary UI (user_notify/streaming) is NOT suppressed: unlike
+    // schedule-silent, trigger suppression only gates final_output, so the live
+    // status/notify channel still reaches the topic.
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'trigger warning still shows', turnId: 'trg_alert',
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][1]).toBe('trigger warning still shows');
+
+    // … and an unrelated turn on the same session keeps its final_output loud.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'human turn answer', lastUuid: 'human-uuid', turnId: 'other-turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await new Promise(r => setTimeout(r, 10));
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toContain('human turn answer');
+    expect(sessionReply.mock.calls[1][4]).toBe('other-turn');
+  });
+
   it('keeps a newer silent retry armed when stale output and terminal arrive first', async () => {
     const ds = makeDs();
     ds.suppressedFinalOutputTurns = new Map([['delivery-stable-key', 2]]);
