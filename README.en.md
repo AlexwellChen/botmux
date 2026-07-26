@@ -44,7 +44,7 @@ botmux setup                 # one scan to create the app → pick a CLI → pic
 botmux start                 # start the daemon (botmux autostart enable for auto-start on boot)
 ```
 
-Then DM the bot, or run `botmux dashboard` to create a group, and start chatting. Full steps (Lark international, `--no-open-platform-auto` manual app creation, troubleshooting) are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
+Then DM the bot, or run `botmux dashboard` to create a group, and start chatting. Full steps (Lark international, manual permission / publish setup after `--no-open-platform-auto`, troubleshooting) are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
 
 ## Core Scenarios
 

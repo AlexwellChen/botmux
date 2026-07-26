@@ -44,7 +44,7 @@ botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作�
 botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
 ```
 
-然后私聊机器人、或 `botmux dashboard` 拉个群，直接开聊。完整步骤（含 Lark 国际版、`--no-open-platform-auto` 手动建应用、排查）见 **[5 分钟快速接入](https://deepcoldy.github.io/botmux/quickstart)**。
+然后私聊机器人、或 `botmux dashboard` 拉个群，直接开聊。完整步骤（含 Lark 国际版、`--no-open-platform-auto` 后手动配置权限 / 发版、排查）见 **[5 分钟快速接入](https://deepcoldy.github.io/botmux/quickstart)**。
 
 ## 核心场景
 
