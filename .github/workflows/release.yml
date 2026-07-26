@@ -153,24 +153,33 @@ jobs:
             exit 1
           fi
 
-      - name: Guard — stable release must contain the latest master
-        # 正式版（latest）只能从「包含最新 master 的 commit」上发：被打 tag 的 commit
-        # 必须把 origin/master 当作祖先——即直接在 master 上打 tag，或在已 rebase 到最新
-        # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
-        # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
+      - name: Guard — stable release must be on the master line (not a diverged branch)
+        # 正式版（latest）只能从 master 主线上的 commit 发：被打 tag 的 commit 必须与
+        # origin/master 处在同一条线上——即 tag 是 master 的祖先（master 后来又前进了，
+        # 常见且无害），或 master 是 tag 的祖先（tag 就在 master 顶端 / 领先 master 几个
+        # 已合入的 commit）。只有当两者「分叉」（互不为祖先，说明 tag 落在一条偏离 master
+        # 的分支上）时才拒绝——防止从落后/分叉的个人分支打出正式版（曾发生 v2.47.0 从落后
+        # master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
+        #
+        # 关键：**发的是被打 tag 的那个 commit 本身**，不受打完 tag 后又合入 master 的
+        # 新 commit 影响。旧实现要求 tag 必须「包含最新 master」，于是「打完 tag 后 master
+        # 又前进」这种无害竞态会误判 tag 落后而 fail（曾让 v3.5.1 发版失败、#593 漏进裂缝）。
+        # 现在改为只挡「真分叉」，这条竞态不再阻断发版。
         # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
-        # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
-        # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
         if: steps.dist_tag.outputs.tag == 'latest'
         run: |
           git fetch origin master --quiet
-          if ! git merge-base --is-ancestor origin/master HEAD; then
-            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the latest origin/master ($(git rev-parse --short origin/master))."
-            echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master."
+          # tag 在 master 之后（master ⊇ tag）或 tag 在 master 之前/顶端（tag ⊇ master）
+          # 都属于同一主线，放行；只有互不为祖先（分叉）才拒绝。
+          if git merge-base --is-ancestor HEAD origin/master \
+            || git merge-base --is-ancestor origin/master HEAD; then
+            echo "OK: tagged commit $(git rev-parse --short HEAD) is on the master line (origin/master=$(git rev-parse --short origin/master))."
+          else
+            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) has diverged from origin/master ($(git rev-parse --short origin/master))."
+            echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto master (fast-forwardable either direction)."
             echo "Fix: rebase/merge onto origin/master then re-tag — or use a -canary/-beta/-rc suffix to publish off-master for testing."
             exit 1
           fi
-          echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
 
       - run: pnpm build
 
