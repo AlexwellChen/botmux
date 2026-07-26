@@ -1,7 +1,11 @@
 # 角色系统部署 runbook
 
 前提：PR1-3（`docs/role-system-design.md` §11.3 的 brandLabel 变量替换 / TUI idle 注入队列 +
-`botmux slash` / `botmux cd`）已合入并部署（`pnpm switch:here && botmux restart`）。
+`botmux slash` / `botmux role switch`）已合入并部署（`pnpm switch:here && botmux restart`）。
+
+> 命名：角色切换命令为 `botmux role switch <目录>`（曾用名 `botmux cd`，已移除）。
+> ⚠️ 存量部署的 `~/botmux-roles/<bot>/_role-protocol.md`（及各角色目录内的副本）里的
+> 命令名需刷新为 `botmux role switch` 并重新分发到各角色目录，否则模型发的旧命令会失败。
 
 ## 1. 选定目标 bot
 
@@ -41,7 +45,7 @@ echo '{"name": "默认助理"}' > ~/botmux-roles/<bot>/shared/default/.botmux-di
   「新建角色」流程同样会复制一份（见协议模板）；协议更新后需扫描各角色目录重新分发。
 
 角色库根目录固定为 `~/botmux-roles`（`src/core/role-library.ts` 的 `roleLibraryRoot()`，
-v0 硬编码约定、不接受配置），每个 bot 在其下各占一个子目录；`botmux cd` 的越界校验
+v0 硬编码约定、不接受配置），每个 bot 在其下各占一个子目录；`botmux role switch` 的越界校验
 （`validateRoleLibraryPath()`）也是对着这个全局根做包含性判断，而不是单独按 bot 子目录收紧——
 纯信息，不影响本 runbook 操作，仅供理解「角色库外」的确切边界。
 
@@ -62,7 +66,7 @@ v0 硬编码约定、不接受配置），每个 bot 在其下各占一个子目
 
 ## 4. 信任预置
 
-目的：避免 Claude Code 的交互式「是否信任此目录」对话框打断 `botmux cd` 注入。
+目的：避免 Claude Code 的交互式「是否信任此目录」对话框打断 `botmux role switch` 注入。
 
 **现有信任种子机制的两条实际路径**（按 bot 是否 readIsolation 分流）：
 

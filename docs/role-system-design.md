@@ -8,6 +8,10 @@
 技术路线：**方案 C（角色 = 工作目录 + Claude Code 原生记忆）**，配套 botmux 代码改动约 300 行：botmux cd/botmux slash 两个命令与 brandLabel 变量替换（见 11.2/11.3）。较 v0.1 的变化：应评审意见从「纯 Skill 方案」切换到 C，原因见第 3 节。v0.3：实测 Claude Code 会话内 /cd（2.1.205）后，切换改为注入式——不重启进程、上下文保留，handoff 机制退役（见 7.1）。v0.4：角色脚注定案为 brandLabel 变量替换 + 通用目录元数据 .botmux-dir.json（与角色解耦）（{cwdName}/{cwdUrl}，见 7.4），§14 跳转目标问题随之关闭。v0.5：知识沉淀升级为「飞书文档审核界面 + 本地运行时真源」双层，pull→merge→push，用户修订可回流（见 §9）。
 </callout>
 
+<!-- 后续变更（不改本 v0.5 快照正文）：角色切换命令名由 `botmux cd <目录>` 改为
+     `botmux role switch <目录>`（第一次上线做干净迭代，未保留 cd 别名）。下文历史正文
+     中出现的 `botmux cd` 语义等同现在的 `botmux role switch`。 -->
+
 # 1. 背景与目标
 
 botmux 飞书机器人（底层 Claude Code）目前的 `/role` 机制只解决「人设注入」，记忆按 (bot, 工作目录) 分桶，与角色无关——同一个 bot 里所有角色共用一份记忆。本方案要达成：

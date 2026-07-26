@@ -4124,17 +4124,17 @@ async function cmdSlash(): Promise<void> {
   process.exit(1);
 }
 
-/** botmux cd <角色目录>：请求 daemon 重钉本话题工作目录（角色切换）。
- *  daemon 侧校验目录必须在 ~/botmux-roles 下；Claude 家族 idle 注入 /cd 不重启，
- *  其余 CLI 杀进程冷启动。协议要求本命令是该轮最后一个动作。 */
-async function cmdCd(): Promise<void> {
-  const argv = process.argv.slice(3);
+/** 角色切换（`botmux role switch <角色目录>`，唯一入口）。daemon 侧硬校验目录必须在
+ *  ~/botmux-roles 下。名字→目录的解析由调用方（模型读 _role-protocol.md）完成，本命令
+ *  只透传解析出的目标目录。argv 由 dispatch 传入 `process.argv.slice(4)`（跳过 `switch`
+ *  子命令词）。 */
+async function cmdRoleSwitch(argv: string[]): Promise<void> {
   const sIdx = argv.indexOf('--session');
   const explicitSid = sIdx >= 0 ? argv[sIdx + 1] : undefined;
   // 所有非 flag 位置参数 join(' ')，而不是只取第一个——路径含空格且未加引号时
-  // （如 `botmux cd ~/botmux-roles/我的 角色`）此前会被截断。
+  // （如 `botmux role switch ~/botmux-roles/我的 角色`）此前会被截断。
   const dir = argv.filter((a, i) => !a.startsWith('--') && !(sIdx >= 0 && i === sIdx + 1)).join(' ');
-  if (!dir) { console.error('用法: botmux cd <目标目录（含空格建议加引号）> [--session <id>]'); process.exit(1); }
+  if (!dir) { console.error(`用法: botmux role switch <目标角色目录（含空格建议加引号）> [--session <id>]`); process.exit(1); }
 
   const ctx = explicitSid ? null : findAncestorSessionContext();
   const sid = explicitSid ?? ctx?.sessionId;
@@ -4785,7 +4785,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --isolated      挂起所有读隔离 bot（凭证轮换后用；下次冷启动自动同步最新凭证）
        --dry-run       只列出目标，不执行
   slash "<斜杠命令>"   会话空闲后向本会话 CLI 注入一条原生斜杠命令（需 bots.json 配 tuiSlashAllow；/cd 恒被拒）
-  cd <目录>        （会话内）切换本话题工作目录到角色库内的目录——角色切换用；
+  role switch <目录>  （会话内）切换本话题到角色库内的角色目录——角色切换用；
                    目录必须位于 ~/botmux-roles 之下
   term-link [id]   获取活跃会话的「可操作终端」（带写 token）。不回显链接，改由
                    daemon 把可操作卡片私密发给 owner（群内仅你可见，话题/单聊回退 DM）。
@@ -9834,7 +9834,16 @@ switch (command) {
   case 'resume':  await cmdResume(); break;
   case 'suspend': await cmdSuspend(); break;
   case 'slash':   await cmdSlash(); break;
-  case 'cd':      await cmdCd(); break;
+  case 'role': {
+    // `botmux role switch <角色目录>` — 角色切换（唯一入口）。名字→目录的解析由
+    // 调用方（模型读 _role-protocol.md）完成，本命令只透传解析出的目标目录，daemon
+    // 侧硬校验目录必须在 ~/botmux-roles 下。
+    const sub = process.argv[3] ?? '';
+    if (sub === 'switch') { await cmdRoleSwitch(process.argv.slice(4)); break; }
+    console.error(`用法: botmux role switch <目标角色目录（含空格建议加引号）> [--session <id>]`);
+    process.exit(1);
+    break;
+  }
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
