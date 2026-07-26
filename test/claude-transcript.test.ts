@@ -134,14 +134,21 @@ describe('pickAssistantTextEvents', () => {
     expect(pickAssistantTextEvents(events)).toEqual([]);
   });
 
-  it('drops API-error records (isApiErrorMessage) so raw error text is not forwarded as a reply', () => {
-    // Claude writes rate_limit / server_error / auth / the terms-400 as
-    // type:"assistant" with a human text block. They are NOT a model reply.
+  it('drops the rate_limit API-error record so its text is not forwarded as a reply', () => {
+    // rate_limit is surfaced as a `limited` state, not an assistant answer.
     const events: TranscriptEvent[] = [
-      { type: 'assistant', uuid: 'err1', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429, message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }] } },
-      { type: 'assistant', uuid: 'err2', isApiErrorMessage: true, error: 'server_error', message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500' }] } },
+      { type: 'assistant', uuid: 'rl', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429, message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }] } },
     ];
     expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('still forwards non-rate API errors (server_error / auth) as text — no dedicated surface', () => {
+    // These have no `limited` equivalent, so their text is the user's only
+    // signal that the request failed; must NOT be suppressed.
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 'se', isApiErrorMessage: true, error: 'server_error', message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500 internal' }] } },
+    ];
+    expect(pickAssistantTextEvents(events).map(e => e.uuid)).toEqual(['se']);
   });
 });
 

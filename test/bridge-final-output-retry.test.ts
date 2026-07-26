@@ -272,6 +272,36 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
+  it('clears a stuck limited state when a real answer is harvested after recovery', async () => {
+    // Regression guard (adopt/bridge sessions): a structured rate-limit emit
+    // parks ds in `limited`, but in-terminal recovery has no Lark turn / retry
+    // button / kill to clear it. A harvested final_output is a definitive
+    // self-heal signal, so it must clear the stale limit + drop 'limited'.
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.workerPort = 4321;
+    ds.usageLimit = { limited: true, kind: 'rate', retryAtMs: Date.now() + 5 * 60_000, retryLabel: '5-10 min', retryReady: false };
+    ds.lastScreenStatus = 'limited';
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(ds.usageLimit).toBeUndefined();
+    expect(ds.lastScreenStatus).not.toBe('limited');
+    expect(sessionReply).toHaveBeenCalled();
+  });
+
   it('records Hermes source binding and allows matching sourceHermesSessionId', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({

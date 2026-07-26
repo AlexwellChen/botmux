@@ -220,13 +220,11 @@ export function pickAssistantTextEvents(events: TranscriptEvent[]): TranscriptEv
   return events.filter(e => {
     if (!e || typeof e !== 'object') return false;
     if ((e as any).isSidechain === true) return false;
-    // API-error records (rate_limit, server_error, authentication_failed,
-    // the terms-acceptance 400, …) are written as type:"assistant" with a
-    // human text block, but they are NOT a model reply — forwarding them
-    // would post a raw error line to Lark as if the assistant had answered.
-    // rate_limit is instead surfaced as a `limited` session state; the rest
-    // are just suppressed here.
-    if (e.isApiErrorMessage === true) return false;
+    // The rate_limit API-error record is surfaced as a `limited` state, not a
+    // reply — drop it so its text ("... resets 10:40pm") isn't forwarded as an
+    // assistant answer. Other API errors (server_error / auth / the terms 400)
+    // have no dedicated surface, so they are still forwarded as their text.
+    if (isTranscriptRateLimitEvent(e)) return false;
     const role = e.message?.role ?? e.type;
     if (role !== 'assistant') return false;
     if (!e.uuid) return false;
