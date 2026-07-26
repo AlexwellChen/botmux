@@ -3321,6 +3321,7 @@ function hermesBridgeIngest(): void {
   // `/clear`-rotates mid-batch; the daemon accumulates them into its authorized
   // set, so a completed turn from an earlier source is not dropped as foreign.
   for (const boundSourceSessionId of filtered.newlyBoundSourceSessionIds) {
+    persistCliSessionId(boundSourceSessionId);
     send({ type: 'bridge_source_session', bridge: 'hermes', sourceSessionId: boundSourceSessionId });
     log(`Hermes bridge bound sourceSessionId=${boundSourceSessionId}`);
   }
@@ -6662,6 +6663,16 @@ async function spawnCli(
       log(`WARN Claude resume transcript sync failed: ${(err as Error).message}`);
     }
   }
+  // Hermes stores sessions in a SQLite state.db (not cwd-scoped JSONL). Resolve
+  // the same path the bridge uses — honoring per-bot env, the forced
+  // BOTMUX_SESSION_ID, and the hermes-botmux-session wrapper profile — so the
+  // adapter probe below queries the exact DB Hermes will `--resume` against.
+  const hermesResumeStateDbPath = cfg.cliId === 'hermes'
+    ? resolveHermesStateDbPath(
+      { ...process.env, ...sanitizePerBotEnv(cfg.env), BOTMUX_SESSION_ID: cfg.sessionId },
+      { botmuxSessionProfile: basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session' },
+    )
+    : undefined;
   const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2;
   let tier1ProbeFalse = false;
   if (effectiveResume && !tier2ForceFresh && !willReattachPersistent) {
@@ -6670,6 +6681,7 @@ async function spawnCli(
       cliSessionId: effectiveCliSessionId,
       workingDir: cfg.workingDir,
       dataDir: claudeDataDir,
+      stateDbPath: hermesResumeStateDbPath,
     });
     if (probe === false) tier1ProbeFalse = true;
   }
