@@ -983,6 +983,17 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /**
+   * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
+   * when the machine crosses into (and back out of) an overloaded state — a
+   * heads-up that botmux session cold-starts may time out and false-die. Host
+   * metrics are machine-wide, so designate ONE bot as the alerter; if several
+   * have it on, a shared episode lock de-dups so the machine only DMs once per
+   * edge. Missing/false = off. Hot-reloaded (no restart) once the daemon build
+   * that ships the watcher is running. See core/host-overload-alert.ts and the
+   * watcher in daemon.ts. BOTMUX_OVERLOAD_ALERT=0 force-disables regardless.
+   */
+  overloadAlert?: boolean;
   /** Native Lark VC bot meeting copilot bridge. Push is primary; polling remains gate/backfill. */
   vcMeetingAgent?: VcMeetingAgentConfig;
   workingDir?: string;
@@ -2104,6 +2115,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
         : undefined,
+      // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
+      overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,

@@ -4,7 +4,7 @@ import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } f
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
 
@@ -22,6 +22,19 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
+import {
+  evaluateOverload,
+  formatOverloadAlert,
+  buildOverloadAlertCard,
+  buildOverloadRecoveredCard,
+  initialOverloadCardState,
+  DEFAULT_OVERLOAD_THRESHOLDS,
+  INITIAL_OVERLOAD_STATE,
+  type OverloadState,
+  type OverloadThresholds,
+} from './core/host-overload-alert.js';
+import { registerOverloadNonce } from './im/lark/overload-nonce.js';
+import { countHostOverload } from './im/lark/card-handler.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
 import {
   selectCodexRuntimeUpdateTargets,
@@ -69,7 +82,7 @@ import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMent
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
 import { applyAllowedUsersResolve } from './utils/allowed-users-apply.js';
-import { withFileLock } from './utils/file-lock.js';
+import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
@@ -16971,6 +16984,111 @@ function resolvePrimaryOwnerOpenId(larkAppId: string): string | undefined {
   }
 }
 
+/** Parse a positive float env override, falling back to `dflt` when unset/invalid. */
+function envFloat(name: string, dflt: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return dflt;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : dflt;
+}
+
+/**
+ * Host-overload thresholds, seeded from module defaults and overridable via env
+ * so an operator can tune sensitivity without a code change:
+ *   BOTMUX_OVERLOAD_ENTER_LOAD_RATIO / _EXIT_LOAD_RATIO   (× logical CPU count)
+ *   BOTMUX_OVERLOAD_ENTER_MEM_FRAC   / _EXIT_MEM_FRAC      (0..1)
+ *   BOTMUX_OVERLOAD_MIN_REALERT_MS
+ * Setting BOTMUX_OVERLOAD_ALERT=0 disables the watcher entirely (checked at the
+ * call site). Swap is not read on this platform, so its thresholds stay default
+ * but are inert (reading passes swap=undefined).
+ */
+function resolveOverloadThresholds(): OverloadThresholds {
+  const cpuCount = Math.max(1, cpus().length || 1);
+  const enterLoadRatio = envFloat('BOTMUX_OVERLOAD_ENTER_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio);
+  let exitLoadRatio = envFloat('BOTMUX_OVERLOAD_EXIT_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.exitLoadRatio);
+  const enterMemUsedFrac = envFloat('BOTMUX_OVERLOAD_ENTER_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac);
+  let exitMemUsedFrac = envFloat('BOTMUX_OVERLOAD_EXIT_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.exitMemUsedFrac);
+  // Hysteresis only works when the recover line sits STRICTLY below the enter
+  // line. Clamping a misconfigured exit down to *equal* enter is not enough: at
+  // enter == exit the enter test (mem `>=`) and the recover test (mem `<=`) both
+  // fire at the exact threshold, so a reading pinned there flaps entered/
+  // recovered every tick. Force a small gap below enter (5%) and warn.
+  const HYSTERESIS_MARGIN = 0.95; // exit = 95% of enter when misconfigured
+  if (exitLoadRatio >= enterLoadRatio) {
+    const clamped = enterLoadRatio * HYSTERESIS_MARGIN;
+    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_LOAD_RATIO (${exitLoadRatio}) >= ENTER (${enterLoadRatio}); clamping exit to ${clamped}`);
+    exitLoadRatio = clamped;
+  }
+  if (exitMemUsedFrac >= enterMemUsedFrac) {
+    const clamped = enterMemUsedFrac * HYSTERESIS_MARGIN;
+    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_MEM_FRAC (${exitMemUsedFrac}) >= ENTER (${enterMemUsedFrac}); clamping exit to ${clamped}`);
+    exitMemUsedFrac = clamped;
+  }
+  return {
+    cpuCount,
+    enterLoadRatio,
+    exitLoadRatio,
+    enterMemUsedFrac,
+    exitMemUsedFrac,
+    enterSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.enterSwapUsedFrac,
+    exitSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.exitSwapUsedFrac,
+    minReAlertMs: envFloat('BOTMUX_OVERLOAD_MIN_REALERT_MS', DEFAULT_OVERLOAD_THRESHOLDS.minReAlertMs),
+  };
+}
+
+/**
+ * Machine-wide de-dup for the host-overload alert. load/mem are host-wide, so if
+ * more than one bot has the `overloadAlert` toggle on, every such daemon would
+ * independently detect the same edge and DM its owner. This claims a short-lived
+ * episode marker in the shared botmux data dir so only the first daemon to see a
+ * given edge actually sends; siblings within the dedup window back off.
+ *
+ * The key is just the edge kind (`entered` / `recovered`): within DEDUP_WINDOW_MS
+ * the first daemon to see an edge claims it and siblings back off. (An earlier
+ * version bucketed `entered` by `Math.round(load15)`, but sibling daemons
+ * sampling load15 either side of an X.5 boundary rounded to different bands,
+ * got different keys, and each DMed — so the band is dropped.)
+ *
+ * The claim is a real mutual exclusion: the ENTIRE read-check-write runs inside
+ * one `withFileLockSync` critical section on the marker. An earlier version used
+ * `openSync(marker, 'wx')`, but that only serializes the FIRST claim — once the
+ * marker exists (it persists after the first alert), every later edge
+ * (recovered / expired) fell back to an unlocked read→replace, so two daemons
+ * both detecting the same `recovered` edge could both read the stale key, both
+ * replace it, and each DM. Serializing the whole section closes that hole. Best-
+ * effort: if the lock itself can't be taken (FS error), allow the DM (better a
+ * rare duplicate than a silent miss).
+ */
+function claimOverloadEpisode(kind: 'entered' | 'recovered'): boolean {
+  const DEDUP_WINDOW_MS = 60_000; // ≥ two 30s ticks; covers sibling daemons racing the same edge.
+  const marker = join(config.session.dataDir, '.overload-episode.json');
+  const key = kind;
+  try {
+    return withFileLockSync(marker, () => {
+      const now = Date.now();
+      if (existsSync(marker)) {
+        try {
+          const prev = JSON.parse(readFileSync(marker, 'utf8')) as { key?: string; at?: number };
+          if (prev.key === key && typeof prev.at === 'number' && now - prev.at < DEDUP_WINDOW_MS) {
+            return false; // Same edge already claimed within the window.
+          }
+        } catch {
+          // Corrupt marker → fall through and take it over.
+        }
+      }
+      // Winner: claim the episode. atomicWriteFileSync is fine here — the lock,
+      // not the write, provides mutual exclusion.
+      atomicWriteFileSync(marker, JSON.stringify({ key, at: now }));
+      return true;
+    }, { maxWaitMs: 2_000 });
+  } catch (err) {
+    // Couldn't acquire the lock (timeout / FS error) → don't silently drop the
+    // edge; allow this DM (a rare duplicate is better than a missed alert).
+    logger.warn(`[overload] episode claim lock failed (${kind}): ${err instanceof Error ? err.message : String(err)}; allowing DM`);
+    return true;
+  }
+}
+
 /** Build the current dashboard URL (active token, not a rotation) from the
  *  dashboard process's persisted `.dashboard-port` / `.dashboard-token`. Falls
  *  back to a token-less base URL if the dashboard hasn't published a token yet. */
@@ -17848,6 +17966,81 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         log: (m) => logger.info(`[restart-report] ${m}`),
       });
     }, 5_000).unref?.();
+  }
+
+  // Host-overload watcher. Enabled per-bot via the `overloadAlert` config toggle
+  // (dashboard → Groups & Bots → bot card), NOT hardcoded to the primary daemon:
+  // any one bot can be designated the machine's alerter. load/mem are host-wide,
+  // so if more than one bot has it on, a cross-process file lock keyed on the
+  // overload episode ensures the machine only DMs once per edge (whichever bot's
+  // daemon wins the lock speaks). Reads os.loadavg()[2] + mem every 30s; on a
+  // healthy→overloaded or overloaded→healthy edge it DMs that bot's owner.
+  // Hysteresis + a min re-alert window (see host-overload-alert.ts) keep a load
+  // hovering near the line from spamming. Set BOTMUX_OVERLOAD_ALERT=0 to force
+  // the whole feature off regardless of per-bot config.
+  if (process.env.BOTMUX_OVERLOAD_ALERT !== '0') {
+    const overloadThresholds = resolveOverloadThresholds();
+    let overloadState: OverloadState = INITIAL_OVERLOAD_STATE;
+    const overloadTimer = setInterval(() => {
+      void (async () => {
+      try {
+        // Per-bot热开关：关了就不采样，但 timer 常驻，用户在 web 打开后下个 tick 即生效。
+        let enabled = false;
+        try { enabled = getBot(cfg.larkAppId).config.overloadAlert === true; } catch { enabled = false; }
+        if (!enabled) { overloadState = INITIAL_OVERLOAD_STATE; return; }
+
+        const reading = {
+          load15: loadavg()[2] ?? 0,
+          memTotalBytes: totalmem(),
+          memFreeBytes: freemem(),
+        };
+        const { nextState, action } = evaluateOverload(overloadState, reading, overloadThresholds, Date.now());
+        overloadState = nextState;
+        if (!action) return;
+
+        // Machine-wide de-dup: multiple bots may have the toggle on, but the
+        // host is one machine. Claim a short-lived episode lock so only one bot
+        // DMs per edge. Losing the claim = another bot already alerted this edge.
+        if (!claimOverloadEpisode(action.kind)) {
+          logger.info(`[overload] ${action.kind} edge already claimed by a sibling bot; skipping DM (${cfg.larkAppId})`);
+          return;
+        }
+        const ownerOpenId = resolvePrimaryOwnerOpenId(cfg.larkAppId);
+        logger.info(
+          `[overload] ${action.kind}: load15=${action.metrics.load15.toFixed(2)} `
+          + `perCpu=${action.metrics.loadPerCpu.toFixed(2)} mem=${(action.metrics.memUsedFrac * 100).toFixed(0)}% `
+          + `reasons=[${action.reasons.join(',')}] owner=${ownerOpenId ? 'yes' : 'none'} bot=${cfg.larkAppId}`,
+        );
+        if (!ownerOpenId) return; // No resolvable owner to DM; the log above still records the edge.
+        // Interactive card. `entered`: register a one-shot nonce, count the
+        // machine-wide zombie/idle candidates so the buttons can show「(N)」
+        // before a click, and send the stateful two-button card (clicking one
+        // never removes the other — the handler rebuilds this same card).
+        // `recovered`: display-only card. On any send failure, fall back to the
+        // plain-text alert so the owner still hears about it.
+        let cardJson: string;
+        if (action.kind === 'entered') {
+          const nonce = randomUUID();
+          registerOverloadNonce(nonce);
+          let counts = { stopped: 0, idle: 0 };
+          try { counts = await countHostOverload(); }
+          catch (err) { logger.warn(`[overload] count failed, showing 0: ${err instanceof Error ? err.message : String(err)}`); }
+          cardJson = buildOverloadAlertCard(initialOverloadCardState(action, counts, nonce));
+        } else {
+          cardJson = buildOverloadRecoveredCard(action);
+        }
+        void sendUserMessage(cfg.larkAppId, ownerOpenId, cardJson, 'interactive')
+          .catch((err) => {
+            logger.warn(`[overload] card DM failed, falling back to text: ${err instanceof Error ? err.message : String(err)}`);
+            return sendUserMessage(cfg.larkAppId, ownerOpenId, formatOverloadAlert(action));
+          })
+          .catch((err) => logger.warn(`[overload] text fallback DM also failed: ${err instanceof Error ? err.message : String(err)}`));
+      } catch (err) {
+        logger.warn(`[overload] sample failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      })();
+    }, 30_000);
+    overloadTimer.unref?.();
   }
 
   // Graceful shutdown. Sends SIGTERM (or `{type:'close'}` IPC via killWorker)

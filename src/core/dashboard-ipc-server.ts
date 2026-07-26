@@ -68,6 +68,7 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
+import { isSessionStopped } from './session-liveness.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
@@ -600,6 +601,83 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
     return jsonRes(res, 409, { ok: false, error: 'backend_not_suspendable' });
   }
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: true });
+});
+
+/**
+ * Count host-overload降压 candidates for THIS daemon's scope, so the alert card
+ * can show "僵尸 N / 闲置 M" before the owner clicks. `stopped` counts zombies
+ * from the SHARED session store (same answer on every daemon — the card handler
+ * only takes it from one), `idle` counts THIS daemon's own idle live workers
+ * (owning-daemon-authoritative — the handler sums across daemons). Mirrors the
+ * exact classification the sweep uses so the preview matches what a click does.
+ */
+ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
+  const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s)).length;
+  let idle = 0;
+  for (const ds of listActiveSessions()) {
+    if (!ds.worker || ds.worker.killed) continue;
+    if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;
+    if (ds.lastScreenStatus !== 'idle') continue;
+    idle++;
+  }
+  jsonRes(res, 200, { ok: true, stopped, idle });
+});
+
+/**
+ * Bulk host-overload降压 sweep, driven by the overload-alert card buttons.
+ * `mode`:
+ *   - `clean_stopped`: close stopped zombie sessions (dead CLI + no tmux) from
+ *     the SHARED session store — machine-wide, so a single daemon's sweep is
+ *     enough (the alert-owning daemon calls this once, no fan-out needed).
+ *   - `suspend_idle`: suspend THIS daemon's own idle (non-busy, suspendable,
+ *     non-adopt) live workers. Live workers only exist in their owning daemon's
+ *     process, so the card handler fans this mode out to every online daemon.
+ * Returns `{ ok, mode, affected }` — `affected` counts sessions acted on here.
+ */
+ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
+  let body: { mode?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const mode = body?.mode;
+
+  if (mode === 'clean_stopped') {
+    const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s));
+    let affected = 0;
+    for (const s of stopped) {
+      try {
+        const r = await closeSession(s.sessionId);
+        // Only count sessions this call actually closed. A shared-store session
+        // already closed by another daemon's concurrent sweep returns
+        // alreadyClosed=true — counting it would inflate `affected` by the
+        // number of daemons that raced on the same zombie.
+        if (r.ok && !r.alreadyClosed) affected++;
+      } catch (err) {
+        logger.warn(`[overload-sweep] close failed for ${s.sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    logger.info(`[overload-sweep] clean_stopped: closed ${affected}/${stopped.length} zombie session(s)`);
+    return jsonRes(res, 200, { ok: true, mode, affected });
+  }
+
+  if (mode === 'suspend_idle') {
+    // This daemon's own idle live workers only. Correctness guards mirror the
+    // idle-worker sweeper: never touch adopt sessions or mid-turn (busy) ones.
+    let affected = 0;
+    for (const ds of listActiveSessions()) {
+      if (!ds.worker || ds.worker.killed) continue;             // no live worker
+      if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;  // never suspend adopt
+      if (ds.lastScreenStatus !== 'idle') continue;              // never cut an in-flight reply
+      try {
+        if (suspendWorker(ds, 'host_overload_suspend')) affected++;
+      } catch (err) {
+        logger.warn(`[overload-sweep] suspend failed for ${ds.session.sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    logger.info(`[overload-sweep] suspend_idle: suspended ${affected} idle worker(s)`);
+    return jsonRes(res, 200, { ok: true, mode, affected });
+  }
+
+  return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
 });
 
 /** 会话级 CLI IPC（slash/cd）的调用方证明：trusted-host（.dashboard-secret HMAC，
@@ -2295,6 +2373,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
+    overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
@@ -2336,6 +2415,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
+    overloadAlert?: unknown;
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -2346,6 +2426,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
+    overloadAlert?: boolean;
   } = {};
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
   if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
@@ -2353,6 +2434,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.codexAppCleanInput === 'boolean') patch.codexAppCleanInput = body.codexAppCleanInput;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
+  if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;

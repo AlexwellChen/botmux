@@ -3901,6 +3901,12 @@ async function cmdDelete(): Promise<void> {
     toDelete = active;
   } else if (target === 'stopped') {
     toDelete = active.filter(s => {
+      // A deliberately cap-suspended session has neither pid nor backing pane
+      // (that's how its memory is reclaimed) but must cold-resume on the next
+      // message — never a zombie. Mirrors the server-side isSessionStopped guard
+      // and the `list` prune disposition; without it `delete stopped` (which the
+      // overload alert text recommends) would drop a live-but-parked session.
+      if (isColdResumeDormant(s)) return false;
       if (isAdoptedSession(s)) {
         const pid = adoptedCliPid(s);
         return pid ? !isProcessAlive(pid) : !(s.pid && isProcessAlive(s.pid));
