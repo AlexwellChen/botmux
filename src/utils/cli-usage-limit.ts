@@ -25,17 +25,24 @@ const RATE_LIMIT_PATTERNS = [
   /\brate limits?.*(?:reached|exceeded)\b/i,
   /\brate limited\b/i,
   // HTTP-style hard rate limits from CLI/provider retries (Codex/OpenAI path).
-  /\b429\b/,
-  /\btoo many requests\b/i,
+  // Anchor 429 to rate-limit context. A bare /\b429\b/ (or a bare "too many
+  // requests") false-positives on ordinary TUI content — port numbers, log
+  // line numbers, and especially agent command output (e.g. code/docs that
+  // literally print "Too Many Requests"). This detector runs on every screen
+  // frame, so keep it tight: only 429 that sits next to a status word or the
+  // full "429 Too Many Requests" phrase, plus the explicit retry-exhaustion line.
+  /status:\s*429\b/i,
+  /\b429\s+too many requests\b/i,
   /\bexceeded retry limit\b/i,
 ];
 
 // Hard rate-limit signatures that often omit a wall-clock retry time.
 // Only these get the fixed-cooldown fallback so generic "try again later"
-// usage copy stays non-blocking (existing product decision).
+// usage copy stays non-blocking (existing product decision). Same tightened
+// contexts as above — never a bare 429 / bare "too many requests".
 const HARD_RATE_LIMIT_WITHOUT_TIME_PATTERNS = [
-  /\b429\b/,
-  /\btoo many requests\b/i,
+  /status:\s*429\b/i,
+  /\b429\s+too many requests\b/i,
   /\bexceeded retry limit\b/i,
 ];
 
@@ -84,7 +91,7 @@ function parseMeridiemTime(text: string, now: Date): { retryAtMs: number; retryL
   return null;
 }
 
-/** Stable ~5 min cooldown pinned to wall-clock buckets for hard 429 fallbacks. */
+/** Stable fixed cooldown pinned to wall-clock buckets for hard 429 fallbacks. */
 function hardRateLimitFallbackTime(now: Date): { retryAtMs: number; retryLabel: string } {
   const nowMs = now.getTime();
   const bucketStart = Math.floor(nowMs / HARD_RATE_LIMIT_COOLDOWN_MS) * HARD_RATE_LIMIT_COOLDOWN_MS;
@@ -93,7 +100,9 @@ function hardRateLimitFallbackTime(now: Date): { retryAtMs: number; retryLabel: 
   const retryAtMs = bucketStart + 2 * HARD_RATE_LIMIT_COOLDOWN_MS;
   return {
     retryAtMs,
-    retryLabel: '~5 min',
+    // Label reflects the real (5min, 10min] window, not an optimistic "~5 min":
+    // the card's countdown text must not undersell how long the wait can be.
+    retryLabel: '5-10 min',
   };
 }
 
@@ -139,4 +148,29 @@ export function detectCliUsageLimit(text: string, now = new Date()): CliUsageLim
 
 export function usageLimitStateKey(state: CliUsageLimitState): string {
   return `${state.kind}:${state.retryAtMs}:${state.retryLabel}`;
+}
+
+/**
+ * Build a rate-limit state from a STRUCTURED signal (e.g. Claude Code's
+ * transcript `error: "rate_limit"` record) instead of screen text.
+ *
+ * The caller has already decided this IS a rate limit via a machine field, so
+ * unlike detectCliUsageLimit() there is no pattern gate here — we only need to
+ * fix the retry time. Claude's rate-limit records usually carry a human clock
+ * in their text ("You've hit your session limit · resets 10:40pm"); when
+ * `text` yields a parseable time we honor it (accurate retry_ready flip),
+ * otherwise we reuse the same wall-clock-bucketed fallback the screen-text
+ * hard-429 path uses so the usageLimitStateKey stays stable across repeated
+ * ticks within a bucket (no persist/timer churn on the daemon side).
+ */
+export function structuredRateLimitState(text = '', now = new Date()): CliUsageLimitState {
+  const parsed = parseMeridiemTime(text, now);
+  const { retryAtMs, retryLabel } = parsed ?? hardRateLimitFallbackTime(now);
+  return {
+    limited: true,
+    kind: 'rate',
+    retryAtMs,
+    retryLabel,
+    retryReady: now.getTime() >= retryAtMs,
+  };
 }

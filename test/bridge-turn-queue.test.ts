@@ -66,6 +66,28 @@ describe('BridgeTurnQueue', () => {
     expect(q.size()).toBe(0);
   });
 
+  it('does not attribute an API-error record (isApiErrorMessage) as the turn reply', () => {
+    // Claude writes a rate_limit / server_error as type:"assistant" with a
+    // human text block AND a terminal stop_reason. It must NOT become the
+    // turn's assistantUuids (that would forward the raw error line to Lark);
+    // the worker surfaces rate_limit separately as a `limited` state.
+    const q = new BridgeTurnQueue();
+    q.mark('t1');
+    const apiErr: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'err1',
+      isApiErrorMessage: true,
+      error: 'rate_limit',
+      apiErrorStatus: 429,
+      message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }], stop_reason: 'stop_sequence' },
+    };
+    q.ingest([user('u1'), apiErr]);
+    // Turn started (user matched) but collected no real reply → held back,
+    // not emitted with the error text.
+    expect(q.peek()[0]?.assistantUuids ?? []).toEqual([]);
+    expect(q.drainEmittable()).toEqual([]);
+  });
+
   it('back-to-back Lark messages without idle: each turn keeps its own uuids', () => {
     const q = new BridgeTurnQueue();
     q.mark('t1');

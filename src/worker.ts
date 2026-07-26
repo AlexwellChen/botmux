@@ -35,7 +35,7 @@ import {
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
@@ -218,7 +218,7 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { detectCliUsageLimit, usageLimitStateKey, structuredRateLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { redactChildEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { decideSubmitConfirmationAction, type SubmitActivityEvidence } from './services/submit-confirmation.js';
@@ -1847,6 +1847,15 @@ function createUsageLimitTracker() {
     detectedThisTurn(seq: number): boolean {
       return detectedTurn === seq;
     },
+    // Record a limit that came from a STRUCTURED signal (transcript error
+    // record) rather than screen text. Mirrors classify()'s state writes so
+    // the tracker stays coherent: mark this turn as having hit a limit (read
+    // by detectedThisTurn for the submit-confirmation recheck) and clear any
+    // stale retry-ready suppression. The actual emit is done by the caller.
+    noteStructuredLimit(): void {
+      suppressedRetryReadyKey = undefined;
+      detectedTurn = turnSeq;
+    },
   };
 }
 
@@ -1919,6 +1928,11 @@ const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
+/** uuids of Claude transcript rate-limit records we've already turned into a
+ *  `limited` emit. drainTranscript re-reads from offset 0 on truncation /
+ *  rotation and emitReadyTurns re-drains from 0, so the same rate_limit record
+ *  can resurface; keying on the record's stable uuid makes the emit idempotent. */
+const emittedRateLimitUuids = new Set<string>();
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
 let herdrAdoptBridgeQuietTimer: NodeJS.Timeout | null = null;
@@ -2802,10 +2816,43 @@ function bridgeIngest(): void {
   bridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   bridgeQueue.ingest(result.events, bridgeJsonlPath);
+  // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
+  // at the turn's terminal boundary. This is the authoritative "limited"
+  // signal — read it here (event-driven, once per record) instead of scraping
+  // the TUI. The queue already skips it as an assistant reply.
+  maybeEmitStructuredRateLimit(result.events);
   // Transcript terminal markers are authoritative and may settle a durable
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
   emitReadyTurns({ explicitTerminalOnly: true });
+}
+
+/** Scan newly-drained Claude transcript events for a structured rate-limit
+ *  record and, on the first unseen one, emit a `limited` screen_update so the
+ *  session surfaces in Dashboard「需要你」with a retry countdown — identical
+ *  wire shape to the screen-text detector's classify() output, so the daemon /
+ *  card / persistence paths need no change. Claude-only (bridgeQueue is the
+ *  Claude bridge; Codex uses codexBridgeQueue and has no structured 429). */
+function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void {
+  for (const ev of events) {
+    if (!ev.uuid || emittedRateLimitUuids.has(ev.uuid)) continue;
+    if (!isTranscriptRateLimitEvent(ev)) continue;
+    emittedRateLimitUuids.add(ev.uuid);
+    // Prefer a clock parsed from the record's own text ("... resets 10:40pm");
+    // fall back to the shared bucketed cooldown when it carries none.
+    const usageLimit = structuredRateLimitState(apiErrorMessageText(ev));
+    usageLimitTracker.noteStructuredLimit();
+    send({
+      type: 'screen_update',
+      content: currentUsageLimitSnapshot(),
+      status: 'limited',
+      usageLimit,
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+    log(`Structured rate-limit detected in Claude transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
+    return; // one limited emit per ingest is enough; state key is stable
+  }
 }
 
 function performBridgeIngestAndScheduleQuietEmit(): void {

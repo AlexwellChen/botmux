@@ -237,6 +237,17 @@ export class BridgeTurnQueue {
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
+        // API-error records (isApiErrorMessage:true — rate_limit, server_error,
+        // auth_failed, the terms-acceptance 400, …) are type:"assistant" with a
+        // human text block AND a terminal stop_reason, but they are not a model
+        // reply. Attributing them would (a) leak the raw error line to Lark as a
+        // final_output, and (b) falsely close the collecting turn with error
+        // text. Skip attribution entirely; the worker detects rate_limit
+        // separately (isTranscriptRateLimitEvent) and surfaces it as a `limited`
+        // state. We intentionally do NOT set terminalObserved here: an errored
+        // turn did not produce a real answer, so let the normal terminal marker
+        // (or retry) close it.
+        if (ev.isApiErrorMessage === true) continue;
         const hasVisibleText = assistantHasVisibleText(ev.message?.content);
         if (hasVisibleText && !this.collecting) {
           // Headless local turn: an assistant boundary arrived without any
