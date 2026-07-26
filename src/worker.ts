@@ -35,7 +35,7 @@ import {
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
@@ -205,7 +205,6 @@ import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
-import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { StuckDetector, matchHookReviewScreen } from './utils/stuck-detector.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
@@ -218,7 +217,7 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { detectCliUsageLimit, usageLimitStateKey, structuredRateLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { redactChildEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { decideSubmitConfirmationAction, type SubmitActivityEvidence } from './services/submit-confirmation.js';
@@ -1801,6 +1800,25 @@ let lastStructuredBridgeActivityAtMs = 0;
 
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
 
+/**
+ * True when this CLI has an authoritative STRUCTURED rate-limit signal in its
+ * transcript (Claude family — `error:"rate_limit"`, surfaced by
+ * maybeEmitStructuredRateLimit). For those CLIs the screen-text `rate`
+ * heuristic is not just redundant but harmful: the model's own output or a dev
+ * editing rate-limit code/tests puts phrases like "429 Too Many Requests" /
+ * "exceeded retry limit" on screen, which the scraper cannot distinguish from a
+ * real limit. So we suppress the screen-scan `rate` verdict and let the
+ * structured path be the sole authority. `usage` (quota "hit your limit …")
+ * has no structured equivalent yet, so it still comes from the screen.
+ *
+ * reliableTurnTerminal is exactly the "transcript-backed" capability flag
+ * (claude-code / seed set it); non-transcript CLIs (Codex, gemini, …) keep the
+ * screen scanner as their only rate-limit signal.
+ */
+function structuredRateLimitAuthoritative(): boolean {
+  return cliAdapter?.reliableTurnTerminal === true;
+}
+
 // Per-turn usage-limit state machine. Owns the turn counter plus the
 // "did this turn hit a limit" / "suppress a stale retry-ready banner" flags, so
 // classify()'s state writes are explicit method calls rather than hidden
@@ -1820,7 +1838,7 @@ function createUsageLimitTracker() {
     beginTurn(snapshot: string): number {
       turnSeq++;
       detectedTurn = undefined;
-      const current = detectCliUsageLimit(snapshot);
+      const current = detectCliUsageLimit(snapshot, undefined, { suppressRateKind: structuredRateLimitAuthoritative() });
       suppressedRetryReadyKey = current.limited && current.retryReady
         ? usageLimitStateKey(current)
         : undefined;
@@ -1832,7 +1850,7 @@ function createUsageLimitTracker() {
       content: string,
       status: RuntimeScreenStatus,
     ): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
-      const detected = detectCliUsageLimit(content);
+      const detected = detectCliUsageLimit(content, undefined, { suppressRateKind: structuredRateLimitAuthoritative() });
       if (!detected.limited) return { status };
 
       const key = usageLimitStateKey(detected);
@@ -1846,6 +1864,15 @@ function createUsageLimitTracker() {
     },
     detectedThisTurn(seq: number): boolean {
       return detectedTurn === seq;
+    },
+    // Record a limit that came from a STRUCTURED signal (transcript error
+    // record) rather than screen text. Mirrors classify()'s state writes so
+    // the tracker stays coherent: mark this turn as having hit a limit (read
+    // by detectedThisTurn for the submit-confirmation recheck) and clear any
+    // stale retry-ready suppression. The actual emit is done by the caller.
+    noteStructuredLimit(): void {
+      suppressedRetryReadyKey = undefined;
+      detectedTurn = turnSeq;
     },
   };
 }
@@ -1919,6 +1946,11 @@ const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
+/** uuids of Claude transcript rate-limit records we've already turned into a
+ *  `limited` emit. drainTranscript re-reads from offset 0 on truncation /
+ *  rotation and emitReadyTurns re-drains from 0, so the same rate_limit record
+ *  can resurface; keying on the record's stable uuid makes the emit idempotent. */
+const emittedRateLimitUuids = new Set<string>();
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
 let herdrAdoptBridgeQuietTimer: NodeJS.Timeout | null = null;
@@ -2802,10 +2834,43 @@ function bridgeIngest(): void {
   bridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   bridgeQueue.ingest(result.events, bridgeJsonlPath);
+  // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
+  // at the turn's terminal boundary. This is the authoritative "limited"
+  // signal — read it here (event-driven, once per record) instead of scraping
+  // the TUI. The queue already skips it as an assistant reply.
+  maybeEmitStructuredRateLimit(result.events);
   // Transcript terminal markers are authoritative and may settle a durable
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
   emitReadyTurns({ explicitTerminalOnly: true });
+}
+
+/** Scan newly-drained Claude transcript events for a structured rate-limit
+ *  record and, on the first unseen one, emit a `limited` screen_update so the
+ *  session surfaces in Dashboard「需要你」with a retry countdown — identical
+ *  wire shape to the screen-text detector's classify() output, so the daemon /
+ *  card / persistence paths need no change. Claude-only (bridgeQueue is the
+ *  Claude bridge; Codex uses codexBridgeQueue and has no structured 429). */
+function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void {
+  for (const ev of events) {
+    if (!ev.uuid || emittedRateLimitUuids.has(ev.uuid)) continue;
+    if (!isTranscriptRateLimitEvent(ev)) continue;
+    emittedRateLimitUuids.add(ev.uuid);
+    // Prefer a clock parsed from the record's own text ("... resets 10:40pm");
+    // fall back to the shared bucketed cooldown when it carries none.
+    const usageLimit = structuredRateLimitState(apiErrorMessageText(ev));
+    usageLimitTracker.noteStructuredLimit();
+    send({
+      type: 'screen_update',
+      content: currentUsageLimitSnapshot(),
+      status: 'limited',
+      usageLimit,
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+    log(`Structured rate-limit detected in Claude transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
+    return; // one limited emit per ingest is enough; state key is stable
+  }
 }
 
 function performBridgeIngestAndScheduleQuietEmit(): void {
@@ -3887,8 +3952,9 @@ let renderRows = PTY_ROWS;
 
 let renderer: TerminalRenderer | null = null;
 /** Most recent unfiltered viewport text — kept in sync by the screen_update
- *  timer for pipe-pane backends so ScreenAnalyzer (which is synchronous) has
- *  a fresh snapshot to read without needing its own tmux capture-pane call. */
+ *  timer for pipe-pane backends so usage-limit detection and the CoCo picker
+ *  have a fresh snapshot to read without needing their own tmux capture-pane
+ *  call. (Historically also fed the AI ScreenAnalyzer, now removed.) */
 let lastAnalyzerSnapshot = '';
 let screenUpdateTimer: ReturnType<typeof setInterval> | null = null;
 const SCREEN_UPDATE_INTERVAL_MS = 2_000;
@@ -4067,16 +4133,16 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   // so the diagnostic shell stays visible. flushPending's retry path restarts
   // both when the next message respawns the CLI.
   stopScreenUpdates();
-  stopScreenAnalyzer();
   stopStuckDetector();
   log(`Crash diagnostic tmux session parked at ${TmuxBackend.diagnosticSessionName(sessionId)}`);
   return true;
 }
 
-// ─── Screen Analyzer (AI-based TUI prompt detection) ────────────────────────
+// ─── TUI prompt blocking state ──────────────────────────────────────────────
 
-let screenAnalyzer: ScreenAnalyzer | null = null;
-/** When true, user messages are queued because a TUI prompt is active */
+/** When true, user messages are queued because a TUI prompt is active. Set by
+ *  the ask-hook / CoCo picker paths (driveCocoPicker, handleTuiKeys); cleared
+ *  when the prompt resolves or a Lark/terminal input overrides it. */
 let tuiPromptBlocking = false;
 
 function isWorkflowWorker(): boolean {
@@ -4135,59 +4201,6 @@ function maybeEmitWorkflowTranscriptOutput(): void {
     turnId: currentBotmuxTurnId ?? `workflow-pty-${sessionId || 'unknown'}`,
   });
   log('Workflow PTY transcript final_output emitted');
-}
-
-function startScreenAnalyzer(): void {
-  const sa = config.screenAnalyzer;
-  log(`ScreenAnalyzer config: enabled=${sa.enabled}, baseUrl=${sa.baseUrl ? 'set' : 'empty'}, model=${sa.model || 'empty'}, extraHeaders=${JSON.stringify(sa.extraHeaders)}`);
-  if (!sa.enabled || !sa.baseUrl || !sa.apiKey || !sa.model) return;
-
-  screenAnalyzer = new ScreenAnalyzer(
-    {
-      baseUrl: sa.baseUrl,
-      apiKey: sa.apiKey,
-      model: sa.model,
-      intervalMs: sa.intervalMs,
-      stableCount: sa.stableCount,
-      snapshotMaxChars: sa.snapshotMaxChars,
-      extraHeaders: sa.extraHeaders,
-      extraBody: sa.extraBody,
-    },
-    {
-      getSnapshot: () => {
-        // ScreenAnalyzer is called every ~5s for TUI-prompt detection. We
-        // can't make this async without overhauling the analyzer, so cache
-        // the last pipe-pane text snapshot here and refresh it eagerly.
-        // For pipe-pane backends, the cache is repopulated by the screen
-        // update timer; for others, fall through to the long-lived renderer.
-        return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
-      },
-      onAnalyzing: () => { /* no-op: only block when prompt is actually detected */ },
-      onTuiPrompt: (description, options, multiSelect) => {
-        tuiPromptBlocking = true;
-        send({ type: 'tui_prompt', description, options, multiSelect, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
-      },
-      onTuiPromptResolved: (selectedText) => {
-        tuiPromptBlocking = false;
-        send({
-          type: 'tui_prompt_resolved',
-          selectedText,
-          turnId: currentBotmuxTurnId,
-          dispatchAttempt: currentBotmuxDispatchAttempt,
-        });
-        // Flush any messages that were queued during the prompt
-        flushPending();
-      },
-      log,
-    },
-  );
-  screenAnalyzer.start();
-}
-
-function stopScreenAnalyzer(): void {
-  screenAnalyzer?.dispose();
-  screenAnalyzer = null;
-  tuiPromptBlocking = false;
 }
 
 // ─── Stuck Detector (AI-free fallback for blocked CLI states) ───────────────
@@ -4366,7 +4379,6 @@ async function captureAndUpload(): Promise<void> {
   }
 
   let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
-  if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
   send({
     type: 'screenshot_uploaded',
     imageKey,
@@ -4451,14 +4463,12 @@ function handleTermAction(key: TermActionKey): void {
   } else if (PTY_SEQ_MAP[key]) {
     backend.write(PTY_SEQ_MAP[key]);
   }
-  // ESC/Ctrl-C/Enter likely ends an active TUI prompt. The analyzer
-  // won't re-analyze while promptActive=true, so un-wedge both flags here.
-  // Without this, dismissing an AskUserQuestion dialog via the quick-key
-  // button leaves tuiPromptBlocking=true forever and silently queues every
-  // subsequent user message.
+  // ESC/Ctrl-C/Enter likely ends an active TUI prompt. Un-wedge the blocking
+  // flag here — without this, dismissing an AskUserQuestion dialog via the
+  // quick-key button leaves tuiPromptBlocking=true forever and silently queues
+  // every subsequent user message.
   if (tuiPromptBlocking && (key === 'esc' || key === 'ctrlc' || key === 'enter')) {
     tuiPromptBlocking = false;
-    screenAnalyzer?.notifySelection(`term_action:${key}`);
     void flushPending();
   }
   log(`Term action: ${key}`);
@@ -4506,7 +4516,6 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean>
       isPromptReady = false;
       idleDetector?.reset();
     }
-    screenAnalyzer?.notifySelection('final');
   }
 
   log(`TUI keys: ${keys.join(' ')}${isFinal ? ' (final)' : ''}`);
@@ -4616,7 +4625,6 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
     isPromptReady = false;
     idleDetector?.reset();
   }
-  screenAnalyzer?.notifySelection('text-input');
 
   // Wait briefly so the cursor position is stable before pasting
   await new Promise(r => setTimeout(r, 200));
@@ -5693,7 +5701,6 @@ function sendToPty(
   if (tuiPromptBlocking) {
     log(`User override: incoming Lark message clears tuiPromptBlocking — "${content.substring(0, 80)}"`);
     tuiPromptBlocking = false;
-    screenAnalyzer?.notifySelection('lark-input');
     // Tear down the prompt card so the user doesn't see stale options.
     send({
       type: 'tui_prompt_resolved',
@@ -5747,7 +5754,6 @@ function startScreenUpdates(): void {
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) return;
     let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
-    if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
 
     void (async () => {
       let content = lastContent;
@@ -5776,8 +5782,9 @@ function startScreenUpdates(): void {
           const hash = pipeText.ansi;
           changed = hash !== lastTextSnapshotHash;
           lastTextSnapshotHash = hash;
-          // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
-          // tmux call would otherwise need to fire twice per tick.
+          // Refresh the unfiltered snapshot cache (lastAnalyzerSnapshot) that
+          // usage-limit detection and the CoCo picker read from. Same tmux
+          // call would otherwise need to fire twice per tick.
           if (changed) {
             const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
             if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
@@ -8142,8 +8149,8 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   promptReadyDetectedDuringSettle = false;
   readyPatternSeenDuringHold = false;
   awaitingPostSessionStartPromptEvidence = false;
-  stopScreenAnalyzer();
   stopStuckDetector();
+  tuiPromptBlocking = false;
   stopScreenUpdates();
   backend?.kill();
   backend = null;
@@ -8255,7 +8262,6 @@ async function restartCliProcess(
       setTimeout(async () => {
         if (lastInitConfig) {
           startScreenUpdates();
-          startScreenAnalyzer();
           startStuckDetector();
           try {
             const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
@@ -9575,7 +9581,6 @@ process.on('message', async (raw: unknown) => {
         if (!isWorkflowWorker()) {
           port = await startWebServer(config.web.workerHost, msg.webPort);
           startScreenUpdates();
-          startScreenAnalyzer();
           startStuckDetector();
         } else {
           // Workflow attempts still expose a read-only web terminal so the
@@ -9746,12 +9751,11 @@ process.on('message', async (raw: unknown) => {
       if (!backend && crashDiagnosticStopped && lastInitConfig && !lastInitConfig.adoptMode) {
         log('Message received after crash-loop stop; retrying CLI start');
         destroyCrashDiagnosticTerminal('retry after message');
-        stopScreenAnalyzer();
         stopStuckDetector();
+        tuiPromptBlocking = false;
         stopScreenUpdates();
         awaitingFirstPrompt = true;
         startScreenUpdates();
-        startScreenAnalyzer();
         startStuckDetector();
         try {
           const restartCfg = { ...lastInitConfig, resume: true, prompt: '' };

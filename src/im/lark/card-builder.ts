@@ -1316,7 +1316,7 @@ export function buildGrantResultCard(kind: 'chat' | 'global' | 'deny', locale?: 
 // ─── TUI Prompt cards ───────────────────────────────────────────────────────
 
 /**
- * Build a Feishu interactive card for a TUI prompt detected by ScreenAnalyzer.
+ * Build a Feishu interactive card for a TUI prompt (ask-hook / CoCo picker).
  * Select-type options get buttons; input-type options shown in list with a note.
  */
 export function buildTuiPromptCard(

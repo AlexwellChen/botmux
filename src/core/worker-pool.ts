@@ -3732,6 +3732,16 @@ function setupWorkerHandlers(
         // Worker pops the turn off its queue right after emit, so it will
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.
+        // A real harvested answer is a definitive self-heal signal: if the
+        // session was parked in `limited` by a structured rate-limit emit
+        // (Claude adopt/bridge sessions where the user recovers in their own
+        // terminal — no Lark turn, retry button, or kill to clear it), the
+        // model is plainly working again. Clear the stale limit so the card /
+        // Dashboard「需要你」 don't stay pinned with a dead retry countdown.
+        if (ds.usageLimit) {
+          clearUsageLimitState(ds);
+          if (ds.lastScreenStatus === 'limited') ds.lastScreenStatus = 'idle';
+        }
         deliverFinalOutput(ds, msg, t, 0);
         break;
       }

@@ -229,28 +229,6 @@ export const config = {
      *  要回到 env 控制需删掉 config.json 里的 dashboard.publicReadOnly）. */
     publicReadOnly: (process.env.BOTMUX_DASHBOARD_PUBLIC_READONLY ?? 'true').toLowerCase() !== 'false',
   },
-  screenAnalyzer: {
-    enabled: (process.env.SCREEN_ANALYZER_ENABLED ?? '').toLowerCase() === 'true',
-    baseUrl: process.env.SCREEN_ANALYZER_BASE_URL ?? '',
-    apiKey: process.env.SCREEN_ANALYZER_API_KEY ?? '',
-    model: process.env.SCREEN_ANALYZER_MODEL ?? '',
-    /** Snapshot polling interval in ms */
-    intervalMs: Number(process.env.SCREEN_ANALYZER_INTERVAL_MS) || 2_000,
-    /** Consecutive unchanged snapshots required before calling AI */
-    stableCount: Number(process.env.SCREEN_ANALYZER_STABLE_COUNT) || 6,
-    /** Max characters to send from snapshot */
-    snapshotMaxChars: Number(process.env.SCREEN_ANALYZER_SNAPSHOT_MAX_CHARS) || 8_000,
-    /** Extra headers for the API request (JSON string, e.g. '{"X-Custom":"value"}') */
-    extraHeaders: (() => {
-      try { return JSON.parse(process.env.SCREEN_ANALYZER_EXTRA_HEADERS ?? '{}'); }
-      catch { return {}; }
-    })() as Record<string, string>,
-    /** Extra body params for the API request (JSON string, e.g. '{"thinking":{"type":"disabled"}}') */
-    extraBody: (() => {
-      try { return JSON.parse(process.env.SCREEN_ANALYZER_EXTRA_BODY ?? '{}'); }
-      catch { return {}; }
-    })() as Record<string, unknown>,
-  },
   stuckDetector: {
     /**
      * Lightweight, AI-free fallback that warns the user when a written input
