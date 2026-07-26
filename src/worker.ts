@@ -8241,12 +8241,14 @@ async function restartCliProcess(
       killCli({ preservePending: opts.preservePending });
       awaitingFirstPrompt = true;
       setTimeout(async () => {
+        let spawnedWorkingDir: string | undefined;
         if (lastInitConfig) {
           startScreenUpdates();
           startScreenAnalyzer();
           startStuckDetector();
           try {
             const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
+            spawnedWorkingDir = restartCfg.workingDir;
             // Re-engage RPC so the new --remote pane binds to the CURRENT app-server
             // (a fresh port), not the dead prior one. engageCodexRpc only sets
             // remote* on success, else spawnCli falls back to paste.
@@ -8267,6 +8269,15 @@ async function restartCliProcess(
           }
         }
         cliRestartInProgress = false;
+        // 合并进本轮的 cwd-move 若在 restartCfg 快照之后才到达，刚 spawn 的 CLI
+        // 仍在旧目录，而 daemon 侧已把会话重钉到新目录（状态分裂）。对账快照与
+        // lastInitConfig：发散 → 立即补一轮 respawn 收敛到最新 cwd（restart 合并
+        // 护栏对已完成的本轮不再拦截；skipRestartBudget 同 cwd-move 语义）。
+        if (spawnedWorkingDir && lastInitConfig && lastInitConfig.workingDir !== spawnedWorkingDir) {
+          log(`Merged cwd-move landed after restart snapshot (${spawnedWorkingDir} → ${lastInitConfig.workingDir}) — follow-up respawn`);
+          void restartCliProcess(`cwd-move follow-up respawn → ${lastInitConfig.workingDir}`, { preservePending: true, skipRestartBudget: true });
+          return;
+        }
         // Riff marks itself prompt-ready inside spawnCli(); that early flush is
         // intentionally held by the restart gate above. Release its raw-input
         // fence now; other backends keep it until their later markPromptReady().
