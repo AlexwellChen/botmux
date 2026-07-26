@@ -384,6 +384,31 @@ botmux 会自动开启机器人能力、长连接事件模式并订阅基础事�
 
 ---
 
+### 单个 Headless Goal（本机 CLI）
+
+`botmux goal run` 在不启动 daemon 的情况下运行一个真实 goal，适合本机脚本、CI 和人工触发的自动化。它走现有 v3 ephemeral worker、沙箱/enforcement、journal、worker fence 和 manifest 校验路径；信任边界与操作者在本机直接运行 botmux 相同，不是远程执行 API。
+
+```bash
+botmux goal run "检查仓库并生成发布说明" \
+  --bot my-codex \
+  --working-dir ~/projects/app \
+  --run-id release-notes-2026-07-22 \
+  --timeout 900 \
+  --json
+```
+
+Goal 也可来自 `--goal-file <path>` 或 `--stdin`。`--timeout` 的单位是秒；SIGINT、SIGTERM 和超时都会先把 run 折算为 durable `cancelled` 终态，再退出。
+
+`--json` 模式只向 stdout 写一份终态 JSON（`schemaVersion: "botmux.goal-run-result/v1"`），日志走 stderr。退出码是稳定的机器合同：`0` succeeded、`10` failed、`11` blocked、`12` cancelled、`13` runId/活动 driver 冲突、`14` 参数或启动错误。失败同样返回结构化 `error.code` / `error.message`。
+
+`--run-id` 是幂等键：已有终态会原样重放且不启动 worker；活动 driver 仍存活时拒绝并返回 `13`；driver 被 `kill -9` 后，用同一请求和 runId 重试会根据 v3 journal/worker fence 接续为新 attempt，不覆盖旧 attempt。不同 goal、bot、工作目录或 timeout 不能复用同一 runId。
+
+JSON 中的 `artifacts` 只包含经既有 manifest validator 验证的相对路径和摘要。`runDirectory.stability` 固定为 `informative-only`：该目录供本机诊断，不属于稳定 API，消费方不应读取其私有布局。采集不到 usage/cost 时字段会省略，不会伪造零值。
+
+当前入口仅提供本机单进程 CLI 合同，不提供 daemon/远程 Host API、事件流或跨机器 fencing；这些能力需要独立 RFC 和安全评审。
+
+---
+
 ### Bot 级环境变量（接入 GLM / 第三方服务商）
 
 每个 `bots.json` 条目都可以配置独立的 `env` 对象，注入到**该 bot 的 CLI 进程**。典型用途：让某个 bot 跑 GLM Coding Plan / 第三方 Anthropic·OpenAI 兼容服务商，另一个 bot 仍跑官方 Claude——只需给前者填上服务商的端点和 key：
