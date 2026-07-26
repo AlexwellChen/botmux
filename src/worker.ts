@@ -46,6 +46,7 @@ import {
   shouldWriteNow,
 } from './utils/input-gate.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
+import { decideRestartFollowup, settleDurableTurnForRestart } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
@@ -3768,6 +3769,31 @@ function codexBridgeDrainAndMaybeEmit(opts: { signalIdle?: boolean } = {}): void
   emitReadyCodexTurns();
 }
 
+/** Before we emit a fail-closed `ambiguous` terminal for a durable turn that a
+ *  CLI kill is about to interrupt, give an already-persisted `completed` record
+ *  a chance to win the worker-local terminal deduper. `reliableTurnTerminal`
+ *  CLIs (claude-code / codex / grok / traex) durably append their terminal line
+ *  to the transcript; if that line landed microseconds before the kill but the
+ *  fs.watch/1s poller hasn't consumed it yet, an unconditional `ambiguous` would
+ *  claim the deduper first and needlessly mark a turn that actually completed →
+ *  same durable key re-dispatchable → external side effect executed twice.
+ *  Draining here publishes that `completed` (claiming the deduper) so the later
+ *  `ambiguous` becomes a no-op. Shared by the CLI `onExit` path and the daemon
+ *  `restart` IPC path — both must drain identically before their ambiguous emit. */
+function drainReliableTerminalBeforeInterrupt(): void {
+  if (cliAdapter?.reliableTurnTerminal !== true) return;
+  if (bridgeJsonlPath) {
+    try { bridgeDrainAndMaybeEmit(); } catch (err: any) {
+      log(`Bridge terminal drain failed: ${err.message}`);
+    }
+  }
+  if (codexBridgeFallbackActive()) {
+    try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch (err: any) {
+      log(`Codex bridge terminal drain failed: ${err.message}`);
+    }
+  }
+}
+
 function emitReadyCodexTurns(): void {
   const ready = codexBridgeQueue.drainEmittable();
   if (ready.length === 0) return;
@@ -4524,11 +4550,12 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean>
 
 // 待注入的 TUI 命令队列。生命周期绑定当前 CLI 进程：killCli() 会清空它，
 // 防止 restart 后残留命令重放进新 CLI——新增清理状态时记得同步那里。
-// barrier=true 标记该注入携带 updateWorkingDir（cwd-move，如 /cd）：markPromptReady
-// 里 barrier 注入必须先于本次 pending 用户消息落地，防止用户消息在「记录已是新
-// cwd、进程仍在旧 cwd」的窗口里被写进旧目录的 CLI。排队策略判定收敛到
-// core/inject-queue-policy.ts（shouldDeferUserFlush / shouldFlushInjectionsFirst）
-// 以获得可单测的纯函数单元——本文件只持有队列状态。
+// barrier 语义：barrier=true 的注入必须先于本次 pending 用户消息落地。历史上
+// 唯一的 barrier 来源是 cwd-move 的 /cd 注入；角色切换改为 restart respawn 后
+// 现存发送方（/slash 白名单注入）全部 barrier=false，机制保留供未来有顺序
+// 依赖的注入复用。排队策略判定收敛到 core/inject-queue-policy.ts
+// （shouldDeferUserFlush / shouldFlushInjectionsFirst）以获得可单测的纯函数
+// 单元——本文件只持有队列状态。
 const pendingInjections: PendingInjection[] = [];
 let injectionFlushing = false;
 
@@ -5054,13 +5081,11 @@ function markPromptReady(): void {
     const { content } = renderer.snapshot();
     send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   }
-  // cwd-move 注入（barrier=true，如 /cd）必须先于本次 pending 用户消息落地：
-  // 用户在 bot 发完「已切换角色」确认后立刻发下一条消息是最常见路径——若
-  // flushPending 先跑，该消息会在 barrier 注入之前被写进旧 cwd 的 CLI（daemon
-  // 记录已是新目录，实际执行仍在旧目录）。跳过本次 flushPending 不会饿死用户
-  // 消息：flushPending 自身的 injectionFlushing 守卫会挡住并发写入，
-  // flushPendingInjections 的 finally 会在注入完成、CLI 重新 idle 后补踢一次
-  // flushPending 排空 pendingMessages。
+  // barrier 注入必须先于本次 pending 用户消息落地（现存发送方均 barrier=false，
+  // 该分支目前不触发；机制保留见 pendingInjections 声明处注释）。跳过本次
+  // flushPending 不会饿死用户消息：flushPending 自身的 injectionFlushing 守卫
+  // 会挡住并发写入，flushPendingInjections 的 finally 会在注入完成、CLI 重新
+  // idle 后补踢一次 flushPending 排空 pendingMessages。
   if (shouldFlushInjectionsFirst(pendingInjections)) {
     void flushPendingInjections();
   } else {
@@ -7998,16 +8023,7 @@ async function spawnCli(
       // before exiting while fs.watch/the 1s poller is still queued. Drain it
       // synchronously before claiming `cli_exit`; otherwise ambiguous wins the
       // deduper and needlessly replays a turn that actually completed.
-      if (bridgeJsonlPath) {
-        try { bridgeDrainAndMaybeEmit(); } catch (err: any) {
-          log(`Bridge exit drain failed: ${err.message}`);
-        }
-      }
-      if (codexBridgeFallbackActive()) {
-        try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch (err: any) {
-          log(`Codex bridge exit drain failed: ${err.message}`);
-        }
-      }
+      drainReliableTerminalBeforeInterrupt();
       // Race-safe with transcript final / submit-failure: the worker-local
       // terminal deduper lets exactly one status win for this attempt.
       emitTurnTerminal(
@@ -8210,7 +8226,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
 ): Promise<void> {
   if (lastInitConfig?.adoptMode) {
     log(`Restart ignored in adopt mode (${reason})`);
@@ -8230,9 +8246,13 @@ async function restartCliProcess(
   revokeManagedTurnOriginForRestart();
   log(`Restart requested (${reason})`);
   // Tier-2 guard: 2nd consecutive in-worker restart forces FRESH. Tier-1
-  // adapter probing is still re-run on every spawn.
-  consecutiveInWorkerRestarts++;
-  log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
+  // adapter probing is still re-run on every spawn. skipRestartBudget（角色
+  // 切换的 cwd-move respawn）不计入：那是用户主动迁移不是崩溃恢复，计进去
+  // 会让「切角色 + 一次无关重启」无故触发强制 FRESH 丢上下文。
+  if (!opts.skipRestartBudget) {
+    consecutiveInWorkerRestarts++;
+    log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
+  }
   const restart = async (): Promise<void> => {
     try {
       tmuxRestartTimer = null;
@@ -8260,11 +8280,13 @@ async function restartCliProcess(
       killCli({ preservePending: opts.preservePending });
       awaitingFirstPrompt = true;
       setTimeout(async () => {
+        let spawnedWorkingDir: string | undefined;
         if (lastInitConfig) {
           startScreenUpdates();
           startStuckDetector();
           try {
             const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
+            spawnedWorkingDir = restartCfg.workingDir;
             // Re-engage RPC so the new --remote pane binds to the CURRENT app-server
             // (a fresh port), not the dead prior one. engageCodexRpc only sets
             // remote* on success, else spawnCli falls back to paste.
@@ -8285,6 +8307,34 @@ async function restartCliProcess(
           }
         }
         cliRestartInProgress = false;
+        // Follow-up decision (pure, unit-tested in restart-followup-policy.ts):
+        //  - cwd-move: a role-switch restart landed after restartCfg was
+        //    snapshotted → CLI came up in the old cwd while daemon repinned to
+        //    the new one. Respawn to converge (budget skipped only if the
+        //    backend is still alive; a dead one keeps the crash evidence).
+        //  - replacement-recovery: the freshly-spawned CLI exited inside the
+        //    window cliRestartInProgress still covers (spawnCli +
+        //    prepareCodexNativeTitleGeneration). onExit nulled `backend`
+        //    synchronously, so `!backend` is the ground-truth recovery signal —
+        //    NOT a merged daemon auto-restart (a restart message carries no
+        //    trustworthy source, so a healthy duplicate /restart during the
+        //    window must NOT be misread as a crash and force a budget-burning
+        //    second restart). Recover now or the session strands at
+        //    backend=null needing a manual /restart. Genuine crash recovery →
+        //    COUNTS toward tier-2 FRESH.
+        const followup = decideRestartFollowup({
+          spawnedWorkingDir,
+          currentWorkingDir: lastInitConfig?.workingDir,
+          backendAlive: !!backend,
+        });
+        if (followup.kind !== 'none') {
+          const reason = followup.kind === 'cwd-move'
+            ? `cwd-move follow-up respawn → ${lastInitConfig?.workingDir}`
+            : 'replacement-exit follow-up restart (replacement exited during in-flight restart)';
+          log(reason);
+          void restartCliProcess(reason, { preservePending: true, skipRestartBudget: followup.skipRestartBudget });
+          return;
+        }
         // Riff marks itself prompt-ready inside spawnCli(); that early flush is
         // intentionally held by the restart gate above. Release its raw-input
         // fence now; other backends keep it until their later markPromptReady().
@@ -9920,7 +9970,58 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'restart': {
-      await restartCliProcess('daemon request', { preservePending: true });
+      // 角色切换的 cwd-move respawn：respawn 用 {...lastInitConfig, resume:true}，
+      // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
+      // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
+      // （COPY 最新 <sid>.jsonl 进新 cwd 桶，已在 master）接住，上下文不丢。
+      if (msg.updateWorkingDir && lastInitConfig) {
+        lastInitConfig.workingDir = msg.updateWorkingDir;
+      }
+      // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
+      // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、
+      // 把重启预算无故烧到 tier-2 强制 FRESH（丢上下文），非 tmux 路径还会
+      // 双 spawn。workingDir 已收敛进 lastInitConfig，pending 的 spawn 展开
+      // {...lastInitConfig} 时自然拿到新目录。
+      //
+      // 这里**只 break、不记任何 flag**：restart 消息不带可信来源，无法区分
+      // 「replacement 崩溃触发的 auto-restart」与「用户重复点了一次 restart」。
+      // replacement 真退出时 onExit 已同步把 backend 置 null，续体用 !backend 即可
+      // 补 recovery（见 decideRestartFollowup）；健康的重复 restart 就该被合并掉，
+      // 记 flag 反而会逼健康进程再重启一轮、烧预算丢 --resume（正是合并要防的）。
+      if (cliRestartInProgress || tmuxRestartTimer) {
+        log(`Restart request merged into in-flight restart${msg.updateWorkingDir ? ` (workingDir → ${msg.updateWorkingDir})` : ''}`);
+        break;
+      }
+      // restart 杀死 CLI，在飞的 durable turn 随之死亡。对被杀的那次投递，主动发一个
+      // 'ambiguous' 终端回执：CLI 被中途杀掉，副作用到底发没发是**真的无法证明**
+      // （故不能报 'cancelled'），交由 daemon 的重试策略即时对账。不发的话 receipt 会
+      // 悬着，等 daemon 租约到期走 expire_durable_turn 的「无法证明 → 扣 ACK → 超时
+      // fencing teardown」慢路径（还会把刚 respawn 的新 CLI 二次 teardown）。
+      // emitTurnTerminal 自带释放（复位 durableTurnInFlight、退休 inflight input、
+      // 撤销 turn-origin relay、丢弃 bridge 尝试）并对后续 CLI-exit 终端去重；它排的
+      // flushPending 微任务会因下面 restartCliProcess 同步置位 cliRestartInProgress 而空跑。
+      // 结算被 restart 打断的在飞 durable turn（编排见 settleDurableTurnForRestart，
+      // 已单测）：drain 已落盘可靠终态让「刚好在 kill 前完成、watcher 未消费」的 turn
+      // 以 completed 抢占 deduper → 复检仍在飞才补发 ambiguous（否则无条件 ambiguous
+      // 会误标已完成投递 → 同 key 可重派 → 副作用两次）→ 兜底释放 latch 免卡 respawn。
+      // emitTurnTerminal 自带释放（复位 durableTurnInFlight、退休 inflight input、撤销
+      // turn-origin relay、丢弃 bridge 尝试）；它排的 flushPending 微任务会因下面
+      // restartCliProcess 同步置位 cliRestartInProgress 而空跑。
+      settleDurableTurnForRestart({
+        hasInFlightTurn: durableTurnInFlight,
+        hasCurrentTurnId: !!currentBotmuxTurnId,
+        drain: () => drainReliableTerminalBeforeInterrupt(),
+        isStillInFlight: () => durableTurnInFlight,
+        emitAmbiguous: () => emitTurnTerminal(currentBotmuxTurnId!, 'ambiguous', undefined, currentBotmuxDispatchAttempt),
+        release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
+      });
+      await restartCliProcess(
+        msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : 'daemon request',
+        // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制
+        // FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
+        // auto-restart 那条裸 restart 的计数兜底。
+        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir },
+      );
       break;
     }
 
@@ -10060,12 +10161,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'inject_command': {
-      // 会话内 /cd 移动后，worker 内部 respawn（claude_exit 自动重启 / IM /restart /
-      // dashboard restart）必须收敛到新目录，而不是陈旧的 lastInitConfig.workingDir。
-      if (msg.updateWorkingDir && lastInitConfig) {
-        lastInitConfig.workingDir = msg.updateWorkingDir;
-      }
-      pendingInjections.push({ command: msg.command, barrier: !!msg.updateWorkingDir });
+      // 唯一发送方是 /slash 路由的白名单 TUI 命令注入。cwd 移动不再走注入
+      // （角色切换已改为 restart+updateWorkingDir 的 respawn），这里不接受
+      // 任何 workingDir 改写——那会绕过 cd 路由的角色库硬校验。
+      pendingInjections.push({ command: msg.command, barrier: false });
       void flushPendingInjections();
       break;
     }
