@@ -212,6 +212,43 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(redirected.rules, '/Users/u/.claude/projects/x.jsonl').access).toBe('none');
   });
 
+  it('authPaths are exposed rw at the policy layer (the worker gates them off under redirect)', () => {
+    // The policy itself always exposes authPaths readWrite — it does not know
+    // about redirect for auth. The redirect gate lives in worker.ts, which
+    // passes authPaths=[] when CLI data is redirected to BOT_HOME (auth is
+    // provisioned there instead). This asserts BOTH halves of that contract so a
+    // future refactor can't silently re-leak the host dir: (1) when authPaths IS
+    // passed it is rw (non-redirect path), (2) when the worker passes [] under
+    // redirect nothing from the host auth dir is exposed. See worker.ts authPaths
+    // gate + the codex ~/.codex whole-dir leak this closes.
+    const nonRedirect = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj', botHome: '/home/u/.botmux/bots/cli_self',
+      redirectedCliData: false,
+      authPaths: ['/home/u/.codex'], // codex authPaths = whole dir
+    }));
+    // codex reads/writes state DBs, history, sessions under ~/.codex → rw.
+    expect(accessForPath(nonRedirect.rules, '/home/u/.codex/state_5.sqlite').access).toBe('readWrite');
+    expect(accessForPath(nonRedirect.rules, '/home/u/.codex/history.jsonl').access).toBe('readWrite');
+
+    // Redirect path: worker passes authPaths=[] → the host ~/.codex is NOT bound.
+    // Its transcripts/state/history must be inaccessible; the live root is
+    // BOT_HOME/codex, covered rw by the botHome internal rule instead.
+    const redirected = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj', botHome: '/home/u/.botmux/bots/cli_self',
+      redirectedCliData: true,
+      authPaths: [], // <- what worker.ts passes under redirect
+    }));
+    expect(accessForPath(redirected.rules, '/home/u/.codex/history.jsonl').access).toBe('none');
+    expect(accessForPath(redirected.rules, '/home/u/.codex/sessions/a/b.jsonl').access).toBe('none');
+    expect(accessForPath(redirected.rules, '/home/u/.codex/state_5.sqlite').access).toBe('none');
+    // …while the isolated per-bot codex home stays rw (its live data root).
+    expect(accessForPath(redirected.rules, '/home/u/.botmux/bots/cli_self/codex/auth.json').access).toBe('readWrite');
+  });
+
   it('linux baseline: toolchain ro, no darwin paths', () => {
     const p = buildFsPolicy(ctx({ platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self', botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj' }));
     expect(accessForPath(p.rules, '/usr/lib/x.so').access).toBe('readOnly');

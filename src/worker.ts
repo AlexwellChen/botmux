@@ -7266,7 +7266,18 @@ async function spawnCli(
         claudeDataDir ? `${sandboxHome}/.claude.lock` : undefined,
         claudeDataDir ? `${sandboxHome}/.local/state/claude` : undefined,
       ]),
-      authPaths: keepExisting([...(cliAdapter.authPaths ?? [])]),
+      // authPaths carries the CLI's REAL login/data dir (claude:
+      // ~/.claude/.credentials.json; codex/codex-app: the WHOLE ~/.codex). When
+      // NOT redirected we must expose it readWrite so token refresh + codex's
+      // SQLite state/log DBs persist. But when CLI data IS redirected to
+      // BOT_HOME (CLAUDE_CONFIG_DIR/CODEX_HOME), the isolated home lives under
+      // `botHome` — already pushed readWrite/internal — and provisionIsolatedBotHome
+      // seeds auth/config there from the host copy (in the WORKER, outside the
+      // sandbox). Passing the host authPaths then adds nothing but a leak: codex's
+      // whole ~/.codex (history.jsonl, sessions/, state_*.sqlite, skills/) would be
+      // bound readWrite into every redirected codex sandbox despite BOT_HOME being
+      // the live root. Gate it OFF under redirect, mirroring cliDataPaths above.
+      authPaths: willRedirectCliData ? [] : keepExisting([...(cliAdapter.authPaths ?? [])]),
       execPaths: keepExisting([...execDirs, ...execCarve]),
       readonlyRoots: keepExisting([
         ...(cfg.skillReadonlyRoots ?? []),
