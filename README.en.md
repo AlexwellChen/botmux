@@ -26,7 +26,7 @@
 
 ---
 
-A daemon watches Lark messages and spawns an isolated AI coding CLI process for each new session, streaming the CLI's output back as live Lark cards and offering an interactive web terminal. It **doesn't reimplement agent capabilities** — it bridges the CLIs you already use directly (`botmux` ships **24 built-in adapters**, see [Supported CLIs](#supported-clis)).
+A daemon watches Lark messages and spawns an isolated session process for each new session, streaming the AI coding CLI / agent's output back as live Lark cards and offering an interactive web terminal. It **doesn't reimplement agent capabilities** — it bridges the tools you already use directly (**20+ CLI / agent adapters**, see [Supported CLIs & Agents](#supported-clis--agents)).
 
 ## What it solves
 
@@ -36,15 +36,15 @@ A daemon watches Lark messages and spawns an isolated AI coding CLI process for 
 
 ## 5-Minute Setup
 
-> Scanning to create the app + granting permissions takes about 5 minutes. ByteDance-internal users: see [one-command setup](https://deepcoldy.github.io/botmux/en/quickstart).
+> About 5 minutes: a single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (`--no-open-platform-auto` skips the automation for manual app creation).
 
 ```bash
 npm install -g botmux        # requires Node >= 22
-botmux setup                 # scan to create a bot → pick a CLI → pick a working dir → scan to grant permissions
+botmux setup                 # one scan to create the app → pick a CLI → pick a working dir (permissions + publish auto-configured)
 botmux start                 # start the daemon (botmux autostart enable for auto-start on boot)
 ```
 
-Then DM the bot, or run `botmux dashboard` to create a group, and start chatting. Full steps (screenshots, internal one-command setup, proxy config) are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
+Then DM the bot, or run `botmux dashboard` to create a group, and start chatting. Full steps (Lark international, `--no-open-platform-auto` manual app creation, troubleshooting) are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
 
 ## Core Scenarios
 
@@ -53,18 +53,18 @@ Then DM the bot, or run `botmux dashboard` to create a group, and start chatting
 - **[Multi-topic orchestration](https://deepcoldy.github.io/botmux/en/multi-topic)** — hand an orchestrator a big task and it seeds topics in the group, spins up an isolated session per bot to run a pipeline, and the Lark task board shows every subtask's progress at a glance.
 - **[Interactive web terminal](https://deepcoldy.github.io/botmux/en/web-terminal)** — not just viewing output: drive the CLI directly from a browser / phone, with a floating shortcut bar on mobile (Esc, Ctrl+C, arrow keys).
 - **[Adopt & relay sessions](https://deepcoldy.github.io/botmux/en/adopt)** — running halfway in local tmux, `/adopt` it from your phone; `/relay` moves the whole session (same process, same memory) into a team group to continue.
-- **[Scheduled tasks & Webhook](https://deepcoldy.github.io/botmux/en/schedule)** — configure recurring tasks in natural language (alert analysis / group summaries), or trigger programmatically from external systems via [Webhook / API](https://deepcoldy.github.io/botmux/en/webhook).
-- **[On-call mode & voice summary](https://deepcoldy.github.io/botmux/en/oncall)** — pull it into an on-call group and any member's @ triggers a probe in the project dir; a one-tap 🔊 voice summary on every card footer makes the model "speak plainly".
+- **[Scheduled tasks](https://deepcoldy.github.io/botmux/en/schedule) & [external triggers](https://deepcoldy.github.io/botmux/en/webhook)** — configure recurring tasks in natural language (alert analysis / group summaries); trigger programmatically from external systems via [Webhook](https://deepcoldy.github.io/botmux/en/webhook) or the [task-trigger API](https://deepcoldy.github.io/botmux/en/api-task-trigger).
+- **[On-call mode](https://deepcoldy.github.io/botmux/en/oncall) & [voice summary](https://deepcoldy.github.io/botmux/en/voice)** — pull it into an on-call group and any member's @ triggers a probe in the project dir; once TTS is configured, each card footer gains a 🔊 voice-summary button that makes the model "speak plainly".
 
-More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sandbox](https://deepcoldy.github.io/botmux/en/sandbox) · [Dashboard](https://deepcoldy.github.io/botmux/en/dashboard) · [tmux persistence](https://deepcoldy.github.io/botmux/en/tmux) · [VC meeting agent](https://deepcoldy.github.io/botmux/en/voice).
+More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sandbox](https://deepcoldy.github.io/botmux/en/sandbox) · [Dashboard](https://deepcoldy.github.io/botmux/en/dashboard) · [tmux persistence](https://deepcoldy.github.io/botmux/en/tmux) · [VC meeting agent](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg).
 
-## Supported CLIs
+## Supported CLIs & Agents
 
-Switch with `cliId` in `bots.json`; processes are fully isolated. **24 built-in adapters**:
+Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process). Representative ones:
 
-`claude-code` · `codex` · `codex-app` · `gemini` · `cursor` · `opencode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `pi` · `oh-my-pi` · `aiden` · `coco` · `traex` · `mtr` · `hermes` · `mira` · `mir` · `genius` · `seed` · `relay` · `riff` (cloud agent)
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `aiden` · `coco` (TRAE) · `hermes` · `mira` · `riff` (cloud agent) …
 
-See [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
+The full list and integration methods (including wrapper / gateway setups) are authoritative in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 
 ## Design Philosophy: Bridge the CLI Directly, No SDK Wrapper
 
@@ -78,7 +78,7 @@ Compared with approaches that rebuild everything on an Agent SDK:
 | CLI capabilities | Full runtime (hooks / memory / plan mode / MCP / `/` commands) | A subset of the SDK API; missing features hand-built |
 | CLI upgrades | Benefit automatically, zero adaptation | Must track SDK version changes |
 | Memory / context | Reuses the CLI's built-in, improves as the CLI iterates | Must be self-built, duplicating native CLI capabilities |
-| Multi-CLI | 24 switchable in one line | Usually bound to a single SDK |
+| Multi-CLI | 20+ CLIs / agents, switch in one line | Usually bound to a single SDK |
 | Multi-bot | Multi-bot @mention routing in one group | Usually single-bot |
 | Direct terminal | `tmux attach` into the real process, same as local dev | Usually can't operate the underlying terminal |
 
@@ -87,7 +87,8 @@ Compared with approaches that rebuild everything on an Agent SDK:
 - 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://deepcoldy.github.io/botmux/en/>**
 - ✨ **Showcase** (illustrated + video): [*Create a really useful Feishu assistant in 5 minutes*](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)
 - ❓ **FAQ / troubleshooting**: [FAQ](https://deepcoldy.github.io/botmux/en/faq) · [Common Pitfalls](https://deepcoldy.github.io/botmux/en/pitfalls)
-- 🤝 **Contributing**: issues / PRs welcome. To add a CLI adapter, see [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
+- 💬 **Community**: find the internal / external "Botmux" chat-group cards at the bottom of the [showcase doc](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg).
+- 🤝 **Contributing**: issues / PRs welcome. To add an adapter, see [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 - 📄 **License**: [MIT](LICENSE)
 
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
