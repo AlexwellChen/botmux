@@ -268,13 +268,23 @@ describe('schedule-card-model · invariants', () => {
 
 describe('schedule-card-model · computeNextNRuns 默认时区 = 本地', () => {
   it('未注入 timezone 时,cron next-run 落在系统本地整点(默认不再写死 Asia/Shanghai)', () => {
-    const task = makeTask({ parsed: cron('0 9 * * *') });
-    // 不传 timezone → 默认取 scheduleTimeZone()(系统本地)。断言用本地 getHours,
-    // 与实现同源;改动前默认 Asia/Shanghai,在非 +8 机器上此处会 != 9。
-    const runs = computeNextNRuns(task, 1, { nowMs: FIXED_NOW });
-    expect(runs).toHaveLength(1);
-    const d = new Date(runs[0]);
-    expect(d.getHours()).toBe(9);
-    expect(d.getMinutes()).toBe(0);
+    // 不传 timezone → 默认取 scheduleTimeZone()(env → 全局 config → host)。本用例断言
+    // HOST-LOCAL 默认(getHours 读 JS 运行时时区),故把 ambient 时区钉到同一 host 时区——
+    // 否则机器 ~/.botmux/config.json 里的 scheduleTimeZone(如非 +8 机器上写了 Asia/Shanghai)
+    // 会让 scheduleTimeZone() 与 getHours() 运行时时区不一致而假失败。
+    const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      const task = makeTask({ parsed: cron('0 9 * * *') });
+      // 断言用本地 getHours,与实现同源;改动前默认 Asia/Shanghai,在非 +8 机器上此处会 != 9。
+      const runs = computeNextNRuns(task, 1, { nowMs: FIXED_NOW });
+      expect(runs).toHaveLength(1);
+      const d = new Date(runs[0]);
+      expect(d.getHours()).toBe(9);
+      expect(d.getMinutes()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
+    }
   });
 });

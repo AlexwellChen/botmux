@@ -533,15 +533,27 @@ describe('One-shot Chinese patterns', () => {
   });
 
   it('明天X点 produces once schedule at local tomorrow', () => {
-    const result = parseNaturalSchedule('明天9:00 看下邮件');
-    expect(result).not.toBeNull();
-    expect(result!.parsed.kind).toBe('once');
-    const runAt = new Date(result!.parsed.runAt!);
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    expect(runAt.getDate()).toBe(tomorrow.getDate());
-    expect(runAt.getHours()).toBe(9);
-    expect(runAt.getMinutes()).toBe(0);
+    // scheduleTimeZone() resolves env → global config → host. This test asserts
+    // the HOST-LOCAL default (getHours() reads the JS runtime zone), so pin the
+    // ambient schedule zone to that same host zone — otherwise a machine whose
+    // ~/.botmux/config.json sets scheduleTimeZone (e.g. Asia/Shanghai on a non-+8
+    // box) makes the wall clock disagree with getHours() and this fails spuriously.
+    const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      const result = parseNaturalSchedule('明天9:00 看下邮件');
+      expect(result).not.toBeNull();
+      expect(result!.parsed.kind).toBe('once');
+      const runAt = new Date(result!.parsed.runAt!);
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      expect(runAt.getDate()).toBe(tomorrow.getDate());
+      expect(runAt.getHours()).toBe(9);
+      expect(runAt.getMinutes()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
+    }
   });
 
   it('明天X点 honors an explicit schedule timezone (host-independent wall clock)', () => {
@@ -653,12 +665,22 @@ describe('computeNextRun', () => {
     // (scheduleTimeZone()), matching how one-shot「明天9点」is parsed via setHours().
     // Pre-fix it was hard-coded to Asia/Shanghai, so on any non-+8 host getHours()
     // would NOT be 9. Host-independent assertion: both sides read the same local zone.
-    const next = computeNextRun({ kind: 'cron', expr: '0 9 * * *', display: '每天 9:00' });
-    expect(next).toBeTruthy();
-    const nextDate = new Date(next!);
-    expect(nextDate.getTime()).toBeGreaterThan(Date.now());
-    expect(nextDate.getHours()).toBe(9);
-    expect(nextDate.getMinutes()).toBe(0);
+    // Pin BOTMUX_SCHEDULE_TIMEZONE to the host zone so a machine-level config override
+    // (~/.botmux/config.json scheduleTimeZone) can't make scheduleTimeZone() diverge
+    // from the getHours() runtime zone and fail this spuriously.
+    const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      const next = computeNextRun({ kind: 'cron', expr: '0 9 * * *', display: '每天 9:00' });
+      expect(next).toBeTruthy();
+      const nextDate = new Date(next!);
+      expect(nextDate.getTime()).toBeGreaterThan(Date.now());
+      expect(nextDate.getHours()).toBe(9);
+      expect(nextDate.getMinutes()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
+    }
   });
 });
 

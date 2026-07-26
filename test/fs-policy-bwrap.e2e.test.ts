@@ -124,9 +124,17 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     const read = run(args, `cat ${JSON.stringify(join(dir, 'key.txt'))}`);
     expect(read.status).not.toBe(0);
     expect(read.out).not.toContain('TOPSECRET');
-    // the mask itself must not even be listable (000, not an empty-but-readable dir)
-    const ls = run(args, `ls ${JSON.stringify(dir)}`);
-    expect(ls.status).not.toBe(0);
+    // The mask is a mode-000 empty tmpfs. For a NON-root uid the kernel's DAC check
+    // makes `ls` itself fail; but root bypasses DAC (CAP_DAC_OVERRIDE) and can still
+    // traverse a 000 dir — and the sandboxed process here is root (no uid drop). The
+    // real guarantee in BOTH cases is that no real entry leaks: the mask replaced the
+    // host dir with an empty one, so key.txt must be absent regardless of ls status.
+    const ls = run(args, `ls -A ${JSON.stringify(dir)}`);
+    if (process.getuid?.() === 0) {
+      expect(ls.out).not.toContain('key.txt');
+    } else {
+      expect(ls.status).not.toBe(0);
+    }
   });
 
   it('deny DIR (existing): NOT writable — regression guard for the writable-tmpfs bug', () => {
