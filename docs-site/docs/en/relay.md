@@ -12,7 +12,7 @@ A half-finished session can **move house entirely**, without losing any context:
 
 **1. `/relay` (picker mode) — "pull" a session into the target group**
 
-In the group you want to relay **into**, send `/relay`. A card pops up listing **your active sessions, as owner, for the same bot elsewhere** (excluding the topic you're currently in; sessions in **other topics of the same group** are listed too, enabling same-group topic-to-topic relay). Pick one to pull it over.
+In the group you want to relay **into**, send `/relay`. A card pops up listing **your active sessions, as owner, for the same bot elsewhere** (excluding the current landing anchor — that's the current topic under thread-scope, the whole group under chat-scope, or the whole DM under a flat DM; so sessions in **other topics of the same group** are listed, enabling same-group topic-to-topic relay). Pick one to pull it over.
 
 **2. `/relay --create` (create-group mode) — "move" the current session to a new group**
 
@@ -35,7 +35,7 @@ The streaming card in the source group freezes into an archive (buttons removed,
 
 ## Limitations
 
-- Picker mode works in **regular groups / topic groups / inside threads / the bot's DM**: topic-group and in-thread targets land in the corresponding topic; DMs land per their mode — flat mode (p2pMode `chat`) continues the single flat DM session, thread mode seeds a new topic on the `/relay` message.
+- Picker mode works in **regular groups / topic groups / inside threads / the bot's DM**: thread-scope targets land in the corresponding topic; DMs land per their mode — flat mode (p2pMode `chat`) continues the single flat DM session, thread mode seeds a new topic on the `/relay` message.
 - Only the **session initiator (owner)** can relay their own session.
 - A session **that is processing (mid-turn) cannot be relayed**; wait until the current turn is idle, then send.
 - An external tmux session brought in via `/adopt` cannot be relayed (the CLI lives on your computer and botmux doesn't control its lifecycle).

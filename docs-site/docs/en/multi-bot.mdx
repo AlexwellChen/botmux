@@ -12,7 +12,7 @@ Multiple Lark bots can run on the same machine, and each bot can be bound to a d
 
 ## Letting bots know each other
 
-The main path no longer requires a manual `/introduce`: botmux discovers bots in the current Lark group via the group bot roster by default. **Cross-deployment** recognition instead goes through the federation in the Dashboard "Teams" panel (a trust roster is only established when you invite someone else's deployment into the same team and create cross-deployment groups). A plain `/group` or the Dashboard "New Group" flow creates an ordinary same-deployment group, without cross-deployment team trust.
+The main path no longer requires a manual `/introduce`: botmux discovers bots in the current Lark group via the group bot roster by default. **Cross-deployment** recognition has two equally-weighted paths, both mirrored into the same team-group record (`isTeamGroupChat`) and both skipping `/grant`: one is the federation in the Dashboard "Teams" panel (invite someone else's deployment into the same team, create cross-deployment groups); the other is central-platform team-sync (the platform pushes down the roster / group list, mirrored as team groups under a `platform:` prefix). A plain `/group` or the Dashboard "New Group" flow creates an ordinary same-deployment group that uses neither path and carries no cross-deployment team trust.
 
 For handoffs, have the model check:
 
