@@ -30,8 +30,8 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `mtr` | MTR | 本地进程 | |
 | `hermes` | Hermes | 本地进程 | |
 | `genius` | Genius | 本地进程 | ✅ |
-| `seed` | Seed（Claude Code fork） | 本地进程 | |
-| `relay` | Relay（Seed 新版） | 本地进程 | |
+| `seed` | Seed（Claude Code fork） | 本地进程 | ✅ |
+| `relay` | Relay（Seed 新版） | 本地进程 | ✅ |
 | `mira` | Mira APP | API / 远端 | |
 | `mir` | Mir CLI（本地 mircli + MCP bridge） | 本地进程 | |
 | `riff` | riff | 云 Agent（API） | |

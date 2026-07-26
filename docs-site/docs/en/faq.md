@@ -11,7 +11,7 @@ Match your **symptom** first — the root cause differs:
 | **No reaction at all** (not even an emoji) | Event subscription / release / long connection not working | [A. No messages received at all](#a-no-messages-received-at-all) |
 | Only **I (owner)** can trigger it; others get an auth card / no reply | Only operate permission granted, no talk permission | [B. Others can't use it / auth card](#b-others-cant-use-it--auth-card) |
 | Must **@ it** to get a reply / want auto-reply without @ | Group @ policy | [B. Others can't use it / auth card](#b-others-cant-use-it--auth-card) |
-| Shows 🟡 "working" but **the result never comes back** (terminal has output) | Model didn't call `botmux send` | [C. Terminal has output but nothing sent to Lark](#c-terminal-has-output-but-nothing-sent-to-lark) |
+| Shows 🟡 "working" but **the result never comes back** (terminal has output) | Terminal CLI session: model didn't call `botmux send` (`codex-app` auto-forwards — it's the exception) | [C. Terminal has output but nothing sent to Lark](#c-terminal-has-output-but-nothing-sent-to-lark) |
 | Session **won't start** / first message errors `zsh: parse error` | Login shell startup file jumps shells | [Session won't start](#sessions-never-start--the-first-message-errors-with-zsh-parse-error-near-n) |
 
 ### A. No messages received at all

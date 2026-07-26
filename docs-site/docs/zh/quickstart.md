@@ -10,7 +10,7 @@
 npm install -g botmux
 ```
 
-要求 **Node.js ≥ 22**，且本地已安装并登录好至少一种 AI 编程 CLI（`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` 等）。推荐安装 **tmux**（≥3.x），装了就自动启用会话常驻。
+要求 **Node.js ≥ 22**，且本地已安装并登录好至少一种 AI 编程 CLI（`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` 等）。**默认会话后端是 tmux（≥3.x），需装好**——不可用时会硬拦截弹卡、不再自动降级 pty；确需无 tmux 环境才用 `BACKEND_TYPE=pty` 或 per-bot `backendType`（`pty`/`herdr`/`zellij`）等显式后端（riff 是云 Agent，不占本地后端）。
 
 ## Step 2 · 配置（`botmux setup`）
 

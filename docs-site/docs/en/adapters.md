@@ -30,8 +30,8 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `mtr` | MTR | local process | |
 | `hermes` | Hermes | local process | |
 | `genius` | Genius | local process | ✅ |
-| `seed` | Seed (Claude Code fork) | local process | |
-| `relay` | Relay (new release of Seed) | local process | |
+| `seed` | Seed (Claude Code fork) | local process | ✅ |
+| `relay` | Relay (new release of Seed) | local process | ✅ |
 | `mira` | Mira APP | API / remote | |
 | `mir` | Mir CLI (local mircli + MCP bridge) | local process | |
 | `riff` | riff | cloud agent (API) | |
