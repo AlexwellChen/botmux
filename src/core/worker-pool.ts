@@ -4250,7 +4250,7 @@ export function adoptSandboxBlocked(
     || sandboxEnabled();
 }
 
-export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean }): void {
+export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean; prompt?: string; turnId?: string }): void {
   const cb = requireCallbacks();
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
@@ -4426,7 +4426,19 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
-    prompt: '',
+    // Adopt is normally observe-only (prompt=''), driven later by 'message'
+    // IPCs. But a re-fork triggered by an incoming Lark turn (worker had exited
+    // — crash, or the "adopted session ended" kill path) must carry that turn's
+    // input so it isn't dropped: the daemon's worker-null branch now routes
+    // adopt sessions here instead of forkWorker (which would spawn a fresh
+    // bmx-* CLI and lose bridge semantics). The init handler queues this prompt
+    // into pendingMessages and the adopt idle detector (setupAdoptIdleDetection
+    // → markPromptReady) flushes it to the observed pane, exactly like a
+    // live-worker follow-up. Content is already bridge-formatted by the caller
+    // (buildReforkCliInput → buildBridgeInputContent), so no <user_message>
+    // wrapper leaks into the user's un-injected external CLI.
+    prompt: opts?.prompt ?? '',
+    turnId: opts?.turnId,
     resume: false,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
