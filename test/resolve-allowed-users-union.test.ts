@@ -87,3 +87,77 @@ describe('resolveAllowedUsersWithMap — on_ union_id entries (PR#72 lockout fix
     warn.mockRestore();
   });
 });
+
+// PR #590 fix: per-entry resolve status drives the last-known-good cache
+// fallback. Only 'transient' entries may be recovered from cache; 'definitive'
+// misses (removed / not-visible / invalid) must NOT be, or a stale owner gets
+// revived. errored must stay in lockstep with 'transient'.
+describe('resolveAllowedUsersWithMap — entryStatus classification (PR#590)', () => {
+  it('union_id resolved → resolved; errored stays false', async () => {
+    stubClient(async ({ path }: any) =>
+      ({ code: 0, data: { user: { open_id: 'ou_ok', union_id: path.user_id, name: 'X' } } }));
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['on_ok']);
+    expect(entryStatus.get('on_ok')).toBe('resolved');
+    expect(errored).toBeFalsy();
+  });
+
+  it('union_id code-0 with NO open_id → definitive (NOT transient); does not flag errored', async () => {
+    // Union user outside this app's contact visibility → tenant returns a code-0
+    // empty shell rather than 41050. Must be definitive so the never-converging
+    // retry chain is not armed and a stale cached ou_ is not revived.
+    stubClient(async ({ path }: any) => ({ code: 0, data: { user: { union_id: path.user_id } } }));
+    const { entryStatus, errored, resolved } = await resolveAllowedUsersWithMap(APP, ['on_ghost']);
+    expect(entryStatus.get('on_ghost')).toBe('definitive');
+    expect(errored).toBeFalsy();
+    expect(resolved).toEqual([]);
+  });
+
+  it('union_id definitive contact code (41050 not_visible) → definitive; not errored', async () => {
+    stubClient(async () => ({ code: 41050, msg: 'not visible' }));
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['on_hidden']);
+    expect(entryStatus.get('on_hidden')).toBe('definitive');
+    expect(errored).toBeFalsy();
+  });
+
+  it('union_id transient failure (throw) → transient + errored', async () => {
+    stubClient(async () => { throw new Error('ECONNRESET'); });
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['on_flaky']);
+    expect(entryStatus.get('on_flaky')).toBe('transient');
+    expect(errored).toBe(true);
+  });
+
+  it('union_id non-definitive non-zero code (server error) → transient + errored', async () => {
+    stubClient(async () => ({ code: 500, msg: 'internal' }));
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['on_5xx']);
+    expect(entryStatus.get('on_5xx')).toBe('transient');
+    expect(errored).toBe(true);
+  });
+
+  it('literal ou_ is always resolved (never dropped/transient)', async () => {
+    stubClient(async () => ({ code: 0, data: { user: {} } }));
+    const { entryStatus } = await resolveAllowedUsersWithMap(APP, ['ou_literal']);
+    expect(entryStatus.get('ou_literal')).toBe('resolved');
+  });
+
+  it('email not returned by a code-0 batch → definitive (not transient)', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [] } }), // batch OK but empty
+    );
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['ghost@corp.com']);
+    expect(entryStatus.get('ghost@corp.com')).toBe('definitive');
+    expect(errored).toBeFalsy();
+  });
+
+  it('email batch call fails (code!=0) → transient + errored for every requested email', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 500, msg: 'batch down' }),
+    );
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['a@corp.com', 'b@corp.com']);
+    expect(entryStatus.get('a@corp.com')).toBe('transient');
+    expect(entryStatus.get('b@corp.com')).toBe('transient');
+    expect(errored).toBe(true);
+  });
+});
+
