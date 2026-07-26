@@ -159,6 +159,15 @@ jobs:
         # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
         # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
         # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
+        #
+        # 为什么保持 fail-closed、不放宽（codex review 结论）：commit graph 无法区分两种
+        # 形状完全相同的场景——「打完 tag 后 master 才前进」（无害竞态）与「B 已在 master 上
+        # 之后再把 tag 指向历史 A」（真丢改动）。二者的 tag/master/ancestry/版本号全一致，只有
+        # 「tag 创建 vs B 落 master」的墙钟先后能区分，而这不可信地存在于 graph 里。因此在没有
+        # 「tag 创建时 master tip」的可信证明前，放宽这道闸必然引入「把旧 commit 发成 latest」
+        # 的洞。竞态的正确解法是「fetch 最新 master 后在新 HEAD 上重打 tag」（下面的 Fix 提示），
+        # 而 #593 那次真正漏的是 changelog（下一步已把 changelog 锚到「上一个已发布 Release」，
+        # 使失败/无 Release 的 tag 不再截断下一版 changelog）——发版闸本身当时拒得没错。
         # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
         # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
         if: steps.dist_tag.outputs.tag == 'latest'
@@ -186,13 +195,29 @@ jobs:
         run: |
           # actions/checkout 默认把 tag 存成轻量指针，需重新 fetch 才能拿到 annotated tag object
           git fetch origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" --force
-          # 上一个 tag: stable 只跟 stable 比 (词法排序会把 canary 排到 stable 前面,
-          # 不过滤的话 v2.24.4 的 compare 会指向 v2.24.4-canary.X 而不是 v2.24.3)
+          # 上一版锚点：
+          # - prerelease（canary/beta/rc/next）：仍按 v:refname 排序取上一个 tag（灰度链条只关心
+          #   相邻 tag，且 prerelease 常不发 GitHub Release）。stable 只跟 stable 比（词法排序会把
+          #   canary 排到 stable 前面，不过滤的话 v2.24.4 的 compare 会指向 v2.24.4-canary.X）。
+          # - stable（latest）：锚到「上一个**已发布** stable GitHub Release」的 tag，而不是
+          #   git tag 排序的第一个。原因：若某个 stable tag 因签名/npm/权限/guard 失败而**只打了
+          #   tag、没发 Release**（如 v3.5.1），旧逻辑会把它当 PREV_TAG，导致下一版 changelog 从
+          #   那个「隐身版本」起算、漏掉它本该带上的 PR（#593 就是这么漏的）。锚到最近已发布
+          #   Release 后，任何中途没发成的 tag 都不会截断 changelog——它们引入的 PR 会被下一版
+          #   一并带上，保证「覆盖上次发布以来的所有 PR」。取不到已发布 Release 时回退到 tag 排序。
           if [[ "$GITHUB_REF_NAME" == *"-"* ]]; then
             PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | head -1)
           else
-            PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | grep -v -e '-' | head -1)
+            PREV_TAG=$(gh release list --limit 40 \
+              --json tagName,isPrerelease,isDraft,publishedAt \
+              --jq '[.[] | select(.isPrerelease==false and .isDraft==false and .tagName!="'"$GITHUB_REF_NAME"'")]
+                    | sort_by(.publishedAt) | reverse | .[0].tagName // ""' 2>/dev/null || echo "")
+            # 回退：无已发布 Release，或该 tag 在本地取不到 commit（异常）→ 用 tag 排序兜底。
+            if [ -z "$PREV_TAG" ] || ! git rev-parse -q --verify "refs/tags/${PREV_TAG}^{commit}" >/dev/null; then
+              PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | grep -v -e '-' | head -1)
+            fi
           fi
+          echo "changelog range: ${PREV_TAG}..${GITHUB_REF_NAME}"
           TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
 
           # 区间内每个非 merge commit → 反查所属 PR（gh api，有界：约等于区间 commit 数，
