@@ -29,6 +29,51 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(engine.activeThreadId).toBe('thread-fake-1');
     expect(engine.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/);
     await engine.sendTurn('hello world'); // resolves on the ack, no throw
+    await engine.waitForThreadPreview();
+    await engine.setThreadName('[BotMux·Lark] hello world');
+    engine.stop();
+  }, 20_000);
+
+  it('waits for a delayed first-message preview before allowing the final title write', async () => {
+    const engine = makeEngine({
+      sessionId: 'delayed-preview',
+      env: { ...process.env, FAKE_PREVIEW_DELAY_READS: '2' },
+    });
+    await engine.start();
+    await engine.startThread();
+    expect(await engine.waitForThreadPreview()).toBe('<botmux_routing> first message preview');
+    await engine.setThreadName('[BotMux·Lark] final title');
+    engine.stop();
+  }, 20_000);
+
+  it('sets the final title when the first-message preview remains unavailable', async () => {
+    const engine = makeEngine({
+      sessionId: 'missing-preview',
+      env: { ...process.env, FAKE_PREVIEW_DELAY_READS: '999999' },
+    });
+    await engine.start();
+    await engine.startThread();
+    expect(await engine.waitForThreadPreview(200)).toBeUndefined();
+    await engine.setThreadName('[BotMux·Lark] final title');
+    expect((await engine.readThreadMetadata()).name).toBe('[BotMux·Lark] final title');
+    engine.stop();
+  }, 20_000);
+
+  it('waits for resumed-thread metadata to advance before restoring its title', async () => {
+    const engine = makeEngine({
+      sessionId: 'resume-title',
+      env: {
+        ...process.env,
+        FAKE_UPDATED_DELAY_READS: '2',
+        FAKE_UPDATED_BEFORE: '100',
+        FAKE_UPDATED_AFTER: '101',
+      },
+    });
+    await engine.start();
+    await engine.resumeThread('thread-resumed-title');
+    expect((await engine.readThreadMetadata()).updatedAt).toBe(100);
+    await engine.waitForThreadUpdatedAfter(100);
+    await engine.setThreadName('[BotMux·Lark] resumed title');
     engine.stop();
   }, 20_000);
 
@@ -37,6 +82,77 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await engine.start();
     const tid = await engine.resumeThread('thread-persisted-42');
     expect(tid).toBe('thread-persisted-42');
+    engine.stop();
+  }, 20_000);
+
+  it('bridges requestUserInput server requests to the host callback', async () => {
+    let received: unknown;
+    let resolveReceived!: () => void;
+    const receivedPromise = new Promise<void>(resolve => { resolveReceived = resolve; });
+    const engine = makeEngine({
+      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1' },
+      appServerFeatures: ['default_mode_request_user_input'],
+      onRequestUserInput: async params => {
+        received = params;
+        resolveReceived();
+        return { answers: { choice: { answers: ['Yes'] } } };
+      },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('ask me');
+    await receivedPromise;
+    expect(received).toMatchObject({
+      questions: [{ id: 'choice', question: 'Continue?' }],
+    });
+    engine.stop();
+  }, 20_000);
+
+  it('interrupts the turn (not a benign reply) when the input bridge rejects', async () => {
+    // The blocker fix. Verified against real traex 0.200.19: replying to
+    // requestUserInput with empty answers OR a JSON-RPC error is normalized to
+    // {answers:{}} and the turn still COMPLETES, silently skipping the ask. Only
+    // `turn/interrupt` actually stops the turn. So on bridge rejection the engine
+    // must send turn/interrupt — asserted here via the engine log + the fixture
+    // resolving turn/start as an interrupted turn rather than a completed one.
+    const logs: string[] = [];
+    const engine = makeEngine({
+      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1' },
+      appServerFeatures: ['default_mode_request_user_input'],
+      log: (m: string) => logs.push(m),
+      onRequestUserInput: async () => { throw new Error('cannot represent as ask card'); },
+    });
+    await engine.start();
+    await engine.startThread();
+    // turn/start resolves (interrupted), so sendTurn does not throw here; the
+    // point is that the turn was stopped, not silently completed.
+    await engine.sendTurn('ask me');
+    // Give the async interrupt round-trip a moment to log its result.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(logs.some(l => l.includes('interrupting turn'))).toBe(true);
+    expect(logs.some(l => l.includes('turn interrupted after requestUserInput failure'))).toBe(true);
+    engine.stop();
+  }, 20_000);
+
+  it('declares the engine dead when turn/interrupt itself fails (no permanently wedged turn)', async () => {
+    // The interrupt is the last lever we have on bridge failure. If it errors or
+    // times out, the turn stays stuck — so the engine must fire onDead so the
+    // worker restarts the pane, rather than only logging and leaking the hang.
+    let deadCount = 0;
+    const engine = makeEngine({
+      sessionId: 'interrupt-fail',
+      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1', FAKE_INTERRUPT_ERROR: '1' },
+      appServerFeatures: ['default_mode_request_user_input'],
+      onRequestUserInput: async () => { throw new Error('cannot represent as ask card'); },
+      onDead: () => { deadCount++; },
+    });
+    await engine.start();
+    await engine.startThread();
+    // failAll rejects the still-pending turn/start, so sendTurn rejects here —
+    // that is the visible failure, not a silent hang. We only care that onDead fired.
+    await engine.sendTurn('ask me').catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(deadCount).toBe(1);
     engine.stop();
   }, 20_000);
 });

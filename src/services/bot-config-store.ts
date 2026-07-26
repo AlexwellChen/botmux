@@ -10,6 +10,9 @@
  */
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, readBotSkillPolicy } from '../bot-registry.js';
+import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
+import { config } from '../config.js';
+import { writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { CLI_OPTIONS, resolveCliId } from '../setup/bot-config-editor.js';
@@ -17,7 +20,7 @@ import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
 import { statSync } from 'node:fs';
 import { logger } from '../utils/logger.js';
-import { parseCustomPassthroughInput } from '../core/passthrough-commands.js';
+import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
 
@@ -82,6 +85,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat'], hint: '私聊单聊模式 thread|chat；chat=扁平连续会话，thread/unset 回默认（每条 DM 独立会话）' },
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大常驻会话数；超过后最久未用的会话自动休眠（退出后台进程和 CLI、回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/空格分隔，如 /goal /export）；unset 回仅内置白名单' },
+  { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'riff'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜riff=远程 riff agent 服务；选 riff 时需配置 riff 字段；unset 回 pty' },
@@ -262,7 +266,7 @@ export async function setBotAllowedUsers(
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
-  const { resolved, map } = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
+  const { resolved, map, entryStatus } = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
   if (resolved.length === 0) return { ok: false, reason: 'empty_resolved' };
   if (senderOpenId && !resolved.includes(senderOpenId)) return { ok: false, reason: 'self_lockout' };
 
@@ -275,6 +279,31 @@ export async function setBotAllowedUsers(
   bot.config.allowedUsers = rawEntries;
   bot.resolvedAllowedUsers = resolved;
   bot.rawAllowedUserResolution = map;
+  // Keep the last-known-good sidecar + dashboard descriptor in lockstep with the
+  // live allowlist. Without this, a hot `set allowedUsers` (e.g. owner switches
+  // from email to on_ while contact API is healthy) leaves the new raw key out
+  // of the cache; the next clean restart during an API blip would then resolve
+  // empty and fail-closed lock the owner out — the exact bug this feature fixes.
+  // retainKeys prunes stale keys (old email/union no longer configured);
+  // deleteEntries drops entries that resolved DEFINITIVELY-gone in THIS set (e.g.
+  // a removed co-owner) so a later transient restart can't revive them from cache.
+  const definitiveEntries: string[] = [];
+  let anyTransient = false;
+  for (const [entry, status] of entryStatus.entries()) {
+    if (status === 'definitive') definitiveEntries.push(entry);
+    else if (status === 'transient') anyTransient = true;
+  }
+  writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, {
+    map,
+    retainKeys: rawEntries,
+    deleteEntries: definitiveEntries,
+  });
+  republishResolvedAllowedUsersDescriptor(larkAppId, resolved);
+  // Partial-transient set: the owner (senderOpenId) resolved (self_lockout guard
+  // above guarantees it), but some OTHER entry transient-failed. Schedule the
+  // same background heal the startup path uses so that entry recovers when the
+  // contact API does, instead of silently staying dropped until the next restart.
+  if (anyTransient) scheduleAllowedUsersResolveRetryFromMutation(larkAppId);
   logger.info(`[config:${larkAppId}] allowedUsers updated: ${rawEntries.length} entries, ${resolved.length} resolved`);
   return { ok: true, raw: rawEntries, resolved };
 }

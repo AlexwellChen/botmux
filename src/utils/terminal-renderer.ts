@@ -1,7 +1,7 @@
 /**
  * Headless terminal renderer: feeds PTY data into an xterm-headless instance
  * and exposes viewport snapshots for the Feishu streaming card (PNG render,
- * export-text action, ScreenAnalyzer).
+ * export-text action, usage-limit detection).
  *
  * Snapshot semantics match PNG: both read the current viewport
  * [baseY, baseY + rows). This keeps text export and screenshot consistent
@@ -97,8 +97,8 @@ export class TerminalRenderer {
   }
 
   /**
-   * Raw viewport snapshot — no line filtering. Used by ScreenAnalyzer which
-   * needs the full screen including ❯ cursor lines.
+   * Raw viewport snapshot — no line filtering. Used by usage-limit detection
+   * and the CoCo picker, which need the full screen including ❯ cursor lines.
    */
   rawSnapshot(): string {
     return this.readViewport(false);

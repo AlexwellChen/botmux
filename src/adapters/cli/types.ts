@@ -249,9 +249,9 @@ export interface CliAdapter {
     readonly sessionStartCommand?: string;
   };
 
-  /** true = 该 CLI 通过 hook 接管 askUserQuestion（不再装 botmux-ask skill 兜底）。
-   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件、
-   *  CoCo 走 ensureAskHook 装插件）。 */
+  /** true = 该 CLI 的 Hook 已接管 askUserQuestion（不再装 botmux-ask
+   *  skill 兜底）。注入机制由各 adapter 自行决定（Claude 走 --settings、
+   *  OpenCode 走插件、CoCo 走 ensureAskHook）。 */
   readonly asksViaHook?: boolean;
 
   /** 命令式 hook 安装钩子：适用于无法靠纯写文件完成、需要 spawn CLI 子命令的场景
@@ -326,12 +326,10 @@ export interface CliAdapter {
   readonly supportsReadIsolation?: boolean;
 
   /** CLI 支持会话内移动工作目录（如 Claude Code ≥2.1.205 的 /cd）。
-   *  true → botmux cd 走 idle 注入（不重启进程）；缺省 → 杀进程冷启动兜底。
-   *  ⚠️ 这是家族级声明，不做运行时版本探测：若部署的二进制过旧（或 fork 变体
-   *  没有会话内 /cd），注入会被 TUI 当 unknown command 静默吞掉——daemon 记录
-   *  已重钉、进程仍留在旧目录，直到下一次 respawn 才收敛（inject_command 已同步
-   *  lastInitConfig.workingDir，任何重启路径都落新目录）。部署前提见
-   *  docs/roles/deploy-runbook.md 第 1 步的版本检查。 */
+   *  ⚠️ 历史能力位，**已从角色切换路由退场**：`botmux role switch` 现统一走「杀 CLI +
+   *  `--resume` 在新 cwd respawn」（适配器无关，见 dashboard-ipc-server 的 cd 路由与
+   *  worker 的 restart case），不再按本字段分流 idle 注入 vs 冷启动。字段保留仅供未来
+   *  可能的会话内移动复用，当前无生产读取点。 */
   readonly supportsSessionCwdMove?: boolean;
 
   /** When true, the worker's soft first-prompt timeout keeps queued input held
@@ -432,6 +430,9 @@ export interface CliAdapter {
     /** Claude-family data dir (~/.claude, ~/.claude-runtime, …) so the probe
      *  targets the SAME root the adapter will actually write into. */
     dataDir?: string;
+    /** Optional CLI-specific resume store path resolved by the worker after
+     *  applying per-bot env/profile settings (for example Hermes state.db). */
+    stateDbPath?: string;
   }): boolean | undefined;
 
   /** Optional: discover sessions resumable from this CLI's on-disk transcript

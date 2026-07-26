@@ -1,0 +1,267 @@
+/**
+ * Card-handler tests for stuck-warning tui_keys clicks.
+ *
+ * Covers (PR #559 review round 5):
+ *   1. Valid click → worker.send called with allowlisted key (not value.keys)
+ *   2. Duplicate click (processing=true) → worker.send NOT called again
+ *   3. Missing selected_index → no worker.send (fail-closed, no default to trust)
+ *   4. Out-of-range index → no worker.send
+ *   5. Non-integer index → no worker.send
+ *
+ * Run:  pnpm vitest run test/stuck-card-handler.test.ts
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
+import { sessionKey, type DaemonSession } from '../src/core/types.js';
+
+const APP_ID = 'cli_test';
+const ROOT_ID = 'om_root';
+const CARD_ID = 'om_stuck_card';
+
+// ─── Mocks ─────────────────────────────────────────────────────────────────
+
+vi.mock('../src/im/lark/client.js', () => ({
+  updateMessage: vi.fn(async () => {}),
+  sendUserMessage: vi.fn(async () => {}),
+  replyMessage: vi.fn(async () => {}),
+  getMessageDetail: vi.fn(async () => ({ body: { content: '' } })),
+  deleteMessage: vi.fn(async () => {}),
+  MessageWithdrawnError: class extends Error {
+    constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
+  },
+}));
+
+vi.mock('../src/im/lark/card-builder.js', () => ({
+  buildTuiPromptCard: vi.fn(() => '{}'),
+  buildTuiPromptResolvedCard: vi.fn((text: string) => JSON.stringify({ text })),
+  buildTuiPromptProcessingCard: vi.fn((text: string) => JSON.stringify({ text })),
+  buildStreamingCard: vi.fn(() => '{}'),
+  buildSessionCard: vi.fn(() => '{}'),
+  getCliDisplayName: vi.fn(() => 'Codex'),
+}));
+
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: vi.fn(() => ({
+    config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'codex' },
+    resolvedAllowedUsers: [],
+    botOpenId: 'ou_bot',
+    botName: 'TestBot',
+  })),
+  getAllBots: vi.fn(() => []),
+}));
+
+vi.mock('../src/config.js', () => ({
+  config: {
+    web: { externalHost: 'localhost' },
+    session: { dataDir: '/tmp/test-sessions' },
+    daemon: { backendType: 'tmux', cliId: 'codex' },
+  },
+}));
+
+vi.mock('../src/services/session-store.js', () => ({
+  closeSession: vi.fn(),
+  updateSession: vi.fn(),
+}));
+
+vi.mock('../src/core/dashboard-events.js', () => ({
+  dashboardEventBus: { publish: vi.fn() },
+}));
+
+vi.mock('../src/core/dashboard-rows.js', () => ({
+  composeRowFromActive: vi.fn(),
+}));
+
+vi.mock('../src/im/lark/l10n.js', () => ({
+  localeForBot: vi.fn(() => 'zh'),
+  tr: vi.fn((key: string) => key),
+}));
+
+vi.mock('../src/im/lark/event-dispatcher.js', () => ({
+  canOperate: vi.fn(() => true),
+  canTalk: vi.fn(() => true),
+}));
+
+vi.mock('../src/core/session-activity.js', () => ({
+  publishAttentionPatch: vi.fn(),
+  announcePendingRepoSession: vi.fn(),
+}));
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
+  return {
+    session: {
+      sessionId: 'sid-card-test',
+      rootMessageId: ROOT_ID,
+      chatId: 'oc_chat',
+      title: 'Test',
+      status: 'active' as any,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      pid: null,
+      chatType: 'group',
+    },
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    workerGeneration: 1,
+    larkAppId: APP_ID,
+    chatId: 'oc_chat',
+    chatType: 'group',
+    scope: 'thread',
+    spawnedAt: Date.now(),
+    cliVersion: '1.0',
+    lastMessageAt: Date.now(),
+    hasHistory: false,
+    ...overrides,
+  } as DaemonSession;
+}
+
+function makeDeps(sessions: Map<string, DaemonSession>): CardHandlerDeps {
+  return {
+    activeSessions: sessions,
+    sessionReply: vi.fn(async () => 'om_reply'),
+    lastRepoScan: new Map(),
+  };
+}
+
+function makeTuiKeysEvent(value: Record<string, any>, clickedMessageId = CARD_ID) {
+  return {
+    action: { value: { action: 'tui_keys', root_id: ROOT_ID, ...value } },
+    operator: { open_id: 'ou_user' },
+    context: { open_message_id: clickedMessageId },
+  };
+}
+
+function flush(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────
+
+describe('stuck-warning card tui_keys handler', () => {
+  let workerSend: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workerSend = vi.fn();
+  });
+
+  it('sends allowlisted key derived from pageType+index (ignores value.keys)', async () => {
+    const ds = makeDs({
+      worker: { killed: false, send: workerSend } as any,
+      stuckWarningCardId: CARD_ID,
+      stuckWarningNonce: 1,
+      stuckWarningNonceCounter: 1,
+      stuckWarningPageType: 'hook review level 1',
+      stuckWarningCliLifetime: 1,
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+    const deps = makeDeps(sessions);
+
+    // Card sends keys=["rm","-rf","/"] (malicious) but index=2 (Esc)
+    await handleCardAction(makeTuiKeysEvent({ keys: '["rm","-rf","/"]', selected_index: '2', is_final: '1' }) as any, deps, APP_ID);
+    await flush();
+
+    // Worker should receive only the allowlisted Escape key, not the malicious keys
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    const sent = workerSend.mock.calls[0][0];
+    expect(sent.type).toBe('tui_keys');
+    expect(sent.keys).toEqual(['Escape']);
+    expect(sent.stuckNonce).toBe(1);
+    expect(sent.stuckCliLifetime).toBe(1);
+  });
+
+  it('duplicate click (processing=true) does NOT send keys again', async () => {
+    const ds = makeDs({
+      worker: { killed: false, send: workerSend } as any,
+      stuckWarningCardId: CARD_ID,
+      stuckWarningNonce: 1,
+      stuckWarningNonceCounter: 1,
+      stuckWarningPageType: 'hook review level 1',
+      stuckWarningCliLifetime: 1,
+      stuckWarningProcessing: true, // already processing
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+    const deps = makeDeps(sessions);
+
+    await handleCardAction(makeTuiKeysEvent({ selected_index: '0', is_final: '1' }) as any, deps, APP_ID);
+    await flush();
+
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('missing selected_index → no keys sent (fail-closed, no default to trust)', async () => {
+    const ds = makeDs({
+      worker: { killed: false, send: workerSend } as any,
+      stuckWarningCardId: CARD_ID,
+      stuckWarningNonce: 1,
+      stuckWarningNonceCounter: 1,
+      stuckWarningPageType: 'hook review level 1',
+      stuckWarningCliLifetime: 1,
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+    const deps = makeDeps(sessions);
+
+    // No selected_index in the event
+    await handleCardAction(makeTuiKeysEvent({ is_final: '1' }) as any, deps, APP_ID);
+    await flush();
+
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('out-of-range index → no keys sent', async () => {
+    const ds = makeDs({
+      worker: { killed: false, send: workerSend } as any,
+      stuckWarningCardId: CARD_ID,
+      stuckWarningNonce: 1,
+      stuckWarningNonceCounter: 1,
+      stuckWarningPageType: 'hook review level 1', // has 3 options (0,1,2)
+      stuckWarningCliLifetime: 1,
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+    const deps = makeDeps(sessions);
+
+    await handleCardAction(makeTuiKeysEvent({ selected_index: '5', is_final: '1' }) as any, deps, APP_ID);
+    await flush();
+
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('non-integer index → no keys sent', async () => {
+    const ds = makeDs({
+      worker: { killed: false, send: workerSend } as any,
+      stuckWarningCardId: CARD_ID,
+      stuckWarningNonce: 1,
+      stuckWarningNonceCounter: 1,
+      stuckWarningPageType: 'hook review level 1',
+      stuckWarningCliLifetime: 1,
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+    const deps = makeDeps(sessions);
+
+    await handleCardAction(makeTuiKeysEvent({ selected_index: 'abc', is_final: '1' }) as any, deps, APP_ID);
+    await flush();
+
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('level 2 page type maps index 0=t, 1=Esc', async () => {
+    const ds = makeDs({
+      worker: { killed: false, send: workerSend } as any,
+      stuckWarningCardId: CARD_ID,
+      stuckWarningNonce: 1,
+      stuckWarningNonceCounter: 1,
+      stuckWarningPageType: 'hook review level 2',
+      stuckWarningCliLifetime: 1,
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+    const deps = makeDeps(sessions);
+
+    await handleCardAction(makeTuiKeysEvent({ selected_index: '1', is_final: '1' }) as any, deps, APP_ID);
+    await flush();
+
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0][0].keys).toEqual(['Escape']);
+  });
+});

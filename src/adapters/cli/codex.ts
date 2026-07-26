@@ -194,6 +194,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         baseArgs.push('--model', model.trim());
       }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
+      // NOTE: canonicalization of workingDir for the file sandbox is done ONCE in
+      // worker.ts (only when sandboxRequested), so off-sandbox spawns keep the
+      // lexical path — realpath'ing here unconditionally would desync codex's cwd
+      // semantics vs the worker's lexical bridge/state tracking.
       const freshArgs = workingDir
         ? [...baseArgs, '-C', workingDir]
         : baseArgs;

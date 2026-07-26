@@ -22,10 +22,38 @@ import { normalizePluginIdList } from './core/plugins/ids.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
+export type CodexNotifierNotifyWhen = 'locked_only' | 'always';
+
+/** Keep the configurable prefix short enough to leave useful room for the
+ *  caller-provided group name. Count UTF-16 code units to match HTML
+ *  `maxLength` and the rest of the dashboard's string validation. */
+export const GROUP_NAME_PREFIX_MAX_LENGTH = 32;
+
+/** Normalize the machine-wide prefix used by the `/group` slash command.
+ *  Missing/blank/invalid values are treated as disabled on the forgiving read
+ *  path; the Dashboard write path rejects invalid non-blank values. */
+export function normalizeGroupNamePrefix(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const value = raw;
+  if (!value.trim()) return undefined;
+  if (value.length > GROUP_NAME_PREFIX_MAX_LENGTH) return undefined;
+  // 覆盖 C0(U+0000–001F) + DEL(U+007F) + C1(U+0080–009F) 全部控制字符。
+  if (/\p{Cc}/u.test(value)) return undefined;
+  return value;
+}
 
 export interface WhiteboardConfig {
   /** Optional local project whiteboard. Off by default; enabling it must not create boards by itself. */
   enabled?: boolean;
+}
+
+export interface CodexNotifierGlobalConfig {
+  /** 实验性机器级开关。缺省关闭；关闭后保留已信任 Hook，但 Hook 会快速跳过。 */
+  enabled?: boolean;
+  /** 发送完成通知的 Bot App ID；启用时必须显式选择。 */
+  targetBotAppId?: string;
+  /** 默认仅锁屏时发送飞书消息；always 表示每次任务完成都发送。 */
+  notifyWhen?: CodexNotifierNotifyWhen;
 }
 
 export interface VcMeetingAgentGlobalConfig {
@@ -40,6 +68,9 @@ export interface VcMeetingAgentGlobalConfig {
 
 export interface GlobalConfig {
   lang?: Locale;
+  /** Machine-wide default prefix for groups created via `/group` or `/g`.
+   *  Other creation paths intentionally ignore it. Missing means disabled. */
+  groupNamePrefix?: string;
   /** Machine-wide repo picker display mode. Missing / 'all' preserves legacy
    *  behavior (repos + linked worktrees). 'repos' lists only main worktrees in
    *  selection cards; explicit /repo /abs/path/to/worktree still works. */
@@ -57,6 +88,8 @@ export interface GlobalConfig {
   maintenance?: MaintenanceConfig;
   /** Optional local project whiteboard. Disabled unless explicitly enabled. */
   whiteboard?: WhiteboardConfig;
+  /** Codex App/CLI 独立任务完成通知。机器级、默认关闭，由 Dashboard 管理。 */
+  codexNotifier?: CodexNotifierGlobalConfig;
   /** Machine-wide meeting listener kill-switch. Missing / enabled !== false
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
@@ -323,6 +356,20 @@ function readWhiteboard(raw: unknown): WhiteboardConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readCodexNotifier(raw: unknown): CodexNotifierGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: CodexNotifierGlobalConfig = {};
+  if (typeof value.enabled === 'boolean') out.enabled = value.enabled;
+  if (typeof value.targetBotAppId === 'string' && value.targetBotAppId.trim()) {
+    out.targetBotAppId = value.targetBotAppId.trim();
+  }
+  if (value.notifyWhen === 'locked_only' || value.notifyWhen === 'always') {
+    out.notifyWhen = value.notifyWhen;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
@@ -350,7 +397,10 @@ function readRawConfig(): Record<string, unknown> {
     const parsed = JSON.parse(readFileSync(path, 'utf-8'));
     return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
   } catch (err: any) {
-    if (!warnedOnce) {
+    // Under the file sandbox config.json is intentionally NOT exposed (it can
+    // hold voice TTS credentials); EPERM/EACCES here is EXPECTED, not a parse
+    // failure — return defaults silently. Only warn on a genuine corrupt-JSON.
+    if (err?.code !== 'EPERM' && err?.code !== 'EACCES' && !warnedOnce) {
       warnedOnce = true;
       // eslint-disable-next-line no-console
       console.warn(`[botmux] Failed to parse ${path}: ${err?.message ?? err}. Ignoring file.`);
@@ -379,6 +429,8 @@ export function readGlobalConfig(): GlobalConfig {
   const raw = readRawConfig();
   const out: GlobalConfig = {};
   if (isLocale(raw.lang)) out.lang = raw.lang;
+  const groupNamePrefix = normalizeGroupNamePrefix(raw.groupNamePrefix);
+  if (groupNamePrefix) out.groupNamePrefix = groupNamePrefix;
   const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
   if (repoPickerMode) out.repoPickerMode = repoPickerMode;
   const dashboard = readDashboard(raw.dashboard);
@@ -389,6 +441,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (maintenance) out.maintenance = maintenance;
   const whiteboard = readWhiteboard(raw.whiteboard);
   if (whiteboard) out.whiteboard = whiteboard;
+  const codexNotifier = readCodexNotifier(raw.codexNotifier);
+  if (codexNotifier) out.codexNotifier = codexNotifier;
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
@@ -510,6 +564,19 @@ export function mergeDashboardConfig(patch: DashboardGlobalConfig): DashboardGlo
     : {};
   mergeGlobalConfig({ dashboard: { ...existing, ...patch } as DashboardGlobalConfig });
   return readGlobalConfig().dashboard ?? {};
+}
+
+/** 写入 notifier 的完整已知配置，同时保留配置块内的未来字段。 */
+export function writeCodexNotifierConfig(config: CodexNotifierGlobalConfig): CodexNotifierGlobalConfig {
+  const raw = readRawConfig();
+  const existing = raw.codexNotifier && typeof raw.codexNotifier === 'object' && !Array.isArray(raw.codexNotifier)
+    ? { ...raw.codexNotifier as Record<string, unknown> }
+    : {};
+  delete existing.enabled;
+  delete existing.targetBotAppId;
+  delete existing.notifyWhen;
+  mergeGlobalConfig({ codexNotifier: { ...existing, ...config } as CodexNotifierGlobalConfig });
+  return readGlobalConfig().codexNotifier ?? {};
 }
 
 /** Merge only the maintenance sub-config, preserving unknown sibling keys.

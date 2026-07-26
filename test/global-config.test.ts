@@ -3,13 +3,17 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  GROUP_NAME_PREFIX_MAX_LENGTH,
   globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
   isGlobalVcMeetingAgentEnabled,
+  invalidateGlobalConfigCache,
   mergeDashboardConfig,
   mergeGlobalConfig,
   readGlobalConfig,
+  writeCodexNotifierConfig,
 } from '../src/global-config.js';
+import { resolveCodexNotifierConfig } from '../src/features/codex-notifier/config.js';
 
 describe('global dashboard config', () => {
   let home: string;
@@ -106,6 +110,40 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().repoPickerMode).toBe('repos');
   });
 
+  it('preserves separator whitespace in groupNamePrefix', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix: '  [AI] ' }));
+    expect(readGlobalConfig().groupNamePrefix).toBe('  [AI] ');
+  });
+
+  it('ignores invalid groupNamePrefix values on the forgiving read path', () => {
+    for (const groupNamePrefix of [
+      42,
+      '   ',
+      'AI\n讨论·',
+      'AI\u0080讨论·',
+      'AI\u0085讨论·',
+      'AI\u009f讨论·',
+      'x'.repeat(GROUP_NAME_PREFIX_MAX_LENGTH + 1),
+    ]) {
+      writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix }));
+      invalidateGlobalConfigCache();
+      expect(readGlobalConfig().groupNamePrefix).toBeUndefined();
+    }
+  });
+
+  it('round-trips and clears groupNamePrefix without losing unknown keys', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ futureSetting: 'keep-me' }));
+    mergeGlobalConfig({ groupNamePrefix: 'AI讨论·' });
+    expect(readGlobalConfig().groupNamePrefix).toBe('AI讨论·');
+    expect(JSON.parse(readFileSync(globalConfigPath(), 'utf8')).futureSetting).toBe('keep-me');
+
+    mergeGlobalConfig({ groupNamePrefix: null });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    expect(readGlobalConfig().groupNamePrefix).toBeUndefined();
+    expect(raw).not.toHaveProperty('groupNamePrefix');
+    expect(raw.futureSetting).toBe('keep-me');
+  });
+
   it('drops invalid repoPickerMode values', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ repoPickerMode: 'grouped' }));
     expect(readGlobalConfig().repoPickerMode).toBeUndefined();
@@ -138,6 +176,79 @@ describe('global dashboard config', () => {
     mergeGlobalConfig({ vcMeetingAgent: { enabled: true, listenerBotAppId: ' cli_listener ' } });
     expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: true, listenerBotAppId: 'cli_listener' });
     expect(globalVcMeetingAgentListenerBotAppId()).toBe('cli_listener');
+  });
+
+  it('keeps codexNotifier strictly disabled by default', () => {
+    expect(readGlobalConfig().codexNotifier).toBeUndefined();
+    expect(resolveCodexNotifierConfig()).toEqual({
+      enabled: false,
+      notifyWhen: 'locked_only',
+    });
+  });
+
+  it('reads and sanitizes the machine-wide codexNotifier config', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: ' cli_notify ',
+        notifyWhen: 'always',
+        futureSetting: 'keep-compatible',
+      },
+    }));
+
+    expect(readGlobalConfig().codexNotifier).toEqual({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+      notifyWhen: 'always',
+    });
+    expect(resolveCodexNotifierConfig()).toEqual({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+      notifyWhen: 'always',
+    });
+  });
+
+  it('writes known codexNotifier fields without dropping future sibling keys', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: 'cli_old',
+        notifyWhen: 'locked_only',
+        futureSetting: { version: 2 },
+      },
+    }));
+
+    writeCodexNotifierConfig({
+      enabled: false,
+      notifyWhen: 'always',
+    });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+
+    expect(raw.codexNotifier).toEqual({
+      enabled: false,
+      notifyWhen: 'always',
+      futureSetting: { version: 2 },
+    });
+    expect(readGlobalConfig().codexNotifier).toEqual({
+      enabled: false,
+      notifyWhen: 'always',
+    });
+  });
+
+  it('drops invalid codexNotifier fields and keeps the safe notify default', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      codexNotifier: {
+        enabled: 'yes',
+        targetBotAppId: '   ',
+        notifyWhen: 'unlocked',
+      },
+    }));
+
+    expect(readGlobalConfig().codexNotifier).toBeUndefined();
+    expect(resolveCodexNotifierConfig()).toEqual({
+      enabled: false,
+      notifyWhen: 'locked_only',
+    });
   });
 
   it('reads global plugin defaults as a sanitized id list', () => {

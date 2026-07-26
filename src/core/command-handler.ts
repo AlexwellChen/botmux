@@ -7,7 +7,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
-import { repoPickerScanOptions } from '../global-config.js';
+import { readGlobalConfig, repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -15,8 +15,7 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { resolvePairedSpawnBackendType } from './persistent-backend.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
-import { computeSandboxDiff } from '../services/sandbox-land.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
@@ -25,7 +24,7 @@ import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -39,7 +38,7 @@ import {
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
-import { discoverAdoptableSessions, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
+import { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
@@ -113,6 +112,24 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * that pollutes the dashboard's session list. Handle them without a session.
  */
 export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
+
+const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
+
+/** Apply the machine-wide prefix used only by `/group` and `/g`, then keep the
+ *  existing Lark headroom. The legacy limit is measured in UTF-16 code units;
+ *  iterating by code point keeps that limit without slicing an emoji's
+ *  surrogate pair. */
+export function formatSlashGroupName(name: string, prefix = ''): string {
+  const prefixed = prefix && !name.startsWith(prefix) ? `${prefix}${name}` : name;
+  if (prefixed.length <= SLASH_GROUP_NAME_MAX_UTF16_LENGTH) return prefixed;
+
+  let truncated = '';
+  for (const character of prefixed) {
+    if (truncated.length + character.length > SLASH_GROUP_NAME_MAX_UTF16_LENGTH) break;
+    truncated += character;
+  }
+  return `${truncated}…`;
+}
 
 /**
  * Daemon commands that operate on an ALREADY-EXISTING session and must never
@@ -999,7 +1016,11 @@ async function handleConfigCommand(
     let value: unknown;
     switch (spec.kind) {
       case 'stringList': {
-        const arr = parseCustomPassthroughInput(rawValue);
+        // 与 card/config-store 路径（bot-config-store.ts 的 coerce）同口径：优先用
+        // 字段自带的 parseList——canTalkDaemonCommands / startupCommands 的解析规则
+        // 与默认的 parseCustomPassthroughInput 相反或不同，硬编码默认解析器会把
+        // 合法输入静默滤光成"空值"。
+        const arr = (spec.parseList ?? parseCustomPassthroughInput)(rawValue);
         if (arr.length === 0) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
         value = arr;
         break;
@@ -1297,41 +1318,6 @@ export async function handleCommand(
         break;
       }
 
-      case '/land': {
-        // 把沙盒会话副本里 agent 的改动落回真实仓库。owner 审阅 diff 卡后点「应用到磁盘」。
-        // agent 在沙盒里无感（以为改的就是真文件），所以只能由 owner 在此手动触发。
-        if (!ds) { await sessionReply(rootId, t('cmd.no_active_session', undefined, loc)); break; }
-        const sid = ds.session.sessionId;
-        const wd = ds.session.workingDir;
-        if (!wd) { await sessionReply(rootId, t('cmd.land.no_workingdir', undefined, loc)); break; }
-        const d = computeSandboxDiff(config.session.dataDir, sid, loc);
-        if (!d.ok) { await sessionReply(rootId, t('cmd.land.cannot', { error: d.error }, loc)); break; }
-        if (d.empty) { await sessionReply(rootId, t('cmd.land.empty', undefined, loc)); break; }
-        // In-card preview: cap by lines AND chars (Lark card size limit); the FULL
-        // diff goes to an attached .patch file (better for large changesets).
-        const MAX_LINES = 60, MAX_CHARS = 4000;
-        const allLines = d.patch.split('\n');
-        let preview = allLines.slice(0, MAX_LINES).join('\n');
-        let truncated = allLines.length > MAX_LINES;
-        if (preview.length > MAX_CHARS) { preview = preview.slice(0, MAX_CHARS); truncated = true; }
-        // Attach the full .patch (git apply-able) — sent as a file message first,
-        // then the review card below it.
-        let patchAttached = false;
-        if (larkAppId) {
-          try {
-            const patchName = `botmux-land-${sid.slice(0, 8)}.patch`;
-            const patchPath = join(config.session.dataDir, 'sandboxes', sid, patchName);
-            writeFileSync(patchPath, d.patch);
-            const fileKey = await uploadFile(larkAppId, patchPath);
-            await sendMessage(larkAppId, ds.session.chatId, JSON.stringify({ file_key: fileKey }), 'file');
-            patchAttached = true;
-          } catch (e) { logger.warn(`[${logTag}] /land patch attach failed: ${(e as Error).message}`); }
-        }
-        const card = buildLandCard({ sessionId: sid, workingDir: wd, statText: d.statText, files: d.files, insertions: d.insertions, deletions: d.deletions, preview, truncated, patchAttached }, loc);
-        await sessionReply(rootId, card, 'interactive');
-        logger.info(`[${logTag}] /land: ${d.files} files (+${d.insertions}/-${d.deletions}) → card${patchAttached ? ' + .patch' : ''}`);
-        break;
-      }
 
       case '/detach':
       case '/disconnect': {
@@ -2370,14 +2356,23 @@ export async function handleCommand(
 
         const botCliId = botCfgForAdopt?.cliId;
 
-        // Discover BOTH tmux AND zellij sessions, regardless of the bot's own
-        // backend — a normal tmux bot should still be able to adopt a CLI the
-        // user is running inside zellij (and vice-versa). The adopt itself
-        // picks the right observe backend from the chosen target.
-        // discoverAdoptableZellijSessions returns [] when zellij isn't
-        // installed, so this is safe on tmux-only hosts.
+        // Discover every supported backend, but only offer live sessions for
+        // this bot's configured CLI. A Pi bot must not show Codex/TRAE panes:
+        // adopting one would unexpectedly change the agent behind the bot.
+        const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
+          const target = active.session.persistentBackendTarget;
+          return active.session.status === 'active'
+            && !active.adoptedFrom
+            && target?.backendType === 'herdr'
+            && !!target.agentName
+            ? [{ sessionName: target.sessionName, agentName: target.agentName }]
+            : [];
+        });
         const sessions: Array<AdoptableSession | ZellijAdoptableSession> = [
-          ...discoverAdoptableSessions(botCliId),
+          ...excludeOwnedHerdrAdoptTargets(
+            discoverAdoptableSessions(botCliId),
+            ownedHerdrTargets,
+          ),
           ...discoverAdoptableZellijSessions(botCliId),
         ];
 
@@ -2620,15 +2615,15 @@ export async function handleCommand(
           rawArgs = rawArgs.replace(roleProfileArg[0], ' ');
         }
         const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
-        const MAX_NAME = 50; // Lark group names cap around 60; leave headroom for '…'
-        let groupName: string;
+        let baseGroupName: string;
         if (firstLine) {
-          groupName = firstLine.length > MAX_NAME ? firstLine.slice(0, MAX_NAME) + '…' : firstLine;
+          baseGroupName = firstLine;
         } else {
           const now = new Date();
           const ts = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-          groupName = t('cmd.group.empty_fallback', { ts }, loc);
+          baseGroupName = t('cmd.group.empty_fallback', { ts }, loc);
         }
+        const groupName = formatSlashGroupName(baseGroupName, readGlobalConfig().groupNamePrefix);
 
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).
@@ -3456,6 +3451,33 @@ export async function startAdoptSession(
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
 
   const zellij = isZellijTarget(target);
+  if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
+    const occupied = [...deps.activeSessions.values()].some(active => {
+      if (active.session.sessionId === ds.session.sessionId || active.session.status !== 'active' || active.adoptedFrom) return false;
+      const owned = active.session.persistentBackendTarget;
+      return owned?.backendType === 'herdr'
+        && owned.sessionName === target.herdrSessionName
+        && owned.agentName === target.herdrAgentName;
+    });
+    if (occupied) {
+      await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
+      return;
+    }
+  }
+
+  // Fail-closed at the ENTRY point, BEFORE any target validation or state
+  // mutation: a sandbox-enabled bot can't wrap an already-running CLI
+  // (confinement is spawn-time only). Reject here so `adoptedFrom` is never
+  // persisted and "adopted" is never replied — otherwise the session would
+  // become a worker=null pseudo-adopt whose next message still routes as a
+  // bridge/adopt session. Covers both real host-process adopt entries
+  // (`/adopt <pane>` and the adopt_select card, which both route here). Checks
+  // the live bot flag AND the session's frozen sandbox decision (union).
+  if (adoptSandboxBlocked(getBot(ds.larkAppId ?? larkAppId).config, ds.session)) {
+    await sessionReply(sessionAnchorId(ds), t('cmd.adopt.sandbox_blocked', undefined, loc));
+    return;
+  }
+
   const valid = zellij
     ? validateZellijAdoptTarget(target.zellijSession, target.zellijPaneId, target.cliPid, target.cliId)
     : validateAdoptTarget(target);

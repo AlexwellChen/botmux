@@ -229,27 +229,21 @@ export const config = {
      *  要回到 env 控制需删掉 config.json 里的 dashboard.publicReadOnly）. */
     publicReadOnly: (process.env.BOTMUX_DASHBOARD_PUBLIC_READONLY ?? 'true').toLowerCase() !== 'false',
   },
-  screenAnalyzer: {
-    enabled: (process.env.SCREEN_ANALYZER_ENABLED ?? '').toLowerCase() === 'true',
-    baseUrl: process.env.SCREEN_ANALYZER_BASE_URL ?? '',
-    apiKey: process.env.SCREEN_ANALYZER_API_KEY ?? '',
-    model: process.env.SCREEN_ANALYZER_MODEL ?? '',
-    /** Snapshot polling interval in ms */
-    intervalMs: Number(process.env.SCREEN_ANALYZER_INTERVAL_MS) || 2_000,
-    /** Consecutive unchanged snapshots required before calling AI */
-    stableCount: Number(process.env.SCREEN_ANALYZER_STABLE_COUNT) || 6,
-    /** Max characters to send from snapshot */
-    snapshotMaxChars: Number(process.env.SCREEN_ANALYZER_SNAPSHOT_MAX_CHARS) || 8_000,
-    /** Extra headers for the API request (JSON string, e.g. '{"X-Custom":"value"}') */
-    extraHeaders: (() => {
-      try { return JSON.parse(process.env.SCREEN_ANALYZER_EXTRA_HEADERS ?? '{}'); }
-      catch { return {}; }
-    })() as Record<string, string>,
-    /** Extra body params for the API request (JSON string, e.g. '{"thinking":{"type":"disabled"}}') */
-    extraBody: (() => {
-      try { return JSON.parse(process.env.SCREEN_ANALYZER_EXTRA_BODY ?? '{}'); }
-      catch { return {}; }
-    })() as Record<string, unknown>,
+  stuckDetector: {
+    /**
+     * Lightweight, AI-free fallback that warns the user when a written input
+     * has not produced a completed turn within `timeoutMs`. Currently targets
+     * the Codex PreToolUse hook-review blocking state (level 1 hooks browser
+     * and level 2 per-hook review). Generic [Y/n]/permission/Press-to-continue
+     * prompts are intentionally NOT handled — they cannot be safely inferred
+     * from a regex and belong in a follow-up. Enabled by default because it
+     * has no external dependencies and only fires when the worker confirms the
+     * turn is genuinely stalled AND the snapshot matches a known hook screen.
+     */
+    enabled: (process.env.STUCK_DETECTOR_ENABLED ?? 'true').toLowerCase() !== 'false',
+    /** Milliseconds after a write before the detector checks whether the turn
+     *  is still unresolved. */
+    timeoutMs: Number(process.env.STUCK_DETECTOR_TIMEOUT_MS) || 45_000,
   },
   worktreeSlugAI: {
     /**

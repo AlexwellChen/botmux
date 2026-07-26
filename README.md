@@ -105,21 +105,25 @@ botmux 可以管理 CLI 无关的自定义 Skill Registry，并按 bot 配置在
 
 > 拆子项目 → 提一版「子项目 ↔ bot」分配 → 发给你**一次审批**（可用卡片确认） → 建飞书任务清单 → 逐个开话题派活 → 收齐回报 → 汇总
 
-底层派活靠 `botmux dispatch`：在群里种一条话题、把指定 bot @ 进去各起独立会话。
+底层派活靠 `botmux dispatch`：在群里种一条话题、把指定 bot @ 进去各起独立会话。同机 Bot 推荐传稳定 App 身份；命令会先在每个 receiver 视角建立并回读该群的双向 talk-only `chatGrant`，再发任务并等待目标 session 确认接单，因此新建“冷群”不依赖历史 `/introduce` / peer 缓存。
 
 ```bash
 botmux dispatch --title "实现登录模块" \
-  --bot "ou_xxx:Alice:coder" --bot "ou_yyy:Bob:reviewer" \
-  --repo /path/to/repo --brief-file /tmp/brief.md
+  --bot-app "cli_xxx:coder" --bot-app "cli_yyy:reviewer" \
+  --brief-file /tmp/brief.md
 ```
 
-- `--repo <目录>` —— 预设子 bot 的工作目录（绝对路径，需在子 bot 所在机器上存在），起会话直接进去、**免手点「选仓库」卡**。
+- `--bot-app <larkAppId[:角色]>` —— 同机 Bot 的推荐入口；自动完成 receiver-scoped 精确对话授权与实际接单确认。它不授管理命令权，不能与 `--repo` 同用，驻守 Bot 应使用自身默认工作目录。
+- `--bot <open_id[:名字[:角色]]>` —— 兼容外部/旧链路的原始 open_id 入口；调用方自行保证 receiver 作用域、权限与接单状态。
+- `--repo <目录>` —— 只适用于已经具备 operate 信任的旧 `--bot` 链路；预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）。
 - `--standby` —— **必须配 `--repo`**（且不能与 `--into` 同用）：只发一次 `/repo` 把 bot 拉起到指定目录待命、不派简报，之后用 `--into ... --brief(-file)` 激活派活。
-- `--into <话题root>` —— 回到已有话题追加一条（激活待命的 bot / 追加协调）；仍需 `--bot`，且非 standby 时必须带 `--brief` 或 `--brief-file`。
+- `--into <话题root>` —— 回到已有话题追加一条（激活待命的 bot / 追加协调）；仍需指定 bot，且非 standby 时必须带 `--brief` 或 `--brief-file`。
+
+子 Bot 完成后运行 `botmux report`。纯同机 `--bot-app` 派单会在每一轮任务中自动注入带精确 seed 的 `botmux report --dispatch-root <seed>` 命令，把回报直接注入 dispatch 时登记的原 PM session；即使同一 chat-scope 会话后来又收到新派单，也不会串到新 seed。legacy / mixed `--bot` 仍保留无精确 seed 的跨机兼容回退。
 
 **协作边界**：
 
-- **同部署的「自家」bot 之间互信** —— 编排者能直接对它们跑 `/repo` 等 operate 级命令（与自家 bot 的对话权限一致）。外部 bot 的授权分两层：`/grant @bot` 只给「对话 / 被 chat-scope 拉起」的权限（talk-only，不碰 `allowedUsers`、跑不了 operate 级命令）；要让外部 bot 跑 `/repo` 等 operate 级命令，需把它列进 `allowedUsers`（或后续 operate 级授权）。`/introduce` 只负责发现 / 登记 open_id，**不授予任何权限**。
+- **同部署不等于隐式管理互信** —— `--bot-app` 只在目标群建立双方 receiver-scoped 的 talk-only `chatGrant`，不碰 `allowedUsers`，跑不了 `/repo` 等 operate 级命令。需要管理命令时必须另有明确的 allowedUsers / team / oncall operate 信任；`/introduce` 只负责发现 / 登记 open_id，**不授予任何权限**。
 - 子 bot 须已在群里、可被 @（具备 `im:message.group_at_msg.include_bot` 权限）。
 - 一条话题可放多个 bot，它们在话题内互相 @ 协作（如 coder 写完 @ reviewer 审）。
 
@@ -196,6 +200,7 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 - 添加机器人对齐 Feishu 单次扫码主路径：名称可选且全程冻结，支持 AI CLI / 工作目录选择、管理员 fail-closed 补填与显式兼容模式
 - 拉新群、自动转让群主、@ 提醒
 - 解散群聊、bot 退群（关联会话自动清理）
+- **Codex 独立任务完成通知（实验性、默认关闭）**：macOS 锁屏时由所选 Bot 私聊同步 Codex App/CLI 最终回复，也覆盖 Codex App Side Chat；普通 App 会话可通过飞书回调请求运行 BotMux 的 Mac 打开原会话，或在飞书中接管继续处理，临时 Side Chat 只同步结果。在「设置 → 实验性配置」选择 Bot 与通知时机（[设计与维护说明](docs/design/codex-notifier.md)）
 - **会话洞察**（owner-only，只读）：解析各会话 transcript，看动作 span / 工作时序 / 上下文曲线 / 失败聚合 + 诊断建议；聊天里发 `/insight` 可取当前会话摘要卡
 - **Workflows 管控面**：
   - v3 Run List 与 Run Detail 展示 DAG、节点状态、决策记录和 attempt 终端日志，到 terminal 自动停轮询
@@ -376,6 +381,31 @@ botmux 会自动开启机器人能力、长连接事件模式并订阅基础事�
 - 明确要编排时可发 `/workflow <目标>`；查看/取消 run 用 `/workflow list|show|cancel`。
 - 成功 run 可用 `/workflow save last 周报` 固化；之后 `/workflow run 周报 region=sg` 复用，缺少的必填参数会单独补问。
 - v2 runtime 已下线。旧定义与历史 run 只保留 `botmux template migrate-v3` / `archive-runs` 离线迁移归档入口。
+
+---
+
+### 单个 Headless Goal（本机 CLI）
+
+`botmux goal run` 在不启动 daemon 的情况下运行一个真实 goal，适合本机脚本、CI 和人工触发的自动化。它走现有 v3 ephemeral worker、沙箱/enforcement、journal、worker fence 和 manifest 校验路径；信任边界与操作者在本机直接运行 botmux 相同，不是远程执行 API。
+
+```bash
+botmux goal run "检查仓库并生成发布说明" \
+  --bot my-codex \
+  --working-dir ~/projects/app \
+  --run-id release-notes-2026-07-22 \
+  --timeout 900 \
+  --json
+```
+
+Goal 也可来自 `--goal-file <path>` 或 `--stdin`。`--timeout` 的单位是秒；SIGINT、SIGTERM 和超时都会先把 run 折算为 durable `cancelled` 终态，再退出。
+
+`--json` 模式只向 stdout 写一份终态 JSON（`schemaVersion: "botmux.goal-run-result/v1"`），日志走 stderr。退出码是稳定的机器合同：`0` succeeded、`10` failed、`11` blocked、`12` cancelled、`13` runId/活动 driver 冲突、`14` 参数或启动错误。失败同样返回结构化 `error.code` / `error.message`。
+
+`--run-id` 是幂等键：已有终态会原样重放且不启动 worker；活动 driver 仍存活时拒绝并返回 `13`；driver 被 `kill -9` 后，用同一请求和 runId 重试会根据 v3 journal/worker fence 接续为新 attempt，不覆盖旧 attempt。不同 goal、bot、工作目录或 timeout 不能复用同一 runId。
+
+JSON 中的 `artifacts` 只包含经既有 manifest validator 验证的相对路径和摘要。`runDirectory.stability` 固定为 `informative-only`：该目录供本机诊断，不属于稳定 API，消费方不应读取其私有布局。采集不到 usage/cost 时字段会省略，不会伪造零值。
+
+当前入口仅提供本机单进程 CLI 合同，不提供 daemon/远程 Host API、事件流或跨机器 fencing；这些能力需要独立 RFC 和安全评审。
 
 ---
 

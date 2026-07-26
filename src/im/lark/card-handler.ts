@@ -9,8 +9,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard, buildRepoSelectCard } from './card-builder.js';
-import { computeSandboxDiff, applySandboxDiff } from '../../services/sandbox-land.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
 import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
@@ -115,6 +114,8 @@ export interface CardHandlerDeps {
   /** VC meeting invite/consumer card actions. Implemented in daemon to
    *  keep meeting sessions, tombstones, and listener-group state single-owned. */
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
+  /** Codex 完成通知卡动作。事件存储、App 打开和会话接管由 daemon 单点持有。 */
+  codexNotifierCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
 }
@@ -837,30 +838,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  // ─── 沙盒落盘卡（land_apply / land_discard）──────────────────────────────────
-  // 不绑 session（sessionId + workingDir 都在 value 里）。owner 强闸门：只有 owner 能把
-  // 隔离副本的改动应用回真实磁盘。agent 在沙盒里无感，不参与。
-  if (value?.action && (value.action === 'land_apply' || value.action === 'land_discard') && larkAppId) {
-    const loc = localeForBot(larkAppId);
-    const owner = getOwnerOpenId(larkAppId);
-    if (!operatorOpenId || operatorOpenId !== owner) {
-      logger.info(`Land action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
-      return { toast: { type: 'error', content: t('card.land.toast_owner_only', undefined, loc) } };
-    }
-    if (value.action === 'land_discard') {
-      return JSON.parse(buildLandResultCard('discarded', '', loc));
-    }
-    const sid: string = value.sessionId;
-    const wd: string = value.workingDir;
-    if (!sid || !wd) return JSON.parse(buildLandResultCard('failed', t('card.land.stale', undefined, loc), loc));
-    const d = computeSandboxDiff(config.session.dataDir, sid, loc);
-    if (!d.ok) return JSON.parse(buildLandResultCard('failed', d.error, loc));
-    if (d.empty) return JSON.parse(buildLandResultCard('discarded', '', loc));
-    const a = applySandboxDiff(wd, config.session.dataDir, sid, loc);
-    if (!a.ok) return JSON.parse(buildLandResultCard('failed', a.error, loc));
-    logger.info(`Land applied: ${d.files} files (+${d.insertions}/-${d.deletions}) → ${wd}`);
-    return JSON.parse(buildLandResultCard('applied', t('card.land.applied_body', { files: d.files, ins: d.insertions, del: d.deletions, dir: wd }, loc), loc));
-  }
   // ─── 机器过载告警卡动作（overload_clean_stopped / overload_suspend_idle / noop）──
   // 不绑 session。owner 强闸门 + nonce 一次性核销（每按钮各一次，防重复点/超时重投/旧卡）。
   // 点完不替换成死卡：重建同一张卡，把点过的按钮标 done+数量并 disabled，另一个仍可点。
@@ -1047,6 +1024,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data);
+  }
+
+  if (
+    (value?.action === 'codex_notifier_continue' || value?.action === 'codex_notifier_open_app')
+    && larkAppId
+  ) {
+    if (!operatorOpenId) {
+      logger.info(`${value.action} blocked because operator identity is missing`);
+      return { toast: { type: 'error', content: '只有机器人管理员可以操作此 Codex 任务' } };
+    }
+    if (!deps.codexNotifierCardAction) {
+      return { toast: { type: 'error', content: 'Codex 完成通知处理器未启用' } };
+    }
+    return deps.codexNotifierCardAction(data, larkAppId);
   }
 
   if (
@@ -1925,6 +1916,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'tui_keys' && ds) {
+      // Fail-closed: only act on a currently-active card (either the
+      // ScreenAnalyzer TUI prompt card or our stuck-warning card). A stale
+      // click from a resolved/replaced card must NOT send any IPC to the
+      // worker — the CLI may have moved on or recovered. PATCH is UI only,
+      // not an authorization check.
+      const isActiveTuiCard = !!ds.tuiPromptCardId && cardMessageId === ds.tuiPromptCardId;
+      const isActiveStuckCard = !!ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId;
+      if (!isActiveTuiCard && !isActiveStuckCard) {
+        logger.info(`[${tag(ds)}] tui_keys from stale card ${cardMessageId} — ignored (active tui=${ds.tuiPromptCardId ?? 'none'} stuck=${ds.stuckWarningCardId ?? 'none'})`);
+        return;
+      }
       let keys: string[] = [];
       try { keys = JSON.parse(value?.keys ?? '[]'); } catch { /* bad json */ }
       const isFinal = value?.is_final === '1';
@@ -1933,6 +1935,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
 
       if (optionType === 'toggle') {
+        // Only a ScreenAnalyzer TUI card may own toggle state. A stuck-warning
+        // card must never read or mutate the other card's global selections.
+        if (!isActiveTuiCard) {
+          logger.info(`[${tag(ds)}] Ignored toggle from non-TUI card ${cardMessageId}`);
+          return;
+        }
         // Toggle: only update card UI, do NOT send keys to terminal yet.
         // Keys will be sent in batch when confirm is clicked.
         if (!ds.tuiToggledIndices) ds.tuiToggledIndices = [];
@@ -1960,10 +1968,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return;
       }
 
-      // For confirm: batch all toggled options' keys first, then confirm keys
+      // For a normal TUI confirm: batch all toggled options' keys first.
+      // For a stuck-warning card: derive the single allowed key from the
+      // page type + selected index — NEVER trust value.keys from the card,
+      // which could be tampered to inject arbitrary keys. The allowlist is
+      // exactly the documented controls for each Codex hook-review screen.
       if (ds.worker) {
         let allKeys: string[] = [];
-        if (ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
+        let isFinalStuck = false;
+        if (isActiveTuiCard && ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
           // Send each toggled option's keys in sequence
           for (const ti of ds.tuiToggledIndices.sort((a, b) => a - b)) {
             const opt = ds.tuiPromptOptions[ti];
@@ -1971,21 +1984,100 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               allKeys.push(...opt.keys);
             }
           }
+          // Then the action's own keys (confirm/select)
+          allKeys.push(...keys);
+        } else if (isActiveStuckCard) {
+          // P1-4: do NOT trust the callback's selected_index. Require it to be
+          // present and a safe integer, then range-check against the page type's
+          // option count. A missing/malformed index must NOT default to 0 (trust),
+          // which is the highest-risk action.
+          const rawIdx = value?.selected_index;
+          if (rawIdx === undefined || rawIdx === null || rawIdx === '') {
+            logger.info(`[${tag(ds)}] Stuck-warning card click missing selected_index — dropped`);
+            return;
+          }
+          const idx = Number(rawIdx);
+          if (!Number.isSafeInteger(idx)) {
+            logger.info(`[${tag(ds)}] Stuck-warning card click with non-integer selected_index=${rawIdx} — dropped`);
+            return;
+          }
+          // Allowlist: map (pageType, idx) → the one safe key.
+          // Level 1: 0=t, 1=Enter, 2=Esc ; Level 2: 0=t, 1=Esc
+          const pt = ds.stuckWarningPageType;
+          const allowlist = pt === 'hook review level 1'
+            ? ['t', 'Enter', 'Escape']
+            : pt === 'hook review level 2'
+              ? ['t', 'Escape']
+              : null;
+          if (!allowlist || idx < 0 || idx >= allowlist.length) {
+            logger.info(`[${tag(ds)}] Stuck-warning card click with out-of-range index ${idx} for pageType=${pt ?? 'none'} — dropped`);
+            return;
+          }
+          allKeys = [allowlist[idx]];
+          // Stuck-card actions are always final (they resolve the current
+          // hook-review screen). Define this server-side — do NOT trust
+          // value.is_final from the callback.
+          isFinalStuck = true;
+        } else {
+          // Non-stuck, non-TUI card (shouldn't happen given the active-card
+          // guard above, but fail-closed).
+          allKeys.push(...keys);
         }
-        // Then the action's own keys (confirm/select)
-        allKeys.push(...keys);
 
         if (allKeys.length > 0) {
-          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal } as DaemonToWorker);
-          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} — "${selectedText}"`);
+          // Atomic processing claim: if a previous click is already in flight
+          // (waiting for tui_keys_delivered / stuck_warning_expired ACK), drop
+          // this duplicate. Without this, two rapid clicks could both pass the
+          // fresh-capture guard and inject keys twice.
+          if (isActiveStuckCard) {
+            if (ds.stuckWarningProcessing) {
+              logger.info(`[${tag(ds)}] Duplicate stuck-warning card click — dropped (processing already in flight)`);
+              return;
+            }
+            ds.stuckWarningProcessing = true;
+          }
+          // Only the stuck-warning card's Enter action re-arms the detector
+          // (Enter advances from the hook list to a per-hook review). Match by
+          // the actual keys sent — NOT by optionType, since t is typed 'confirm'
+          // in the card definition. t/Esc and all ScreenAnalyzer cards never
+          // set this flag. Also require the source card to be our own.
+          const isStuckWarningEnter = isActiveStuckCard
+            && allKeys.length === 1
+            && allKeys[0] === 'Enter';
+          // If this click is from a stuck-warning card, forward the nonce,
+          // cliLifetime, and page type so the worker can re-verify the current
+          // screen still matches before injecting keys. A stale click (CLI
+          // recovered) will be dropped at the worker boundary.
+          const stuckNonce = isActiveStuckCard ? ds.stuckWarningNonce : undefined;
+          const stuckCliLifetime = isActiveStuckCard ? ds.stuckWarningCliLifetime : undefined;
+          const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
+          const effectiveFinal = isFinal || isFinalStuck;
+          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal: effectiveFinal, rearmStuckDetector: isStuckWarningEnter, stuckNonce, stuckCliLifetime, stuckPageType: stuckPage } as DaemonToWorker);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${effectiveFinal} rearmStuck=${isStuckWarningEnter} stuckNonce=${stuckNonce ?? 'none'} — "${selectedText}"`);
         }
 
-        if (isFinal) {
-          const resolveText = ds.tuiToggledIndices?.length
+        if (isFinal || isFinalStuck) {
+          const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
             ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
             : selectedText;
           const finalText = resolveText || selectedText;
           const locDs = localeForBot(ds.larkAppId);
+          // For a stuck-warning card, do NOT clear authority or render success
+          // here. The worker may still reject the keys (stale screen). We show a
+          // "processing" state to block duplicate clicks, and wait for the
+          // worker's tui_keys_delivered (success) or stuck_warning_expired
+          // ("page changed, not sent") ACK before resolving the card.
+          if (isActiveStuckCard) {
+            if (cardMessageId) {
+              const processingCard = buildTuiPromptProcessingCard('处理中…', locDs);
+              updateMessage(ds.larkAppId, cardMessageId, processingCard).catch(err =>
+                logger.debug(`[${tag(ds)}] Failed to set stuck-warning card to processing: ${err}`),
+              );
+            }
+            publishAttentionPatch(ds);
+            try { return JSON.parse(buildTuiPromptProcessingCard('处理中…', locDs)); } catch { /* fall through */ }
+          }
+          // Normal TUI prompt card (ScreenAnalyzer): resolve immediately.
           if (cardMessageId) {
             setTimeout(() => {
               const resolvedCard = buildTuiPromptResolvedCard(finalText, locDs);
@@ -1994,10 +2086,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               );
             }, allKeys.length * 100 + 500);
           }
-          ds.tuiPromptCardId = undefined;
-          ds.tuiPromptOptions = undefined;
-          ds.tuiPromptMultiSelect = undefined;
-          ds.tuiToggledIndices = undefined;
+          // Clear state only for the card that was actually clicked — a stuck
+          // card click must NOT wipe the ScreenAnalyzer TUI prompt state (or
+          // vice versa) if both coexist / race.
+          if (cardMessageId === ds.tuiPromptCardId) {
+            ds.tuiPromptCardId = undefined;
+            ds.tuiPromptOptions = undefined;
+            ds.tuiPromptMultiSelect = undefined;
+            ds.tuiToggledIndices = undefined;
+          }
           publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }
         }
@@ -2533,8 +2630,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     let selected: { key?: string; source?: string; tmuxTarget?: string; zellijSession?: string; zellijPaneId?: string; cliPid?: number };
     try { selected = JSON.parse(option); } catch { return; }
 
-    // Re-discover to get full session info and validate. Backend determines
-    // which discovery to run (re-confirms the pane + pid are still alive).
+    // Re-discover to get full session info and validate. Keep the same CLI
+    // filter used to build the card so a stale/tampered option cannot switch
+    // this bot to a different agent implementation.
     const botCfg = getBot(ds.larkAppId).config;
     let target: Awaited<ReturnType<typeof resolveAdoptTarget>>;
     async function resolveAdoptTarget() {
@@ -2548,9 +2646,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return discoverAdoptableZellijSessions(botCfg.cliId)
           .find(s => s.zellijSession === selected.zellijSession && s.zellijPaneId === selected.zellijPaneId);
       }
-      const { discoverAdoptableSessions, adoptTargetKey } = await import('../../core/session-discovery.js');
-      return discoverAdoptableSessions(botCfg.cliId)
-        .find(s => selected.key
+      const { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, adoptTargetKey } = await import('../../core/session-discovery.js');
+      const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
+        const target = active.session.persistentBackendTarget;
+        return active.session.status === 'active'
+          && !active.adoptedFrom
+          && target?.backendType === 'herdr'
+          && !!target.agentName
+          ? [{ sessionName: target.sessionName, agentName: target.agentName }]
+          : [];
+      });
+      return excludeOwnedHerdrAdoptTargets(
+        discoverAdoptableSessions(botCfg.cliId),
+        ownedHerdrTargets,
+      ).find(s => selected.key
           ? adoptTargetKey(s) === selected.key
           : s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
     }

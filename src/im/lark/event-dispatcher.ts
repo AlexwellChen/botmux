@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
@@ -1315,12 +1315,11 @@ export function canOperate(
   senderUnionId?: string | undefined,
 ): boolean {
   const bot = getBot(larkAppId);
-  // L1 同部署兄弟 bot 互信 operate：与 canTalk 一致——isKnownPeerBot 只认本部署
-  // bots-info.json 里注册过的自家 bot。这不重开 PR #46 的封堵：人的 talk 授权
-  // （chatGrant/globalGrant）仍不漏成 operate；这里只放行「自家 bot 之间」的 /
-  // 命令（让编排者能对子 bot 跑 /repo /cd 等）。
-  if (isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) return true;
-  // L2 跨部署「团队 peer bot」互信 operate（与 L1 兄弟 bot 对等，覆盖编排者给
+  // 同部署 cross-ref / isKnownPeerBot 只证明「这是一个可路由的 bot 身份」，仅供
+  // evaluateTalk 的 peer 腿使用，绝不能隐式升级为管理权限。需要让编排者执行
+  // /repo /cd /restart 等命令时，必须命中下面显式支持 operate 的权限源。
+  //
+  // 跨部署「团队 peer bot」互信 operate（覆盖编排者给
   // 队友派 /repo /cd 等）。**只认租户稳定的 union_id**（isTeamBot / 平台 roster），
   // 不走 isTrustedTeamBotSender 的「团队群成员」分支——那条按 chat 放行是 sender
   // 无关的，会把「团队群里的真人」也误放进 operate，破坏 allowedUsers 边界。union_id
@@ -1334,6 +1333,33 @@ export function canOperate(
   // 用原始配置判定（hasConfiguredAllowlist）：配了 owner 但解析为空时 fail-closed, 不 fail-open。
   if (!hasConfiguredAllowlist(bot)) return true;
   return !!senderOpenId && allowedUsers.includes(senderOpenId);
+}
+
+/**
+ * Daemon 命令统一闸：canOperate 恒放行；此外，bot 配置的 `canTalkDaemonCommands`
+ * 名单内的命令降到 canTalk 判定（oncall / allowedChatGroup / grant / p2pOpen 等
+ * 对话放行腿命中即可）。名单外或未配置 → 与 canOperate 完全等价（现状不变）。
+ *
+ * 只作用于 daemon.ts 两条路由的 DAEMON_COMMANDS 统一闸；在统一闸之前特判的命令
+ * （/vc-auth /term）与 handler 内部自带 owner 闸的命令（/card /insight /land）
+ * 不受影响——内部闸仍是最终权威（fail-closed）。
+ *
+ * chatType 省略时 p2pOpen 腿不生效（fail-closed），与 canTalk 语义一致——
+ * 私聊路径的调用点必须把 chatType 传进来。
+ */
+export function canRunDaemonCommand(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  senderUnionId: string | undefined,
+  cmd: string,
+  memberUnionId?: string | undefined,
+  chatType?: 'p2p' | 'group',
+): boolean {
+  if (canOperate(larkAppId, chatId, senderOpenId, senderUnionId)) return true;
+  const list = getBot(larkAppId).config.canTalkDaemonCommands;
+  if (!list?.includes(cmd)) return false;
+  return canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
 }
 
 /**
@@ -2261,21 +2287,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             larkAppId, chatId, chatType, message, senderOpenId, messageId, routing: ctx, forceTopicApplied: forcedTopic,
           });
         }
-        // Regular-group foreign-bot @mention: gate to vetted botmux peers
-        // (registered in our bot-openids cross-ref). Fires for legacy chat-scope
-        // routing, the new-topic send-shape
-        // (decision.source === 'regular-group-thread'), AND a `/t` force-topic
-        // seed (forcedTopic) — so random Lark bots cannot silently spawn sessions
-        // in 普通群, whether this bot replies in threads or a stranger bot @s us
-        // with `/t`. Known Bot A → Bot B handoffs in 普通群 still work.
-        //
-        // ownsSession is read on ctx.anchor AFTER the `/t` override above. That
-        // exemption means "a foreign bot following up into a session we already
-        // own" (e.g. a chat-scope session at chatId). A `/t` rewrites the anchor
-        // to a fresh messageId where we own nothing, so an unvetted bot can NOT
-        // ride the existing chat-scope session's ownership to skip vetting — it
-        // must independently hit isKnownPeerBot / chatGrants / globalGrants (or
-        // this bot's own oncall chat).
+        // Foreign-bot @mention gate: apply the same vetted-peer/talk-only
+        // boundary to chat scope, regular-group threads, and native topic
+        // threads. Previously native topic replies skipped this outer gate and
+        // were silently dropped by daemon's second evaluateTalk check, so the
+        // owner never saw a grant card. Owning an existing session is not an
+        // authorization source; a revoked/unknown bot must still pass one of
+        // the explicit trust or grant legs below.
         //
         // 注意 isKnownPeerBot 查的是 cross-ref（bot-openids-<appId>.json），它只
         // 收录 bots-info.json 里有名字的 bot，即本机 daemon 自己配置的 bot
@@ -2303,20 +2321,41 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 开放模式（未配任何 allowlist：allowedUsers / allowedChatGroups /
         // globalGrants 全空）与人侧 evaluateTalk 的 `reason:'open'`（1011 行）对齐：
         // 「谁都能触发」本应人、bot 同权。过去这道 gate 漏了这一腿，导致开放模式下
-        // 外部 bot @ 仍被丢弃，必须真人先 @ 一次建 session（ownsSession=true）才救活。
+        // 外部 bot @ 仍被丢弃，必须真人先 @ 一次建 session 才救活。
         // 补上 hasConfiguredAllowlist 短路后两条路径统一：一旦配了任一 allowlist，
         // 立刻恢复「限制态」设闸，安全边界不变。
-        if ((ctx.scope === 'chat' || decision.source === 'regular-group-thread' || forcedTopic)
-            && !findOncallChat(larkAppId, chatId)
+        if (!findOncallChat(larkAppId, chatId)
             && hasConfiguredAllowlist(getBot(larkAppId))) {
-          const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
-          if (!ownsSession
-              && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
+          if (!isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
               && !isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
               && !hasChatGrant(larkAppId, chatId, senderOpenId)
               && !hasGlobalGrant(larkAppId, senderOpenId)) {
-            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
-            return;
+            // Cold-start self-heal: the cross-ref (bot-openids-<appId>.json) is
+            // learned lazily from observed mentions[], so the FIRST bot→bot
+            // direct @ from a same-deployment sibling can arrive before the
+            // receiver has learned that sibling's receiver-scoped open_id
+            // (Lark open_id is per-app). That raced a real sibling into this
+            // "unknown external bot" branch and mis-fired a /grant card
+            // (regression from ec146a49). Before deciding unknown, confirm the
+            // sender against the group's LIVE `/members/bots` roster: accept
+            // only when it binds to exactly one locally-configured sibling of
+            // the same unique name that independently confirms is_in_chat.
+            // Fails closed to the grant card on any API error / ambiguity /
+            // genuine external bot — never a name-only shortcut.
+            const sibling = await resolveSiblingBotBySenderOpenId(larkAppId, chatId, senderOpenId)
+              .catch((err): { ok: false; reason: string } => ({ ok: false, reason: `resolve_threw: ${err?.message ?? String(err)}` }));
+            if (sibling.ok) {
+              // Persist the newly-proven mapping so subsequent @s from this
+              // sibling hit isKnownPeerBot directly (no live API roundtrip).
+              updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, [
+                { name: sibling.botName, id: { open_id: sibling.senderOpenId } },
+              ]);
+              logger.info(`Lazy sibling cross-ref backfill: ${sibling.botName} → ${senderOpenId?.substring(0, 12)} (was cold; skipping /grant)`);
+            } else {
+              logger.info(`Foreign bot @mention not a known sibling (${sibling.reason}); sending grant request card`);
+              await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+              return;
+            }
           }
         }
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);

@@ -3,7 +3,7 @@ import { createServer, get as httpGet, request as httpRequest, type IncomingMess
 import { createServer as createTcpServer, connect as netConnect } from 'node:net';
 import type { Duplex } from 'node:stream';
 import {
-  readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream,
+  readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream, realpathSync,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
@@ -33,7 +33,11 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
-import { redactGroupsForPublic, redactSchedulesForPublic } from './dashboard/public-redact.js';
+import {
+  redactGroupsForPublic,
+  redactSchedulesForPublic,
+  redactSettingsForPublic,
+} from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
@@ -93,6 +97,8 @@ import { spawn } from 'node:child_process';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
+  hasResolvedCodexNotifierRecipient,
+  resolveCodexNotifierRecipientView,
 } from './dashboard/settings-write-applier.js';
 import {
   addBotsToGroup,
@@ -120,6 +126,17 @@ import {
 import { redactGitUrlCredentials } from './core/skills/sources.js';
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
+import {
+  emitCodexNotifierOutboxItem,
+  installCodexNotifierHook,
+  isCodexNotifierWorkerStateFresh,
+  isCodexNotifierHookInstalled,
+  listCodexNotifierOutbox,
+  readCodexNotifierWorkerState,
+  resolveCodexNotifierConfig,
+  runCodexSideConversationMonitor,
+  runCodexNotifierWorkerSupervisor,
+} from './features/codex-notifier/index.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
@@ -294,6 +311,60 @@ const debugTerminalManager = createDebugTerminalManager({
  * tasks (see scheduler.belongsToOwner). Returns undefined when the row is
  * genuinely unknown or no daemon is online.
  */
+/**
+ * Read-only directory listing for the dashboard sandbox-paths tree picker.
+ * Served locally by the dashboard process (same host as the daemons). Returns
+ * immediate CHILD DIRECTORIES only — never file contents. Trust model matches
+ * validateWorkingDir: the caller is an authed admin and the daemon already runs
+ * prompts with full FS access, so this is a convenience browser, not a security
+ * boundary. Symlinks are realpath-resolved; a raw path is never echoed into an
+ * error the browser renders verbatim.
+ */
+function listDirLocally(rawPath: string): {
+  ok: boolean;
+  path: string | null;
+  parent: string | null;
+  entries: { name: string; path: string; kind: 'dir' }[];
+  home?: string;
+  error?: string;
+} {
+  // Canonicalize $HOME so the root entry + the `~` the frontend expands both use
+  // the SAME canonical form the child listings (realpathSync below) and the
+  // worker's sandbox binds use. On a symlinked-$HOME host (/home/u →
+  // /data00/home/u) the lexical homedir() would make `~/.claude` expand to
+  // /home/u/.claude while the tree's child nodes come back as /data00/... — the
+  // picker would then never match `~`-relative tier entries.
+  let home = homedir();
+  try { home = realpathSync(home); } catch { /* lexical fallback if unresolvable */ }
+  if (!rawPath) {
+    // Root view: HOME first (the common case), then filesystem root. `home` is
+    // also returned explicitly so the frontend doesn't guess from entries[0].
+    const roots = [...new Set([home, '/'])];
+    return {
+      ok: true, path: null, parent: null, home,
+      entries: roots.map(p => ({ name: p, path: p, kind: 'dir' as const })),
+    };
+  }
+  const expanded = rawPath.startsWith('~') ? join(home, rawPath.slice(1)) : rawPath;
+  let resolved: string;
+  try { resolved = realpathSync(expanded); }
+  catch { return { ok: false, path: null, parent: null, entries: [], error: 'path_not_found' }; }
+  let entries: { name: string; path: string; kind: 'dir' }[];
+  try {
+    entries = readdirSync(resolved, { withFileTypes: true })
+      .filter(d => {
+        try { return d.isDirectory() || (d.isSymbolicLink() && statSync(join(resolved, d.name)).isDirectory()); }
+        catch { return false; }
+      })
+      .map(d => ({ name: d.name, path: join(resolved, d.name), kind: 'dir' as const }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch (e: any) {
+    return { ok: false, path: resolved, parent: null, entries: [], error: e?.code === 'EACCES' ? 'permission_denied' : 'cannot_read_dir' };
+  }
+  const parent = resolved === '/' ? null : dirname(resolved);
+  return { ok: true, path: resolved, parent, entries };
+}
+
 function resolveScheduleOwner(id: string): string | undefined {
   const explicit = aggregator.scheduleOwnerOf(id);
   if (explicit) return explicit;
@@ -355,8 +426,48 @@ function spawnStartBotLive(appId: string): Promise<{ ok: boolean; message?: stri
   });
 }
 
+function spawnStopBotLive(appId: string): Promise<{ ok: boolean; message?: string }> {
+  return new Promise((resolve) => {
+    let out = '';
+    let err = '';
+    let settled = false;
+    const done = (r: { ok: boolean; message?: string }) => { if (!settled) { settled = true; resolve(r); } };
+    try {
+      const child = spawn(process.execPath, [botmuxCliEntry(), 'stop-bot', appId, '--json'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: process.env,
+        cwd: globalInstallUpdateCwd(),
+      });
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        done({ ok: false, message: 'stop-bot 超时（30s）' });
+      }, 30_000);
+      timer.unref?.();
+      child.stdout?.on('data', (d) => { out += String(d); });
+      child.stderr?.on('data', (d) => { err += String(d); });
+      child.on('error', (e) => {
+        clearTimeout(timer);
+        done({ ok: false, message: e instanceof Error ? e.message : String(e) });
+      });
+      child.on('exit', (code) => {
+        clearTimeout(timer);
+        let parsed: any;
+        try { parsed = JSON.parse(out.trim()); } catch { /* non-JSON */ }
+        if (code === 0) {
+          done({ ok: true, message: parsed?.processName ? `${parsed.processName} 已停止` : undefined });
+        } else {
+          done({ ok: false, message: parsed?.message || err.trim() || `stop-bot 退出码 ${code}` });
+        }
+      });
+    } catch (e) {
+      done({ ok: false, message: e instanceof Error ? e.message : String(e) });
+    }
+  });
+}
+
 const botOnboarding = new BotOnboardingManager({
   botsJsonPath: BOTS_JSON_PATH,
+  stopBotLive: spawnStopBotLive,
   startBotLive: spawnStartBotLive,
 });
 // 飞书 Web 登录态刷新（机器人改名缺登录态时的 dashboard 扫码入口）。机器级单例，
@@ -366,6 +477,8 @@ const subs = new Map<string, () => void>();
 const attaching = new Set<string>();   // dedup concurrent attaches per appId
 
 interface ResolvedDashboardSettings {
+  /** Machine-wide prefix applied only by the `/group` and `/g` slash commands. */
+  groupNamePrefix: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -377,6 +490,25 @@ interface ResolvedDashboardSettings {
    *  source the SPA can offer as a one-click fill; never persisted unless picked. */
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  codexNotifier: {
+    enabled: boolean;
+    targetBotAppId: string | null;
+    notifyWhen: 'locked_only' | 'always';
+    platformSupported: boolean;
+    hookInstalled: boolean;
+    botOptions: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      recipientConfigured: boolean;
+      recipientVerified: boolean;
+      recipientHint: string | null;
+    }>;
+    targetDaemonOnline: boolean;
+    pendingCount: number;
+    workerOnline: boolean;
+    lastError: { at: string; message: string; retryAt: string } | null;
+  };
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -445,6 +577,51 @@ async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: t
   const bot = bots.find(b => b.larkAppId === appId);
   if (!bot) return { ok: false, error: 'vcMeetingAgent_listenerBot_unknown' };
   return { ok: true };
+}
+
+async function validateCodexNotifierTargetBotAppId(
+  appId: string,
+  options: { requireReady?: boolean } = {},
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const bot = loadBotConfigs().find(candidate => candidate.larkAppId === appId);
+    if (!bot) return { ok: false, error: 'codexNotifier_target_unknown' };
+    if (bot.cliId !== 'codex' && bot.cliId !== 'codex-app') {
+      return { ok: false, error: 'codexNotifier_target_cli_unsupported' };
+    }
+    if (!(bot.allowedUsers ?? []).some(user => typeof user === 'string' && user.trim())) {
+      return { ok: false, error: 'codexNotifier_target_owner_missing' };
+    }
+    if (options.requireReady !== true) return { ok: true };
+    const daemon = registry.list().find(candidate => candidate.larkAppId === appId);
+    if (!daemon) return { ok: false, error: 'codexNotifier_target_daemon_offline' };
+    const resolvedOwners = daemon.resolvedAllowedUsers ?? [];
+    if (!hasResolvedCodexNotifierRecipient(resolvedOwners)) {
+      return { ok: false, error: 'codexNotifier_target_owner_unverified' };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'codexNotifier_target_unknown' };
+  }
+}
+
+function codexNotifierBotOptions(): ResolvedDashboardSettings['codexNotifier']['botOptions'] {
+  try {
+    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+    return loadBotConfigs()
+      .filter(bot => bot.cliId === 'codex' || bot.cliId === 'codex-app')
+      .map(bot => {
+        const resolvedOwners = onlineByAppId.get(bot.larkAppId)?.resolvedAllowedUsers ?? [];
+        return {
+          larkAppId: bot.larkAppId,
+          botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
+          cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
+          ...resolveCodexNotifierRecipientView(bot.allowedUsers, resolvedOwners),
+        };
+      });
+  } catch {
+    return [];
+  }
 }
 
 function normalizeVcMeetingAgentRecord(raw: unknown): Record<string, unknown> {
@@ -818,8 +995,12 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
 function resolveDashboardSettings(): ResolvedDashboardSettings {
   const global = readGlobalConfig();
   const dashboard = global.dashboard ?? {};
+  const codexNotifier = resolveCodexNotifierConfig();
+  const codexNotifierBots = codexNotifierBotOptions();
+  const codexNotifierState = readCodexNotifierWorkerState(config.session.dataDir);
   const larkCli = checkLarkCliVersion();
   return {
+    groupNamePrefix: global.groupNamePrefix ?? '',
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
     enableLocalCliOpen: dashboard.enableLocalCliOpen === true,
@@ -833,6 +1014,19 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       recommendedRef: TRAEX_RECOMMENDED_REF,
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
+    codexNotifier: {
+      enabled: codexNotifier.enabled,
+      targetBotAppId: codexNotifier.targetBotAppId ?? null,
+      notifyWhen: codexNotifier.notifyWhen,
+      platformSupported: process.platform === 'darwin',
+      hookInstalled: isCodexNotifierHookInstalled(),
+      botOptions: codexNotifierBots,
+      targetDaemonOnline: !!codexNotifier.targetBotAppId
+        && registry.list().some(bot => bot.larkAppId === codexNotifier.targetBotAppId),
+      pendingCount: listCodexNotifierOutbox(config.session.dataDir).length,
+      workerOnline: isCodexNotifierWorkerStateFresh(codexNotifierState),
+      lastError: codexNotifierState?.lastError ?? null,
+    },
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
@@ -864,6 +1058,7 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
 settingsWriteApplierDeps.syncVcMeetingListenerBotConfig = syncVcMeetingListenerBotConfig;
 settingsWriteApplierDeps.validateVcMeetingListenerBotAppId = validateVcMeetingListenerBotAppId;
+settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 
 /** Helper to render a {status, body} HandlerResult through `res`. */
 function writeHandlerResult(res: import('node:http').ServerResponse, result: GroupsHandlerResult): void {
@@ -1103,6 +1298,29 @@ registry.on(syncSubscriptions);
 // Initial attach for every daemon already known. Run in parallel so a slow
 // daemon doesn't block the others.
 await Promise.all(registry.list().map(attachDaemon));
+
+const codexNotifierAbort = new AbortController();
+if (resolveCodexNotifierConfig().enabled) {
+  try {
+    installCodexNotifierHook();
+  } catch (error) {
+    logger.warn(`[codex-notifier] Hook reconcile failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+void runCodexNotifierWorkerSupervisor({
+  dataDir: config.session.dataDir,
+  signal: codexNotifierAbort.signal,
+  emit: item => emitCodexNotifierOutboxItem(item, { signal: codexNotifierAbort.signal }),
+  runProducer: signal => runCodexSideConversationMonitor({
+    dataDir: config.session.dataDir,
+    signal,
+    logger,
+  }),
+  logger,
+  onLeaseUnavailable: path => {
+    logger.warn(`[codex-notifier] outbox worker 已由另一 Dashboard 持有，等待接管：${path}`);
+  },
+});
 
 const resourceMonitor = createResourceMonitorService({
   intervalMs: 10_000,
@@ -2278,14 +2496,15 @@ const server = createServer(async (req, res) => {
     }
 
     const presentedToken = authedToken(req, url);
-    const dashboardSettings = resolveDashboardSettings();
+    const globalDashboardConfig = readGlobalConfig().dashboard;
     const decision = decideDashboardAuth({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
       presentedToken,
       activeToken: activeToken ?? '',
-      publicReadOnly: dashboardSettings.publicReadOnly,
+      publicReadOnly: globalDashboardConfig?.publicReadOnly
+        ?? config.dashboard.publicReadOnly,
     });
     // `authed` is consumed by route handlers that distinguish the public-read
     // carve-out from a valid management cookie (notably v3 run details).
@@ -2511,6 +2730,7 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { schedules, timezone: scheduleTimeZone() });
     }
     if (req.method === 'GET' && url.pathname === '/api/settings') {
+      const dashboardSettings = resolveDashboardSettings();
       // `authed` lets the Settings page disable toggles for read-only
       // visitors up front, instead of letting them flip a switch that
       // 401s + rolls back on save.
@@ -2520,7 +2740,7 @@ const server = createServer(async (req, res) => {
       // `bound` reflects central-platform binding; the Settings UI only shows the
       // 远程访问 toggle when bound (the central URLs are meaningless otherwise).
       return jsonRes(res, 200, {
-        settings: dashboardSettings,
+        settings: authed ? dashboardSettings : redactSettingsForPublic(dashboardSettings),
         lang: readGlobalConfig().lang ?? null,
         authed,
         bound: readPlatformBinding() !== null,
@@ -3146,6 +3366,7 @@ const server = createServer(async (req, res) => {
         workingDir?: unknown;
         dirMode?: unknown;
         model?: unknown;
+        requireCriticalScopesBeforeActivation?: unknown;
       };
       try {
         const chunks: Buffer[] = [];
@@ -3217,6 +3438,16 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'missing_expected_identity', message: '免扫码添加前必须确认当前账号与企业' });
       }
       const sessionMode = sessionModeRaw === 'reuse' ? 'reuse' as const : 'qr' as const;
+      if (
+        parsed.requireCriticalScopesBeforeActivation !== undefined
+        && typeof parsed.requireCriticalScopesBeforeActivation !== 'boolean'
+      ) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'invalid_critical_scope_activation_gate',
+          message: 'requireCriticalScopesBeforeActivation 必须是 boolean',
+        });
+      }
       const job = botOnboarding.start({
         appName,
         registrationMode,
@@ -3226,8 +3457,102 @@ const server = createServer(async (req, res) => {
         workingDir,
         dirMode,
         model,
+        ...(parsed.requireCriticalScopesBeforeActivation === true
+          ? { requireCriticalScopesBeforeActivation: true }
+          : {}),
       });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/recover-permissions') {
+      let parsed: {
+        workingDir?: unknown;
+        predecessorJobId?: unknown;
+        expectedAppId?: unknown;
+        priorRecoveryJobId?: unknown;
+        requireCriticalScopesBeforeActivation?: unknown;
+      };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        parsed = raw ? JSON.parse(raw) : {};
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const workingDir = typeof parsed.workingDir === 'string' ? parsed.workingDir.trim() : '';
+      const predecessorJobId = typeof parsed.predecessorJobId === 'string' ? parsed.predecessorJobId.trim() : '';
+      const expectedAppId = typeof parsed.expectedAppId === 'string' ? parsed.expectedAppId.trim() : '';
+      const priorRecoveryJobId = typeof parsed.priorRecoveryJobId === 'string' ? parsed.priorRecoveryJobId.trim() : undefined;
+      if (
+        parsed.requireCriticalScopesBeforeActivation !== undefined
+        && typeof parsed.requireCriticalScopesBeforeActivation !== 'boolean'
+      ) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'invalid_critical_scope_activation_gate',
+          message: 'requireCriticalScopesBeforeActivation 必须是 boolean',
+        });
+      }
+      if (!workingDir || !predecessorJobId || !expectedAppId || invalidWorkingDirs({ workingDir }).length > 0) {
+        return jsonRes(res, 400, { ok: false, error: 'permission_recovery_target_invalid' });
+      }
+      const recovered = botOnboarding.startPermissionRecovery({
+        workingDir,
+        predecessorJobId,
+        expectedAppId,
+        priorRecoveryJobId,
+        ...(parsed.requireCriticalScopesBeforeActivation === true
+          ? { requireCriticalScopesBeforeActivation: true }
+          : {}),
+      });
+      if (!recovered.ok) {
+        const status = recovered.error === 'permission_recovery_target_missing' ? 404
+          : recovered.error === 'permission_recovery_target_ambiguous' ? 409
+            : recovered.error === 'permission_recovery_state_unavailable' ? 503
+            : 400;
+        return jsonRes(res, status, recovered);
+      }
+      return jsonRes(res, 202, { job: botOnboarding.get(recovered.job.id) });
+    }
+    let mScopePropagation: RegExpMatchArray | null;
+    if (
+      req.method === 'POST'
+      && (mScopePropagation = url.pathname.match(
+        /^\/api\/bot-onboarding\/([^/]+)\/complete-scope-propagation$/,
+      ))
+    ) {
+      const onboardingId = decodeURIComponent(mScopePropagation[1]);
+      let parsed: { workingDir?: unknown; expectedAppId?: unknown };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        parsed = raw ? JSON.parse(raw) : {};
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const workingDir = typeof parsed.workingDir === 'string' ? parsed.workingDir.trim() : '';
+      const expectedAppId = typeof parsed.expectedAppId === 'string' ? parsed.expectedAppId.trim() : '';
+      if (!workingDir || !expectedAppId || invalidWorkingDirs({ workingDir }).length > 0) {
+        return jsonRes(res, 400, { ok: false, error: 'permission_recovery_target_invalid' });
+      }
+      const completed = await botOnboarding.completeScopePropagation({
+        jobId: onboardingId,
+        workingDir,
+        expectedAppId,
+      });
+      if (!completed.ok) {
+        const status = completed.error === 'permission_recovery_target_missing' ? 404
+          : completed.error === 'permission_recovery_target_ambiguous' ? 409
+            : completed.error === 'permission_recovery_scopes_pending' ? 425
+              : (
+                  completed.error === 'permission_recovery_state_unavailable'
+                  || completed.error === 'permission_recovery_activation_failed'
+                ) ? 503
+                : 400;
+        return jsonRes(res, status, completed);
+      }
+      return jsonRes(res, 200, { job: botOnboarding.get(onboardingId) });
     }
     let mOwner: RegExpMatchArray | null;
     if (req.method === 'POST' && (mOwner = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)\/owner$/))) {
@@ -3342,6 +3667,35 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 单会话元信息（状态/标题/cli/工作目录等）。dashboard 之前只代理了
+    // GET /api/sessions（列表），没有单会话 :id 路由，编程式调用方（如任务
+    // 编排器的「任务详情」面板）走 getMeta 会落到最底的 404 not_found_yet。
+    // owner-only；ownerOf 对已关闭会话仍可解析。放在 trigger-result 之后，
+    // 避免把 /trigger-result、/insight 等子路径吞进这个单段匹配。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。
+    // 四态 running/completed/failed/not_found，daemon 重启后从持久化结果兜底
+    // 重建 completed。owner-only（写权限 cookie），代理到 owner daemon 同名 IPC。
+    // ownerOf 对已关闭会话仍可解析（aggregator 的 /api/sessions 含 closed）。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/trigger-result$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/trigger-result${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // 会话 insight（只读 trace 分析：动作 span / 失败聚合 / 规则建议）。
     // owner-only：不在公开读白名单 → decideDashboardAuth 已对只读访客 401，
     // 公开/联邦访客看不到 tab 也拿不到 span。代理到 owner daemon 的同名 IPC。
@@ -3378,6 +3732,7 @@ const server = createServer(async (req, res) => {
       res.end(await upstream.text());
       return;
     }
+
 
     // Dashboard「复现命令」：透传到 owning daemon 取该 session 的真实 CLI 调用。
     // 与 write-link 同样只在管理 cookie（写权限）下可达：命令含 token/凭证。
@@ -3912,6 +4267,42 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/custom-passthrough — proxy to that bot's daemon. Body
+    // `{ customPassthroughCommands: string }` (raw text, comma/space separated; '' = clear).
+    let mBotPassthrough: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotPassthrough = url.pathname.match(/^\/api\/bots\/([^/]+)\/custom-passthrough$/))) {
+      const appId = decodeURIComponent(mBotPassthrough[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-custom-passthrough`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/cantalk-daemon-commands — proxy to that bot's daemon. Body
+    // `{ canTalkDaemonCommands: string }` (raw text, comma/space separated; '' = clear).
+    let mBotCanTalk: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotCanTalk = url.pathname.match(/^\/api\/bots\/([^/]+)\/cantalk-daemon-commands$/))) {
+      const appId = decodeURIComponent(mBotCanTalk[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-cantalk-daemon-commands`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/launch-shell — proxy to that bot's daemon. Body
     // `{ launchShell: string }` (shell name or absolute path; '' = clear → $SHELL).
     let mBotLaunchShell: RegExpMatchArray | null;
@@ -3963,6 +4354,34 @@ const server = createServer(async (req, res) => {
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/sandbox-paths — proxy to that bot's daemon.
+    // Body `{ readWrite?: string[]; readOnly?: string[]; deny?: string[] }`.
+    let mBotSandboxPaths: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSandboxPaths = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox-paths$/))) {
+      const appId = decodeURIComponent(mBotSandboxPaths[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-sandbox-paths`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // GET /api/fs/list?path=… — read-only directory listing for the sandbox-paths
+    // tree picker. Not bot-specific (the filesystem is shared with this host's
+    // daemons — the dashboard process runs on the SAME machine), so serve it
+    // locally instead of proxying. Returns immediate child directories only.
+    if (req.method === 'GET' && url.pathname === '/api/fs/list') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(listDirLocally(url.searchParams.get('path') ?? '')));
       return;
     }
 
@@ -4808,6 +5227,7 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 
 // Graceful shutdown
 function shutdown(): void {
+  codexNotifierAbort.abort();
   for (const off of subs.values()) off();
   subs.clear();
   registry.stop();
