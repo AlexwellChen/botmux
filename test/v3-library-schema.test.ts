@@ -10,6 +10,7 @@ import {
   validateDagTemplate,
   validateSavedWorkflowMetadata,
   validateSavedWorkflowRevisionPayload,
+  validateSavedWorkflowRevisionDraft,
   validateSpecTemplate,
   collectSavedWorkflowChatSideEffectProblems,
   type SavedWorkflowRevisionPayloadV1,
@@ -115,17 +116,59 @@ describe('v3 Saved Workflow library schema', () => {
     expect(() => validateDagTemplate(withoutBot)).toThrow(/direct bot selector/);
   });
 
-  it('rejects chat-facing side effects in saved workflow goal nodes with migration guidance', () => {
+  it('detects chat-facing side effects but only rejects them at the authoring boundary, not on load', () => {
     const unsafeDag = dagTemplate('写入外部系统，然后 botmux send --mention ou_owner "完成"');
 
+    // The detector still flags the effect.
     expect(collectSavedWorkflowChatSideEffectProblems(unsafeDag)).toMatchObject([{
       nodeId: 'research',
       kind: 'botmux-send',
     }]);
-    expect(() => validateSavedWorkflowRevisionPayload(payload({
+
+    const unsafePayload = payload({
       dagTemplate: unsafeDag,
       safety: { gateDigest: computeSavedWorkflowGateDigest(unsafeDag), sideEffects: [] },
-    }))).toThrow(/businessTask.*hostExecutor feishu-send\/feishu-reply/s);
+    });
+
+    // READ path stays lenient: a revision that was legal before the lint existed
+    // must remain loadable/show-able/appendable (backward-compat — no brick).
+    expect(() => validateSavedWorkflowRevisionPayload(unsafePayload)).not.toThrow();
+    const stored = buildSavedWorkflowRevision(unsafePayload);
+    expect(() => loadSavedWorkflowRevision(stored, { workflowId: WORKFLOW_ID })).not.toThrow();
+
+    // AUTHORING boundary rejects a NEW draft with migration guidance.
+    const { workflowId: _w, humanVersion: _h, createdAt: _c, createdBy: _b, ...draft } = unsafePayload;
+    expect(() => validateSavedWorkflowRevisionDraft(draft))
+      .toThrow(/businessTask.*hostExecutor feishu-send\/feishu-reply/s);
+  });
+
+  it('detects a chat-facing side effect nested inside a loop body goal', () => {
+    const loopDag: V3DagTemplate = {
+      nodes: [{
+        id: 'repair',
+        type: 'loop',
+        bot: 'cli_research',
+        depends: [],
+        inputs: [],
+        maxIterations: 3,
+        body: {
+          nodes: [{
+            id: 'iterate',
+            type: 'goal',
+            goal: '修好之后 botmux reply --in-thread "done"',
+            depends: [],
+            inputs: [],
+            resultSchema: { type: 'object', properties: { passed: { type: 'boolean' } }, required: ['passed'] },
+          }],
+        },
+        exit: { node: 'iterate', when: { path: 'result.passed', equals: true } },
+      }],
+    };
+    expect(collectSavedWorkflowChatSideEffectProblems(loopDag)).toMatchObject([{
+      nodeId: 'repair.iterate',
+      kind: 'botmux-send',
+      path: 'dagTemplate.nodes.repair.iterate.goal',
+    }]);
   });
 
   it('produces a stable content hash across object-key order and changes on semantic content', () => {

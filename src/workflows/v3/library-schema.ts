@@ -408,12 +408,14 @@ export function validateDagTemplate(raw: unknown): V3DagTemplate {
   const botProblems: string[] = [];
   validateDirectBotSelectors(nodes, undefined, 'dagTemplate.nodes', botProblems);
   if (botProblems.length > 0) throw new SavedWorkflowSchemaError(botProblems);
-  const dagTemplate = { nodes };
-  const chatEffects = formatSavedWorkflowChatSideEffectProblems(
-    collectSavedWorkflowChatSideEffectProblems(dagTemplate),
-  );
-  if (chatEffects.length > 0) throw new SavedWorkflowSchemaError(chatEffects);
-  return dagTemplate;
+  // NOTE: the chat-facing side-effect policy lint is deliberately NOT run here.
+  // validateDagTemplate is the structural deserializer shared by the READ path
+  // (loadSavedWorkflowRevision → validateSavedWorkflowRevisionPayload), so
+  // gating it would retroactively brick already-saved revisions that were legal
+  // before the lint existed. The policy check runs only at authoring boundaries
+  // (buildSavedWorkflowRevisionBaseline / validateSavedWorkflowRevisionDraft /
+  // v2 migration) via assertNoSavedWorkflowChatSideEffects.
+  return { nodes };
 }
 
 function validateDirectBotSelectors(
@@ -546,6 +548,25 @@ export function formatSavedWorkflowChatSideEffectProblems(
     `${problem.path} contains chat-facing side effect (${problem.kind}); ${problem.guidance}`);
 }
 
+/**
+ * Authoring-boundary policy gate. Throw when a to-be-saved DAG template has a
+ * chat-facing side effect in a goal node. This is intentionally NOT part of the
+ * structural deserializer (validateDagTemplate) or the read path
+ * (validateSavedWorkflowRevisionPayload): those are traversed when LOADING an
+ * already-saved revision, and gating them would retroactively brick revisions
+ * that were legal before the lint existed. Callers on the write/compile/publish
+ * side (buildSavedWorkflowRevisionBaseline, validateSavedWorkflowRevisionDraft,
+ * v2→v3 migration) invoke this so a fresh authored definition must be
+ * lint-clean, while old revisions stay loadable/show-able/appendable (and can
+ * be fixed by appending a clean revision).
+ */
+export function assertNoSavedWorkflowChatSideEffects(dagTemplate: V3DagTemplate): void {
+  const chatEffects = formatSavedWorkflowChatSideEffectProblems(
+    collectSavedWorkflowChatSideEffectProblems(dagTemplate),
+  );
+  if (chatEffects.length > 0) throw new SavedWorkflowSchemaError(chatEffects);
+}
+
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -648,10 +669,6 @@ export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflo
         `dagTemplate bindings: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    const chatEffects = formatSavedWorkflowChatSideEffectProblems(
-      collectSavedWorkflowChatSideEffectProblems(dagTemplate),
-    );
-    problems.push(...chatEffects);
   }
   const safety = normalizeSafety(raw.safety, safeDag, problems);
 
@@ -695,6 +712,11 @@ export function validateSavedWorkflowRevisionDraft(raw: unknown): SavedWorkflowR
     createdBy: { openId: 'validation-owner', larkAppId: 'validation-app' },
     ...raw,
   });
+  // Authoring boundary: a new revision draft (e.g. distillation submit) must be
+  // free of chat-facing side effects. Kept here rather than in
+  // validateSavedWorkflowRevisionPayload so the READ path (loadSavedWorkflowRevision)
+  // never applies the policy to already-saved revisions.
+  assertNoSavedWorkflowChatSideEffects(normalized.dagTemplate);
   const {
     workflowId: _workflowId,
     humanVersion: _humanVersion,
