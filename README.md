@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <img src="gif/fold&unfold.gif" width="640" alt="飞书流式卡片实时回传 CLI 输出">
+  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux 产品全景：飞书话题连接实时卡片、Web 终端、多 Bot 编排与 20+ CLI / Agent">
 </p>
 
 ---
