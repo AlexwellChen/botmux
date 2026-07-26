@@ -205,7 +205,6 @@ import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
-import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { StuckDetector, matchHookReviewScreen } from './utils/stuck-detector.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
@@ -3934,8 +3933,9 @@ let renderRows = PTY_ROWS;
 
 let renderer: TerminalRenderer | null = null;
 /** Most recent unfiltered viewport text — kept in sync by the screen_update
- *  timer for pipe-pane backends so ScreenAnalyzer (which is synchronous) has
- *  a fresh snapshot to read without needing its own tmux capture-pane call. */
+ *  timer for pipe-pane backends so usage-limit detection and the CoCo picker
+ *  have a fresh snapshot to read without needing their own tmux capture-pane
+ *  call. (Historically also fed the AI ScreenAnalyzer, now removed.) */
 let lastAnalyzerSnapshot = '';
 let screenUpdateTimer: ReturnType<typeof setInterval> | null = null;
 const SCREEN_UPDATE_INTERVAL_MS = 2_000;
@@ -4114,16 +4114,16 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   // so the diagnostic shell stays visible. flushPending's retry path restarts
   // both when the next message respawns the CLI.
   stopScreenUpdates();
-  stopScreenAnalyzer();
   stopStuckDetector();
   log(`Crash diagnostic tmux session parked at ${TmuxBackend.diagnosticSessionName(sessionId)}`);
   return true;
 }
 
-// ─── Screen Analyzer (AI-based TUI prompt detection) ────────────────────────
+// ─── TUI prompt blocking state ──────────────────────────────────────────────
 
-let screenAnalyzer: ScreenAnalyzer | null = null;
-/** When true, user messages are queued because a TUI prompt is active */
+/** When true, user messages are queued because a TUI prompt is active. Set by
+ *  the ask-hook / CoCo picker paths (driveCocoPicker, handleTuiKeys); cleared
+ *  when the prompt resolves or a Lark/terminal input overrides it. */
 let tuiPromptBlocking = false;
 
 function isWorkflowWorker(): boolean {
@@ -4182,59 +4182,6 @@ function maybeEmitWorkflowTranscriptOutput(): void {
     turnId: currentBotmuxTurnId ?? `workflow-pty-${sessionId || 'unknown'}`,
   });
   log('Workflow PTY transcript final_output emitted');
-}
-
-function startScreenAnalyzer(): void {
-  const sa = config.screenAnalyzer;
-  log(`ScreenAnalyzer config: enabled=${sa.enabled}, baseUrl=${sa.baseUrl ? 'set' : 'empty'}, model=${sa.model || 'empty'}, extraHeaders=${JSON.stringify(sa.extraHeaders)}`);
-  if (!sa.enabled || !sa.baseUrl || !sa.apiKey || !sa.model) return;
-
-  screenAnalyzer = new ScreenAnalyzer(
-    {
-      baseUrl: sa.baseUrl,
-      apiKey: sa.apiKey,
-      model: sa.model,
-      intervalMs: sa.intervalMs,
-      stableCount: sa.stableCount,
-      snapshotMaxChars: sa.snapshotMaxChars,
-      extraHeaders: sa.extraHeaders,
-      extraBody: sa.extraBody,
-    },
-    {
-      getSnapshot: () => {
-        // ScreenAnalyzer is called every ~5s for TUI-prompt detection. We
-        // can't make this async without overhauling the analyzer, so cache
-        // the last pipe-pane text snapshot here and refresh it eagerly.
-        // For pipe-pane backends, the cache is repopulated by the screen
-        // update timer; for others, fall through to the long-lived renderer.
-        return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
-      },
-      onAnalyzing: () => { /* no-op: only block when prompt is actually detected */ },
-      onTuiPrompt: (description, options, multiSelect) => {
-        tuiPromptBlocking = true;
-        send({ type: 'tui_prompt', description, options, multiSelect, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
-      },
-      onTuiPromptResolved: (selectedText) => {
-        tuiPromptBlocking = false;
-        send({
-          type: 'tui_prompt_resolved',
-          selectedText,
-          turnId: currentBotmuxTurnId,
-          dispatchAttempt: currentBotmuxDispatchAttempt,
-        });
-        // Flush any messages that were queued during the prompt
-        flushPending();
-      },
-      log,
-    },
-  );
-  screenAnalyzer.start();
-}
-
-function stopScreenAnalyzer(): void {
-  screenAnalyzer?.dispose();
-  screenAnalyzer = null;
-  tuiPromptBlocking = false;
 }
 
 // ─── Stuck Detector (AI-free fallback for blocked CLI states) ───────────────
@@ -4413,7 +4360,6 @@ async function captureAndUpload(): Promise<void> {
   }
 
   let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
-  if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
   send({
     type: 'screenshot_uploaded',
     imageKey,
@@ -4498,14 +4444,12 @@ function handleTermAction(key: TermActionKey): void {
   } else if (PTY_SEQ_MAP[key]) {
     backend.write(PTY_SEQ_MAP[key]);
   }
-  // ESC/Ctrl-C/Enter likely ends an active TUI prompt. The analyzer
-  // won't re-analyze while promptActive=true, so un-wedge both flags here.
-  // Without this, dismissing an AskUserQuestion dialog via the quick-key
-  // button leaves tuiPromptBlocking=true forever and silently queues every
-  // subsequent user message.
+  // ESC/Ctrl-C/Enter likely ends an active TUI prompt. Un-wedge the blocking
+  // flag here — without this, dismissing an AskUserQuestion dialog via the
+  // quick-key button leaves tuiPromptBlocking=true forever and silently queues
+  // every subsequent user message.
   if (tuiPromptBlocking && (key === 'esc' || key === 'ctrlc' || key === 'enter')) {
     tuiPromptBlocking = false;
-    screenAnalyzer?.notifySelection(`term_action:${key}`);
     void flushPending();
   }
   log(`Term action: ${key}`);
@@ -4553,7 +4497,6 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean>
       isPromptReady = false;
       idleDetector?.reset();
     }
-    screenAnalyzer?.notifySelection('final');
   }
 
   log(`TUI keys: ${keys.join(' ')}${isFinal ? ' (final)' : ''}`);
@@ -4663,7 +4606,6 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
     isPromptReady = false;
     idleDetector?.reset();
   }
-  screenAnalyzer?.notifySelection('text-input');
 
   // Wait briefly so the cursor position is stable before pasting
   await new Promise(r => setTimeout(r, 200));
@@ -5740,7 +5682,6 @@ function sendToPty(
   if (tuiPromptBlocking) {
     log(`User override: incoming Lark message clears tuiPromptBlocking — "${content.substring(0, 80)}"`);
     tuiPromptBlocking = false;
-    screenAnalyzer?.notifySelection('lark-input');
     // Tear down the prompt card so the user doesn't see stale options.
     send({
       type: 'tui_prompt_resolved',
@@ -5794,7 +5735,6 @@ function startScreenUpdates(): void {
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) return;
     let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
-    if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
 
     void (async () => {
       let content = lastContent;
@@ -5823,8 +5763,9 @@ function startScreenUpdates(): void {
           const hash = pipeText.ansi;
           changed = hash !== lastTextSnapshotHash;
           lastTextSnapshotHash = hash;
-          // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
-          // tmux call would otherwise need to fire twice per tick.
+          // Refresh the unfiltered snapshot cache (lastAnalyzerSnapshot) that
+          // usage-limit detection and the CoCo picker read from. Same tmux
+          // call would otherwise need to fire twice per tick.
           if (changed) {
             const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
             if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
@@ -8189,8 +8130,8 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   promptReadyDetectedDuringSettle = false;
   readyPatternSeenDuringHold = false;
   awaitingPostSessionStartPromptEvidence = false;
-  stopScreenAnalyzer();
   stopStuckDetector();
+  tuiPromptBlocking = false;
   stopScreenUpdates();
   backend?.kill();
   backend = null;
@@ -8302,7 +8243,6 @@ async function restartCliProcess(
       setTimeout(async () => {
         if (lastInitConfig) {
           startScreenUpdates();
-          startScreenAnalyzer();
           startStuckDetector();
           try {
             const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
@@ -9622,7 +9562,6 @@ process.on('message', async (raw: unknown) => {
         if (!isWorkflowWorker()) {
           port = await startWebServer(config.web.workerHost, msg.webPort);
           startScreenUpdates();
-          startScreenAnalyzer();
           startStuckDetector();
         } else {
           // Workflow attempts still expose a read-only web terminal so the
@@ -9793,12 +9732,11 @@ process.on('message', async (raw: unknown) => {
       if (!backend && crashDiagnosticStopped && lastInitConfig && !lastInitConfig.adoptMode) {
         log('Message received after crash-loop stop; retrying CLI start');
         destroyCrashDiagnosticTerminal('retry after message');
-        stopScreenAnalyzer();
         stopStuckDetector();
+        tuiPromptBlocking = false;
         stopScreenUpdates();
         awaitingFirstPrompt = true;
         startScreenUpdates();
-        startScreenAnalyzer();
         startStuckDetector();
         try {
           const restartCfg = { ...lastInitConfig, resume: true, prompt: '' };
