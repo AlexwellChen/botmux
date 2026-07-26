@@ -287,20 +287,43 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(authPathsSurvivingCliDataRedirect(['', '/home/u/x'], [''])).toEqual(['/home/u/x']);
   });
 
-  it('WIRING GUARD: worker.ts assembles authPaths via resolveRedirectedAdapterAuthPaths with the right roots', () => {
+  it('LEXICAL containment: a leaf declared inside the root is dropped by its DECLARED path, not its realpath', () => {
+    // The resolver decides containment purely on the (lexical) strings it's given.
+    // The worker MUST pass lexically-expanded (not realpath'd) paths — asserted in
+    // WIRING GUARD below — so that a symlinked-out leaf like
+    // ~/.claude/.credentials.json → /external/creds is still judged INSIDE ~/.claude
+    // and dropped. If the worker instead realpath'd first, the resolver would see
+    // /external/creds (outside the root) and wrongly KEEP it → the real host
+    // credential gets RW-bound back into the sandbox. This asserts the resolver's
+    // half: given the declared (lexical) leaf, it drops it.
+    expect(resolve4(['/home/u/.claude/.credentials.json'], ['/home/u/.claude'])).toEqual([]);
+    // …and if a caller wrongly pre-resolved the leaf to an external target, the
+    // resolver can only honor what it's handed — documenting WHY the worker must
+    // filter lexically (the KEEP here is the bug the worker-order + guard prevent).
+    expect(resolve4(['/external/creds/claude.json'], ['/home/u/.claude'])).toEqual(['/external/creds/claude.json']);
+  });
+
+  it('WIRING GUARD: worker.ts assembles authPaths via resolveRedirectedAdapterAuthPaths with the right roots, filtered LEXICALLY then keepExisting', () => {
     // A pure-fn test alone can't catch the worker dropping/reverting the call or
-    // passing wrong roots (the blind spot that let the first cut miss Seed/Relay).
-    // Assert the actual call site in worker.ts source: it must (a) invoke the
-    // resolver for authPaths, (b) feed willRedirectCliData, and (c) build
-    // rehomedHostRoots from cliAdapter.claudeDataDir + the codex host ~/.codex.
+    // passing wrong roots (the blind spot that let the first cut miss Seed/Relay),
+    // nor the ORDER bug (realpath before containment leaks a symlinked-out leaf).
+    // Assert the actual call site in worker.ts source: it must (a) produce authPaths
+    // by keepExisting-wrapping the resolver, (b) feed the resolver LEXICALLY-expanded
+    // declared paths (expandTilde, NOT keepExisting/realpath first), (c) thread
+    // willRedirectCliData, (d) build rehomedHostRoots from cliAdapter.claudeDataDir
+    // + codex host ~/.codex, also lexically expanded.
     const src = readFileSync(resolve('src/worker.ts'), 'utf8');
-    // (a) authPaths is produced by the resolver, not a raw keepExisting / [].
-    expect(src).toMatch(/authPaths:\s*resolveRedirectedAdapterAuthPaths\(\{/);
-    // (b) the redirect flag is threaded in.
+    // (a) survivors are realpath/existence-filtered AFTER the resolver, not before.
+    expect(src).toMatch(/authPaths:\s*keepExisting\(resolveRedirectedAdapterAuthPaths\(\{/);
+    // (b) declared authPaths reach the resolver lexically (expandTilde), not via keepExisting.
+    expect(src).toMatch(/declaredAuthPaths:\s*\[\.\.\.\(cliAdapter\.authPaths[\s\S]*?\)\]\.map\(expandTilde\)/);
+    // (c) the redirect flag is threaded in.
     expect(src).toMatch(/resolveRedirectedAdapterAuthPaths\(\{[\s\S]*?willRedirectCliData,/);
-    // (c) rehomed roots come from the adapter's host data dir + codex host root.
-    expect(src).toMatch(/resolveRedirectedAdapterAuthPaths\(\{[\s\S]*?rehomedHostRoots:[\s\S]*?cliAdapter\.claudeDataDir/);
-    expect(src).toMatch(/resolveRedirectedAdapterAuthPaths\(\{[\s\S]*?rehomedHostRoots:[\s\S]*?isolatedCodexHome\s*\?\s*`\$\{sandboxHome\}\/\.codex`/);
+    // (d) rehomed roots = adapter host data dir + codex host root, lexically expanded.
+    expect(src).toMatch(/rehomedHostRoots:\s*\[cliAdapter\.claudeDataDir,\s*isolatedCodexHome\s*\?\s*`\$\{sandboxHome\}\/\.codex`/);
+    expect(src).toMatch(/rehomedHostRoots:[\s\S]*?\.map\(expandTilde\)/);
+    // negative: the resolver must NOT be fed keepExisting/realpath'd paths (the leak-order bug).
+    expect(src).not.toMatch(/declaredAuthPaths:\s*keepExisting\(/);
   });
 });
 

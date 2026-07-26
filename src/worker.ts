@@ -7276,14 +7276,20 @@ async function spawnCli(
       // login sources (Seed/Relay bytedcli SSO) so cold-start login doesn't regress.
       // rehomedHostRoots = the ORIGINAL host claudeDataDir (cliAdapter's, NOT the
       // BOT_HOME value claudeDataDir was reassigned to above) + codex host ~/.codex.
-      authPaths: resolveRedirectedAdapterAuthPaths({
-        declaredAuthPaths: keepExisting([...(cliAdapter.authPaths ?? [])]),
+      //
+      // CONTAINMENT MUST USE LEXICAL (`~`-expanded, NOT realpath'd) paths: if e.g.
+      // ~/.claude/.credentials.json is a symlink to an external dotfiles/creds dir,
+      // realpath-then-contain would resolve it OUTSIDE ~/.claude and wrongly KEEP it
+      // → the real host credential gets RW-bound back into the sandbox, defeating
+      // the redirect. So filter on the lexical declared paths first, THEN keepExisting
+      // (realpath + existence-filter) only the survivors for bwrap.
+      authPaths: keepExisting(resolveRedirectedAdapterAuthPaths({
+        declaredAuthPaths: [...(cliAdapter.authPaths ?? [])].map(expandTilde),
         willRedirectCliData,
-        rehomedHostRoots: keepExisting([
-          cliAdapter.claudeDataDir,                                 // claude family: ~/.claude, ~/.relay, seed .claude-runtime
-          isolatedCodexHome ? `${sandboxHome}/.codex` : undefined,  // codex: host ~/.codex (isolatedCodexHome set ⇒ codex family)
-        ]),
-      }),
+        rehomedHostRoots: [cliAdapter.claudeDataDir, isolatedCodexHome ? `${sandboxHome}/.codex` : undefined]
+          .filter((r): r is string => !!r)
+          .map(expandTilde),
+      })),
       execPaths: keepExisting([...execDirs, ...execCarve]),
       readonlyRoots: keepExisting([
         ...(cfg.skillReadonlyRoots ?? []),

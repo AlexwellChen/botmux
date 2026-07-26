@@ -598,9 +598,11 @@ export interface BwrapCompilation {
  * Compile the policy to a bwrap argv prefix. Deny-by-default is bwrap's
  * natural shape: a fresh tmpfs root, then ONLY the rule paths are bound in
  * (later mounts win → emitting shallow→deep gives deepest-rule-wins, matching
- * accessForPath()). deny rules materialize as READ-ONLY, UNREADABLE empty
- * masks (mode-000 empty-dir ro-bind for dirs, mode-000 empty-file ro-bind for
- * files) and are emitted whenever they sit under an exposed tree — outside it
+ * accessForPath()). deny rules materialize as READ-ONLY empty masks with the
+ * real content HIDDEN (mode-000 empty-dir ro-bind for dirs, mode-000 empty-file
+ * ro-bind for files; mode 000 additionally blocks listing for a non-root uid,
+ * while root may list the empty mask — no real content leaks either way) and are
+ * emitted whenever they sit under an exposed tree — outside it
  * they're unreachable already (deny-by-default), and bwrap would fail mounting
  * onto a void path.
  *
@@ -664,16 +666,17 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
         maskMounts.push({ path: r.path, kind: 'dir' });
       } else if (opts.filePaths?.has(r.path)) {
         // FILE-shaped leaf deny: ro-bind a mode-000 empty placeholder file
-        // (unreadable + read-only).
+        // (content hidden + read-only; mode 000 blocks read for non-root).
         const empty = `${opts.emptiesDir}/mask-${emptyIdx++}`;
         emptyFiles.push({ path: empty, maskedPath: r.path });
         a.push('--ro-bind', empty, r.path);
         maskMounts.push({ path: r.path, kind: 'file' });
       } else {
         // DIRECTORY-shaped leaf deny (existing dir OR not-yet-existing path):
-        // ro-bind the shared mode-000 empty dir → contents hidden, mount
-        // read-only, and the mask itself unreadable (a real deny, not a
-        // writable/listable tmpfs).
+        // ro-bind the shared mode-000 empty dir → real contents hidden, mount
+        // read-only; mode 000 additionally blocks listing for a non-root uid
+        // (root may list the empty mask, but there is no real content to see —
+        // not a writable/listable tmpfs).
         a.push('--ro-bind', opts.emptyDir, r.path);
         maskMounts.push({ path: r.path, kind: 'dir' });
       }

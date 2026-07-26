@@ -532,12 +532,14 @@ describe('One-shot Chinese patterns', () => {
     expect(Math.abs(runAt - expected)).toBeLessThan(5_000);
   });
 
-  it('明天X点 produces once schedule at local tomorrow', () => {
-    // scheduleTimeZone() resolves env → global config → host. This test asserts
-    // the HOST-LOCAL default (getHours() reads the JS runtime zone), so pin the
-    // ambient schedule zone to that same host zone — otherwise a machine whose
-    // ~/.botmux/config.json sets scheduleTimeZone (e.g. Asia/Shanghai on a non-+8
-    // box) makes the wall clock disagree with getHours() and this fails spuriously.
+  it('明天X点 produces once schedule at the pinned host-zone wall clock', () => {
+    // scheduleTimeZone() resolves env → global config → host. This test pins the
+    // ambient schedule zone to the JS runtime host zone and asserts the resulting
+    // wall clock under THAT explicit override — it is a consumer-behavior check,
+    // not the "no-config host fallback" (that path is covered by timezone.test.ts).
+    // Pinning also stops a machine whose ~/.botmux/config.json sets scheduleTimeZone
+    // (e.g. Asia/Shanghai on a non-+8 box) from making the wall clock disagree with
+    // getHours() and failing this spuriously.
     const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
     process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
     try {
@@ -660,14 +662,14 @@ describe('computeNextRun', () => {
     expect(next).toBeNull();
   });
 
-  it('cron: returns next wall-clock occurrence in the HOST-LOCAL timezone', () => {
-    // 0 9 * * * — daily at 09:00. computeNextRun now uses the host's local timezone
-    // (scheduleTimeZone()), matching how one-shot「明天9点」is parsed via setHours().
-    // Pre-fix it was hard-coded to Asia/Shanghai, so on any non-+8 host getHours()
-    // would NOT be 9. Host-independent assertion: both sides read the same local zone.
-    // Pin BOTMUX_SCHEDULE_TIMEZONE to the host zone so a machine-level config override
-    // (~/.botmux/config.json scheduleTimeZone) can't make scheduleTimeZone() diverge
-    // from the getHours() runtime zone and fail this spuriously.
+  it('cron: next wall-clock occurrence under an explicit pinned schedule timezone', () => {
+    // 0 9 * * * — daily at 09:00. computeNextRun uses scheduleTimeZone() (env →
+    // config → host). Here we PIN BOTMUX_SCHEDULE_TIMEZONE to the JS runtime host
+    // zone and assert the wall clock under that explicit override (a consumer-
+    // behavior check; the no-config host fallback is covered by timezone.test.ts).
+    // Pinning also stops a machine-level config override (~/.botmux/config.json
+    // scheduleTimeZone) from making scheduleTimeZone() diverge from the getHours()
+    // runtime zone and failing this spuriously.
     const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
     process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
     try {

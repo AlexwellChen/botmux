@@ -40,9 +40,14 @@ const originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
 // isUnsupportedProviderKey). A dev shell — or the botmux worker that spawns this bot —
 // commonly exports ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_*TOKEN* / AWS_* / GOOGLE_* etc.,
 // which would trip that check and fail these tests spuriously (observed: 6 red on a
-// box with ANTHROPIC_AUTH_TOKEN + CLAUDE_CODE_*_TOKENS set). Mirror the production
-// key patterns and strip any matching ambient key for the duration of each test,
-// restoring afterward so we don't leak into other suites.
+// box with ANTHROPIC_AUTH_TOKEN + CLAUDE_CODE_*_TOKENS set). This regex is a
+// deliberately CONSERVATIVE SUPERSET of the production rule (it strips ALL
+// CLAUDE_CODE_*, whereas production only flags USE/SKIP/OAUTH or keys containing
+// AUTH/CRED/TOKEN/API_KEY/CERT/KEY/PROVIDER/HOST) — the point is only to clear the
+// ambient provider FAMILY prefixes so each test's OWN explicit re-injection is the
+// sole provider signal. Core provider selection / no-fallback behavior is exercised
+// by the tests' own explicit env, so over-stripping here can't bypass it. Restored
+// afterward so we don't leak into other suites.
 const AMBIENT_PROVIDER_KEY = /^(?:ANTHROPIC_|AWS_|GOOGLE_|AZURE_|CLOUD_ML_REGION|VERTEX_REGION|CLAUDE_CODE_)/;
 const strippedAmbientEnv: Record<string, string> = {};
 

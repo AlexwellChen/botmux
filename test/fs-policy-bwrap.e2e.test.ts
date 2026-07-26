@@ -13,8 +13,10 @@
  *      host creating a secret there mid-session became readable (stat→exec
  *      TOCTOU). Fixed by ALWAYS masking a reachable deny (worker pre-creates
  *      the mountpoint so the empty mask always binds).
- *  (c) 0755/0644 masks were themselves readable (`ls`/`cat` succeeded on the
- *      empty mask). Fixed with mode 000 → the access command itself fails.
+ *  (c) 0755/0644 masks were themselves listable (`ls`/`cat` succeeded on the
+ *      empty mask). Fixed with mode 000 → for a NON-root uid the access command
+ *      fails; a root uid (CAP_DAC_OVERRIDE) can still list, but the mask is empty
+ *      so no real content leaks either way (emptiness is the guarantee).
  *
  * This runs the compiler exactly as the worker does: resolve symlinks, split
  * file- vs dir-shaped denies, mode-000 the empty sources, pre-create missing
