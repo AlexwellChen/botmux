@@ -9834,6 +9834,16 @@ switch (command) {
   case 'resume':  await cmdResume(); break;
   case 'suspend': await cmdSuspend(); break;
   case 'slash':   await cmdSlash(); break;
+  case 'cd': {
+    // Tombstone for the removed `botmux cd`（改名为 `botmux role switch`）。**必须
+    // fail-loud**：存量部署里 _role-protocol.md 若还没刷新、模型仍发 `botmux cd`，
+    // 静默 exit 0 会让它以为切换成功（实际什么都没做）——「假切换成功」比明确报错
+    // 危险得多。所以这里打印迁移提示、退 1、绝不执行任何切换。
+    console.error('✗ `botmux cd` 已移除，改用 `botmux role switch <角色目录>`（同一切换语义）。');
+    console.error('  本次未执行任何切换。若你是角色协议（_role-protocol.md）触发的，请把命令刷新为 `botmux role switch`。');
+    process.exit(1);
+    break;
+  }
   case 'role': {
     // `botmux role switch <角色目录>` — 角色切换（唯一入口）。名字→目录的解析由
     // 调用方（模型读 _role-protocol.md）完成，本命令只透传解析出的目标目录，daemon

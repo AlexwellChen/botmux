@@ -56,11 +56,17 @@ describe('botmux role switch (角色切换命令)', () => {
     expect(runCli(['role', 'bogus']).stderr).toContain('botmux role switch <');
   });
 
-  it('旧 botmux cd 已不再是已识别命令（回退到根帮助，不执行角色切换）', () => {
-    const { stdout, stderr } = runCli(['cd', '~/botmux-roles/x']);
-    // 未知命令回退根帮助横幅；绝不能命中角色切换用法（证明 cd 分支确已移除）。
+  it('旧 botmux cd 是 fail-loud tombstone：exit 1 + 指向 role switch + 绝不切换', () => {
+    const { status, stdout, stderr } = runCli(['cd', '~/botmux-roles/x']);
+    // 关键：必须 exit≠0。存量协议漏刷仍发 `botmux cd` 时，静默 exit 0 会被模型
+    // 当成「切换成功」（实际没切）——假切换成功比明确报错危险。
+    expect(status).toBe(1);
+    // 明确指引迁移到新命令。
+    expect(stderr).toContain('botmux role switch');
+    expect(stderr).toContain('已移除');
+    // 绝不能真的执行切换（无 daemon 交互、无「已切换」字样）。
     const combined = stdout + stderr;
-    expect(combined).not.toContain('botmux cd <');
+    expect(combined).not.toContain('已切换到');
     expect(combined).not.toContain('切换被拒绝');
   });
 });

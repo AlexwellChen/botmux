@@ -66,7 +66,7 @@ v0 硬编码约定、不接受配置），每个 bot 在其下各占一个子目
 
 ## 4. 信任预置
 
-目的：避免 Claude Code 的交互式「是否信任此目录」对话框打断 `botmux role switch` 注入。
+目的：避免 Claude Code 的交互式「是否信任此目录」对话框打断角色切换后的新会话冷启动。
 
 **现有信任种子机制的两条实际路径**（按 bot 是否 readIsolation 分流）：
 
@@ -79,24 +79,18 @@ v0 硬编码约定、不接受配置），每个 bot 在其下各占一个子目
   （`src/worker.ts:235`，由 `provisionIsolatedBotHome()` 在 `src/worker.ts:169` 调用），
   写入该 bot 专属的 `<BOT_HOME>/claude/.claude.json`，同样是 spawn 时机自动执行。
 
-**已知限制、待部署时用真机核实**：上述两条路径都只在「CLI (re)spawn」这一刻，对**当次 cwd**
-打信任标记；而 spec §11.1 的「热注入」路径——CLI 存活、适配器 `supportsSessionCwdMove` 为
-true 时，daemon 直接向 TUI 注入会话内 `/cd <目录>`（`src/core/dashboard-ipc-server.ts:339-346`，
-不杀进程、不重新 spawn）——不会走到这两个信任种子函数。也就是说，若某个角色目录此前从未被
-spawn 过（典型场景：「新建角色」后立刻「切到XX」），第一次热注入 `/cd` 到它，理论上可能撞上
-Claude Code 自己的交互式信任对话框、卡住会话；这一点未在真机上专项验证过。
+**角色切换现走进程 respawn（`botmux role switch` → daemon 收敛 workingDir 后杀 CLI、在新
+目录 `--resume` 重开），所以切到任何角色目录都会经过上面的 (re)spawn 信任种子路径**——包括
+「新建角色后立即切到它」这种该目录从未被 spawn 过的场景，重启时会对新 cwd 现种信任，不再有
+旧「热注入 `/cd`（进程不重启、绕过信任种子）」那条会撞交互式信任框的路径。
 
-缓解与验证顺序（部署时按此核实，不要假设已解决）：
+验证（部署时顺带确认，非阻塞）：
 
 1. **部署前**：至少对 `defaultWorkingDir` 指向的默认角色目录执行一次真实 spawn（新话题跟它
    说句话即可），确认信任已种下（`~/.claude.json` 或隔离 bot 的
    `<BOT_HOME>/claude/.claude.json` 里能看到该 realpath 的 `hasTrustDialogAccepted: true`）。
-2. **第 6 步真机验证时**重点盯住「新建角色→立即切到XX」这条路径（清单第 6/11 项）：
-   如果观察到会话卡在信任框，冷启动兜底（CLI 未存活时 `canInject=false` 分支，daemon 杀进程、
-   下条消息在新目录冷启动）会在下一次消息时自动补种信任，可作为临时规避——但用户体验是丢一次
-   会话连续性；根治需要回到 T3-T10 评估「新建角色时预种信任」的代码改动（本 runbook 范围外）。
-3. 若第 2 步验证下来热注入路径实际未触发信任框（例如 Claude Code 对同一父目录下的子目录
-   有自己的信任继承逻辑），在此记录真机结论并更新本节，去掉「待核实」字样。
+2. **第 6 步真机验证时**顺带盯「新建角色→立即切到XX」：respawn 会在新目录种信任，正常不应
+   卡信任框；若真机观察到异常，在此记录结论并更新本节。
 
 ## 5. 飞书凭证验证
 
@@ -137,14 +131,15 @@ pnpm switch:here && botmux restart
 
 - [ ] 中途切换角色：对话上下文保留（新角色能引用切换前的讨论）；切换后能引用新角色已有记忆（MEMORY.md 补读生效）
 
-- [ ] 若 bot 开了读隔离：角色库与 .botmux-dir.json 读写正常、记忆桶正常；botmux cd / botmux slash 全链路可用（自识别→findDaemon→鉴权→POST，全程未触碰 bots.json。鉴权双路径：非隔离进程用 .dashboard-secret 做 trusted-host HMAC 签名；沙箱/读隔离 CLI 读不到 secret，改带本会话每轮轮换的 origin capability（/api/asks 同款），daemon 侧与活跃会话记录比对）
+- [ ] 若 bot 开了读隔离：角色库与 .botmux-dir.json 读写正常、记忆桶正常；botmux role switch / botmux slash 全链路可用（自识别→findDaemon→鉴权→POST，全程未触碰 bots.json。鉴权双路径：非隔离进程用 .dashboard-secret 做 trusted-host HMAC 签名；沙箱/读隔离 CLI 读不到 secret，改带本会话每轮轮换的 origin capability（/api/asks 同款），daemon 侧与活跃会话记录比对）
 
 - [ ] 回复卡片左下角显示当前角色名；配置了 .botmux-dir.json url 时点击跳转正确；切换角色后脚注随之变化；非角色目录会话仍显示原 brand
 
 补充核实项（本 runbook 第 4 步补记，不在原 §12 清单内，建议在验证「新建角色→切到XX」时顺带确认）：
 
-- [ ] 「新建角色」后立即「切到XX」（CLI 存活、走热注入路径），确认没有卡在 Claude Code
-      的交互式信任对话框；如卡住，记录现象并按第 4 步的缓解顺序处理
+- [ ] 「新建角色」后立即「切到XX」（该目录首次被 spawn，走 respawn 在新目录冷启动），
+      确认 respawn 已对新 cwd 种信任、没有卡在 Claude Code 的交互式信任对话框；如卡住，
+      记录现象并按第 4 步核实
 
 ## 7. 回滚
 
