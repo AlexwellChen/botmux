@@ -10,7 +10,7 @@
  */
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, readBotSkillPolicy } from '../bot-registry.js';
-import { republishResolvedAllowedUsersDescriptor } from '../bot-registry.js';
+import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
 import { config } from '../config.js';
 import { writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
@@ -266,7 +266,7 @@ export async function setBotAllowedUsers(
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
-  const { resolved, map } = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
+  const { resolved, map, entryStatus } = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
   if (resolved.length === 0) return { ok: false, reason: 'empty_resolved' };
   if (senderOpenId && !resolved.includes(senderOpenId)) return { ok: false, reason: 'self_lockout' };
 
@@ -284,9 +284,26 @@ export async function setBotAllowedUsers(
   // from email to on_ while contact API is healthy) leaves the new raw key out
   // of the cache; the next clean restart during an API blip would then resolve
   // empty and fail-closed lock the owner out — the exact bug this feature fixes.
-  // retainKeys prunes stale keys (old email/union no longer configured).
-  writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, { map, retainKeys: rawEntries });
+  // retainKeys prunes stale keys (old email/union no longer configured);
+  // deleteEntries drops entries that resolved DEFINITIVELY-gone in THIS set (e.g.
+  // a removed co-owner) so a later transient restart can't revive them from cache.
+  const definitiveEntries: string[] = [];
+  let anyTransient = false;
+  for (const [entry, status] of entryStatus.entries()) {
+    if (status === 'definitive') definitiveEntries.push(entry);
+    else if (status === 'transient') anyTransient = true;
+  }
+  writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, {
+    map,
+    retainKeys: rawEntries,
+    deleteEntries: definitiveEntries,
+  });
   republishResolvedAllowedUsersDescriptor(larkAppId, resolved);
+  // Partial-transient set: the owner (senderOpenId) resolved (self_lockout guard
+  // above guarantees it), but some OTHER entry transient-failed. Schedule the
+  // same background heal the startup path uses so that entry recovers when the
+  // contact API does, instead of silently staying dropped until the next restart.
+  if (anyTransient) scheduleAllowedUsersResolveRetryFromMutation(larkAppId);
   logger.info(`[config:${larkAppId}] allowedUsers updated: ${rawEntries.length} entries, ${resolved.length} resolved`);
   return { ok: true, raw: rawEntries, resolved };
 }

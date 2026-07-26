@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -59,10 +59,14 @@ describe('allowed-users-cache sidecar', () => {
   });
 
   it('tolerates a corrupt cache file (returns {})', () => {
-    // Write then corrupt by writing a non-JSON payload via a malformed map.
-    writeAllowedUsersResolveCache(dir, APP, { map: { on_a: 'ou_a' } });
-    // A second write with a Record works; simulate corruption by reading a
-    // path that holds invalid JSON is covered by the try/catch → {}.
-    expect(readAllowedUsersResolveCache(dir, APP)).toEqual({ on_a: 'ou_a' });
+    // Actually write malformed JSON to the cache path and confirm the reader
+    // swallows it rather than throwing.
+    writeFileSync(allowedUsersCachePath(dir, APP), '{ this is : not json', 'utf8');
+    expect(readAllowedUsersResolveCache(dir, APP)).toEqual({});
+  });
+
+  it('tolerates a valid-JSON file whose map field is the wrong shape (returns {})', () => {
+    writeFileSync(allowedUsersCachePath(dir, APP), JSON.stringify({ map: ['not', 'an', 'object'] }), 'utf8');
+    expect(readAllowedUsersResolveCache(dir, APP)).toEqual({});
   });
 });

@@ -45,6 +45,7 @@ import {
   effectiveBotDisplayName,
   resolveVcMeetingConsumerProfiles,
   setResolvedAllowedUsersRepublishHook,
+  setAllowedUsersResolveRetryHook,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -17111,6 +17112,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // republish the descriptor through the same path without importing daemon
   // internals. Registered once per daemon; one daemon per bot.
   setResolvedAllowedUsersRepublishHook(republishResolvedAllowedUsers);
+  // And let a mutation that hit a transient contact failure schedule the same
+  // background resolve-retry the startup path uses (heal-when-API-recovers).
+  setAllowedUsersResolveRetryHook((appId) => scheduleAllowedUsersResolveRetry(appId));
   // 名称状态刷新：displayName 或飞书真名变化后，用有效展示名刷新 descriptor +
   // SessionRow.botName，无需重启 daemon。displayName 路径经 bot-config-store 的
   // 钩子触发；真·改名路径在下面的 renamer 里直接调用。

@@ -1106,14 +1106,16 @@ export async function resolveAllowedUsersWithMap(
           data: { emails, include_resigned: false },
         });
         if (res.code !== 0) {
-          // Distinguish a DEFINITIVE batch error (permanent 4xx: invalid arg /
-          // not visible / cross-app — classifyContactErrorCode) from a TRANSIENT
-          // one (network / rate-limit / 5xx). Only transient failures may fall
-          // back to cache + arm the retry; a permanent 4xx marks every requested
-          // email definitive so we don't spin retries or revive a stale owner.
-          const definitive = !!classifyContactErrorCode(res.code);
-          if (!definitive) errored = true;
-          for (const rawEmail of emails) entryStatus.set(rawEmail, definitive ? 'definitive' : 'transient');
+          // A non-zero batchGetId code is a WHOLE-REQUEST failure, not a
+          // per-email identity verdict — even a permanent 4xx like 40001
+          // (invalid argument) tells us nothing about whether any individual
+          // owner still exists. Treating it as per-email definitive would
+          // silently prune an email-only owner's last-known-good cache and
+          // fail-closed lock them out. So mark every requested email TRANSIENT
+          // (retry-eligible, cache-fallback-eligible). Only a code-0 response
+          // that omits a specific email (below) is a per-entry definitive miss.
+          errored = true;
+          for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
           logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
         } else {
           const userList: any[] = res.data?.user_list ?? [];
@@ -1139,12 +1141,12 @@ export async function resolveAllowedUsersWithMap(
           }
         }
       } catch (err: any) {
-        // A throw with a definitive contact code (permanent 4xx surfaced as an
-        // AxiosError/SDK error) is a definitive miss; anything else (network /
-        // timeout / 5xx) is transient and retry-eligible.
-        const definitive = !!classifyContactErrorCode(getLarkErrorCode(err));
-        if (!definitive) errored = true;
-        for (const rawEmail of emails) entryStatus.set(rawEmail, definitive ? 'definitive' : 'transient');
+        // A throw is a whole-request failure (network / timeout / 5xx / even a
+        // thrown 4xx) — same reasoning as the non-zero-code branch above: it is
+        // NOT a per-email identity verdict, so every requested email is
+        // transient (retry + cache-fallback eligible), never definitive.
+        errored = true;
+        for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
         logger.warn(`resolveAllowedUsers failed: ${err.message}`);
       }
     }

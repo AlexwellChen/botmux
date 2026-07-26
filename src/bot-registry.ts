@@ -1460,6 +1460,20 @@ export function republishResolvedAllowedUsersDescriptor(larkAppId: string, resol
   try { republishResolvedAllowedUsersHook?.(larkAppId, resolved); } catch { /* best effort */ }
 }
 
+/**
+ * Hook the daemon registers so a runtime allowedUsers mutation that hit a
+ * TRANSIENT contact failure for some entry can schedule the same background
+ * resolve-retry the startup path uses (heal-when-API-recovers). No-op until the
+ * daemon registers it (e.g. one-shot CLI paths with no retry loop).
+ */
+let allowedUsersResolveRetryHook: ((larkAppId: string) => void) | undefined;
+export function setAllowedUsersResolveRetryHook(fn: (larkAppId: string) => void): void {
+  allowedUsersResolveRetryHook = fn;
+}
+export function scheduleAllowedUsersResolveRetryFromMutation(larkAppId: string): void {
+  try { allowedUsersResolveRetryHook?.(larkAppId); } catch { /* best effort */ }
+}
+
 /** Bot 自身的 open_id（用于在 mention 解析时排除自己）。 */
 export function getBotOpenId(larkAppId: string): string | undefined {
   return bots.get(larkAppId)?.botOpenId;
