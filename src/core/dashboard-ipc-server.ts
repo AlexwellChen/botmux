@@ -1083,6 +1083,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/insight', (req, res, params) => {
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId,
       cwd: session.workingDir,
+      larkAppId: session.larkAppId,
     }, {
       offset,
       limit,
@@ -1101,6 +1102,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/insight', (req, res, params) => {
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId,
       cwd: session.workingDir,
+      larkAppId: session.larkAppId,
     }, { detail });
     jsonRes(res, 200, { ok: true, report });
   } catch (err: any) {
@@ -1120,6 +1122,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/insight/turn/:turnIndex', (req, res, p
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId,
       cwd: session.workingDir,
+      larkAppId: session.larkAppId,
     }, parseInt(params.turnIndex, 10) || 0, { offset, limit });
     jsonRes(res, 200, { ok: true, turn });
   } catch (err: any) {
