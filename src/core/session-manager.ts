@@ -835,9 +835,13 @@ export function buildFollowUpContent(
   if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   if (roleBlock) parts.push(roleBlock);
   if (opts?.cliId !== 'mira') {
+    // Non-hermes CLIs get the anti-resend variant only when the experimental
+    // dashboard toggle is on (config.noVisibleOutputHint, default OFF); otherwise
+    // the reminder is byte-for-byte the pre-feature baseline. Live-read so a
+    // Settings flip applies to the next follow-up turn without a daemon restart.
     const reminder = opts?.cliId === 'hermes'
       ? hermesFollowupReminder(opts?.locale)
-      : t('ai.followup.reminder', undefined, opts?.locale);
+      : t(config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder', undefined, opts?.locale);
     parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
   }
   if (whiteboardBlock) parts.push(whiteboardBlock);

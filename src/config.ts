@@ -282,6 +282,14 @@ export const config = {
   // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle
   // sets this global explicitly.
   get codexRpcInputDefault(): boolean { return readGlobalConfig().dashboard?.codexRpcInput === true; },
+  // Live getter (like codexRpcInputDefault): re-reads the experimental global
+  // toggle that gates the "no visible output" anti-resend guidance in the botmux
+  // routing hints, so a Settings change takes effect on the next session without
+  // a daemon restart. Default OFF (absent ⇒ disabled): the guidance mainly helps
+  // when Claude Code (≥2.1.212) drives a non-Claude backend model that misreads a
+  // thinking-only nudge as a send failure; it is harmless but unnecessary for the
+  // common all-Claude setup, so operators opt in explicitly.
+  get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

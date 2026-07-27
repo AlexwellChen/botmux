@@ -14,6 +14,7 @@
  */
 import { t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
+import { config } from '../../config.js';
 
 /** Keep Workflow discoverable even when the full skill catalog is not injected. */
 function workflowDiscoveryHint(locale?: Locale): string {
@@ -37,7 +38,11 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.heredoc_example', undefined, locale),
     t('ai.shell.helpers', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
-    t('ai.shell.no_visible_output_ok', undefined, locale),
+    // Experimental anti-resend guidance — opt-in via dashboard Settings
+    // (dashboard.noVisibleOutputHint). Default OFF, so the rendered hints match
+    // the pre-feature baseline unless an operator flips it on. Live-read here so
+    // a toggle takes effect on the next session without a daemon restart.
+    ...(config.noVisibleOutputHint ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
     t('ai.shell.mention_gate', undefined, locale),
     workflowDiscoveryHint(locale),
     hiddenContextDefense(locale),
@@ -49,7 +54,9 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
 }
 
 /** @deprecated Use `buildBotmuxShellHints(locale)` instead. Kept for any external callers.
- *  Static legacy value must not read runtime config at module import time. */
+ *  Static legacy value must not read runtime config at module import time — so the
+ *  experimental `no_visible_output_ok` line (gated on config.noVisibleOutputHint) is
+ *  intentionally absent here; only the live `buildBotmuxShellHints` path carries it. */
 export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.intro'),
   t('ai.shell.commands_are_shell'),
@@ -58,7 +65,6 @@ export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.heredoc_example'),
   t('ai.shell.helpers'),
   t('ai.shell.when_to_send'),
-  t('ai.shell.no_visible_output_ok'),
   t('ai.shell.mention_gate'),
   workflowDiscoveryHint(),
   hiddenContextDefense(),
@@ -122,7 +128,10 @@ export function buildBotmuxSystemPromptText(opts: {
     '<botmux_routing>',
     t('ai.routing.intro', undefined, locale),
     t('ai.routing.must_use_botmux', undefined, locale),
-    t('ai.routing.no_visible_output_ok', undefined, locale),
+    // Experimental anti-resend guidance — opt-in via dashboard Settings
+    // (dashboard.noVisibleOutputHint). Default OFF ⇒ this block is byte-for-byte
+    // the pre-feature baseline. Live-read so a toggle applies to the next session.
+    ...(config.noVisibleOutputHint ? [t('ai.routing.no_visible_output_ok', undefined, locale)] : []),
     '',
     t('ai.routing.usage_heading', undefined, locale),
     t('ai.routing.usage_send_when', undefined, locale),
