@@ -7173,6 +7173,19 @@ async function spawnCli(
     const canonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
     const sandboxHome = canonical(homedir());
     const expandTilde = (raw: string) => raw.replace(/^~(?=\/|$)/, sandboxHome);
+    // LEXICAL `~` expansion — uses the raw (NON-canonicalized) homedir(). Used ONLY
+    // for the redirect authPath CONTAINMENT decision below, where both sides of the
+    // coversPath check MUST live in the same namespace. `expandTilde` above resolves
+    // `~` to the CANONICAL home (correct for bwrap binds), but the rehomed roots we
+    // compare against are lexical (`cliAdapter.claudeDataDir` = join(homedir(),'.claude'),
+    // built from the un-canonicalized homedir()). Mixing the two silently fails the
+    // containment on a SYMLINKED $HOME (`/home/u` → `/data00/home/u`): the authPath
+    // canonicalizes to `/data00/home/u/.claude/...` while the root stays `/home/u/.claude`,
+    // coversPath misses, and the real host credential wrongly survives → RW-bound back
+    // into the redirected sandbox (codex #605 P1). Expanding BOTH sides lexically keeps
+    // them in one namespace; survivors are canonicalized afterwards by keepExisting.
+    const lexicalHome = homedir();
+    const expandTildeLexical = (raw: string) => raw.replace(/^~(?=\/|$)/, lexicalHome);
     const keepExisting = (paths: (string | undefined)[]) => {
       const out: string[] = [];
       for (const raw of paths) {
@@ -7365,18 +7378,25 @@ async function spawnCli(
       // rehomedHostRoots = the ORIGINAL host claudeDataDir (cliAdapter's, NOT the
       // BOT_HOME value claudeDataDir was reassigned to above) + codex host ~/.codex.
       //
-      // CONTAINMENT MUST USE LEXICAL (`~`-expanded, NOT realpath'd) paths: if e.g.
-      // ~/.claude/.credentials.json is a symlink to an external dotfiles/creds dir,
-      // realpath-then-contain would resolve it OUTSIDE ~/.claude and wrongly KEEP it
-      // → the real host credential gets RW-bound back into the sandbox, defeating
-      // the redirect. So filter on the lexical declared paths first, THEN keepExisting
-      // (realpath + existence-filter) only the survivors for bwrap.
+      // CONTAINMENT MUST USE LEXICAL (`~`-expanded, NOT realpath'd) paths on BOTH
+      // sides: if e.g. ~/.claude/.credentials.json is a symlink to an external
+      // dotfiles/creds dir, realpath-then-contain would resolve it OUTSIDE ~/.claude
+      // and wrongly KEEP it → the real host credential gets RW-bound back into the
+      // sandbox, defeating the redirect. AND the two sides must share ONE home
+      // namespace: expand declaredAuthPaths + rehomedHostRoots with `lexicalHome`
+      // (raw homedir()), NOT the canonical `sandboxHome` — else on a symlinked $HOME
+      // the authPath canonicalizes to /data00/home/u/... while `cliAdapter.claudeDataDir`
+      // (= join(homedir(),'.claude'), lexical) stays /home/u/..., coversPath misses,
+      // and the credential leaks (codex #605 P1). The codex host root is likewise
+      // `${lexicalHome}/.codex`, not `${sandboxHome}/.codex`, or the codex leak fix
+      // itself regresses under a symlinked home. Filter lexically first, THEN
+      // keepExisting (realpath + existence-filter) only the survivors for bwrap.
       authPaths: keepExisting(resolveRedirectedAdapterAuthPaths({
-        declaredAuthPaths: [...(cliAdapter.authPaths ?? [])].map(expandTilde),
+        declaredAuthPaths: [...(cliAdapter.authPaths ?? [])].map(expandTildeLexical),
         willRedirectCliData,
-        rehomedHostRoots: [cliAdapter.claudeDataDir, isolatedCodexHome ? `${sandboxHome}/.codex` : undefined]
+        rehomedHostRoots: [cliAdapter.claudeDataDir, isolatedCodexHome ? `${lexicalHome}/.codex` : undefined]
           .filter((r): r is string => !!r)
-          .map(expandTilde),
+          .map(expandTildeLexical),
       })),
       execPaths: keepExisting([...execDirs, ...execCarve]),
       readonlyRoots: keepExisting([
