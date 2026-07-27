@@ -234,8 +234,7 @@ describe('activeConversationBotOpenIds', () => {
         { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_old', larkAppId: 'cli_reviewer' },
       ],
       targetChatId: 'oc_main',
-      currentRootMessageId: 'om_current',
-      chatScope: false,
+      outboundRootMessageId: 'om_current',
       botEntries,
       crossRef,
     });
@@ -248,27 +247,78 @@ describe('activeConversationBotOpenIds', () => {
         { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_old', larkAppId: 'cli_reviewer' },
       ],
       targetChatId: 'oc_main',
-      currentRootMessageId: 'om_current',
-      chatScope: false,
+      outboundRootMessageId: 'om_current',
       botEntries,
       crossRef,
     });
     expect(result).toEqual(new Set());
   });
 
-  it('uses the whole chat as the anchor for chat-scope sessions', () => {
+  it('treats a same-chat chat-scope peer as reachable from a thread sender', () => {
     const result = activeConversationBotOpenIds({
       sessions: [
         { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_reviewer' },
         { status: 'active', scope: 'chat', chatId: 'oc_else', rootMessageId: 'oc_else', larkAppId: 'cli_orchestrator' },
       ],
       targetChatId: 'oc_main',
-      currentRootMessageId: 'om_irrelevant',
-      chatScope: true,
+      outboundRootMessageId: 'om_current',
       botEntries,
       crossRef,
     });
     expect(result).toEqual(new Set(['ou_reviewer']));
+  });
+
+  it('treats a same-root thread peer as reachable from a chat-scope reply into that topic', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set(['ou_reviewer']));
+  });
+
+  it('does not treat a thread peer as reachable from a plain chat send', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set());
+  });
+
+  it('fails closed when multiple bot apps share the same display name', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_same_1' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      botEntries: [
+        { larkAppId: 'cli_same_1', botName: 'Same' },
+        { larkAppId: 'cli_same_2', botName: 'Same' },
+      ],
+      crossRef: { Same: 'ou_same_2' },
+    });
+    expect(result).toEqual(new Set());
+  });
+
+  it('treats a non-array bot identity payload as empty instead of throwing', () => {
+    expect(activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      botEntries: {} as any,
+      crossRef,
+    })).toEqual(new Set());
   });
 });
 

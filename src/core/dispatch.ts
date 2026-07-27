@@ -238,8 +238,7 @@ export function activeConversationBotOpenIds(input: {
     larkAppId?: string;
   }>;
   targetChatId: string;
-  currentRootMessageId: string;
-  chatScope: boolean;
+  outboundRootMessageId?: string;
   botEntries: Array<{ larkAppId: string; botName: string | null }>;
   crossRef: Record<string, string>;
 }): Set<string> {
@@ -248,18 +247,30 @@ export function activeConversationBotOpenIds(input: {
     if (session.status !== 'active'
       || !session.larkAppId
       || session.chatId !== input.targetChatId) continue;
-    const here = input.chatScope
-      ? session.scope === 'chat'
-      : session.scope !== 'chat'
-        && !!input.currentRootMessageId
-        && session.rootMessageId === input.currentRootMessageId;
+    // A chat-scope peer is reachable from any message in the same group:
+    // mentions inside a topic fold back into that peer's shared chat session.
+    // A thread-scope peer is reachable only when this send actually lands in
+    // the same thread root.
+    const here = session.scope === 'chat'
+      || (!!input.outboundRootMessageId
+        && session.rootMessageId === input.outboundRootMessageId);
     if (here) activeAppIds.add(session.larkAppId);
   }
 
   const openIds = new Set<string>();
-  for (const entry of input.botEntries) {
+  const entries = Array.isArray(input.botEntries) ? input.botEntries : [];
+  const crossRef = input.crossRef && typeof input.crossRef === 'object'
+    ? input.crossRef
+    : {};
+  for (const entry of entries) {
     if (!entry.botName || !activeAppIds.has(entry.larkAppId)) continue;
-    const openId = input.crossRef[entry.botName];
+    // crossRef is keyed by display name. When several apps share that name,
+    // the value cannot prove which app it represents; fail closed and retain
+    // the old-topic hint instead of silencing it for the wrong bot.
+    const sameNameEntries = entries.filter(candidate =>
+      candidate.botName?.toLowerCase() === entry.botName!.toLowerCase());
+    if (sameNameEntries.length !== 1) continue;
+    const openId = crossRef[entry.botName];
     if (openId) openIds.add(openId);
   }
   return openIds;

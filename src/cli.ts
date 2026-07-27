@@ -7487,6 +7487,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // reply_in_thread, otherwise Lark would force every reply into a fresh
   // topic — defeating the whole point of chat-scope routing.
   const isChatScope = s.scope === 'chat';
+  // Compute the actual outbound anchor before the advisory guard. A chat-scope
+  // sender can still reply into a per-turn topic, so sender scope alone does
+  // not describe which peer sessions are reachable.
+  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
 
   // Load the sender-scoped bot identity map once. Besides prose @Name
   // injection below, it lets the sub-bot hint recognize peers that already
@@ -7496,10 +7500,16 @@ async function cmdSend(rest: string[]): Promise<void> {
   try {
     const dataDir = resolveDataDir();
     const botInfoPath = join(dataDir, 'bots-info.json');
-    botEntries = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
+    const parsedBotEntries = existsSync(botInfoPath)
+      ? JSON.parse(readFileSync(botInfoPath, 'utf-8'))
+      : [];
+    botEntries = Array.isArray(parsedBotEntries) ? parsedBotEntries : [];
     const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
-    crossRef = existsSync(crossRefPath)
+    const parsedCrossRef = existsSync(crossRefPath)
       ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
+      : {};
+    crossRef = parsedCrossRef && typeof parsedCrossRef === 'object' && !Array.isArray(parsedCrossRef)
+      ? parsedCrossRef
       : {};
   } catch { /* best-effort identity map */ }
 
@@ -7528,8 +7538,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   const reachableOpenIds = activeConversationBotOpenIds({
     sessions: allSessions,
     targetChatId,
-    currentRootMessageId: s.rootMessageId,
-    chatScope: isChatScope,
+    outboundRootMessageId: sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId,
     botEntries,
     crossRef,
   });
@@ -7568,9 +7577,8 @@ async function cmdSend(rest: string[]): Promise<void> {
     rootMessageId: s.rootMessageId,
     title: s.title,
   };
-  // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
-  // decision point. Used for file attachments (always plain in chat scope).
-  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  // Dispatch helper below uses the same precomputed target as the advisory
+  // guard, so the hint and actual Lark delivery cannot disagree about scope.
   const dispatch = async (
     content: string,
     msgType: string,
