@@ -17,17 +17,24 @@
  * and the rest see the file already gone (renamed to `schedules.json.bak-split-v1`).
  *
  * Routing (per task):
- *   - OWNERLESS (no `larkAppId`)        → PRIMARY bot's store, kept ownerless.
+ *   - OWNERLESS (`larkAppId` undefined) → PRIMARY bot's store, kept ownerless.
  *       The scheduler runs ownerless tasks on the primary daemon (bot-0) — the
- *       exact pre-split behaviour. The appId is NOT stamped on.
+ *       exact pre-split behaviour. The appId is NOT stamped on. ONLY `undefined`
+ *       is ownerless; a falsy non-string is corrupt data (next branch).
+ *   - owner present but NOT a string     → fail-safe: abort the split. Covers
+ *     (bool/number/null/object, truthy      `true`/`false`/`0`/`null`/objects —
+ *      OR falsy)                             none matches a string appId, and a
+ *       falsy one would otherwise slip into primary and run under primary's
+ *       identity (codex #611 f3+f4). `assertSafeAppId`'s RegExp.test would also
+ *       silently coerce a truthy one (`true`→"true"), so guard the TYPE first.
  *   - owner IS in bots.json             → that owner's own BOT_HOME store.
  *   - owner well-formed but NOT in       → that owner's own (dormant) store, NOT
  *     bots.json (removed / config drift)   primary. Folding it into primary would
  *       either strand it (primary's owner filter rejects a foreign appId) or, if
  *       stripped, run it under the wrong bot identity; its own store keeps it
  *       verbatim so it reappears intact if the bot is re-added (codex #611 f1).
- *   - owner is an UNSAFE appId (cannot   → fail-safe: abort the split before any
- *     be a path segment)                   import, leave the legacy file for a
+ *   - owner is an UNSAFE string appId    → fail-safe: abort the split before any
+ *     (cannot be a path segment)           import, leave the legacy file for a
  *       human. Never silently drop the row.
  * Id conflicts with an existing per-bot entry keep the existing entry (the
  * per-bot store is newer by definition) and are logged.
@@ -80,27 +87,48 @@ export function migrateSharedSchedulesAtStartup(
       for (const [id, task] of Object.entries(raw as Record<string, ScheduledTask>)) {
         if (!task || typeof task !== 'object') continue;
         let owner: string;
-        if (!task.larkAppId) {
-          // Truly OWNERLESS legacy task → primary's store, kept ownerless. The
-          // scheduler runs an ownerless task on the primary daemon (bot-0), which
-          // is exactly the pre-split behaviour. Do NOT stamp primary's appId — that
-          // would pin it away from the legacy ownerless semantics.
+        if (task.larkAppId === undefined) {
+          // Truly OWNERLESS legacy task (field absent) → primary's store, kept
+          // ownerless. The scheduler runs an ownerless task on the primary daemon
+          // (bot-0), which is exactly the pre-split behaviour. Do NOT stamp
+          // primary's appId — that would pin it away from the legacy ownerless
+          // semantics. ONLY `undefined` counts as ownerless: a falsy non-string
+          // (`false`/`0`/`null`) is corrupt data, not "no owner", and must not be
+          // silently absorbed into primary where it would run under primary's
+          // identity (codex #611 finding 4).
           owner = primaryAppId;
+        } else if (typeof task.larkAppId !== 'string') {
+          // Present but NOT a string (boolean/number/null/object, truthy OR falsy):
+          // corrupt owner data. It can NEVER match a real bot — the scheduler's
+          // owner filter compares `task.larkAppId === ownerAppId` against a STRING
+          // appId — and `assertSafeAppId`'s `RegExp.test` would silently coerce it
+          // (`true`→"true", `false`→"false") and pass, migrating it into
+          // `bots/<coerced>/` where no daemon ever runs it, OR (for falsy values)
+          // slip past a truthiness check into primary and run under the WRONG
+          // identity (codex #611 findings 3 & 4). Guard the TYPE, then fail-safe:
+          // abort the whole split with no import performed, leaving legacy intact.
+          logger.error(
+            `[schedule-split] task ${id} has a non-string larkAppId ` +
+            `(${task.larkAppId === null ? 'null' : typeof task.larkAppId}); ` +
+            'split aborted, legacy schedules.json preserved',
+          );
+          return;
         } else if (known.has(task.larkAppId)) {
           // Configured owner → its own BOT_HOME store.
           owner = task.larkAppId;
         } else {
-          // Well-formed appId that is NOT currently in bots.json (bot removed, or
-          // config drift): route to ITS OWN store, not primary. Folding it into
-          // primary either strands it (primary's owner filter rejects a foreign
-          // appId — codex #611 finding 1) or, if we stripped the appId, would run
-          // it under the WRONG bot identity. Its own dormant store preserves the
-          // task verbatim so it reappears intact if that bot is re-added later.
+          // Well-formed STRING appId that is NOT currently in bots.json (bot
+          // removed, or config drift): route to ITS OWN store, not primary. Folding
+          // it into primary either strands it (primary's owner filter rejects a
+          // foreign appId — codex #611 finding 1) or, if we stripped the appId,
+          // would run it under the WRONG bot identity. Its own dormant store
+          // preserves the task verbatim so it reappears intact if the bot is
+          // re-added later.
           //
-          // An unsafe appId cannot be a path segment (`scheduleFilePathFor` →
-          // `assertSafeAppId` would throw). Fail-safe: abort the whole split with
-          // NO import performed yet (imports happen after this loop), leaving the
-          // legacy file untouched for a human — never silently drop the row.
+          // An unsafe string appId (path-traversal, or empty string) cannot be a
+          // path segment (`scheduleFilePathFor` → `assertSafeAppId` throws).
+          // Fail-safe: abort the whole split with NO import performed yet (imports
+          // happen after this loop), leaving legacy untouched — never drop the row.
           try {
             assertSafeAppId(task.larkAppId);
           } catch {

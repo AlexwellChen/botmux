@@ -4,7 +4,7 @@
  * mocked config/logger — same scaffolding as schedule-store.test.ts.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -114,6 +114,42 @@ describe('migrateSharedSchedulesAtStartup', () => {
     expect(existsSync(legacyFp())).toBe(true);
     expect(existsSync(`${legacyFp()}.bak-split-v1`)).toBe(false);
     expect(existsSync(storeFp(PRIMARY))).toBe(false);
+  });
+
+  it.each([
+    ['boolean true', true],
+    ['boolean false', false],
+    ['number', 123],
+    ['zero', 0],
+    ['null', null],
+    ['empty string', ''],
+    ['object', { evil: 1 }],
+  ])('fail-safe on a non-string / empty larkAppId (%s): abort split, legacy preserved, no coerced store', async (_label, badOwner) => {
+    // codex #611 findings 3+4: a present-but-non-string larkAppId must NOT be
+    // treated as ownerless nor coerced into a path.
+    //  - truthy non-string (`true`) slips past assertSafeAppId's RegExp.test
+    //    (coerced to "true") → lands in bots/true/, unreachable (owner filter:
+    //    true !== "true").
+    //  - falsy non-string (`false`/`0`/`null`) would slip past a `!larkAppId`
+    //    ownerless check into primary and run under primary's WRONG identity.
+    //  - `''` is a string but not a legal appId (assertSafeAppId rejects it).
+    // All must fail-safe: abort the whole split, keep legacy, import nothing.
+    writeFileSync(legacyFp(), JSON.stringify({
+      a: legacyTask('a', PRIMARY),
+      bad: { ...legacyTask('bad'), larkAppId: badOwner },
+    }));
+    const { migration } = await freshImport();
+    migration.migrateSharedSchedulesAtStartup([PRIMARY], PRIMARY);
+
+    // Split aborted before any import: legacy preserved, no backup, and NO store
+    // written — neither primary's nor a coerced-name one (bots/true/, bots/0/, …).
+    expect(existsSync(legacyFp())).toBe(true);
+    expect(existsSync(`${legacyFp()}.bak-split-v1`)).toBe(false);
+    expect(existsSync(storeFp(PRIMARY))).toBe(false);
+    // No sibling per-bot store dir was created for a coerced owner name.
+    const botsDir = join(tempDir, 'bots');
+    const siblingDirs = existsSync(botsDir) ? readdirSync(botsDir) : [];
+    expect(siblingDirs).toEqual([]);
   });
 
   it('is idempotent — second run is a no-op', async () => {
