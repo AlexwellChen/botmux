@@ -147,7 +147,8 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
 /** Proxy env vars that must reach the CLI child process so it can dial the
  *  upstream API on hosts without direct internet access. Forwarded explicitly
  *  by buildBotmuxEnvAssignments (tmux/tmux-pipe/zellij backends) and
- *  prepareSandbox (bwrap); the pty backend inherits them via the full child env.
+ *  prepareDirectSandbox (bwrap --setenv); the pty backend inherits them via the
+ *  full child env.
  *  Deliberately NOT in BOTMUX_INJECTED_ENV_KEYS: that list drives tmuxEnv()
  *  stripping and scrubTmuxServerGlobalEnv() cleanup — adding proxy keys there
  *  would delete the user's own tmux server proxy config. */

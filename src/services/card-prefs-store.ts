@@ -31,6 +31,10 @@ export interface BotCardPrefs {
   codexAppCleanInput: boolean;
   writableTerminalLinkInCard: boolean;
   privateCard: boolean;
+  /** When true, this bot's daemon watches host load/mem and DMs the owner on
+   *  overload enter/recover edges. Machine-wide signal, so designate one bot;
+   *  a shared episode lock de-dups if several have it on. Default false. */
+  overloadAlert: boolean;
   /** bot@bot 同目录拉起: when a bot is @-ed into a chat where a sibling bot is
    *  already working, inherit that sibling's workingDir & skip the repo card.
    *  Default TRUE (unlike the others) — only an explicit false is persisted. */
@@ -59,6 +63,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexAppCleanInput: c.codexAppCleanInput === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
+      overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
@@ -75,6 +80,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexAppCleanInput: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
+      overloadAlert: false,
       botToBotSameDir: true,
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '',
@@ -144,6 +150,7 @@ export async function updateBotCardPrefs(
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
+    apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
     applyStr(entry, 'autoStartOnGroupJoinPrompt', patch.autoStartOnGroupJoinPrompt);
@@ -159,6 +166,7 @@ export async function updateBotCardPrefs(
         codexAppCleanInput: entry.codexAppCleanInput === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
+        overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
@@ -191,6 +199,9 @@ export async function updateBotCardPrefs(
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
   }
+  if (patch.overloadAlert !== undefined) {
+    bot.config.overloadAlert = patch.overloadAlert || undefined;
+  }
   if (patch.botToBotSameDir !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
     bot.config.botToBotSameDir = patch.botToBotSameDir === false ? false : undefined;
@@ -222,6 +233,7 @@ export async function updateBotCardPrefs(
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
+    `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +
     `botToBotSameDir=${r.result.botToBotSameDir} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +

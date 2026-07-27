@@ -22,4 +22,4 @@
 
 ⚠️ 注意与「读隔离/重定向」的交互：claude 家族 + codex 若 `supportsReadIsolation`，沙盒开启时 CLI 数据会被重定向到 BOT_HOME（`CLAUDE_CONFIG_DIR`/`CODEX_HOME`），此时 worker 会把落在**宿主原数据根之内**的 `authPaths` 丢弃（见 `authPathsSurvivingCliDataRedirect`）——避免把 CLI 根本不读的宿主目录（如整个 `~/.codex` 的 history/sessions）暴露进沙盒；落在数据根之外的登录源（如 Seed/Relay 的 `~/.local/share/bytedcli`）才保留。新增声明 `authPaths` 的 claude 家族适配器需想清这条。
 
-验证手段：用 `prepareSandbox` 生成真实 bwrap argv + `node-pty` 拉起真 CLI 跑 ≥90s，观察是否崩、并核对写入是否落到真实目录（见 `test/sandbox.test.ts` 的 symlink 回归用例）。
+验证手段：用 `prepareDirectSandbox` 生成真实 bwrap argv + `node-pty` 拉起真 CLI 跑 ≥90s，观察是否崩、并核对写入是否落到真实目录（见 `test/sandbox.test.ts` 的 symlink 回归用例）。

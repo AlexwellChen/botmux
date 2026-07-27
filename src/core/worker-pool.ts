@@ -92,8 +92,15 @@ import {
 } from '../services/vc-meeting-im-reply.js';
 import { neutralizeLarkAtTags } from '../services/send-policy.js';
 import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-message-store.js';
+import {
+  getVcMeetingListenerTopicRoot,
+  recordVcMeetingListenerTopicRoot,
+  type VcMeetingListenerTopicKey,
+} from '../services/vc-meeting-listener-topic-store.js';
+import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-output-protocol.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
 import {
@@ -142,6 +149,10 @@ export interface WorkerSessionReplyOptions {
    * share a visible chat anchor with ordinary sessions, so the anchor alone
    * cannot identify the transcript/lifecycle owner. */
   sourceSessionId?: string;
+  /** Automatic VC delivery presentation. Explicit human IM replies omit this
+   * and continue to follow their quote/thread context. */
+  placement?: 'auto' | 'chat' | 'topic';
+  meetingTopicKey?: VcMeetingListenerTopicKey;
 }
 
 export interface WorkerPoolCallbacks {
@@ -1507,9 +1518,55 @@ export async function closeSession(
     // crash/limited turn may never have reached an idle edge).
     recordUsageForDaemonSession(ds);
     killWorker(ds);
+    // Commit the daemon-visible close barrier before any network await below.
+    // `botmux delete` may be running inside the session being destroyed; once
+    // its worker/backing pane exits, a new IM message must not find this stale
+    // entry and resurrect the old logical session while doc cleanup is pending.
+    activeSessionsRegistry?.delete(activeSessionKey(ds));
+    killedLive = true;
+  }
+
+  // Persistence is part of the same no-await barrier as Map eviction. If the
+  // daemon crashes during best-effort doc cleanup, restart recovery must not
+  // restore a session that was already explicitly closed.
+  const stored = sessionStore.getSession(sessionId);
+  const wasOpen = !!stored && stored.status !== 'closed';
+  if (wasOpen) sessionStore.closeSession(sessionId);
+
+  if (ds) {
+    if (!ds.exitEventEmitted) {
+      ds.exitEventEmitted = true;
+      dashboardEventBus.publish({
+        type: 'session.exited',
+        body: { sessionId, reason: 'dashboard_close' },
+      });
+      emitSessionLifecycleHook(ds, 'session.exit', { reason: 'dashboard_close' });
+    }
+  }
+
+  // Preserve the existing externally-visible event order: exit first, then
+  // the final persisted-row update. Persistence itself was already committed
+  // above as part of the close barrier.
+  if (wasOpen) {
+    const after = sessionStore.getSession(sessionId);
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId,
+        patch: {
+          status: 'closed',
+          closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
+          tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null,
+        },
+      },
+    });
+  }
+
+  if (ds) {
     // 文档入口清理：会话关闭即删除其绑定。只有旧
     // /subscribe-lark-doc 记录需要调飞书逐文件退订 API；
-    // /watch-comment 仅依赖应用级评论事件，删本地监听表即可。
+    // /watch-comment 仅依赖应用级评论事件，删本地监听表即可。此段允许 await，
+    // 因为上面的内存 + 持久化关闭屏障已经提交。
     try {
       const anchor = sessionAnchorId(ds);
       const subs = listDocSubscriptionsForSession(config.session.dataDir, ds.larkAppId, anchor);
@@ -1523,35 +1580,6 @@ export async function closeSession(
     } catch (err: any) {
       logger.warn(`[doc-comment] cleanup on close failed for ${sessionId.slice(0, 8)}: ${err?.message ?? err}`);
     }
-    activeSessionsRegistry?.delete(activeSessionKey(ds));
-    killedLive = true;
-    if (!ds.exitEventEmitted) {
-      ds.exitEventEmitted = true;
-      dashboardEventBus.publish({
-        type: 'session.exited',
-        body: { sessionId, reason: 'dashboard_close' },
-      });
-      emitSessionLifecycleHook(ds, 'session.exit', { reason: 'dashboard_close' });
-    }
-  }
-
-  // Persistence path — load → mark closed → save (delegated to sessionStore).
-  const stored = sessionStore.getSession(sessionId);
-  const wasOpen = !!stored && stored.status !== 'closed';
-  if (wasOpen) {
-    sessionStore.closeSession(sessionId);
-    const after = sessionStore.getSession(sessionId);
-    dashboardEventBus.publish({
-      type: 'session.update',
-      body: {
-        sessionId,
-        patch: {
-          status: 'closed',
-          closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
-          tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null,
-        },
-      },
-    });
   }
 
   // alreadyClosed = nothing happened on either path.
@@ -2455,6 +2483,7 @@ function setupWorkerHandlers(
     dispatchAttempt?: number,
   ): boolean => {
     if (isSilentScheduledTurn(ds, turnId)) return true;
+    if (isTriggerFinalSuppressed(ds, turnId)) return true;
     if (!ds.session.vcMeetingReceiver) {
       return ordinaryManagedSuppression(turnId, dispatchAttempt);
     }
@@ -3703,6 +3732,16 @@ function setupWorkerHandlers(
         // Worker pops the turn off its queue right after emit, so it will
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.
+        // A real harvested answer is a definitive self-heal signal: if the
+        // session was parked in `limited` by a structured rate-limit emit
+        // (Claude adopt/bridge sessions where the user recovers in their own
+        // terminal — no Lark turn, retry button, or kill to clear it), the
+        // model is plainly working again. Clear the stale limit so the card /
+        // Dashboard「需要你」 don't stay pinned with a dead retry countdown.
+        if (ds.usageLimit) {
+          clearUsageLimitState(ds);
+          if (ds.lastScreenStatus === 'limited') ds.lastScreenStatus = 'idle';
+        }
         deliverFinalOutput(ds, msg, t, 0);
         break;
       }
@@ -4046,12 +4085,52 @@ function deliverFinalOutput(
         && managedDecision.kind === 'listener_thread'
         ? managedDecision.meetingOwner
         : undefined;
+      const listenerOutputPlacement = managedDecision?.ok
+        && managedDecision.kind === 'listener_thread'
+        ? managedDecision.outputPlacement
+        : 'auto';
+      const listenerOutputProtocol = managedDecision?.ok
+        && managedDecision.kind === 'listener_thread'
+        ? managedDecision.listenerOutputProtocol
+        : 'plain';
+      const meetingTopicKey: VcMeetingListenerTopicKey | undefined = !imOrigin
+        && listenerOutputOwner
+        && listenerOutputPlacement === 'topic'
+        ? {
+            ...listenerOutputOwner,
+            targetChatId: ds.chatId,
+          }
+        : undefined;
+      let visibleAssistantText = msg.content;
+      if (!imOrigin
+        && listenerOutputOwner
+        && msg.dispatchAttempt !== undefined
+        && listenerOutputProtocol === 'decision_v1') {
+        const controlledOutput = parseVcMeetingListenerOutput(msg.content);
+        if (!controlledOutput.ok) {
+          ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+          logger.error(
+            `[${t}] VC listener output suppressed: invalid control envelope `
+            + `(${controlledOutput.reason}) turn=${msg.turnId.substring(0, 8)}`,
+          );
+          return;
+        }
+        if (controlledOutput.decision === 'skip') {
+          ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+          logger.info(
+            `[${t}] VC listener output skipped by agent decision `
+            + `(turn ${msg.turnId.substring(0, 8)})`,
+          );
+          return;
+        }
+        visibleAssistantText = controlledOutput.content;
+      }
       // Meeting-derived text is untrusted card markdown. A model-authored
       // native <at> tag and the ordinary owner footer would both create a
       // second addressing side effect outside the action ledger.
       const safeAssistantText = managedReceiver
-        ? neutralizeLarkAtTags(msg.content)
-        : msg.content;
+        ? neutralizeLarkAtTags(visibleAssistantText)
+        : visibleAssistantText;
       const safeUserText = managedReceiver && msg.userText !== undefined
         ? neutralizeLarkAtTags(msg.userText)
         : msg.userText;
@@ -4086,6 +4165,9 @@ function deliverFinalOutput(
       const proposedOutput = {
         targetChatId: ds.chatId,
         ...(imOrigin ? { quoteTargetId: imOrigin.larkMessageId } : {}),
+        ...(!imOrigin && listenerOutputOwner
+          ? { placement: listenerOutputPlacement }
+          : {}),
         msgType: 'interactive',
         content: cardJson,
       };
@@ -4119,6 +4201,19 @@ function deliverFinalOutput(
       }
       const recordPrimaryOutput = (messageId: string): void => {
         if (!listenerOutputOwner) return;
+        if (meetingTopicKey
+          && !getVcMeetingListenerTopicRoot(config.session.dataDir, meetingTopicKey)) {
+          const topic = recordVcMeetingListenerTopicRoot(
+            config.session.dataDir,
+            meetingTopicKey,
+            messageId,
+          );
+          if (!topic.ok) {
+            logger.error(
+              `[${t}] VC listener topic anchor rejected message=${messageId} reason=${topic.reason}`,
+            );
+          }
+        }
         try {
           const recorded = recordVcMeetingListenerMessage(config.session.dataDir, {
             ...listenerOutputOwner,
@@ -4166,6 +4261,12 @@ function deliverFinalOutput(
               // provider call). Never fan meeting content out to user hooks,
               // including the first attempt and crash reconciliation replay.
               suppressHook: true,
+              ...(!imOrigin && listenerOutputOwner
+                ? {
+                    placement: canonicalOutput.placement ?? 'auto',
+                    ...(meetingTopicKey ? { meetingTopicKey } : {}),
+                  }
+                : {}),
             }
           : undefined,
       );

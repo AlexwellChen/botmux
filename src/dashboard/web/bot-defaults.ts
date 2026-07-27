@@ -64,6 +64,7 @@ export type BotDefaultsRow = {
   codexAppCleanInput?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
+  overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   summaryRange?: { limit?: number; sinceHours?: number };
   p2pMode?: string;
