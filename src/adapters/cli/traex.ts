@@ -185,8 +185,9 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'traex',
     // Whole ~/.trae/cli kept REAL: traex is codex-based and keeps the same SQLite
-    // state/log DBs there (state_*.sqlite / logs_*.sqlite) — the sandbox home
-    // overlay lacks the fcntl locks SQLite needs (same failure as codex.ts).
+    // state/log DBs there (state_*.sqlite / logs_*.sqlite) — under the deny-by-
+    // default file sandbox a path not in authPaths doesn't exist, so the DBs are
+    // unreachable / lack the fcntl locks SQLite needs (same failure as codex.ts).
     authPaths: ['~/.trae/cli'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
@@ -328,6 +329,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       'DeepSeek-V4-Pro',
       'kimi-k2.6',
     ],
+    // RPC mode bridges native AskUserQuestion directly. Keep the normal
+    // botmux-ask skill available too: TraeX sessions can fail closed to a
+    // standard PTY when RPC is unavailable, where native questions cannot
+    // reach the card bridge.
+    asksViaHook: false,
   };
 }
 

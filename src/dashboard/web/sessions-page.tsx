@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -24,9 +25,11 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
+  normalizeHiddenTableColumns,
   normalizeSessionsViewMode,
   readStoredBoardOrder,
   readStoredCreateKeepOpen,
+  readStoredHiddenTableColumns,
   readStoredKanbanGroupBy,
   readStoredSessionsShowUnknownChats,
   readStoredSessionsViewMode,
@@ -34,6 +37,7 @@ import {
   type SessionsViewMode,
   writeStoredBoardOrder,
   writeStoredCreateKeepOpen,
+  writeStoredHiddenTableColumns,
   writeStoredKanbanGroupBy,
   writeStoredSessionsShowUnknownChats,
   writeStoredSessionsViewMode,
@@ -54,6 +58,7 @@ import {
   isUnknownChatSession,
   lockActionLabel,
   openWriteLink,
+  copySpawnCommand,
   repoBasename,
   restartConfirmMessage,
   sessionLocationText,
@@ -225,7 +230,7 @@ function IconActionButton(props: {
       id={props.id}
       className={className}
       data-action={props.action}
-      title={props.label}
+      data-tip={props.label}
       aria-label={props.label}
       disabled={props.disabled}
       onClick={(event) => {
@@ -248,7 +253,7 @@ function TerminalControls(props: { row: any; url: string | null }): JSX.Element 
           href={props.url}
           target="_blank"
           rel="noopener"
-          title={t('sessions.openTerminal')}
+          data-tip={t('sessions.openTerminal')}
           aria-label={t('sessions.openTerminal')}
           onClick={event => event.stopPropagation()}
           dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
@@ -258,7 +263,7 @@ function TerminalControls(props: { row: any; url: string | null }): JSX.Element 
           type="button"
           className="term-btn term-write"
           data-action="write-link"
-          title={t('sessions.openTerminal')}
+          data-tip={t('sessions.openTerminal')}
           aria-label={t('sessions.openTerminal')}
           onClick={(event) => {
             event.stopPropagation();
@@ -280,7 +285,7 @@ function ChatScopeLink(props: { row: any; className?: string }): JSX.Element | n
       href={row.feishuChatLink}
       target="_blank"
       rel="noopener"
-      title={t('sessions.openChat')}
+      data-tip={t('sessions.openChat')}
       aria-label={t('sessions.openChat')}
       onClick={event => event.stopPropagation()}
       dangerouslySetInnerHTML={rawHtml(ICON.feishu)}
@@ -444,6 +449,7 @@ function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boo
 export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: string, checked: boolean) => void }): JSX.Element {
   const checked = CLI_FILTER_OPTIONS.filter(cli => props.selected.has(cli)).length;
   const detailsRef = useRef<HTMLDetailsElement>(null);
+  const [query, setQuery] = useState('');
 
   useEffect(() => {
     const close = () => {
@@ -464,24 +470,52 @@ export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: s
     };
   }, []);
 
+  const q = query.trim().toLowerCase();
+  const visible = q ? CLI_FILTER_OPTIONS.filter(cli => cli.toLowerCase().includes(q)) : CLI_FILTER_OPTIONS;
+
   return (
     <details className="filter-cli" ref={detailsRef}>
       <summary>{t('sessions.cli')} · <b id="cli-filter-count" className={checked === CLI_FILTER_OPTIONS.length ? undefined : 'cli-filter-active'}>
         {checked === CLI_FILTER_OPTIONS.length ? t('common.all') : `${checked}/${CLI_FILTER_OPTIONS.length}`}
       </b></summary>
       <div className="filter-cli-pop" role="group" aria-label={t('sessions.cli')}>
-        {CLI_FILTER_OPTIONS.map(cli => (
-          <label key={cli} className="filter-check">
-            <input
-              type="checkbox"
-              name="cli"
-              value={cli}
-              checked={props.selected.has(cli)}
-              onChange={event => props.onToggle(cli, event.currentTarget.checked)}
-            />
-            <span>{cli}</span>
-          </label>
-        ))}
+        <div className="filter-cli-head">
+          <input
+            type="search"
+            className="filter-cli-search"
+            placeholder={t('sessions.cliSearch')}
+            value={query}
+            autoFocus
+            onChange={event => setQuery(event.currentTarget.value)}
+            onClick={event => event.stopPropagation()}
+          />
+          <div className="filter-cli-bulk">
+            <button
+              type="button"
+              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (!props.selected.has(cli)) props.onToggle(cli, true); }}
+            >{t('sessions.cliSelectAll')}</button>
+            <button
+              type="button"
+              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (props.selected.has(cli)) props.onToggle(cli, false); }}
+            >{t('sessions.cliClear')}</button>
+          </div>
+        </div>
+        <div className="filter-cli-options">
+          {visible.length === 0 ? (
+            <span className="filter-cli-empty">{t('sessions.cliNoMatch')}</span>
+          ) : visible.map(cli => (
+            <label key={cli} className="filter-check">
+              <input
+                type="checkbox"
+                name="cli"
+                value={cli}
+                checked={props.selected.has(cli)}
+                onChange={event => props.onToggle(cli, event.currentTarget.checked)}
+              />
+              <span>{cli}</span>
+            </label>
+          ))}
+        </div>
       </div>
     </details>
   );
@@ -536,9 +570,13 @@ function SessionsFilters(props: {
       />
       <DropdownMenu
         ariaLabel={t('sessions.location')}
+        className="filter-chat-menu"
         label={chatLabel}
         value={props.filters.chat}
         options={chatOptions}
+        searchable
+        searchPlaceholder={t('sessions.chatSearch')}
+        searchEmptyLabel={t('sessions.chatNoMatch')}
         onChange={value => props.setFilters(prev => ({ ...prev, chat: value }))}
       />
       <CliFilterGroup
@@ -807,6 +845,9 @@ function SessionsTable(props: {
   selectAllChecked: boolean;
   selectAllIndeterminate: boolean;
   selectAllDisabled: boolean;
+  hiddenColumns: Set<string>;
+  onToggleColumn: (colId: string) => void;
+  onResetColumns: () => void;
   onOpen: (row: any) => void;
   onSelect: (id: string, selected: boolean) => void;
   onSelectAll: (selected: boolean) => void;
@@ -817,19 +858,22 @@ function SessionsTable(props: {
     if (selectAllRef.current) selectAllRef.current.indeterminate = props.selectAllIndeterminate;
   }, [props.selectAllIndeterminate]);
 
-  const headers = [
-    ['botName', t('sessions.bot')],
-    ['cliId', t('sessions.cli')],
-    ['status', t('sessions.status')],
-    ['chat', t('sessions.location')],
-    ['tokenIn', t('sessions.tokenIn')],
-    ['tokenOut', t('sessions.tokenOut')],
-    ['title', t('sessions.titleCol')],
-    ['workingDir', t('sessions.workingDir')],
-    ['spawnedAt', t('sessions.created')],
-    ['lastMessageAt', t('sessions.last')],
-    ['adopt', t('sessions.adopt')],
-  ] as const;
+  const allColumns: Array<{ id: string; label: string }> = [
+    { id: 'botName', label: t('sessions.bot') },
+    { id: 'cliId', label: t('sessions.cli') },
+    { id: 'status', label: t('sessions.status') },
+    { id: 'chat', label: t('sessions.location') },
+    { id: 'tokenIn', label: t('sessions.tokenIn') },
+    { id: 'tokenOut', label: t('sessions.tokenOut') },
+    { id: 'title', label: t('sessions.titleCol') },
+    { id: 'workingDir', label: t('sessions.workingDir') },
+    { id: 'spawnedAt', label: t('sessions.created') },
+    { id: 'lastMessageAt', label: t('sessions.last') },
+    { id: 'adopt', label: t('sessions.adopt') },
+  ];
+  const visibleColumns = allColumns.filter(c => !props.hiddenColumns.has(c.id));
+  // select + visible data + actions
+  const colSpan = 2 + visibleColumns.length;
   const labels = {
     select: t('sessions.selectSession'),
     botName: t('sessions.bot'),
@@ -846,6 +890,36 @@ function SessionsTable(props: {
     actions: t('sessions.actions'),
   };
 
+  // 单元格渲染：按列 id 返回对应的 JSX，隐藏列不渲染。
+  function renderCell(row: any, colId: string): JSX.Element | null {
+    switch (colId) {
+      case 'botName':
+        return <td data-label={labels.botName}>{botDisplayName(row)}</td>;
+      case 'cliId':
+        return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span></td>;
+      case 'status':
+        return <td data-label={labels.status}><StatusBadge status={row.status} /><LockChip row={row} /></td>;
+      case 'chat':
+        return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
+      case 'tokenIn':
+        return <td className="token-cell" data-label={labels.tokenIn}>{formatTokenCount(row.tokenUsage?.in)}</td>;
+      case 'tokenOut':
+        return <td className="token-cell" data-label={labels.tokenOut}>{formatTokenCount(row.tokenUsage?.out)}</td>;
+      case 'title':
+        return <td className="sessions-table-text-cell" data-label={labels.title} title={String(row.title ?? '')}>{stripMentionPrefix(row.title ?? '').slice(0, 48)}</td>;
+      case 'workingDir':
+        return <td className="sessions-table-path-cell" data-label={labels.workingDir} title={row.workingDir ?? ''}>{String(row.workingDir ?? '').slice(-34)}</td>;
+      case 'spawnedAt':
+        return <td data-label={labels.spawnedAt}>{relTime(row.spawnedAt)}</td>;
+      case 'lastMessageAt':
+        return <td data-label={labels.lastMessageAt}>{relTime(row.lastMessageAt)}</td>;
+      case 'adopt':
+        return <td data-label={labels.adopt}>{row.adopt ? <span className="badge">adopt</span> : null}</td>;
+      default:
+        return null;
+    }
+  }
+
   return (
     <table id="sessions-table" hidden={props.hidden}>
       <thead>
@@ -861,10 +935,35 @@ function SessionsTable(props: {
               onChange={event => props.onSelectAll(event.currentTarget.checked)}
             />
           </th>
-          {headers.map(([sort, label]) => (
-            <SortHeader key={sort} sort={sort} label={label} sortKey={props.sortKey} sortDir={props.sortDir} onSort={props.onSort} />
+          {visibleColumns.map(col => (
+            <SortHeader key={col.id} sort={col.id} label={col.label} sortKey={props.sortKey} sortDir={props.sortDir} onSort={props.onSort} />
           ))}
-          <th>{t('sessions.actions')}</th>
+          <th className="session-table-columns-th">
+            <details className="session-table-columns-menu">
+              <summary title={t('sessions.columns')}>
+                <span className="session-table-columns-icon" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
+                </span>
+                {t('sessions.columns')}
+              </summary>
+              <div className="session-table-columns-dropdown" role="menu">
+                <div className="session-table-columns-header">
+                  <span>{t('sessions.columnsMenu')}</span>
+                  <button type="button" className="session-table-columns-reset" onClick={props.onResetColumns}>{t('sessions.columnsReset')}</button>
+                </div>
+                {allColumns.map(col => (
+                  <label key={col.id} className="session-table-columns-item">
+                    <input
+                      type="checkbox"
+                      checked={!props.hiddenColumns.has(col.id)}
+                      onChange={() => props.onToggleColumn(col.id)}
+                    />
+                    {col.label}
+                  </label>
+                ))}
+              </div>
+            </details>
+          </th>
         </tr>
       </thead>
       <tbody>
@@ -882,22 +981,14 @@ function SessionsTable(props: {
                   onChange={event => props.onSelect(id, event.currentTarget.checked)}
                 />
               </td>
-              <td data-label={labels.botName}>{botDisplayName(row)}</td>
-              <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span></td>
-              <td data-label={labels.status}><StatusBadge status={row.status} /><LockChip row={row} /></td>
-              <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>
-              <td className="token-cell" data-label={labels.tokenIn}>{formatTokenCount(row.tokenUsage?.in)}</td>
-              <td className="token-cell" data-label={labels.tokenOut}>{formatTokenCount(row.tokenUsage?.out)}</td>
-              <td className="sessions-table-text-cell" data-label={labels.title} title={String(row.title ?? '')}>{stripMentionPrefix(row.title ?? '').slice(0, 48)}</td>
-              <td className="sessions-table-path-cell" data-label={labels.workingDir} title={row.workingDir ?? ''}>{String(row.workingDir ?? '').slice(-34)}</td>
-              <td data-label={labels.spawnedAt}>{relTime(row.spawnedAt)}</td>
-              <td data-label={labels.lastMessageAt}>{relTime(row.lastMessageAt)}</td>
-              <td data-label={labels.adopt}>{row.adopt ? <span className="badge">adopt</span> : null}</td>
+              {visibleColumns.map(col => (
+                <Fragment key={col.id}>{renderCell(row, col.id)}</Fragment>
+              ))}
               <td className="sessions-table-action-cell" data-label={labels.actions}><button className="open" type="button">{t('sessions.details')}</button></td>
             </tr>
           );
         }) : (
-          <tr><td colSpan={13} className="empty">{t('sessions.empty')}</td></tr>
+          <tr><td colSpan={colSpan} className="empty">{t('sessions.empty')}</td></tr>
         )}
       </tbody>
     </table>
@@ -1425,60 +1516,6 @@ function TerminalModal(props: { state: TerminalState | null; onClose: () => void
   );
 }
 
-function LandPanel(props: { row: any }): JSX.Element {
-  const [state, setState] = useState<{ loading: boolean; diff?: any; patch?: string; message?: ReactNode } | null>(null);
-  useEffect(() => setState(null), [props.row.sessionId]);
-  const load = async () => {
-    setState({ loading: true });
-    try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(props.row.sessionId)}/sandbox-diff`);
-      const d = await r.json().catch(() => ({}));
-      if (!d.ok) { setState({ loading: false, message: <p>{t('sessions.landUnavailable')}: {String(d.error ?? r.status)}</p> }); return; }
-      if (d.empty) { setState({ loading: false, message: <p>{t('sessions.landEmpty')}</p> }); return; }
-      const full = String(d.patch ?? '');
-      setState({
-        loading: false,
-        diff: d,
-        patch: full.slice(0, 20000) + (full.length > 20000 ? '\n...(truncated)' : ''),
-      });
-    } catch (e) {
-      setState({ loading: false, message: <p>{t('sessions.landUnavailable')}: {String(e)}</p> });
-    }
-  };
-  const apply = async () => {
-    const rr = await fetch(`/api/sessions/${encodeURIComponent(props.row.sessionId)}/sandbox-land/apply`, { method: 'POST' });
-    const res = await rr.json().catch(() => ({}));
-    setState({
-      loading: false,
-      message: res.ok
-        ? <p>{t('sessions.landApplied')}: {res.files} files (+{res.insertions}/-{res.deletions}) → <code>{String(res.workingDir ?? '')}</code></p>
-        : <p>{t('sessions.landFailed')}: {String(res.error ?? rr.status)}</p>,
-    });
-  };
-  const discard = async () => {
-    await fetch(`/api/sessions/${encodeURIComponent(props.row.sessionId)}/sandbox-land/discard`, { method: 'POST' });
-    setState({ loading: false, message: <p>{t('sessions.landDiscarded')}</p> });
-  };
-  return (
-    <>
-      <button id="land-btn" type="button" disabled={state?.loading} onClick={() => void load()}>{t('sessions.land')}</button>
-      <div id="land-area">
-        {state?.loading ? <LoadingState label={t('sessions.landLoading')} compact /> : null}
-        {state?.message}
-        {state?.diff && state.patch !== undefined ? (
-          <>
-            <p><b>{state.diff.files}</b> files (+{state.diff.insertions}/-{state.diff.deletions}) → <code>{String(state.diff.workingDir ?? '')}</code></p>
-            <pre style={{ maxHeight: 320, overflow: 'auto', whiteSpace: 'pre-wrap' }}>{state.patch}</pre>
-            <div className="actions">
-              <button id="land-apply" type="button" className="primary" onClick={() => void apply()}>{t('sessions.landApply')}</button>
-              <button id="land-discard" type="button" className="contrast" onClick={() => void discard()}>{t('sessions.landDiscard')}</button>
-            </div>
-          </>
-        ) : null}
-      </div>
-    </>
-  );
-}
 
 function InsightReport(props: { report: any }): JSX.Element {
   const rep = props.report;
@@ -1627,12 +1664,20 @@ function Drawer(props: {
             {!row.feishuChatLink || row.scope !== 'chat' ? <LocateButton row={row} locateSession={props.locateSession} /> : null}
             <button id="history-drawer-btn" type="button" onClick={() => props.openHistory(row)}>{t('sessions.history.title')}</button>
             <TerminalControls row={row} url={terminal} />
+            {shouldOpenWritableTerminal() && row.status !== 'closed' ? (
+              <button
+                id="copy-cmd-btn"
+                type="button"
+                data-tip={t('sessions.copyCommandHint')}
+                onClick={event => void copySpawnCommand(row, event.currentTarget)}
+              >
+                {t('sessions.copyCommand')}
+              </button>
+            ) : null}
             {canRestartSession(row) ? (
               <button id="restart-btn" type="button" onClick={async event => { if (await props.restartSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.restart')}</button>
             ) : null}
-            {row.status !== 'closed' ? (
-              <button id="lock-btn" type="button" onClick={event => void props.setSessionLocked(row, !row.locked, event.currentTarget)}>{lockActionLabel(row)}</button>
-            ) : null}
+            <button id="lock-btn" type="button" onClick={event => void props.setSessionLocked(row, !row.locked, event.currentTarget)}>{lockActionLabel(row)}</button>
             {row.queued && row.status !== 'closed' ? (
               <button id="start-btn" type="button" className="primary" onClick={async event => { if (await props.startSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.create.start')}</button>
             ) : null}
@@ -1642,7 +1687,6 @@ function Drawer(props: {
             {row.status !== 'closed' ? (
               <button id="close-btn" type="button" className="contrast" onClick={async event => { if (await props.closeSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.close')}</button>
             ) : null}
-            <LandPanel row={row} />
             <InsightPanel row={row} />
           </div>
         </article>
@@ -2142,6 +2186,7 @@ function SessionsPage(): JSX.Element {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [sortKey, setSortKey] = useState('lastMessageAt');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(() => new Set(readStoredHiddenTableColumns(windowStorage())));
   const [viewMode, setViewMode] = useState<SessionsViewMode>(() => readStoredSessionsViewMode(windowStorage()));
   const [boardOrder, setBoardOrder] = useState<string[]>(() => readStoredBoardOrder(windowStorage()));
   const [boardAnimated, setBoardAnimated] = useState(false);
@@ -2890,7 +2935,34 @@ function SessionsPage(): JSX.Element {
     }
   }, []);
 
-  // 侧边菜单「创建会话」入口：已在本页时收事件直接打开；跨页跳转时消费挂载前的 pending
+  // 调试终端：起一个 owner-only 裸 bash（不绑飞书话题），在新标签打开 xterm 页面。
+  // 让用户把「复制复现命令」拿到的命令粘进去改参数复现问题，用完关闭即回收。
+  const openDebugTerminal = useCallback(async (): Promise<void> => {
+    const input = window.prompt(t('sessions.debugTerminalPrompt'), '');
+    if (input === null) return; // 用户取消
+    const workingDir = input.trim();
+    const tab = window.open('about:blank', '_blank');
+    if (tab) tab.opener = null;
+    try {
+      const r = await fetch('/api/debug-terminal', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(workingDir ? { workingDir } : {}),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body?.ok === false || !body?.url) {
+        tab?.close();
+        if (r.status !== 401) alert(`${t('sessions.debugTerminalFail')}: ${body?.error ?? r.status}`);
+        return;
+      }
+      if (tab) tab.location.href = body.url;
+      else window.open(body.url, '_blank', 'noopener');
+    } catch (e) {
+      tab?.close();
+      alert(`${t('sessions.debugTerminalFail')}: ${e}`);
+    }
+  }, []);
+
   useEffect(() => {
     const maybeOpenFromEntry = () => {
       if (consumePendingCreateSession() && ui.authed) void openCreateSession();
@@ -2982,6 +3054,16 @@ function SessionsPage(): JSX.Element {
             </button>
           ) : null}
           {ui.authed ? (
+            <button
+              type="button"
+              className="debug-terminal-btn"
+              title={t('sessions.debugTerminalHint')}
+              onClick={() => void openDebugTerminal()}
+            >
+              {t('sessions.debugTerminal')}
+            </button>
+          ) : null}
+          {ui.authed ? (
             <CreateActionButton
               className="page-primary-action create-session-btn"
               disabled={createLoading}
@@ -3039,6 +3121,24 @@ function SessionsPage(): JSX.Element {
           selectAllChecked={selectAllChecked}
           selectAllIndeterminate={selectAllIndeterminate}
           selectAllDisabled={selectableRows.length === 0}
+          hiddenColumns={hiddenColumns}
+          onToggleColumn={(colId) => {
+            const willHide = !hiddenColumns.has(colId);
+            const next = new Set(hiddenColumns);
+            if (willHide) next.add(colId);
+            else next.delete(colId);
+            writeStoredHiddenTableColumns(windowStorage(), Array.from(next));
+            setHiddenColumns(next);
+            // 如果当前排序列被隐藏，回退到默认 lastMessageAt desc
+            if (willHide && colId === sortKey) {
+              setSortKey('lastMessageAt');
+              setSortDir('desc');
+            }
+          }}
+          onResetColumns={() => {
+            setHiddenColumns(new Set());
+            writeStoredHiddenTableColumns(windowStorage(), []);
+          }}
           onOpen={row => setDrawerSessionId(row.sessionId)}
           onSelect={(id, checked) => setSelected(prev => {
             const next = new Set(prev);

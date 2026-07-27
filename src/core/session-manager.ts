@@ -12,7 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, forkAdoptWorker, adoptSandboxBlocked, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
@@ -21,7 +21,14 @@ import {
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
 } from '../skills/injection-mode.js';
-import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
+import {
+  getSessionPersistentBackendType,
+  persistentBackendTargetForSession,
+  probePersistentBackendTarget,
+  probePersistentBackendServer,
+  killPersistentBackendTarget,
+  type PersistentBackendType,
+} from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -108,9 +115,9 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<boole
   // 热切场景）走 closeSession 的 close IPC 由 worker 侧优雅拆除 backing——先硬杀
   // pane 会跟 worker 的退出处理赛跑。
   if (backendType && (!ds.worker || ds.worker.killed)) {
-    const backendName = persistentSessionName(backendType, ds.session.sessionId);
-    logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session and killing ${backendType} ${backendName}`);
-    killPersistentSession(backendType, backendName);
+    const target = persistentBackendTargetForSession(ds)!;
+    logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session and killing ${backendType} ${target.sessionName}${target.backendType === 'herdr' && target.agentName ? `/${target.agentName}` : ''}`);
+    killPersistentBackendTarget(target);
   } else {
     logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session`);
   }
@@ -1205,6 +1212,28 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // user-editable via /rename and must not change restore semantics.
     if (session.adoptedFrom) {
       const adopted = session.adoptedFrom as NonNullable<DaemonSession['adoptedFrom']>;
+      // Fail-closed BEFORE building an adopt DaemonSession: a sandbox-enabled
+      // session (frozen `session.sandbox`, or a bot that now requires the
+      // sandbox) can't attach to an already-running host CLI (confinement is
+      // spawn-time only). Convert it to a plain cold-start IN PLACE — clear the
+      // adopt metadata, normalize the "Adopt: …" title (else the next restart's
+      // legacy title-only branch below would permanently close it), persist —
+      // then fall through to the normal restore path so it registers/announces
+      // as an ordinary session, NOT an adopt row. Doing the conversion here (not
+      // via a worker-pool side-effect after announceSessionRow) keeps daemon
+      // orchestration state consistent.
+      let adoptBotCfg: { sandbox?: boolean; readIsolation?: boolean } = {};
+      try { adoptBotCfg = getBot(session.larkAppId ?? '').config; } catch { /* unknown bot → only the frozen decision matters */ }
+      if (adoptSandboxBlocked(adoptBotCfg, session)) {
+        logger.warn(`[${session.sessionId.substring(0, 8)}] sandbox session persisted as adopt — converting to cold-start (a sandbox can't wrap a live CLI)`);
+        session.adoptedFrom = undefined;
+        if (session.title?.startsWith('Adopt:')) {
+          const project = session.title.slice('Adopt:'.length).trim();
+          session.title = project || 'Session';
+        }
+        try { sessionStore.updateSession(session); } catch { /* best-effort */ }
+        // fall through: session.adoptedFrom is now unset → normal restore below
+      } else {
       const validation = adopted.zellijPaneId
         ? (typeof adopted.originalCliPid === 'number' && validateZellijAdoptTarget(adopted.zellijSession ?? '', adopted.zellijPaneId, adopted.originalCliPid, adopted.cliId) ? 'alive' : 'missing')
         : validateAdoptTargetState(adopted);
@@ -1266,6 +1295,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       forkAdoptWorker(ds, { restoredFromMetadata: true });
       logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adoptTargetLabel(adopted)}, scope: ${scope})`);
       continue;
+      }
     }
     // Title-only adopt sessions have no target metadata and can only come from
     // legacy records. They cannot be validated or safely restored.
@@ -1356,7 +1386,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         // instead of resurrecting an invisible worker.
         const backendType = getSessionPersistentBackendType(ds);
         if (backendType) {
-          killPersistentSession(backendType, persistentSessionName(backendType, session.sessionId));
+          killPersistentBackendTarget(persistentBackendTargetForSession(ds)!);
         }
         sessionStore.closeSession(session.sessionId);
         removeDeferredTopicBinding(config.session.dataDir, session.sessionId);
@@ -1413,8 +1443,11 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     if (!backendType) continue;
     if (!shouldAutoForkOnRestore(backendType)) continue;
 
-    const backendName = persistentSessionName(backendType, ds.session.sessionId);
-    const probe = probePersistentSession(backendType, backendName);
+    const backendTarget = persistentBackendTargetForSession(ds)!;
+    const backendName = backendTarget.backendType === 'herdr' && backendTarget.agentName
+      ? `${backendTarget.sessionName}/${backendTarget.agentName}`
+      : backendTarget.sessionName;
+    const probe = probePersistentBackendTarget(backendTarget);
     if (probe === 'missing') {
       const tag = ds.session.sessionId.substring(0, 8);
       // Intentionally cold-resume-suspended (idle-worker sweeper killed the
@@ -1506,7 +1539,8 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
   // CONFIRMED alive. 'missing' or 'unknown' both bail (a 502 the terminal
   // retries) — same conservative stance as the old boolean check, with no risk
   // of closing anything.
-  if (probePersistentSession(backendType, persistentSessionName(backendType, ds.session.sessionId)) !== 'exists') {
+  const backendTarget = persistentBackendTargetForSession(ds)!;
+  if (probePersistentBackendTarget(backendTarget) !== 'exists') {
     return undefined;
   }
 

@@ -1,4 +1,5 @@
 import { defineConfig } from '@rspress/core';
+import { pluginLlms } from '@rspress/plugin-llms';
 
 const docsBase = process.env.BOTMUX_DOCS_BASE || '/';
 // Rspress resolves public assets against `base` when emitting HTML. Keeping
@@ -47,6 +48,7 @@ const zhSidebar = [
       { text: '语音总结', link: '/voice' },
       { text: 'Dashboard 管控面', link: '/dashboard' },
       { text: '接入点（Webhook）', link: '/webhook' },
+      { text: 'API 编程式触发任务', link: '/api-task-trigger' },
       { text: 'Workflow（实验性）', link: '/workflow' },
       { text: '生命周期 Hooks', link: '/hooks' },
       { text: 'Skill + CLI 交互', link: '/skill-cli' },
@@ -120,6 +122,7 @@ const enSidebar = [
       { text: 'Voice Summary', link: '/en/voice' },
       { text: 'Dashboard', link: '/en/dashboard' },
       { text: 'Webhook Ingress', link: '/en/webhook' },
+      { text: 'Programmatic Task Trigger API', link: '/en/api-task-trigger' },
       { text: 'Workflow (Experimental)', link: '/en/workflow' },
       { text: 'Lifecycle Hooks', link: '/en/hooks' },
       { text: 'Skill + CLI Interaction', link: '/en/skill-cli' },
@@ -163,6 +166,9 @@ export default defineConfig({
   icon: faviconPath,
   logo: productLogoPath,
   logoText: 'botmux 文档',
+  // llms.txt 支持：产出 /llms.txt（索引）+ /llms-full.txt（全文），并为每篇文档
+  // 生成 .md 纯文本版，方便 AI / LLM 抓取本站内容（AI 友好）。
+  plugins: [pluginLlms()],
   // 多语言：zh 为默认语（无前缀），en 走 /en/ 前缀
   locales: [
     { lang: 'zh', label: '简体中文', title: 'botmux 文档', description: '飞书话题群 ↔ AI 编程 CLI 桥接' },

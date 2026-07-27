@@ -4,7 +4,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
@@ -28,10 +28,10 @@ import {
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
 // ~/.botmux/.dashboard-secret existing on the box.
 const TEST_IPC_SECRET = 'test-ipc-secret-deadbeef';
-function tokenAuthHeaders(secret = TEST_IPC_SECRET): Record<string, string> {
+function tokenAuthHeaders(secret = TEST_IPC_SECRET, bind?: string): Record<string, string> {
   const ts = Math.floor(Date.now() / 1000).toString();
   const nonce = randomBytes(8).toString('hex');
-  const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
+  const sig = createHmac('sha256', secret).update(bind ? `${ts}:${nonce}:${bind}` : `${ts}:${nonce}`).digest('base64url');
   return { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig };
 }
 
@@ -108,6 +108,7 @@ afterEach(async () => {
   __testOnly_resetBotRegistry();
   setIpcAuthSecret(null);
   resetAskBrokerForTest();
+  setExactChatGrantHandler(null);
 });
 
 describe('dashboard IPC server', () => {
@@ -324,6 +325,296 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   });
 });
 
+describe('POST /api/grants/chat', () => {
+  it('requires loopback HMAC before invoking the permission service', async () => {
+    const handler = vi.fn();
+    setExactChatGrantHandler(handler as any);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_peer'],
+      }),
+    });
+    expect(res.status).toBe(401);
+
+    const bareLegacyHmac = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders() },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_peer'],
+      }),
+    });
+    expect(bareLegacyHmac.status).toBe(401);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('returns 503 when the daemon receiver identity is not ready', async () => {
+    const handler = vi.fn();
+    setExactChatGrantHandler(handler as any);
+    setLarkAppId('');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_peer'],
+      }),
+    });
+    expect(res.status).toBe(503);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('uses the daemon identity as source-of-truth and rejects stale descriptor routing', async () => {
+    const handler = vi.fn();
+    setExactChatGrantHandler(handler as any);
+    setLarkAppId('cli_actual_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_stale_descriptor',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_peer'],
+      }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'receiver_mismatch' });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('forwards only the daemon receiver and preserves explicit talk-only output', async () => {
+    const handler = vi.fn(async (input: any) => ({
+      ok: true as const,
+      operation: 'grant' as const,
+      permissionSource: 'chatGrant' as const,
+      talkOnly: true as const,
+      receiverLarkAppId: input.receiverLarkAppId,
+      chatId: input.chatId,
+      grantsTalk: true,
+      grantsOperate: false as const,
+      subjects: [{
+        subjectOpenId: input.subjectOpenIds[0],
+        chatGrantActive: true,
+        changed: true,
+        grantsTalk: true,
+        grantsOperate: false as const,
+      }],
+    }));
+    setExactChatGrantHandler(handler);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_peer'],
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(handler).toHaveBeenCalledWith({
+      operation: 'grant',
+      receiverLarkAppId: 'cli_receiver',
+      chatId: 'oc_chat',
+      subjectOpenIds: ['ou_peer'],
+    });
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      talkOnly: true,
+      grantsTalk: true,
+      grantsOperate: false,
+      subjects: [{ subjectOpenId: 'ou_peer', chatGrantActive: true }],
+    });
+  });
+
+  it('accepts stable subject app ids and returns the receiver-side identity mapping', async () => {
+    const handler = vi.fn(async (input: any) => ({
+      ok: true as const,
+      operation: 'grant' as const,
+      permissionSource: 'chatGrant' as const,
+      talkOnly: true as const,
+      receiverLarkAppId: input.receiverLarkAppId,
+      chatId: input.chatId,
+      grantsTalk: true,
+      grantsOperate: false as const,
+      subjectMappings: [{ larkAppId: input.subjectLarkAppIds[0], subjectOpenId: 'ou_pm_seen_by_receiver' }],
+      subjects: [{
+        subjectOpenId: 'ou_pm_seen_by_receiver',
+        chatGrantActive: true,
+        changed: true,
+        grantsTalk: true,
+        grantsOperate: false as const,
+      }],
+    }));
+    setExactChatGrantHandler(handler);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectLarkAppIds: ['cli_pm'],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(handler).toHaveBeenCalledWith({
+      operation: 'grant',
+      receiverLarkAppId: 'cli_receiver',
+      chatId: 'oc_chat',
+      subjectLarkAppIds: ['cli_pm'],
+    });
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      talkOnly: true,
+      grantsOperate: false,
+      subjectMappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_pm_seen_by_receiver' }],
+    });
+  });
+
+  it('requires exactly one subject identity form before invoking the permission service', async () => {
+    const handler = vi.fn();
+    setExactChatGrantHandler(handler as any);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const url = `http://127.0.0.1:${handle.port}/api/grants/chat`;
+    const bind = cliAuthBind('POST', '/api/grants/chat', handle.port);
+
+    for (const subjects of [
+      {},
+      { subjectOpenIds: ['ou_peer'], subjectLarkAppIds: ['cli_peer'] },
+    ]) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, bind) },
+        body: JSON.stringify({
+          operation: 'grant',
+          receiverLarkAppId: 'cli_receiver',
+          chatId: 'oc_chat',
+          ...subjects,
+        }),
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ error: 'exactly_one_subject_identity_required' });
+    }
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('rejects stable subject app ids for revoke or readback before invoking the service', async () => {
+    const handler = vi.fn();
+    setExactChatGrantHandler(handler as any);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'revoke',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectLarkAppIds: ['cli_pm'],
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: 'subject_lark_app_ids_grant_only' });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('passes through stable identity failures without exposing the internal status field', async () => {
+    const handler = vi.fn(async () => ({
+      ok: false as const,
+      status: 409,
+      error: 'subject_lark_app_ambiguous',
+      message: 'ambiguous bot_name',
+      invalidSubjectLarkAppIds: ['cli_pm'],
+    }));
+    setExactChatGrantHandler(handler);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectLarkAppIds: ['cli_pm'],
+      }),
+    });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toMatchObject({
+      ok: false,
+      error: 'subject_lark_app_ambiguous',
+      invalidSubjectLarkAppIds: ['cli_pm'],
+    });
+    expect(body).not.toHaveProperty('status');
+  });
+
+  it('passes through service failure status without exposing the internal status field', async () => {
+    const handler = vi.fn(async () => ({
+      ok: false as const,
+      status: 409,
+      error: 'subject_not_current_chat_bot',
+      message: 'not current',
+      invalidSubjectOpenIds: ['ou_stale'],
+    }));
+    setExactChatGrantHandler(handler);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_stale'],
+      }),
+    });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: false, error: 'subject_not_current_chat_bot' });
+    expect(body).not.toHaveProperty('status');
+  });
+});
+
 describe('GET /api/sessions', () => {
   it('returns array shape (sessions: Row[])', async () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -359,7 +650,7 @@ describe('POST /api/sessions/:sessionId/rename', () => {
       session.backendType = 'tmux';
       sessionStore.updateSession(session);
 
-      findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      const active = {
         session,
         worker: { killed: false, connected: true, send },
         workerPort: 1234,
@@ -372,7 +663,8 @@ describe('POST /api/sessions/:sessionId/rename', () => {
         cliVersion: '1',
         lastMessageAt: Date.now(),
         hasHistory: true,
-      } as any);
+      } as any;
+      findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
 
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/rename`, {
@@ -384,6 +676,8 @@ describe('POST /api/sessions/:sessionId/rename', () => {
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true, title: 'New Title', agentSync: 'requested' });
       expect(sessionStore.getSession(session.sessionId)?.title).toBe('New Title');
+      expect(sessionStore.getSession(session.sessionId)?.nativeSessionTitle).toBe('New Title');
+      expect(sessionStore.getSession(session.sessionId)?.nativeSessionTitleUserDefined).toBe(true);
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'New Title' });
       expect(events).toContainEqual({
         type: 'session.update',
@@ -401,8 +695,13 @@ describe('POST /api/sessions/:sessionId/rename', () => {
 
 describe('POST /api/sessions/:sessionId/close', () => {
   it('returns 200 with ok=true even when session does not exist (idempotent)', async () => {
-    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/nonexistent/close`, { method: 'POST' });
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const path = '/api/sessions/nonexistent/close';
+    const res = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+      method: 'POST',
+      headers: trustedHostHeaders('POST', path, handle.port),
+    });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.ok).toBe(true);
@@ -802,6 +1101,47 @@ describe('GET /api/events', () => {
       expect(ev!.body.session.hasHistory).toBe(true);
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
+    }
+  });
+
+  it('replays this-run closed sessions as session.spawned (zombie-close visibility)', async () => {
+    // A restore-time zombie is registered, announced, then immediately
+    // closeSession()'d (evicted from the active Map) — all before a racing
+    // dashboard's SSE subscription exists. By connect time it's gone from the Map,
+    // so the active-only replay can't surface it. The closed-since-process-start
+    // replay must still deliver it as a closed row so the dashboard doesn't lose
+    // it (or keep a stale active entry).
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-sse-closed-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      workerPool.setActiveSessionsRegistry(registry); // empty — zombie already evicted
+
+      const session = sessionStore.createSession('oc_zombie', 'om_zombie', 'zombie topic', 'group');
+      session.larkAppId = '';
+      session.scope = 'thread';
+      session.cliId = 'codex' as any;
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId); // closedAt = now ≥ PROCESS_START_MS
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const ev = await readSseEvent(
+        `http://127.0.0.1:${handle.port}/api/events`,
+        e => e.type === 'session.spawned' && e.body?.session?.sessionId === session.sessionId,
+      );
+      expect(ev).not.toBeNull();
+      expect(ev!.body.session.status).toBe('closed');
+      expect(typeof ev!.body.session.closedAt).toBe('number');
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
     }
   });
 });

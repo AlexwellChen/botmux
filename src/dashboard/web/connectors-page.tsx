@@ -20,6 +20,7 @@ interface Connector {
   };
   promptEnvelope: { sourceName: string; instruction?: string };
   topicMessage?: { mode: 'default' | 'custom' | 'none'; text?: string };
+  suppressFinalOutput?: boolean;
   loggingPolicy?: { storePayload: boolean; storeHeaders: boolean; retentionDays: number };
   lifecycleExtractors?: { dedupKey: string } | null;
 }
@@ -50,6 +51,7 @@ interface CreateForm {
   instruction: string;
   topicMessageMode: 'default' | 'custom' | 'none';
   topicMessageText: string;
+  suppressFinalOutput: boolean;
   verify: 'token' | 'hmac-sha256';
   secret: string;
   storePayload: boolean;
@@ -87,6 +89,7 @@ const emptyForm: CreateForm = {
   instruction: '',
   topicMessageMode: 'default',
   topicMessageText: '',
+  suppressFinalOutput: false,
   verify: 'token',
   secret: '',
   storePayload: true,
@@ -280,6 +283,7 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
     instruction: connector.promptEnvelope?.instruction || '',
     topicMessageMode: connector.topicMessage?.mode || 'default',
     topicMessageText: connector.topicMessage?.text || '',
+    suppressFinalOutput: connector.suppressFinalOutput === true,
     verify: connector.verify?.type || 'token',
     secret: '',
     storePayload: connector.loggingPolicy?.storePayload !== false,
@@ -492,6 +496,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
         mode: form.topicMessageMode,
         ...(form.topicMessageMode === 'custom' ? { text: topicMessageText } : {}),
       },
+      suppressFinalOutput: form.suppressFinalOutput,
       verify: { type: form.verify },
       loggingPolicy: { storePayload: form.storePayload, storeHeaders: true, retentionDays: 14 },
     };
@@ -554,6 +559,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           instruction: '',
           topicMessageMode: 'default',
           topicMessageText: '',
+          suppressFinalOutput: false,
           allowChats: [],
           storePayload: true,
         }));
@@ -879,6 +885,14 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
             <span>
               <strong>{tr('connectors.storePayload')}</strong>
               <small>{tr('connectors.storePayloadHint')}</small>
+            </span>
+          </label>
+
+          <label className="connector-log-policy cn-field-wide" htmlFor="cn-suppress-final">
+            <input id="cn-suppress-final" type="checkbox" checked={form.suppressFinalOutput} onChange={e => patchForm({ suppressFinalOutput: e.currentTarget.checked })} />
+            <span>
+              <strong>{tr('connectors.suppressFinalOutput')}</strong>
+              <small>{tr('connectors.suppressFinalOutputHint')}</small>
             </span>
           </label>
 

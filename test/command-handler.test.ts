@@ -273,6 +273,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   suspendWorker: vi.fn(() => false),
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
+  adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
@@ -484,7 +485,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { codexHome } from '../src/services/codex-paths.js';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
-import { repoPickerScanOptions } from '../src/global-config.js';
+import { readGlobalConfig, repoPickerScanOptions } from '../src/global-config.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
@@ -596,7 +597,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -629,9 +630,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 31 = current master command set plus /vc. /subscribe-lark-doc remains
+    // 30 = current master command set without the removed /land command.
+    // /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(31);
+    expect(DAEMON_COMMANDS.size).toBe(30);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -776,6 +778,53 @@ describe('/botconfig skills JSON text command', () => {
       expect(stored.skills).toEqual({ include: ['skill:deploy-runbook'] });
       expect(typeof stored.skills).toBe('object');
       expect(bot.config.skills).toEqual({ include: ['skill:deploy-runbook'] });
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
+describe('/botconfig canTalkDaemonCommands uses the field parser (not the passthrough one)', () => {
+  it('persists daemon commands via the text command path', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-ctdc-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+
+    try {
+      await handleCommand(
+        '/botconfig',
+        ROOT_ID,
+        // 默认 stringList 解析器（parseCustomPassthroughInput）会拒绝一切 daemon
+        // 命令——本字段必须走 spec.parseList，否则这里被当成"空值"拒绝。
+        makeLarkMessage('/botconfig set canTalkDaemonCommands status /Help', { senderId: 'ou_sender' }),
+        makeDeps(),
+        'app-1',
+      );
+
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored.canTalkDaemonCommands).toEqual(['/status', '/help']);
+      expect((bot.config as any).canTalkDaemonCommands).toEqual(['/status', '/help']);
     } finally {
       delete process.env.BOTS_CONFIG;
       rmSync(dir, { recursive: true, force: true });
@@ -1034,6 +1083,7 @@ describe('handleCommand', () => {
     // tests (verified on vitest 4; resetAllMocks is what restores factory
     // impls). Every mock that tests override must therefore be restored to
     // its default here, or the last override leaks into subsequent tests.
+    vi.mocked(readGlobalConfig).mockReturnValue({});
     vi.mocked(repoPickerScanOptions).mockReturnValue({ includeWorktrees: true });
     vi.mocked(findOncallChat).mockReturnValue(undefined);
     vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
@@ -1788,6 +1838,8 @@ describe('handleCommand', () => {
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'Native 同步' });
       expect(killWorker).not.toHaveBeenCalled();
       expect(ds.session.title).toBe('Native 同步');
+      expect(ds.session.nativeSessionTitle).toBe('Native 同步');
+      expect(ds.session.nativeSessionTitleUserDefined).toBe(true);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('已向 codex 发送原生改名请求');
     });
@@ -3008,6 +3060,41 @@ describe('handleCommand', () => {
       expect(replyArgs[1] as string).toContain('adopt-select');
     });
 
+    it('should not adopt a managed Herdr agent that already has an active owner', async () => {
+      vi.mocked(discoverAdoptableSessions).mockReturnValue([
+        {
+          source: 'herdr',
+          herdrSessionName: 'botmux',
+          herdrTarget: 'w1:p1',
+          herdrPaneId: 'w1:p1',
+          herdrAgentName: 'botmux-owned',
+          cliId: 'claude-code',
+          cwd: '/home/testuser/projectA',
+          paneCols: 200,
+          paneRows: 50,
+        },
+      ]);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const owner = makeDaemonSession({
+        session: makeSession({
+          sessionId: 'owned-session',
+          status: 'active',
+          persistentBackendTarget: {
+            backendType: 'herdr',
+            sessionName: 'botmux',
+            agentName: 'botmux-owned',
+          },
+        }),
+      });
+      deps.activeSessions.set('owned-session', owner);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt botmux:w1:p1'), deps, LARK_APP_ID);
+
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toMatch(/未发现|未找到/);
+    });
+
     it('should list Codex App threads instead of scanning tmux for codex-app bots', async () => {
       mockCodexAppBot();
       vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
@@ -3230,6 +3317,56 @@ describe('handleCommand', () => {
       const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(reply).toContain('My Project');
       expect(reply).toContain('oc_new_group');
+    });
+
+    it('applies the configured global prefix to /group and reports the final name', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: '[AI] ' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/group', ROOT_ID, makeLarkMessage('/group My Project'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].name).toBe('[AI] My Project');
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('[AI] My Project');
+    });
+
+    it('applies the configured global prefix through the /g alias', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].name).toBe('AI讨论·Project');
+    });
+
+    it('does not duplicate a prefix already present in the requested name', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/group', ROOT_ID, makeLarkMessage('/group AI讨论·Project'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].name).toBe('AI讨论·Project');
+    });
+
+    it('prefixes the existing timestamp fallback when /group has no name', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/group', ROOT_ID, makeLarkMessage('/group'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].name).toMatch(/^AI讨论·新会话 \d{2}\/\d{2} \d{2}:\d{2}$/);
+    });
+
+    it('keeps the legacy UTF-16 limit without splitting emoji', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/group', ROOT_ID, makeLarkMessage(`/group ${'😀'.repeat(60)}`), deps, LARK_APP_ID);
+
+      const name = mockedCreate.mock.calls[0][0].name!;
+      expect(name.length).toBeLessThanOrEqual(51);
+      expect(name).toBe(`AI讨论·${'😀'.repeat(22)}…`);
+      expect(name).not.toContain('\uFFFD');
     });
 
     it('passes /group --role-profile through and strips it from the group name', async () => {
@@ -3813,6 +3950,9 @@ describe('handleCommand', () => {
     // bot itself is the sole participant. New group = user + this bot; the DM
     // session migrates over with no peer coordination.
     it('p2p --create: solo relay without mentions — group is user + this bot, session migrates', async () => {
+      // The global prefix is deliberately scoped to /group; relay names must
+      // remain untouched even when the setting is enabled.
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
       const ds = makeDaemonSession({
         session: makeSession({ ownerOpenId: 'ou_sender', chatType: 'p2p' }),
         chatType: 'p2p',
@@ -3825,6 +3965,7 @@ describe('handleCommand', () => {
       expect(mockedCreate).toHaveBeenCalledTimes(1);
       const opts = mockedCreate.mock.calls[0][0];
       expect(opts.larkAppIds).toEqual([LARK_APP_ID]);
+      expect(opts.name).toBe('搬去群里');
       expect(opts.userOpenIds).toEqual(['ou_sender']);
       expect(opts.transferOwnerTo).toBe('ou_sender');
 

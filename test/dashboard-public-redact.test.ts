@@ -4,6 +4,7 @@ import {
   redactSchedulesForPublic,
   redactSessionEventForPublic,
   redactSessionsForPublic,
+  redactSettingsForPublic,
 } from '../src/dashboard/public-redact.js';
 
 // A representative slice of the /api/groups `chats` payload that dashboard.ts
@@ -166,5 +167,58 @@ describe('session presentation redaction', () => {
     const updated = redactSessionEventForPublic('session.update', updateBody) as any;
     expect(updated.patch).toEqual({ repoName: 'customer-a' });
     expect(updateBody.patch.gitBranch).toBe('issue/CUSTOMER-456');
+  });
+});
+
+describe('redactSettingsForPublic', () => {
+  it('removes the complete notifier snapshot from tokenless settings', () => {
+    const settings = {
+      publicReadOnly: true,
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: 'cli_codex',
+        notifyWhen: 'always',
+        platformSupported: true,
+        hookInstalled: true,
+        botOptions: [{
+          larkAppId: 'cli_codex',
+          botName: 'Codex',
+          cliId: 'codex',
+          recipientConfigured: true,
+          recipientVerified: true,
+          recipientHint: 'a***@example.com',
+          futureSecret: 'private',
+        }],
+        targetDaemonOnline: true,
+        pendingCount: 1,
+        workerHeartbeatAt: '2026-07-24T01:02:03.000Z',
+        workerOnline: true,
+        lastError: {
+          at: '2026-07-24T01:00:00.000Z',
+          message: 'failed to read /Users/alice/private-repo',
+          retryAt: '2026-07-24T01:01:00.000Z',
+        },
+        futureSecret: 'private',
+      },
+    };
+
+    const out = redactSettingsForPublic(settings) as any;
+
+    expect(out.publicReadOnly).toBe(true);
+    expect(out.codexNotifier).toBeUndefined();
+    expect(JSON.stringify(out)).not.toContain('a***@example.com');
+    expect(JSON.stringify(out)).not.toContain('cli_codex');
+    expect(JSON.stringify(out)).not.toContain('/Users/alice/private-repo');
+    expect(settings.codexNotifier.botOptions[0].recipientHint).toBe('a***@example.com');
+    expect(settings.codexNotifier.lastError).not.toBeNull();
+  });
+
+  it('tolerates missing or malformed settings shapes', () => {
+    expect(redactSettingsForPublic(null)).toBeNull();
+    expect(redactSettingsForPublic({ publicReadOnly: true })).toEqual({ publicReadOnly: true });
+    expect(redactSettingsForPublic({ codexNotifier: 'private malformed value' })).toEqual({});
+    expect(redactSettingsForPublic({
+      codexNotifier: { botOptions: ['private malformed option'] },
+    })).toEqual({});
   });
 });

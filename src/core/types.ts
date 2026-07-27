@@ -72,6 +72,12 @@ export interface DaemonSession {
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
+   *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
+   *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机
+   *  其他用户直接读到（绕过 dashboard cookie + loopback-HMAC）。worker 每次 ready
+   *  都会重报，daemon 重启后自愈。仅有写权限的 dashboard 视图经 spawn-command 接口取。 */
+  spawnCommand?: string;
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
   /** One in-memory owner is preparing the pending repo's first worker. Kept
    *  separate from worktreeCreating because plain select, skip, and /repo can
@@ -158,6 +164,12 @@ export interface DaemonSession {
    *  Entries outlive turn_terminal briefly to cover trailing worker events and
    *  are pruned by age/size when new silent turns are armed. */
   silentScheduledTurns?: Map<string, number>;
+  /** Turn-exact ids for loud external triggers whose connector opted into
+   *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
+   *  (the streaming card / start notice still show); keyed on the trigger turn
+   *  id so a normal user turn on the same session is unaffected. Bounded +
+   *  age-pruned like silentScheduledTurns. */
+  suppressedTriggerFinalTurns?: Map<string, number>;
   /** Session-scoped override: when true, the streaming card is posted/patched
    *  even if the bot has `disableStreamingCard` set. Flipped on by the `/card`
    *  command so a user can manually summon a live card in an otherwise-quiet
@@ -228,6 +240,33 @@ export interface DaemonSession {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
+  /** turnId of the last stuck_warning posted — dedup so we don't spam the
+   *  thread with repeated warnings for the same unresolved turn. */
+  stuckWarningTurnId?: string;
+  /** message_id of the stuck_warning interactive card (if active) */
+  stuckWarningCardId?: string;
+  /** Daemon-side monotonic counter for stuck_warning nonces. NEVER cleared —
+   *  even when the active warning authority is dropped, the counter keeps
+   *  climbing so a late POST result / ACK from a previous warning (nonce=N)
+   *  can never match a newer warning that happened to reuse N after a clear.
+   *  stuckWarningNonce (below) is the active warning's nonce and may clear. */
+  stuckWarningNonceCounter?: number;
+  /** Daemon-side monotonic nonce for the active stuck_warning. Bumped on every
+   *  new warning so a late POST result or stale card click from a previous
+   *  warning (or a previous worker generation) cannot resurrect authority. */
+  stuckWarningNonce?: number;
+  /** Page type of the active stuck-warning card ('hook review level 1' or
+   *  'hook review level 2') — forwarded to the worker on card click so it can
+   *  re-verify the current screen before injecting keys. */
+  stuckWarningPageType?: string;
+  /** When true, a card click has been dispatched to the worker and we are
+   *  waiting for the tui_keys_delivered / stuck_warning_expired ACK. Blocks
+   *  duplicate clicks from injecting keys twice. */
+  stuckWarningProcessing?: boolean;
+  /** Worker's cliLifetimeNonce at the time the stuck_warning was posted.
+   *  Forwarded back to the worker in tui_keys so it can verify the backend
+   *  hasn't been replaced within the same worker process. */
+  stuckWarningCliLifetime?: number;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;

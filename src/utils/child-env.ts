@@ -19,6 +19,17 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'GITHUB_TOKEN',
   'GH_TOKEN',
   'CLAUDECODE',
+  // Parent-tmux client vars: when the daemon itself was started inside a tmux
+  // session, process.env carries TMUX (server socket path) + TMUX_PANE. Leaking
+  // these into a spawned CLI makes tmux-aware tools (codex integrates with tmux)
+  // try to talk to the daemon's PARENT tmux server — which does not exist inside
+  // the file sandbox (fresh /tmp tmpfs), so the connect() ENOENTs and the CLI
+  // aborts with "No such file or directory (os error 2)". The tmux/tmux-pipe
+  // backends already strip these for their OWN pane launch via tmuxEnv(), but the
+  // sandbox path injects childEnv straight into the pane's env(1), so strip at
+  // the source. Non-tmux CLIs are unaffected (they don't read TMUX).
+  'TMUX',
+  'TMUX_PANE',
 ] as const;
 
 /**
@@ -107,6 +118,11 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_OWNER_OPEN_ID',
   'BOTMUX_TURN_ID',
   'BOTMUX_DISPATCH_ATTEMPT',
+  // Resolved display footer for sandboxed `botmux send`; avoids reading the
+  // credential-bearing bots.json from inside the child.
+  'BOTMUX_BRAND_LABEL',
+  // Pi deferred long-first-prompt extension reads one exact per-session file.
+  'BOTMUX_PI_INITIAL_PROMPT_FILE',
   // Loopback port of the owning daemon's agent-facing IPC. Read-isolated CLIs
   // (whose daemon discovery dir is Seatbelt-denied) need it to reach the
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).
@@ -131,7 +147,8 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
 /** Proxy env vars that must reach the CLI child process so it can dial the
  *  upstream API on hosts without direct internet access. Forwarded explicitly
  *  by buildBotmuxEnvAssignments (tmux/tmux-pipe/zellij backends) and
- *  prepareSandbox (bwrap); the pty backend inherits them via the full child env.
+ *  prepareDirectSandbox (bwrap --setenv); the pty backend inherits them via the
+ *  full child env.
  *  Deliberately NOT in BOTMUX_INJECTED_ENV_KEYS: that list drives tmuxEnv()
  *  stripping and scrubTmuxServerGlobalEnv() cleanup — adding proxy keys there
  *  would delete the user's own tmux server proxy config. */
