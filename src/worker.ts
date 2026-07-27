@@ -227,7 +227,7 @@ import {
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
 import { detectCliUsageLimit, usageLimitStateKey, structuredRateLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
-import { redactChildEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { decideSubmitConfirmationAction, type SubmitActivityEvidence } from './services/submit-confirmation.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
 import * as sessionStore from './services/session-store.js';
@@ -268,6 +268,12 @@ import { CodexRpcEngine } from './codex-rpc-engine.js';
 // default (~/.claude relocates Claude's state file → onboarding rerun) and
 // why GROK_HOME is exempt.
 scrubSessionCliHomeEnv(process.env);
+// Claude session-identity markers ride the same restart-from-a-session vector
+// and this process's env seeds childEnv AND the tmux client env — a marker
+// that survives to the first `tmux new-session` gets copied into the shared
+// server's global env and flips transcript saving off for every pane (see
+// CLAUDE_SESSION_MARKER_ENV_KEYS).
+scrubClaudeSessionMarkerEnv(process.env);
 
 // ─── State ───────────────────────────────────────────────────────────────────
 

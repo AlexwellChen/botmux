@@ -77,7 +77,7 @@ import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interac
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
-import { scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
@@ -243,6 +243,10 @@ function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
   // stale dumps (see SESSION_CLI_HOME_ENV_KEYS for the full story, including
   // why GROK_HOME is exempt and why deleting beats pinning a default).
   scrubSessionCliHomeEnv(env);
+  // Claude session markers ride the same pm2 env-persistence vector; baked in
+  // they eventually flip transcript saving off fleet-wide once the tmux server
+  // respawns from a poisoned daemon (see CLAUDE_SESSION_MARKER_ENV_KEYS).
+  scrubClaudeSessionMarkerEnv(env);
   return env;
 }
 
