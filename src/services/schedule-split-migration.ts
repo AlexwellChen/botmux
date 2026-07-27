@@ -16,11 +16,21 @@
  * and re-checks existence inside it, so exactly one daemon performs the split
  * and the rest see the file already gone (renamed to `schedules.json.bak-split-v1`).
  *
- * Routing: each task goes to its `larkAppId` owner's store; tasks with no
- * `larkAppId` (or an appId not in bots.json) go to the PRIMARY bot (index 0) —
- * the same fallback the scheduler's owner filter has always used for legacy
- * ownerless tasks. Id conflicts with an existing per-bot entry keep the
- * existing entry (the per-bot store is newer by definition) and are logged.
+ * Routing (per task):
+ *   - OWNERLESS (no `larkAppId`)        → PRIMARY bot's store, kept ownerless.
+ *       The scheduler runs ownerless tasks on the primary daemon (bot-0) — the
+ *       exact pre-split behaviour. The appId is NOT stamped on.
+ *   - owner IS in bots.json             → that owner's own BOT_HOME store.
+ *   - owner well-formed but NOT in       → that owner's own (dormant) store, NOT
+ *     bots.json (removed / config drift)   primary. Folding it into primary would
+ *       either strand it (primary's owner filter rejects a foreign appId) or, if
+ *       stripped, run it under the wrong bot identity; its own store keeps it
+ *       verbatim so it reappears intact if the bot is re-added (codex #611 f1).
+ *   - owner is an UNSAFE appId (cannot   → fail-safe: abort the split before any
+ *     be a path segment)                   import, leave the legacy file for a
+ *       human. Never silently drop the row.
+ * Id conflicts with an existing per-bot entry keep the existing entry (the
+ * per-bot store is newer by definition) and are logged.
  *
  * Downgrade: the pre-split file survives verbatim as `*.bak-split-v1`; an
  * older build can be restored by renaming it back (documented in the PR).
@@ -32,6 +42,7 @@ import { join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { assertSafeAppId } from '../adapters/cli/read-isolation.js';
 import * as scheduleStore from './schedule-store.js';
 import type { ScheduledTask } from '../types.js';
 
@@ -68,7 +79,39 @@ export function migrateSharedSchedulesAtStartup(
       const byBot = new Map<string, Array<[string, ScheduledTask]>>();
       for (const [id, task] of Object.entries(raw as Record<string, ScheduledTask>)) {
         if (!task || typeof task !== 'object') continue;
-        const owner = task.larkAppId && known.has(task.larkAppId) ? task.larkAppId : primaryAppId;
+        let owner: string;
+        if (!task.larkAppId) {
+          // Truly OWNERLESS legacy task → primary's store, kept ownerless. The
+          // scheduler runs an ownerless task on the primary daemon (bot-0), which
+          // is exactly the pre-split behaviour. Do NOT stamp primary's appId — that
+          // would pin it away from the legacy ownerless semantics.
+          owner = primaryAppId;
+        } else if (known.has(task.larkAppId)) {
+          // Configured owner → its own BOT_HOME store.
+          owner = task.larkAppId;
+        } else {
+          // Well-formed appId that is NOT currently in bots.json (bot removed, or
+          // config drift): route to ITS OWN store, not primary. Folding it into
+          // primary either strands it (primary's owner filter rejects a foreign
+          // appId — codex #611 finding 1) or, if we stripped the appId, would run
+          // it under the WRONG bot identity. Its own dormant store preserves the
+          // task verbatim so it reappears intact if that bot is re-added later.
+          //
+          // An unsafe appId cannot be a path segment (`scheduleFilePathFor` →
+          // `assertSafeAppId` would throw). Fail-safe: abort the whole split with
+          // NO import performed yet (imports happen after this loop), leaving the
+          // legacy file untouched for a human — never silently drop the row.
+          try {
+            assertSafeAppId(task.larkAppId);
+          } catch {
+            logger.error(
+              `[schedule-split] task ${id} has an unsafe larkAppId ${JSON.stringify(task.larkAppId)}; ` +
+              'split aborted, legacy schedules.json preserved for manual resolution',
+            );
+            return;
+          }
+          owner = task.larkAppId;
+        }
         let bucket = byBot.get(owner);
         if (!bucket) { bucket = []; byBot.set(owner, bucket); }
         bucket.push([id, task]);

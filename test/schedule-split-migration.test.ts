@@ -69,23 +69,51 @@ afterEach(() => {
 });
 
 describe('migrateSharedSchedulesAtStartup', () => {
-  it('splits tasks into each owner bot store; ownerless and unknown owners go to primary', async () => {
+  it('routes by owner: ownerless→primary (kept ownerless), configured→own store, unconfigured-but-safe→own dormant store', async () => {
+    const UNCONFIGURED = 'cli_unconfigured009'; // safe appId, NOT in bots.json
     writeFileSync(legacyFp(), JSON.stringify({
       a: legacyTask('a', PRIMARY),
       b: legacyTask('b', OTHER),
-      c: legacyTask('c'),                       // ownerless → primary
-      d: legacyTask('d', 'cli_unknown0000009'), // not in bots.json → primary
+      c: legacyTask('c'),                     // ownerless → primary, stays ownerless
+      d: legacyTask('d', UNCONFIGURED),       // safe but not configured → its OWN store (not primary)
     }));
 
     const { migration } = await freshImport();
     migration.migrateSharedSchedulesAtStartup([PRIMARY, OTHER], PRIMARY);
 
-    expect(Object.keys(readStore(PRIMARY)).sort()).toEqual(['a', 'c', 'd']);
+    // Ownerless 'c' lands in primary and STAYS ownerless (so the primary daemon's
+    // owner filter runs it — stamping primary's appId would break that).
+    expect(Object.keys(readStore(PRIMARY)).sort()).toEqual(['a', 'c']);
+    expect(readStore(PRIMARY).c.larkAppId).toBeUndefined();
+    expect(readStore(PRIMARY).a.larkAppId).toBe(PRIMARY);
     expect(Object.keys(readStore(OTHER))).toEqual(['b']);
+    // 'd' goes to its OWN store keeping its appId — NOT folded into primary. This
+    // is codex #611 finding 1: folding it into primary either strands it (foreign
+    // appId fails primary's filter) or runs it under the wrong identity. Its own
+    // dormant store keeps it intact until that bot is (re-)configured.
+    expect(Object.keys(readStore(UNCONFIGURED))).toEqual(['d']);
+    expect(readStore(UNCONFIGURED).d.larkAppId).toBe(UNCONFIGURED);
     // Legacy file renamed to backup, verbatim.
     expect(existsSync(legacyFp())).toBe(false);
     const bak = JSON.parse(readFileSync(`${legacyFp()}.bak-split-v1`, 'utf-8'));
     expect(Object.keys(bak).sort()).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  it('fail-safe on an unsafe larkAppId: aborts the split with no import, legacy file preserved', async () => {
+    // A path-traversal appId cannot be a store path segment. The split must abort
+    // BEFORE any import (imports happen after the routing loop) rather than throw
+    // mid-way or silently drop the row — leave everything for a human.
+    writeFileSync(legacyFp(), JSON.stringify({
+      a: legacyTask('a', PRIMARY),
+      evil: legacyTask('evil', '../../etc'),
+    }));
+    const { migration } = await freshImport();
+    migration.migrateSharedSchedulesAtStartup([PRIMARY], PRIMARY);
+
+    // Legacy left in place, no backup, no partial per-bot store written.
+    expect(existsSync(legacyFp())).toBe(true);
+    expect(existsSync(`${legacyFp()}.bak-split-v1`)).toBe(false);
+    expect(existsSync(storeFp(PRIMARY))).toBe(false);
   });
 
   it('is idempotent — second run is a no-op', async () => {
