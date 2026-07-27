@@ -5250,13 +5250,24 @@ function markPromptReady(): void {
     persistCodexRunnerBuildOnReady = false;
   }
   if (activeRestartAttemptId) {
-    send({
-      type: 'restart_result',
-      attemptId: activeRestartAttemptId,
-      status: 'succeeded',
-      category: 'prompt_ready',
-    });
-    activeRestartAttemptId = undefined;
+    // Defense in depth: only report a successful restart when a replacement
+    // backend is actually installed. Every legitimate ready path assigns
+    // `backend` before firing (spawnCli sets it, then idle/PTY callbacks run);
+    // a stray callback that reached here with no backend (e.g. a late stale
+    // generation slipping through a future gate change) must NOT claim success
+    // and consume the attempt id — leave it for the real replacement or the
+    // coordinator timeout.
+    if (backend) {
+      send({
+        type: 'restart_result',
+        attemptId: activeRestartAttemptId,
+        status: 'succeeded',
+        category: 'prompt_ready',
+      });
+      activeRestartAttemptId = undefined;
+    } else {
+      log('prompt-ready with no backend installed — deferring restart success receipt');
+    }
   }
   // Send immediate idle snapshot so Lark card reflects idle status.
   // BUT: skip when messages are pending — flushPending() will immediately
@@ -8245,6 +8256,15 @@ async function spawnCli(
   // prompt-ready — without this hook a follow-up arriving mid-task would sit
   // in pendingMessages forever once the task finishes.
   backend.onTaskDone?.(() => {
+    // Generation fence (matches the onAgentStatus above and the onExit below):
+    // a stale RiffBackend's `fetchAndEmitOutput(...).finally(taskDoneCb)` can
+    // resolve AFTER destroySession()/kill() during a restart (neither clears
+    // taskDoneCb nor awaits the in-flight fetch). If that late callback reached
+    // markPromptReady() while a replacement is spawning, it would ride through
+    // the global restart gate and emit a premature `restart_result: succeeded`,
+    // swallowing the replacement's true terminal outcome. Only the current
+    // backend generation may re-arm prompt-ready.
+    if (backend !== observedBackend) return;
     log(`${cliName()} task finished — re-arming prompt-ready for queued follow-ups`);
     markPromptReady();
   });

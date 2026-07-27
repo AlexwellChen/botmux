@@ -37,7 +37,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
@@ -1368,6 +1368,97 @@ export function killWorker(ds: DaemonSession): void {
   ds.workerViewToken = null;
 }
 
+/**
+ * Whether a worker-less restart must first destroy the session's persistent
+ * backing pane. Adopt sessions are excluded — botmux never owned the user's
+ * pane, so killing it would violate the bridge invariant. Pure so the
+ * adopt-skip decision is unit-testable without spawning a worker.
+ */
+export function shouldDestroyPaneBeforeRestart(
+  ds: Pick<DaemonSession, 'initConfig' | 'adoptedFrom'>,
+): boolean {
+  return !ds.initConfig?.adoptMode && !ds.adoptedFrom;
+}
+
+/**
+ * Destroy a still-alive persistent backing pane (tmux/herdr/zellij) before a
+ * worker-less restart forks a fresh worker. Without this, a session that lost
+ * its worker but kept its pane (the normal post-daemon-restart state) would let
+ * spawnCli REATTACH the surviving CLI instead of relaunching it — the CLI is
+ * never actually restarted, yet prompt-ready still fires `restart_result:
+ * succeeded`, so the user sees "restarted" while a wedged CLI stays wedged.
+ * Killing the pane first forces a genuine physical fresh spawn, making the
+ * success receipt truthful.
+ *
+ * Fail-safe (codex 复审观察): the kill primitives swallow their own failures
+ * (TmuxBackend.killSession `catch {}`, Herdr `runHerdr` returns false), so a
+ * plain try/catch here can NEVER observe a failed kill — a wedged tmux server
+ * could leave the pane alive and the fork would silently reattach. So we PROBE
+ * after killing and retry once if the pane survives, escalating to a loud warn
+ * when it still exists. A surviving pane still forks (refusing would strand the
+ * session with no restart at all, strictly worse than the original bug), but
+ * the warn makes the rare failure diagnosable instead of a silent false
+ * success. A fully reattach-proof path (forceFresh signal into spawnCli) is a
+ * larger, separate change — tracked as a follow-up, not blocking this fix.
+ *
+ * Scope: persistent panes only (getSessionPersistentBackendType excludes riff,
+ * which never reattaches — it always builds a fresh RiffBackend — and whose
+ * remote task must survive a restart to preserve follow-up lineage). Adopt
+ * sessions are skipped: botmux never owned the user's pane.
+ */
+function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
+  if (!shouldDestroyPaneBeforeRestart(ds)) return;
+  const target = persistentBackendTargetForSession(ds);
+  if (!target) return;
+
+  const killOnce = (): void => {
+    try {
+      killPersistentBackendTarget(target);
+    } catch (err) {
+      // The primitives normally swallow their own errors; this only catches a
+      // truly unexpected throw (e.g. target resolution). Non-fatal — the probe
+      // below is the real signal.
+      logger.warn(`[${tag(ds)}] restart: kill of ${target.backendType} pane threw: ${err}`);
+    }
+  };
+
+  killOnce();
+  // Advance a single probe result monotonically through the real retry path so
+  // an 'unknown' first probe is never mislabelled as a post-retry survivor:
+  //  - 'missing' → gone, fork is genuinely fresh.
+  //  - 'unknown' → probe indeterminate (e.g. tmux server hiccup); do NOT retry
+  //    and do NOT block the restart — pre-fix always forked, stranding is worse.
+  //  - 'exists'  → confirmed alive: warn, kill once more, re-probe. Only this
+  //    branch performs (and can report) a retry.
+  let probe = probePersistentBackendTarget(target);
+  if (probe === 'exists') {
+    logger.warn(`[${tag(ds)}] restart: ${target.backendType} pane survived first kill — retrying before refork`);
+    killOnce();
+    probe = probePersistentBackendTarget(target);
+  }
+  if (probe === 'exists') {
+    // The kill genuinely failed (twice). Forking will likely reattach the live
+    // pane (the very bug this guards), so the eventual `restart_result:
+    // succeeded` may again be untruthful — but leave a loud, greppable trail.
+    logger.error(
+      `[${tag(ds)}] restart: ${target.backendType} pane STILL alive after retry — `
+      + 'the refork may reattach instead of relaunching (restart success may be untruthful)',
+    );
+  } else if (probe === 'unknown') {
+    // Do NOT over-promise a relaunch: an indeterminate probe could still be a
+    // live pane the fork reattaches. Fork proceeds (stranding is worse) but the
+    // diagnostic must not claim a fresh relaunch it can't guarantee.
+    logger.warn(
+      `[${tag(ds)}] restart: ${target.backendType} kill outcome indeterminate — `
+      + 'refork may reattach instead of relaunching',
+    );
+  } else {
+    logger.info(
+      `[${tag(ds)}] restart: ${target.backendType} pane missing after kill — CLI will physically relaunch`,
+    );
+  }
+}
+
 /** Join or start one correlated physical restart for a session. */
 export function requestSessionRestart(
   ds: DaemonSession,
@@ -1378,6 +1469,11 @@ export function requestSessionRestart(
       ds.worker.send({ type: 'restart', attemptId } as DaemonToWorker);
       return;
     }
+    // No live worker but the persistent pane may still be alive (e.g. after a
+    // daemon restart). Tear it down first so forkWorker → spawnCli spawns a
+    // fresh CLI instead of reattaching the old one and falsely reporting a
+    // successful restart.
+    destroyLivePaneBeforeRestart(ds);
     forkWorker(ds, '', {
       resume: ds.hasHistory,
       restartAttemptId: attemptId,
