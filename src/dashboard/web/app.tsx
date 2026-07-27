@@ -29,6 +29,10 @@ import { InfoTip } from './dashboard-components.js';
 import { initFloatingScrollbars } from './floating-scrollbars.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 import { updateAndRestartBotmux, type BotmuxUpdatePhase } from './update-action.js';
+import {
+  dashboardClientShellRedirect,
+  readDashboardClientShell,
+} from './client-shell.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -193,13 +197,16 @@ function isActiveNav(item: NavItem, hash: string): boolean {
 }
 
 function sidebarNavItems(): NavItem[] {
-  if (pinnedPluginNavItems.length === 0) return NAV_ITEMS;
-  const pluginIndex = NAV_ITEMS.findIndex(item => item.id === 'plugins');
-  if (pluginIndex < 0) return [...NAV_ITEMS, ...pinnedPluginNavItems];
+  const builtInItems = readDashboardClientShell()
+    ? NAV_ITEMS.filter(item => item.id !== 'workflows')
+    : NAV_ITEMS;
+  if (pinnedPluginNavItems.length === 0) return builtInItems;
+  const pluginIndex = builtInItems.findIndex(item => item.id === 'plugins');
+  if (pluginIndex < 0) return [...builtInItems, ...pinnedPluginNavItems];
   return [
-    ...NAV_ITEMS.slice(0, pluginIndex + 1),
+    ...builtInItems.slice(0, pluginIndex + 1),
     ...pinnedPluginNavItems,
-    ...NAV_ITEMS.slice(pluginIndex + 1),
+    ...builtInItems.slice(pluginIndex + 1),
   ];
 }
 
@@ -1270,6 +1277,11 @@ async function route(): Promise<void> {
   activeHash = hash;
   renderShell();
 
+  const clientShellRedirect = dashboardClientShellRedirect(hash);
+  if (clientShellRedirect) {
+    window.location.replace(clientShellRedirect);
+    return;
+  }
   if (!isAuthed && MANAGE_ROUTES.some(r => hash.startsWith('#/' + r))) {
     renderAuthRequiredPage(getRouteRoot());
     routeState.rerenderOnUiChange = true;
