@@ -484,7 +484,7 @@ import { existsSync, statSync, readFileSync, mkdirSync, mkdtempSync, rmSync, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { codexHome } from '../src/services/codex-paths.js';
-import { scanMultipleProjects } from '../src/services/project-scanner.js';
+import { scanMultipleProjects, describeProjectDir } from '../src/services/project-scanner.js';
 import { readGlobalConfig, repoPickerScanOptions } from '../src/global-config.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
@@ -2025,14 +2025,13 @@ describe('handleCommand', () => {
 
     it('should resolve a first-level project name and switch repo (mid-session)', async () => {
       vi.mocked(existsSync).mockReturnValue(true);
-      vi.mocked(scanMultipleProjects).mockReturnValue([
-        { name: 'payments', path: '/home/testuser/payments', branch: 'main' },
-      ]);
+      vi.mocked(describeProjectDir).mockReturnValueOnce({ name: 'payments', branch: 'main' });
       const ds = makeDaemonSession({ pendingRepo: false, repoCardMessageId: 'om_card' });
       const deps = makeDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo payments'), deps, LARK_APP_ID);
 
+      expect(scanMultipleProjects).not.toHaveBeenCalled();
       expect(ds.workingDir).toBe('/home/testuser/payments');
       expect(sessionStore.createSession).toHaveBeenCalledWith(
         CHAT_ID, ROOT_ID, 'payments (main)', 'group', undefined,
