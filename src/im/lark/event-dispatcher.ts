@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
@@ -1336,6 +1336,33 @@ export function canOperate(
 }
 
 /**
+ * Daemon 命令统一闸：canOperate 恒放行；此外，bot 配置的 `canTalkDaemonCommands`
+ * 名单内的命令降到 canTalk 判定（oncall / allowedChatGroup / grant / p2pOpen 等
+ * 对话放行腿命中即可）。名单外或未配置 → 与 canOperate 完全等价（现状不变）。
+ *
+ * 只作用于 daemon.ts 两条路由的 DAEMON_COMMANDS 统一闸；在统一闸之前特判的命令
+ * （/vc-auth /term）与 handler 内部自带 owner 闸的命令（/card /insight /land）
+ * 不受影响——内部闸仍是最终权威（fail-closed）。
+ *
+ * chatType 省略时 p2pOpen 腿不生效（fail-closed），与 canTalk 语义一致——
+ * 私聊路径的调用点必须把 chatType 传进来。
+ */
+export function canRunDaemonCommand(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  senderUnionId: string | undefined,
+  cmd: string,
+  memberUnionId?: string | undefined,
+  chatType?: 'p2p' | 'group',
+): boolean {
+  if (canOperate(larkAppId, chatId, senderOpenId, senderUnionId)) return true;
+  const list = getBot(larkAppId).config.canTalkDaemonCommands;
+  if (!list?.includes(cmd)) return false;
+  return canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+}
+
+/**
  * 入口 A：无权限者 @bot 时弹授权申请卡（正文 @owner，由 owner 处置）。
  * 受 grant-pending 节流：pending 中 / deny 冷却期内静默不发。开放模式（无 owner）兜底不发。
  */
@@ -2303,8 +2330,32 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               && !isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
               && !hasChatGrant(larkAppId, chatId, senderOpenId)
               && !hasGlobalGrant(larkAppId, senderOpenId)) {
-            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
-            return;
+            // Cold-start self-heal: the cross-ref (bot-openids-<appId>.json) is
+            // learned lazily from observed mentions[], so the FIRST bot→bot
+            // direct @ from a same-deployment sibling can arrive before the
+            // receiver has learned that sibling's receiver-scoped open_id
+            // (Lark open_id is per-app). That raced a real sibling into this
+            // "unknown external bot" branch and mis-fired a /grant card
+            // (regression from ec146a49). Before deciding unknown, confirm the
+            // sender against the group's LIVE `/members/bots` roster: accept
+            // only when it binds to exactly one locally-configured sibling of
+            // the same unique name that independently confirms is_in_chat.
+            // Fails closed to the grant card on any API error / ambiguity /
+            // genuine external bot — never a name-only shortcut.
+            const sibling = await resolveSiblingBotBySenderOpenId(larkAppId, chatId, senderOpenId)
+              .catch((err): { ok: false; reason: string } => ({ ok: false, reason: `resolve_threw: ${err?.message ?? String(err)}` }));
+            if (sibling.ok) {
+              // Persist the newly-proven mapping so subsequent @s from this
+              // sibling hit isKnownPeerBot directly (no live API roundtrip).
+              updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, [
+                { name: sibling.botName, id: { open_id: sibling.senderOpenId } },
+              ]);
+              logger.info(`Lazy sibling cross-ref backfill: ${sibling.botName} → ${senderOpenId?.substring(0, 12)} (was cold; skipping /grant)`);
+            } else {
+              logger.info(`Foreign bot @mention not a known sibling (${sibling.reason}); sending grant request card`);
+              await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+              return;
+            }
           }
         }
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);

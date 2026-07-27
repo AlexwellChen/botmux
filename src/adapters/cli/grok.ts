@@ -90,7 +90,8 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *
  *  ## Sandbox
  *  `authPaths: [$GROK_HOME]` (directory) — grok keeps SQLite DBs there
- *  (session_search.sqlite, worktrees.db) which fail under overlayfs fcntl
+ *  (session_search.sqlite, worktrees.db); under the deny-by-default file sandbox
+ *  a path not in authPaths doesn't exist, so they'd be unreachable / lack fcntl
  *  locks.
  */
 export function createGrokAdapter(pathOverride?: string): CliAdapter {

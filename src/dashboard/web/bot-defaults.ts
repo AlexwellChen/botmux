@@ -51,6 +51,9 @@ export type BotDefaultsRow = {
   autoboundChatCount?: number;
   brandLabel?: string | null;
   sandbox?: boolean;
+  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
+   *  null/absent = none configured (pure deny-by-default baseline). */
+  sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
@@ -61,6 +64,7 @@ export type BotDefaultsRow = {
   codexAppCleanInput?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
+  overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   summaryRange?: { limit?: number; sinceHours?: number };
   p2pMode?: string;
@@ -73,6 +77,8 @@ export type BotDefaultsRow = {
   residentSessionCount?: number;
   dormantSessionCount?: number;
   startupCommands?: string;
+  customPassthroughCommands?: string;
+  canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;
   riff?: Record<string, unknown> | null;

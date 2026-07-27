@@ -17,6 +17,32 @@
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |
 | `/t <prompt>` `/topic <prompt>` | 普通群内强制开新话题 |
 
+## 💬 回复模式（`/reply-mode`）
+
+控制 bot 被 @ 触发时如何开会话。无参数（或 `status`）查看当前模式；带参数修改需 `canOperate`，仅查看需 `canTalk`。群聊中均需 @ 目标 bot 才生效，多 bot 群须 @ 到具体 bot。仅普通群与 1:1 私聊支持；话题群无需设置（本就是话题），命令会被拒绝。
+
+**私聊（1:1 DM）**——模式对该 bot 的**所有 DM 生效**（bot 级全局配置，非 per-chat），但不同用户与该 bot 的 DM 仍各自隔离会话、互不共享。只有 `chat` / `topic` 两态（`new-topic` 是 `topic` 的兼容别名）：
+
+| 命令 | 说明 |
+|------|------|
+| `/reply-mode` `/reply-mode status` | 查看当前私聊会话模式 |
+| `/reply-mode chat` | 每个 1:1 私聊内部扁平连续会话（同一 DM 的消息共用一个会话） |
+| `/reply-mode topic` `/reply-mode new-topic` | 每条**顶层** DM 开独立会话/线程（默认）；同一已有 thread 内的回复继续该 thread 会话 |
+
+`shared` / `chat-topic` 依赖群内原生话题，私聊不支持，会被拒绝。
+
+**普通群**——顶层 @ 的开会话方式（per-chat 覆盖，优先级高于 dashboard 默认值）：
+
+| 命令 | 说明 |
+|------|------|
+| `/reply-mode` `/reply-mode status` | 查看当前群回复模式 |
+| `/reply-mode chat` | 整群连续会话（顶层 @ 都进同一个会话） |
+| `/reply-mode chat-topic` | 顶层连续、原生话题各自独立会话 |
+| `/reply-mode new-topic` | 每次 @ 新建话题与独立会话 |
+| `/reply-mode topic` `/reply-mode shared` | 话题展示但共享同一会话（`topic` 是 `shared` 的兼容别名） |
+
+群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值。
+
 ## 🔀 透传给底层 CLI
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` —— 字面送达底层 CLI，交给它的内置命令处理。

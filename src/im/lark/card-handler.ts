@@ -9,13 +9,23 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard, buildRepoSelectCard } from './card-builder.js';
-import { computeSandboxDiff, applySandboxDiff } from '../../services/sandbox-land.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
 import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied, getPendingQuota, getPendingMessage } from './grant-pending.js';
+import { claimOverloadNonce, releaseOverloadNonce } from './overload-nonce.js';
+import {
+  buildOverloadAlertCard,
+  buildOverloadExpiredCard,
+  OVERLOAD_ACTION_CLEAN_STOPPED,
+  OVERLOAD_ACTION_SUSPEND_IDLE,
+  OVERLOAD_ACTION_NOOP,
+  type OverloadCardState,
+} from '../../core/host-overload-alert.js';
+import { listOnlineDaemons } from '../../utils/daemon-discovery.js';
+import { fetchDaemonIpc } from '../../core/daemon-ipc-auth.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import {
   handleV3GateAction,
@@ -104,6 +114,8 @@ export interface CardHandlerDeps {
   /** VC meeting invite/consumer card actions. Implemented in daemon to
    *  keep meeting sessions, tombstones, and listener-group state single-owned. */
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
+  /** Codex 完成通知卡动作。事件存储、App 打开和会话接管由 daemon 单点持有。 */
+  codexNotifierCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
 }
@@ -723,6 +735,86 @@ export async function runAutoWorktreeCommit(deps: {
 
 // ─── Main handler ─────────────────────────────────────────────────────────
 
+/**
+ * Drive a host-overload降压 sweep across daemons.
+ *
+ * `suspend_idle` fans out to EVERY online daemon and sums the affected counts —
+ * live workers only exist in their owning daemon's process, so each must sweep
+ * its own. `clean_stopped` operates on the SHARED, machine-wide session store,
+ * so ONE daemon does the whole job: it tries daemons in order until the first
+ * one succeeds (not a fixed `daemons[0]`, so a single flaky descriptor doesn't
+ * sink the action while healthy siblings sit idle). Fanning clean_stopped out
+ * would make siblings race the same zombies and double-count them.
+ *
+ * Throws when there are no online daemons, or when every attempt failed — so
+ * the caller rolls back the nonce instead of burning the button on an action
+ * that never ran. A partial success (≥1 daemon ok) returns normally.
+ */
+async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promise<number> {
+  const daemons = listOnlineDaemons();
+  if (daemons.length === 0) throw new Error(`sweep ${mode}: no online daemon`);
+
+  const postSweep = async (d: { ipcPort: number; larkAppId: string }): Promise<number | null> => {
+    try {
+      const res = await fetchDaemonIpc(d.ipcPort, '/api/host-overload/sweep', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      const body: any = await res.json().catch(() => ({}));
+      if (res.ok && body?.ok && typeof body.affected === 'number') return body.affected;
+      logger.warn(`[overload-sweep] daemon ${d.larkAppId} returned ${res.status} ${JSON.stringify(body)}`);
+      return null;
+    } catch (err) {
+      logger.warn(`[overload-sweep] daemon ${d.larkAppId} unreachable: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  };
+
+  if (mode === 'clean_stopped') {
+    // Machine-wide (shared store): try daemons in order, stop at the first
+    // success. Only if EVERY daemon failed do we throw (→ nonce rollback).
+    for (const d of daemons) {
+      const n = await postSweep(d);
+      if (n !== null) return n;
+    }
+    throw new Error(`sweep clean_stopped reached no daemon (${daemons.length} failed)`);
+  }
+
+  // suspend_idle: fan out to all daemons and sum. Throw only if not one acked.
+  let affected = 0;
+  let ok = 0;
+  const results = await Promise.all(daemons.map(postSweep));
+  for (const n of results) {
+    if (n !== null) { affected += n; ok++; }
+  }
+  if (ok === 0) throw new Error(`sweep suspend_idle reached no daemon (${daemons.length} failed)`);
+  return affected;
+}
+
+/**
+ * Machine-wide counts for the overload alert preview. `stopped` (zombies) reads
+ * the SHARED session store, so every daemon returns the same number → take the
+ * max (any one authoritative). `idle` live workers are per-owning-daemon → sum.
+ * Best-effort: an unreachable daemon just contributes 0.
+ */
+export async function countHostOverload(): Promise<{ stopped: number; idle: number }> {
+  const daemons = listOnlineDaemons();
+  let stopped = 0;
+  let idle = 0;
+  await Promise.all(daemons.map(async (d) => {
+    try {
+      const res = await fetchDaemonIpc(d.ipcPort, '/api/host-overload/counts', { method: 'GET' });
+      const body: any = await res.json().catch(() => ({}));
+      if (res.ok && body?.ok) {
+        if (typeof body.stopped === 'number') stopped = Math.max(stopped, body.stopped);
+        if (typeof body.idle === 'number') idle += body.idle;
+      }
+    } catch { /* unreachable daemon contributes 0 */ }
+  }));
+  return { stopped, idle };
+}
+
 export async function handleCardAction(data: CardActionData, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
   const { activeSessions, lastRepoScan } = deps;
   // turnId is forwarded only when the caller actually has a turn anchor
@@ -746,29 +838,57 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  // ─── 沙盒落盘卡（land_apply / land_discard）──────────────────────────────────
-  // 不绑 session（sessionId + workingDir 都在 value 里）。owner 强闸门：只有 owner 能把
-  // 隔离副本的改动应用回真实磁盘。agent 在沙盒里无感，不参与。
-  if (value?.action && (value.action === 'land_apply' || value.action === 'land_discard') && larkAppId) {
-    const loc = localeForBot(larkAppId);
+  // ─── 机器过载告警卡动作（overload_clean_stopped / overload_suspend_idle / noop）──
+  // 不绑 session。owner 强闸门 + nonce 一次性核销（每按钮各一次，防重复点/超时重投/旧卡）。
+  // 点完不替换成死卡：重建同一张卡，把点过的按钮标 done+数量并 disabled，另一个仍可点。
+  if (value?.action === OVERLOAD_ACTION_NOOP) {
+    // 已完成的按钮（disabled 兜底）——个别客户端仍会回调，给个 toast 不做任何事。
+    return { toast: { type: 'info', content: '该操作已执行过' } };
+  }
+  if (value?.action && (value.action === OVERLOAD_ACTION_CLEAN_STOPPED || value.action === OVERLOAD_ACTION_SUSPEND_IDLE) && larkAppId) {
     const owner = getOwnerOpenId(larkAppId);
     if (!operatorOpenId || operatorOpenId !== owner) {
-      logger.info(`Land action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
-      return { toast: { type: 'error', content: t('card.land.toast_owner_only', undefined, loc) } };
+      logger.info(`Overload action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
+      return { toast: { type: 'error', content: '仅管理员可操作' } };
     }
-    if (value.action === 'land_discard') {
-      return JSON.parse(buildLandResultCard('discarded', '', loc));
+    // Parse the card state carried on the button. Missing/corrupt → treat as a
+    // stale card (daemon restart drops the nonce too).
+    let st: OverloadCardState;
+    try { st = JSON.parse(value.st ?? ''); } catch { return JSON.parse(buildOverloadExpiredCard()); }
+    if (!st?.nonce) return JSON.parse(buildOverloadExpiredCard());
+    // One-shot per (nonce, action): the OTHER button on the same card stays
+    // clickable (different action), but this button can't re-fire.
+    if (!claimOverloadNonce(st.nonce, value.action)) {
+      return JSON.parse(buildOverloadExpiredCard('这个按钮已点过，或该告警卡已过期。'));
     }
-    const sid: string = value.sessionId;
-    const wd: string = value.workingDir;
-    if (!sid || !wd) return JSON.parse(buildLandResultCard('failed', t('card.land.stale', undefined, loc), loc));
-    const d = computeSandboxDiff(config.session.dataDir, sid, loc);
-    if (!d.ok) return JSON.parse(buildLandResultCard('failed', d.error, loc));
-    if (d.empty) return JSON.parse(buildLandResultCard('discarded', '', loc));
-    const a = applySandboxDiff(wd, config.session.dataDir, sid, loc);
-    if (!a.ok) return JSON.parse(buildLandResultCard('failed', a.error, loc));
-    logger.info(`Land applied: ${d.files} files (+${d.insertions}/-${d.deletions}) → ${wd}`);
-    return JSON.parse(buildLandResultCard('applied', t('card.land.applied_body', { files: d.files, ins: d.insertions, del: d.deletions, dir: wd }, loc), loc));
+    const mode = value.action === OVERLOAD_ACTION_CLEAN_STOPPED ? 'clean_stopped' : 'suspend_idle';
+    let affected: number;
+    try {
+      affected = await sweepHostOverload(mode);
+    } catch (err) {
+      logger.warn(`[overload] ${value.action} failed: ${err instanceof Error ? err.message : String(err)}`);
+      // Only the destructive sweep is guarded here: roll back the claim so a
+      // transient sweep failure doesn't permanently burn the button — the owner
+      // can click it again to retry. (The post-sweep count refresh below is
+      // deliberately outside this try: once the sweep has run, its failure must
+      // not re-open the button for a second destructive run.)
+      releaseOverloadNonce(st.nonce, value.action);
+      return { toast: { type: 'error', content: '执行失败，请稍后重试或用 CLI 手动处理' } };
+    }
+    if (mode === 'clean_stopped') st.cleanedN = affected; else st.suspendedN = affected;
+    // Refresh the machine-wide candidate counts so the still-live button and
+    // the header reflect what's left after this sweep. Best-effort: the sweep
+    // already succeeded, so a count failure must not roll back the nonce.
+    try {
+      const counts = await countHostOverload();
+      st.stopped = counts.stopped;
+      st.idle = counts.idle;
+    } catch (err) {
+      logger.warn(`[overload] post-sweep count refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    logger.info(`[overload] ${value.action} by owner ${operatorOpenId}: affected=${affected}, remaining stopped=${st.stopped} idle=${st.idle}`);
+    // Rebuild the SAME card: clicked button → ✓done+disabled, other → still live.
+    return JSON.parse(buildOverloadAlertCard(st));
   }
   // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny，talk-only）─────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
@@ -904,6 +1024,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data);
+  }
+
+  if (
+    (value?.action === 'codex_notifier_continue' || value?.action === 'codex_notifier_open_app')
+    && larkAppId
+  ) {
+    if (!operatorOpenId) {
+      logger.info(`${value.action} blocked because operator identity is missing`);
+      return { toast: { type: 'error', content: '只有机器人管理员可以操作此 Codex 任务' } };
+    }
+    if (!deps.codexNotifierCardAction) {
+      return { toast: { type: 'error', content: 'Codex 完成通知处理器未启用' } };
+    }
+    return deps.codexNotifierCardAction(data, larkAppId);
   }
 
   if (
@@ -1782,6 +1916,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'tui_keys' && ds) {
+      // Fail-closed: only act on a currently-active card (either the
+      // ScreenAnalyzer TUI prompt card or our stuck-warning card). A stale
+      // click from a resolved/replaced card must NOT send any IPC to the
+      // worker — the CLI may have moved on or recovered. PATCH is UI only,
+      // not an authorization check.
+      const isActiveTuiCard = !!ds.tuiPromptCardId && cardMessageId === ds.tuiPromptCardId;
+      const isActiveStuckCard = !!ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId;
+      if (!isActiveTuiCard && !isActiveStuckCard) {
+        logger.info(`[${tag(ds)}] tui_keys from stale card ${cardMessageId} — ignored (active tui=${ds.tuiPromptCardId ?? 'none'} stuck=${ds.stuckWarningCardId ?? 'none'})`);
+        return;
+      }
       let keys: string[] = [];
       try { keys = JSON.parse(value?.keys ?? '[]'); } catch { /* bad json */ }
       const isFinal = value?.is_final === '1';
@@ -1790,6 +1935,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
 
       if (optionType === 'toggle') {
+        // Only a ScreenAnalyzer TUI card may own toggle state. A stuck-warning
+        // card must never read or mutate the other card's global selections.
+        if (!isActiveTuiCard) {
+          logger.info(`[${tag(ds)}] Ignored toggle from non-TUI card ${cardMessageId}`);
+          return;
+        }
         // Toggle: only update card UI, do NOT send keys to terminal yet.
         // Keys will be sent in batch when confirm is clicked.
         if (!ds.tuiToggledIndices) ds.tuiToggledIndices = [];
@@ -1817,10 +1968,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return;
       }
 
-      // For confirm: batch all toggled options' keys first, then confirm keys
+      // For a normal TUI confirm: batch all toggled options' keys first.
+      // For a stuck-warning card: derive the single allowed key from the
+      // page type + selected index — NEVER trust value.keys from the card,
+      // which could be tampered to inject arbitrary keys. The allowlist is
+      // exactly the documented controls for each Codex hook-review screen.
       if (ds.worker) {
         let allKeys: string[] = [];
-        if (ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
+        let isFinalStuck = false;
+        if (isActiveTuiCard && ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
           // Send each toggled option's keys in sequence
           for (const ti of ds.tuiToggledIndices.sort((a, b) => a - b)) {
             const opt = ds.tuiPromptOptions[ti];
@@ -1828,21 +1984,100 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               allKeys.push(...opt.keys);
             }
           }
+          // Then the action's own keys (confirm/select)
+          allKeys.push(...keys);
+        } else if (isActiveStuckCard) {
+          // P1-4: do NOT trust the callback's selected_index. Require it to be
+          // present and a safe integer, then range-check against the page type's
+          // option count. A missing/malformed index must NOT default to 0 (trust),
+          // which is the highest-risk action.
+          const rawIdx = value?.selected_index;
+          if (rawIdx === undefined || rawIdx === null || rawIdx === '') {
+            logger.info(`[${tag(ds)}] Stuck-warning card click missing selected_index — dropped`);
+            return;
+          }
+          const idx = Number(rawIdx);
+          if (!Number.isSafeInteger(idx)) {
+            logger.info(`[${tag(ds)}] Stuck-warning card click with non-integer selected_index=${rawIdx} — dropped`);
+            return;
+          }
+          // Allowlist: map (pageType, idx) → the one safe key.
+          // Level 1: 0=t, 1=Enter, 2=Esc ; Level 2: 0=t, 1=Esc
+          const pt = ds.stuckWarningPageType;
+          const allowlist = pt === 'hook review level 1'
+            ? ['t', 'Enter', 'Escape']
+            : pt === 'hook review level 2'
+              ? ['t', 'Escape']
+              : null;
+          if (!allowlist || idx < 0 || idx >= allowlist.length) {
+            logger.info(`[${tag(ds)}] Stuck-warning card click with out-of-range index ${idx} for pageType=${pt ?? 'none'} — dropped`);
+            return;
+          }
+          allKeys = [allowlist[idx]];
+          // Stuck-card actions are always final (they resolve the current
+          // hook-review screen). Define this server-side — do NOT trust
+          // value.is_final from the callback.
+          isFinalStuck = true;
+        } else {
+          // Non-stuck, non-TUI card (shouldn't happen given the active-card
+          // guard above, but fail-closed).
+          allKeys.push(...keys);
         }
-        // Then the action's own keys (confirm/select)
-        allKeys.push(...keys);
 
         if (allKeys.length > 0) {
-          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal } as DaemonToWorker);
-          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} — "${selectedText}"`);
+          // Atomic processing claim: if a previous click is already in flight
+          // (waiting for tui_keys_delivered / stuck_warning_expired ACK), drop
+          // this duplicate. Without this, two rapid clicks could both pass the
+          // fresh-capture guard and inject keys twice.
+          if (isActiveStuckCard) {
+            if (ds.stuckWarningProcessing) {
+              logger.info(`[${tag(ds)}] Duplicate stuck-warning card click — dropped (processing already in flight)`);
+              return;
+            }
+            ds.stuckWarningProcessing = true;
+          }
+          // Only the stuck-warning card's Enter action re-arms the detector
+          // (Enter advances from the hook list to a per-hook review). Match by
+          // the actual keys sent — NOT by optionType, since t is typed 'confirm'
+          // in the card definition. t/Esc and all ScreenAnalyzer cards never
+          // set this flag. Also require the source card to be our own.
+          const isStuckWarningEnter = isActiveStuckCard
+            && allKeys.length === 1
+            && allKeys[0] === 'Enter';
+          // If this click is from a stuck-warning card, forward the nonce,
+          // cliLifetime, and page type so the worker can re-verify the current
+          // screen still matches before injecting keys. A stale click (CLI
+          // recovered) will be dropped at the worker boundary.
+          const stuckNonce = isActiveStuckCard ? ds.stuckWarningNonce : undefined;
+          const stuckCliLifetime = isActiveStuckCard ? ds.stuckWarningCliLifetime : undefined;
+          const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
+          const effectiveFinal = isFinal || isFinalStuck;
+          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal: effectiveFinal, rearmStuckDetector: isStuckWarningEnter, stuckNonce, stuckCliLifetime, stuckPageType: stuckPage } as DaemonToWorker);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${effectiveFinal} rearmStuck=${isStuckWarningEnter} stuckNonce=${stuckNonce ?? 'none'} — "${selectedText}"`);
         }
 
-        if (isFinal) {
-          const resolveText = ds.tuiToggledIndices?.length
+        if (isFinal || isFinalStuck) {
+          const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
             ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
             : selectedText;
           const finalText = resolveText || selectedText;
           const locDs = localeForBot(ds.larkAppId);
+          // For a stuck-warning card, do NOT clear authority or render success
+          // here. The worker may still reject the keys (stale screen). We show a
+          // "processing" state to block duplicate clicks, and wait for the
+          // worker's tui_keys_delivered (success) or stuck_warning_expired
+          // ("page changed, not sent") ACK before resolving the card.
+          if (isActiveStuckCard) {
+            if (cardMessageId) {
+              const processingCard = buildTuiPromptProcessingCard('处理中…', locDs);
+              updateMessage(ds.larkAppId, cardMessageId, processingCard).catch(err =>
+                logger.debug(`[${tag(ds)}] Failed to set stuck-warning card to processing: ${err}`),
+              );
+            }
+            publishAttentionPatch(ds);
+            try { return JSON.parse(buildTuiPromptProcessingCard('处理中…', locDs)); } catch { /* fall through */ }
+          }
+          // Normal TUI prompt card (ScreenAnalyzer): resolve immediately.
           if (cardMessageId) {
             setTimeout(() => {
               const resolvedCard = buildTuiPromptResolvedCard(finalText, locDs);
@@ -1851,10 +2086,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               );
             }, allKeys.length * 100 + 500);
           }
-          ds.tuiPromptCardId = undefined;
-          ds.tuiPromptOptions = undefined;
-          ds.tuiPromptMultiSelect = undefined;
-          ds.tuiToggledIndices = undefined;
+          // Clear state only for the card that was actually clicked — a stuck
+          // card click must NOT wipe the ScreenAnalyzer TUI prompt state (or
+          // vice versa) if both coexist / race.
+          if (cardMessageId === ds.tuiPromptCardId) {
+            ds.tuiPromptCardId = undefined;
+            ds.tuiPromptOptions = undefined;
+            ds.tuiPromptMultiSelect = undefined;
+            ds.tuiToggledIndices = undefined;
+          }
           publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }
         }

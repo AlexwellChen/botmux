@@ -258,9 +258,9 @@ export interface CliAdapter {
     readonly sessionStartCommand?: string;
   };
 
-  /** true = 该 CLI 通过 hook 接管 askUserQuestion（不再装 botmux-ask skill 兜底）。
-   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件、
-   *  CoCo 走 ensureAskHook 装插件）。 */
+  /** true = 该 CLI 的 Hook 已接管 askUserQuestion（不再装 botmux-ask
+   *  skill 兜底）。注入机制由各 adapter 自行决定（Claude 走 --settings、
+   *  OpenCode 走插件、CoCo 走 ensureAskHook）。 */
   readonly asksViaHook?: boolean;
 
   /** 命令式 hook 安装钩子：适用于无法靠纯写文件完成、需要 spawn CLI 子命令的场景
@@ -335,12 +335,10 @@ export interface CliAdapter {
   readonly supportsReadIsolation?: boolean;
 
   /** CLI 支持会话内移动工作目录（如 Claude Code ≥2.1.205 的 /cd）。
-   *  true → botmux cd 走 idle 注入（不重启进程）；缺省 → 杀进程冷启动兜底。
-   *  ⚠️ 这是家族级声明，不做运行时版本探测：若部署的二进制过旧（或 fork 变体
-   *  没有会话内 /cd），注入会被 TUI 当 unknown command 静默吞掉——daemon 记录
-   *  已重钉、进程仍留在旧目录，直到下一次 respawn 才收敛（inject_command 已同步
-   *  lastInitConfig.workingDir，任何重启路径都落新目录）。部署前提见
-   *  docs/roles/deploy-runbook.md 第 1 步的版本检查。 */
+   *  ⚠️ 历史能力位，**已从角色切换路由退场**：`botmux role switch` 现统一走「杀 CLI +
+   *  `--resume` 在新 cwd respawn」（适配器无关，见 dashboard-ipc-server 的 cd 路由与
+   *  worker 的 restart case），不再按本字段分流 idle 注入 vs 冷启动。字段保留仅供未来
+   *  可能的会话内移动复用，当前无生产读取点。 */
   readonly supportsSessionCwdMove?: boolean;
 
   /** When true, the worker's soft first-prompt timeout keeps queued input held
@@ -379,15 +377,15 @@ export interface CliAdapter {
   readonly claudeStateJsonPath?: string;
 
   /** Paths (files or dirs) holding THIS CLI's auth / login state that must stay
-   *  REAL + writable inside the file sandbox. The sandbox isolates writes (so the
-   *  agent's project edits are reviewable), but a CLI's token refresh / login
-   *  must PERSIST to the real auth — otherwise the sandboxed CLI loses its login
-   *  (see seed's `bytecloud-auth`). The sandbox binds each existing path rw over
-   *  the isolated overlay so auth reads/refreshes/logins hit the real files.
-   *  `~` is expanded. Default to NARROW (auth only) so session history stays
-   *  isolated — but widen to the CLI's whole state dir when it keeps SQLite DBs
-   *  there (e.g. codex): the overlayfs home lacks the POSIX fcntl locks SQLite
-   *  needs, so a narrow carve-out leaves the CLI unable to start.
+   *  REAL + writable inside the file sandbox. The sandbox isolates the filesystem
+   *  to a deny-by-default whitelist (so the agent only sees the rule paths), but a
+   *  CLI's token refresh / login must PERSIST to the real auth — otherwise the
+   *  sandboxed CLI loses its login (see seed's `bytecloud-auth`). The sandbox binds
+   *  each existing path rw (real host path) so auth reads/refreshes/logins hit the
+   *  real files. `~` is expanded. Default to NARROW (auth only) so session history
+   *  stays out of the sandbox — but widen to the CLI's whole state dir when it keeps
+   *  SQLite DBs there (e.g. codex): only whitelisted paths exist in the sandbox, so
+   *  a narrow carve-out leaves the DB dir absent and the CLI unable to start.
    *  undefined / empty → no carve-out. */
   readonly authPaths?: readonly string[];
 
@@ -403,7 +401,7 @@ export interface CliAdapter {
    *  app-server) is the one that must survive `--tmpfs /run`.
    *
    *  Return ONLY executable paths — never plain path args like the working dir,
-   *  whose parent dir re-bind would shadow the project overlay and widen exposure.
+   *  whose parent dir re-bind would shadow the project bind and widen exposure.
    *  Resolved lazily / read AFTER buildArgs() (so a lazily-resolved bin is cached).
    *  Missing/empty → no extra re-expose. */
   sandboxExtraExecPaths?(): readonly string[];
@@ -441,6 +439,9 @@ export interface CliAdapter {
     /** Claude-family data dir (~/.claude, ~/.claude-runtime, …) so the probe
      *  targets the SAME root the adapter will actually write into. */
     dataDir?: string;
+    /** Optional CLI-specific resume store path resolved by the worker after
+     *  applying per-bot env/profile settings (for example Hermes state.db). */
+    stateDbPath?: string;
   }): boolean | undefined;
 
   /** Optional: discover sessions resumable from this CLI's on-disk transcript

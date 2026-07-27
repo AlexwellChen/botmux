@@ -931,6 +931,59 @@ describe('session.start lifecycle integration', () => {
   });
 });
 
+describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
+  const adopt = () => makeDs({
+    adoptedFrom: {
+      tmuxTarget: 'bmx-deadbeef:0.0',
+      originalCliPid: 23456,
+      sessionId: 'codex-session',
+      cliId: 'codex',
+      cwd: '/repo',
+    },
+  });
+
+  it('legacy readIsolation:true → refuses to adopt + clears stale adopt metadata (no fork/session.start)', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ readIsolation: true }));
+    const ds = adopt();
+    ds.session.adoptedFrom = { ...ds.adoptedFrom } as any;
+    forkAdoptWorker(ds);
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(emitHookEventMock).not.toHaveBeenCalledWith('session.start', expect.anything());
+    // fail-closed: no worker=null pseudo-adopt lingers; next msg cold-starts sandboxed
+    expect(ds.adoptedFrom).toBeUndefined();
+    expect(ds.session.adoptedFrom).toBeUndefined();
+  });
+
+  it('new sandbox:true → refuses to adopt (would run unsandboxed) + clears metadata', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ sandbox: true }));
+    const ds = adopt();
+    ds.session.adoptedFrom = { ...ds.adoptedFrom } as any;
+    forkAdoptWorker(ds);
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(emitHookEventMock).not.toHaveBeenCalledWith('session.start', expect.anything());
+    expect(ds.adoptedFrom).toBeUndefined();
+    expect(ds.session.adoptedFrom).toBeUndefined();
+  });
+
+  it('global BOTMUX_SANDBOX=1 → refuses to adopt even when the bot has no per-bot flag', () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '1');
+    vi.mocked(getBot).mockImplementation(() => defaultBot());
+    forkAdoptWorker(adopt());
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(emitHookEventMock).not.toHaveBeenCalledWith('session.start', expect.anything());
+    vi.unstubAllEnvs();
+  });
+
+  it('no sandbox anywhere → adopt proceeds (fork + session.start)', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot());
+    forkAdoptWorker(adopt());
+    expect(forkMock).toHaveBeenCalled();
+    expect(emitHookEventMock).toHaveBeenCalledWith('session.start', expect.objectContaining({
+      reason: 'adopt',
+    }));
+  });
+});
+
 describe('managed turn authority worker generations', () => {
   it('revokes the old capability immediately when a normal double-fork replacement fails', () => {
     const oldWorker = makeFakeWorker();

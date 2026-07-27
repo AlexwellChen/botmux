@@ -149,6 +149,15 @@ function finalOutputMsg(): Extract<WorkerToDaemon, { type: 'final_output' }> {
   return { type: 'final_output', content: 'final answer', lastUuid: 'uuid-1', turnId: 'turn-1' };
 }
 
+function listenerFinalOutputMsg(
+  content = 'final answer',
+): Extract<WorkerToDaemon, { type: 'final_output' }> {
+  return {
+    ...finalOutputMsg(),
+    content: JSON.stringify({ decision: 'publish', content }),
+  };
+}
+
 function seedReceiverReceipt(responseMode: 'silent' | 'listener_thread'): void {
   const memberKey = {
     listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
@@ -164,7 +173,9 @@ function seedReceiverReceipt(responseMode: 'silent' | 'listener_thread'): void {
     ...memberKey,
     ownerBootId: 'owner-boot', ownerEpoch: 1, membershipGeneration: 1,
     deliveryKey: 'delivery-stable-key', inputHash: 'input-hash', fromSeq: 1, toSeq: 1,
-    responseMode, receiverBootId: 'receiver-boot',
+    responseMode,
+    listenerOutputProtocol: responseMode === 'listener_thread' ? 'decision_v1' : 'plain',
+    receiverBootId: 'receiver-boot',
   })).toMatchObject({ kind: 'accepted' });
   expect(markVcMeetingDeliveryDispatched('/tmp/test-sessions', {
     ...memberKey, deliveryKey: 'delivery-stable-key',
@@ -259,6 +270,36 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).not.toHaveBeenCalled();
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+
+  it('clears a stuck limited state when a real answer is harvested after recovery', async () => {
+    // Regression guard (adopt/bridge sessions): a structured rate-limit emit
+    // parks ds in `limited`, but in-terminal recovery has no Lark turn / retry
+    // button / kill to clear it. A harvested final_output is a definitive
+    // self-heal signal, so it must clear the stale limit + drop 'limited'.
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.workerPort = 4321;
+    ds.usageLimit = { limited: true, kind: 'rate', retryAtMs: Date.now() + 5 * 60_000, retryLabel: '5-10 min', retryReady: false };
+    ds.lastScreenStatus = 'limited';
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(ds.usageLimit).toBeUndefined();
+    expect(ds.lastScreenStatus).not.toBe('limited');
+    expect(sessionReply).toHaveBeenCalled();
   });
 
   it('records Hermes source binding and allows matching sourceHermesSessionId', async () => {
@@ -988,7 +1029,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     seedReceiverReceipt('listener_thread');
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, {
-      ...finalOutputMsg(),
+      ...listenerFinalOutputMsg(),
       turnId: 'delivery-stable-key',
       dispatchAttempt: 1,
     }, 'tag', 0);
@@ -996,6 +1037,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][1]).toContain('final answer');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('decision');
     expect(sessionReply.mock.calls[0][5]).toMatchObject({
       uuid: expect.stringMatching(/^vcp_[0-9a-f]+$/),
       sourceSessionId: ds.session.sessionId,
@@ -1006,6 +1049,71 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       meetingId: 'meeting-1',
       targetChatId: ds.chatId,
     })).toEqual(['om_meeting_fallback']);
+  });
+
+  it('treats a valid skip decision as a successful no-message outcome', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...listenerFinalOutputMsg(),
+      content: '{"decision":"skip"}',
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    }, 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(listVcMeetingActions('/tmp/test-sessions', {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+    })).toEqual([]);
+  });
+
+  it('fails closed on a malformed automatic listener control envelope', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      content: '暂无重要更新',
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    }, 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1', targetChatId: ds.chatId,
+    })).toEqual([]);
   });
 
   it('reuses one provider UUID when a listener reply is accepted before crash reconciliation', async () => {
@@ -1038,7 +1146,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     seedReceiverReceipt('listener_thread');
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     const first = {
-      ...finalOutputMsg(),
+      ...listenerFinalOutputMsg(),
       turnId: 'delivery-stable-key',
       dispatchAttempt: 1,
       lastUuid: 'bridge-attempt-1',
@@ -1063,7 +1171,10 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     __testOnly_deliverFinalOutput(ds, {
       ...first,
-      content: 'changed replay answer must not create another effect',
+      content: JSON.stringify({
+        decision: 'publish',
+        content: 'changed replay answer must not create another effect',
+      }),
       dispatchAttempt: 2,
       lastUuid: 'bridge-attempt-2',
     }, 'tag', 0);
@@ -1363,6 +1474,49 @@ describe('Worker turn_terminal routing', () => {
     } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
     await Promise.resolve();
     expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops only the final_output of a suppressed trigger turn while other turns and its aux UI stay loud', async () => {
+    const ds = makeDs();
+    // A loud connector opted into suppressFinalOutput; trigger-session armed this
+    // exact turn id (parallel to silentScheduledTurns but final-only).
+    ds.suppressedTriggerFinalTurns = new Map([['trg_alert', Date.now()]]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // The suppressed turn's final_output must be dropped …
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'trigger summary that must not be posted', lastUuid: 'trg-uuid', turnId: 'trg_alert',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    // … but its auxiliary UI (user_notify/streaming) is NOT suppressed: unlike
+    // schedule-silent, trigger suppression only gates final_output, so the live
+    // status/notify channel still reaches the topic.
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'trigger warning still shows', turnId: 'trg_alert',
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][1]).toBe('trigger warning still shows');
+
+    // … and an unrelated turn on the same session keeps its final_output loud.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'human turn answer', lastUuid: 'human-uuid', turnId: 'other-turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await new Promise(r => setTimeout(r, 10));
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toContain('human turn answer');
+    expect(sessionReply.mock.calls[1][4]).toBe('other-turn');
   });
 
   it('keeps a newer silent retry armed when stale output and terminal arrive first', async () => {
