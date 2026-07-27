@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { CliId } from '../adapters/cli/types.js';
@@ -124,10 +124,25 @@ function botHomeClaudeDataDir(larkAppId: string | undefined): string | null {
 
 function claudeJsonlWithBotHomeFallback(sid: string, q: TranscriptPathQuery, primaryDataDir: string): string | null {
   if (!q.cwd) return null;
-  const path = getClaudeSessionJsonlPath(sid, q.cwd, primaryDataDir);
-  if (path) return path;
+  const globalPath = getClaudeSessionJsonlPath(sid, q.cwd, primaryDataDir);
   const botHomeDir = botHomeClaudeDataDir(q.larkAppId);
-  return botHomeDir ? getClaudeSessionJsonlPath(sid, q.cwd, botHomeDir) : null;
+  const botHomeJsonl = botHomeDir ? getClaudeSessionJsonlPath(sid, q.cwd, botHomeDir) : null;
+  // Both exist when a persistent session straddles a sandbox flip (the CLI kept
+  // its session id but moved data dirs — either direction). The stale copy stops
+  // growing while the live one keeps its mtime fresh, so newest-wins tracks the
+  // file the CLI is actually writing; a fixed preference would freeze usage at
+  // the flip point forever.
+  if (globalPath && botHomeJsonl) return newerFile(globalPath, botHomeJsonl);
+  return globalPath ?? botHomeJsonl;
+}
+
+/** Ties (e.g. a byte-identical copy) keep `a` — the global/stock path. */
+function newerFile(a: string, b: string): string {
+  try {
+    return statSync(b).mtimeMs > statSync(a).mtimeMs ? b : a;
+  } catch {
+    return a;
+  }
 }
 
 export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTranscriptPath | null {

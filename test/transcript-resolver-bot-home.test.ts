@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -73,13 +73,45 @@ describe('resolveSessionTranscriptPath — sandboxed-bot BOT_HOME fallback', () 
     expect(resolved).toEqual({ path: expected, kind: 'claude' });
   });
 
-  it('prefers the global dir when the transcript exists there (non-redirected bot)', () => {
+  it('resolves the global dir when only it has the transcript (non-redirected bot)', () => {
     const global = writeGlobalTranscript('sb-2');
-    writeBotHomeTranscript('sb-2');
     const resolved = resolveSessionTranscriptPath({
       cliId: 'claude-code', sessionId: 'sb-2', cwd, larkAppId: APP_ID,
     });
     expect(resolved?.path).toBe(global);
+  });
+
+  // A persistent session that straddles a sandbox flip keeps its session id but
+  // moves data dirs — the stale copy stops growing, the live one stays fresh.
+  it('picks the newer file when both dirs have the transcript (sandbox flipped ON)', () => {
+    const global = writeGlobalTranscript('sb-flip');
+    const botHome = writeBotHomeTranscript('sb-flip');
+    utimesSync(global, new Date('2026-01-01'), new Date('2026-01-01'));
+    utimesSync(botHome, new Date('2026-01-02'), new Date('2026-01-02'));
+    expect(resolveSessionTranscriptPath({
+      cliId: 'claude-code', sessionId: 'sb-flip', cwd, larkAppId: APP_ID,
+    })?.path).toBe(botHome);
+  });
+
+  it('picks the newer file when both dirs have the transcript (sandbox flipped OFF)', () => {
+    const global = writeGlobalTranscript('sb-flop');
+    const botHome = writeBotHomeTranscript('sb-flop');
+    utimesSync(global, new Date('2026-01-02'), new Date('2026-01-02'));
+    utimesSync(botHome, new Date('2026-01-01'), new Date('2026-01-01'));
+    expect(resolveSessionTranscriptPath({
+      cliId: 'claude-code', sessionId: 'sb-flop', cwd, larkAppId: APP_ID,
+    })?.path).toBe(global);
+  });
+
+  it('keeps the global path on an exact mtime tie (byte-identical copy)', () => {
+    const global = writeGlobalTranscript('sb-tie');
+    const botHome = writeBotHomeTranscript('sb-tie');
+    const t = new Date('2026-01-01');
+    utimesSync(global, t, t);
+    utimesSync(botHome, t, t);
+    expect(resolveSessionTranscriptPath({
+      cliId: 'claude-code', sessionId: 'sb-tie', cwd, larkAppId: APP_ID,
+    })?.path).toBe(global);
   });
 
   it('returns null without larkAppId (no fallback target)', () => {
