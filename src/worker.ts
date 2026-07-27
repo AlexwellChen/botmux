@@ -7486,10 +7486,8 @@ async function spawnCli(
       if (!existsSync(tsFile)) writeFileSync(tsFile, '');
     } catch { /* */ }
     try { mkdirSync(join(dataDir, 'attachments', cfg.larkAppId), { recursive: true }); } catch { /* */ }
-    // schedules.json is a shared RMW store (`botmux schedule`); pre-create as an
-    // empty map if absent (same content schedule-store itself writes) so a fresh
-    // install's first in-sandbox `schedule add` can bind+write it on bwrap too.
-    try { const sf = join(dataDir, 'schedules.json'); if (!existsSync(sf)) writeFileSync(sf, '{}'); } catch { /* */ }
+    // (Schedules moved into each bot's BOT_HOME — the whole dir is already
+    // bound readWrite for the owner, so no per-file pre-create is needed.)
 
     const mandatoryDenyPaths: string[] = [];
     const mandatoryDenyRegexes: string[] = [];

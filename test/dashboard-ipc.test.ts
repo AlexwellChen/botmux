@@ -8,6 +8,11 @@ import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
+import { setScheduleScope } from '../src/services/schedule-store.js';
+
+// Per-bot schedule stores: the daemon binds the store to its own bot before
+// serving IPC; the schedule endpoints under test assume that binding exists.
+setScheduleScope('cli_ipc_test_bot001');
 import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
