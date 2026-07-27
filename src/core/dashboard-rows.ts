@@ -81,8 +81,8 @@ export interface SessionRow {
   /** Riff AIO Sandbox web terminal link. When set, the dashboard "Web终端"
    *  button opens this URL directly instead of building a local port link. */
   riffAccessUrl?: string;
-  /** Presentation enrichment stamped by the dashboard /api/sessions handler
-   *  (see session-row-enrichment): bot avatar URL from bots-info.json.
+  /** Presentation enrichment stamped by the central dashboard read-model:
+   *  bot avatar URL from the live daemon descriptor.
    *  Absent on older daemons — consumers must fall back. */
   botAvatarUrl?: string;
   /** Repo top-level dir name of workingDir, when it is a git repo. */

@@ -7816,9 +7816,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         const startAttach = (cols: number, rows: number) => {
           if (cp) return;
           // Why: a prior web resize may leave the shared tmux window in manual mode.
-          spawnSync('tmux', ['set-option', '-t', tmuxTarget, 'window-size', 'latest'], {
+          // `largest` restores the shared default without letting a smaller/newer
+          // viewer resize every other attached client.
+          spawnSync('tmux', ['set-option', '-t', tmuxTarget, 'window-size', 'largest'], {
             stdio: 'ignore',
             env: tmuxEnv() as { [key: string]: string },
+            timeout: 3000,
           });
           // Defense in depth: view-capability clients attach through tmux's
           // own read-only mode as well as the WebSocket input gate below.

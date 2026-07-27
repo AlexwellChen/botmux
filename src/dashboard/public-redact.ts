@@ -58,3 +58,36 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
     return rest;
   });
 }
+
+/** Branch names often carry issue/customer identifiers. `/api/sessions` and
+ * `/events` are both public-read surfaces, so keep one non-mutating projection
+ * for their shared session row shape. */
+export function redactSessionForPublic(session: unknown): unknown {
+  if (!session || typeof session !== 'object' || Array.isArray(session)) return session;
+  const { gitBranch: _gitBranch, ...rest } = session as Record<string, unknown>;
+  return rest;
+}
+
+export function redactSessionsForPublic(sessions: unknown[]): unknown[] {
+  if (!Array.isArray(sessions)) return sessions;
+  return sessions.map(redactSessionForPublic);
+}
+
+/** Apply the same branch-name policy to session rows delivered over SSE. */
+export function redactSessionEventForPublic(type: string, body: unknown): unknown {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const eventBody = body as Record<string, unknown>;
+  if (type === 'session.spawned') {
+    return { ...eventBody, session: redactSessionForPublic(eventBody.session) };
+  }
+  if (
+    type === 'session.update'
+    && eventBody.patch
+    && typeof eventBody.patch === 'object'
+    && !Array.isArray(eventBody.patch)
+  ) {
+    const { gitBranch: _gitBranch, ...patch } = eventBody.patch as Record<string, unknown>;
+    return { ...eventBody, patch };
+  }
+  return body;
+}

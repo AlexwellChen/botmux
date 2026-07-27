@@ -19,6 +19,11 @@ import {
 } from './dashboard/auth.js';
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
+import {
+  parseDashboardAskAnswerRequest,
+  proxyDashboardAskAnswer,
+} from './dashboard/desktop-asks.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
 import { jsonRes } from './dashboard/http.js';
@@ -32,7 +37,12 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
-import { redactGroupsForPublic, redactSchedulesForPublic } from './dashboard/public-redact.js';
+import {
+  redactGroupsForPublic,
+  redactSchedulesForPublic,
+  redactSessionEventForPublic,
+  redactSessionsForPublic,
+} from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
@@ -54,7 +64,7 @@ import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { enrichSessionRowsForPresentation } from './core/session-row-enrichment.js';
+import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -148,7 +158,10 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
-import { handleDesktopCompat } from './dashboard/compat.js';
+import {
+  compatMachineIdForAuthenticatedRequest,
+  handleDesktopCompat,
+} from './dashboard/compat.js';
 import { isDashboardChunkJsPath, missingDashboardChunkModule } from './dashboard/stale-chunk-module.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
@@ -272,6 +285,12 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
+const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
+
+// Keep Git-derived fields in the central read-model so REST snapshots and SSE
+// share one row shape. Idle/limited turn boundaries force a low-frequency
+// branch refresh after the CLI has had a chance to change repositories.
+aggregator.on(sessionPresentation.onEvent);
 
 /**
  * Resolve which daemon owns a schedule row. For rows with an explicit
@@ -1046,7 +1065,11 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
       ]);
       const s = await sRes.json() as { sessions: any[] };
       const sch = await schRes.json() as { schedules: any[] };
-      aggregator.hydrateSessions(d.larkAppId, s.sessions ?? []);
+      const rows = (s.sessions ?? []).map((row) => (
+        d.botAvatarUrl ? { ...row, botAvatarUrl: d.botAvatarUrl } : row
+      ));
+      aggregator.hydrateSessions(d.larkAppId, rows);
+      for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
       aggregator.hydrateSchedules(sch.schedules ?? []);
     } catch (e: any) {
       logger.warn(`[dashboard] hydrate ${d.larkAppId}: ${e.message ?? e}`);
@@ -1067,13 +1090,23 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
 }
 
 function syncSubscriptions(): void {
-  const online = new Set(registry.list().map(d => d.larkAppId));
+  const daemons = registry.list();
+  const online = new Set(daemons.map(d => d.larkAppId));
   // Attach (hydrate + subscribe) any newly-online daemon. Fire-and-forget
   // because the registry callback is sync and the attach is per-daemon
   // independent.
-  for (const d of registry.list()) {
+  for (const d of daemons) {
     if (!subs.has(d.larkAppId)) {
       void attachDaemon(d);
+    }
+    if (d.botAvatarUrl) {
+      for (const row of aggregator.getSessions()) {
+        if (row.larkAppId !== d.larkAppId || row.botAvatarUrl === d.botAvatarUrl) continue;
+        aggregator.applyEvent(d.larkAppId, {
+          type: 'session.update',
+          body: { sessionId: row.sessionId, patch: { botAvatarUrl: d.botAvatarUrl } },
+        });
+      }
     }
   }
   // Close subscriptions for daemons that went offline. Cache entries are
@@ -2153,7 +2186,17 @@ const server = createServer(async (req, res) => {
     // Desktop shell compatibility probe (read-only, no token required). Keep it
     // outside the browser auth gate so packaged desktop apps can decide whether
     // this runtime speaks their dashboard protocol before loading the SPA.
-    if (handleDesktopCompat(req, res, url)) {
+    if (req.method === 'GET' && url.pathname === '/__desktop/compat') {
+      const presentedToken = authedToken(req, url);
+      const boundMachineId = activeToken && presentedToken === activeToken
+        ? readPlatformBinding()?.machineId
+        : null;
+      const compatMachineId = compatMachineIdForAuthenticatedRequest(
+        presentedToken,
+        activeToken,
+        boundMachineId,
+      );
+      handleDesktopCompat(req, res, url, { machineId: compatMachineId ?? undefined });
       return;
     }
 
@@ -2400,10 +2443,9 @@ const server = createServer(async (req, res) => {
           ? { ...s, botName: n }
           : s;
       });
-      // Presentation enrichment (bot avatar + git repo/branch) — additive,
-      // cached, best-effort; Desktop sidebar renders these, board ignores them.
-      const enriched = await enrichSessionRowsForPresentation(sessions, config.session.dataDir);
-      return jsonRes(res, 200, { sessions: enriched });
+      return jsonRes(res, 200, {
+        sessions: authed ? sessions : redactSessionsForPublic(sessions),
+      });
     }
 
     // Desktop / operator UI: aggregate pending ask-hooks across daemons.
@@ -2412,7 +2454,9 @@ const server = createServer(async (req, res) => {
       const asks: unknown[] = [];
       await Promise.all(daemons.map(async (d) => {
         try {
-          const upstream = await fetchDaemonIpc(d.ipcPort, '/api/asks/pending');
+          const upstream = await fetchDaemonIpc(d.ipcPort, '/api/asks/pending', {
+            signal: AbortSignal.timeout(2_000),
+          });
           if (!upstream.ok) return;
           const body = await upstream.json() as { asks?: unknown[] };
           for (const a of body.asks ?? []) {
@@ -2430,47 +2474,20 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/asks/answer') {
-      let body: { askId?: string; selections?: string[][]; by?: string; larkAppId?: string };
+      let body: unknown;
       try {
-        body = await readJsonBody(req) as typeof body;
+        body = await readJsonBody(req);
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      if (!body.askId || !Array.isArray(body.selections)) {
-        return jsonRes(res, 400, { ok: false, error: 'askId_and_selections_required' });
+      const parsed = parseDashboardAskAnswerRequest(body);
+      if (!parsed.ok) {
+        return jsonRes(res, 400, { ok: false, error: parsed.error });
       }
-      // Prefer explicit bot; else try each daemon until one accepts.
-      const candidates = body.larkAppId
-        ? registry.list().filter((d) => d.larkAppId === body.larkAppId)
-        : registry.list();
-      for (const d of candidates) {
-        try {
-          const upstream = await proxyToDaemon(d.larkAppId, '/api/asks/answer', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              askId: body.askId,
-              selections: body.selections,
-              by: body.by ?? 'desktop',
-            }),
-          });
-          const text = await upstream.text();
-          if (upstream.ok) {
-            res.writeHead(upstream.status, { 'content-type': 'application/json' });
-            res.end(text);
-            return;
-          }
-          // 409 stale on wrong daemon — try next
-          if (upstream.status !== 409) {
-            res.writeHead(upstream.status, { 'content-type': 'application/json' });
-            res.end(text);
-            return;
-          }
-        } catch {
-          /* try next */
-        }
-      }
-      return jsonRes(res, 409, { ok: false, error: 'stale' });
+      const upstream = await proxyDashboardAskAnswer(parsed.value, proxyToDaemon);
+      res.writeHead(upstream.status, { 'content-type': upstream.contentType });
+      res.end(upstream.body);
+      return;
     }
     if (req.method === 'POST' && url.pathname === '/api/sessions/cleanup-idle') {
       let body: { olderThanHours?: unknown; sessionIds?: unknown };
@@ -4502,7 +4519,9 @@ const server = createServer(async (req, res) => {
         // full task object — strip the prompt AND workingDir for anonymous SSE
         // listeners, or the REST-side scrub would be trivially bypassed by
         // `/events`.
-        let body = ev.body;
+        let body = authed
+          ? ev.body
+          : redactSessionEventForPublic(ev.type, ev.body) as typeof ev.body;
         if (!authed && (ev.type === 'schedule.created' || ev.type === 'schedule.updated')) {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {

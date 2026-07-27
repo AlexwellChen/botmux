@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  canonicalDashboardClientShellUrl,
   dashboardClientShellRedirect,
   dashboardShellAllowsWebTerminal,
   isWebTerminalDashboardHash,
@@ -21,6 +22,25 @@ describe('dashboard client shell', () => {
       .toBe('mobile');
     expect(readDashboardClientShell('?botmuxClientShell=unknown', '#/'))
       .toBeNull();
+  });
+
+  it('canonicalizes a legacy hash marker into the durable URL query', () => {
+    expect(canonicalDashboardClientShellUrl(
+      'https://botmux.example.test/#/sessions?botmuxClientShell=desktop&focus=ask-1',
+    )).toBe(
+      'https://botmux.example.test/?botmuxClientShell=desktop#/sessions?focus=ask-1',
+    );
+    expect(canonicalDashboardClientShellUrl(
+      'https://botmux.example.test/?locale=zh#/sessions?botmuxClientShell=desktop&focus=ask-1',
+    )).toBe(
+      'https://botmux.example.test/?locale=zh&botmuxClientShell=desktop#/sessions?focus=ask-1',
+    );
+    expect(canonicalDashboardClientShellUrl(
+      'https://botmux.example.test/?botmuxClientShell=mobile#/sessions',
+    )).toBeNull();
+    expect(canonicalDashboardClientShellUrl(
+      'https://botmux.example.test/#/sessions?botmuxClientShell=unknown',
+    )).toBeNull();
   });
 
   it('recognizes every legacy and current workflow route', () => {

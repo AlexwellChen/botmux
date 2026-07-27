@@ -1,6 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-import { readPlatformBinding } from '../platform/binding.js';
 import { botmuxInstallRoot, botmuxVersion } from '../utils/install-info.js';
 import { resolveEffectiveBotmuxVersion } from '../utils/version-info.js';
 import { jsonRes } from './http.js';
@@ -10,39 +9,46 @@ export interface DashboardCompatModule {
   route?: string;
 }
 
-export type DashboardCompatCapability =
-  | 'asks.answer'
-  | 'asks.read'
-  | 'bots.configure'
-  | 'bots.read'
-  | 'connectors.manage'
-  | 'connectors.read'
-  | 'groups.manage'
-  | 'groups.read'
-  | 'insights.read'
-  | 'monitoring.read'
-  | 'office.read'
-  | 'plugins.manage'
-  | 'plugins.read'
-  | 'roles.manage'
-  | 'roles.read'
-  | 'schedules.manage'
-  | 'schedules.read'
-  | 'sessions.manage'
-  | 'sessions.read'
-  | 'sessions.terminal'
-  | 'settings.manage'
-  | 'settings.read'
-  | 'skills.manage'
-  | 'skills.read'
-  | 'team.manage'
-  | 'team.read'
-  | 'updates.manage'
-  | 'updates.read'
-  | 'whiteboards.manage'
-  | 'whiteboards.read'
-  | 'workflow.manage'
-  | 'workflow.read';
+const DASHBOARD_MODULE_SPECS = {
+  overview: {
+    supported: true,
+    route: '#/',
+    capabilities: ['overview.read'],
+  },
+  sessions: {
+    supported: true,
+    route: '#/sessions',
+    capabilities: ['sessions.read', 'sessions.manage', 'sessions.terminal', 'asks.read', 'asks.answer'],
+  },
+  groups: { supported: true, route: '#/groups', capabilities: ['groups.read', 'groups.manage'] },
+  roles: { supported: true, route: '#/roles', capabilities: ['roles.read', 'roles.manage'] },
+  monitoring: { supported: true, route: '#/monitoring', capabilities: ['monitoring.read'] },
+  insights: { supported: true, route: '#/insights', capabilities: ['insights.read'] },
+  schedules: { supported: true, route: '#/schedules', capabilities: ['schedules.read', 'schedules.manage'] },
+  whiteboards: { supported: true, route: '#/whiteboards', capabilities: ['whiteboards.read', 'whiteboards.manage'] },
+  office: { supported: true, route: '#/office', capabilities: ['office.read'] },
+  bots: { supported: true, route: '#/bot-defaults', capabilities: ['bots.read', 'bots.configure'] },
+  skills: { supported: true, route: '#/skills', capabilities: ['skills.read', 'skills.manage'] },
+  plugins: { supported: true, route: '#/plugins', capabilities: ['plugins.read', 'plugins.manage'] },
+  team: { supported: true, route: '#/team', capabilities: ['team.read', 'team.manage'] },
+  connectors: { supported: true, route: '#/connectors', capabilities: ['connectors.read', 'connectors.manage'] },
+  settings: {
+    supported: true,
+    route: '#/settings',
+    capabilities: ['settings.read', 'settings.manage', 'updates.read', 'updates.manage'],
+  },
+  workflow: {
+    supported: false,
+    capabilities: ['workflow.read', 'workflow.manage'],
+  },
+} as const satisfies Record<string, {
+  supported: boolean;
+  route?: string;
+  capabilities: readonly string[];
+}>;
+
+type DashboardModuleSpec = typeof DASHBOARD_MODULE_SPECS[keyof typeof DASHBOARD_MODULE_SPECS];
+export type DashboardCompatCapability = DashboardModuleSpec['capabilities'][number];
 
 export interface DesktopCompatManifest {
   schemaVersion: 1;
@@ -72,24 +78,6 @@ export interface BuildCompatManifestOptions {
   machineId?: string | null;
 }
 
-const DASHBOARD_CORE_ROUTES = [
-  '#/',
-  '#/sessions',
-  '#/groups',
-  '#/roles',
-  '#/monitoring',
-  '#/insights',
-  '#/schedules',
-  '#/whiteboards',
-  '#/office',
-  '#/bot-defaults',
-  '#/skills',
-  '#/plugins',
-  '#/team',
-  '#/connectors',
-  '#/settings',
-] as const;
-
 const DASHBOARD_COMPAT_FEATURES = [
   'desktop-shell',
   'dashboard-protocol-v1',
@@ -98,66 +86,37 @@ const DASHBOARD_COMPAT_FEATURES = [
   'dashboard-capabilities',
 ] as const;
 
-const DASHBOARD_MODULES = {
-  overview: { supported: true, route: '#/' },
-  sessions: { supported: true, route: '#/sessions' },
-  groups: { supported: true, route: '#/groups' },
-  roles: { supported: true, route: '#/roles' },
-  monitoring: { supported: true, route: '#/monitoring' },
-  insights: { supported: true, route: '#/insights' },
-  schedules: { supported: true, route: '#/schedules' },
-  whiteboards: { supported: true, route: '#/whiteboards' },
-  office: { supported: true, route: '#/office' },
-  bots: { supported: true, route: '#/bot-defaults' },
-  skills: { supported: true, route: '#/skills' },
-  plugins: { supported: true, route: '#/plugins' },
-  team: { supported: true, route: '#/team' },
-  connectors: { supported: true, route: '#/connectors' },
-  settings: { supported: true, route: '#/settings' },
-  workflow: { supported: false },
-} satisfies Record<string, DashboardCompatModule>;
+function buildDashboardModules(): Record<string, DashboardCompatModule> {
+  return Object.fromEntries(
+    Object.entries(DASHBOARD_MODULE_SPECS).map(([id, spec]) => [
+      id,
+      {
+        supported: spec.supported,
+        ...('route' in spec ? { route: spec.route } : {}),
+      },
+    ]),
+  );
+}
 
-const DASHBOARD_CAPABILITIES: Record<DashboardCompatCapability, boolean> = {
-  'asks.answer': true,
-  'asks.read': true,
-  'bots.configure': true,
-  'bots.read': true,
-  'connectors.manage': true,
-  'connectors.read': true,
-  'groups.manage': true,
-  'groups.read': true,
-  'insights.read': true,
-  'monitoring.read': true,
-  'office.read': true,
-  'plugins.manage': true,
-  'plugins.read': true,
-  'roles.manage': true,
-  'roles.read': true,
-  'schedules.manage': true,
-  'schedules.read': true,
-  'sessions.manage': true,
-  'sessions.read': true,
-  'sessions.terminal': true,
-  'settings.manage': true,
-  'settings.read': true,
-  'skills.manage': true,
-  'skills.read': true,
-  'team.manage': true,
-  'team.read': true,
-  'updates.manage': true,
-  'updates.read': true,
-  'whiteboards.manage': true,
-  'whiteboards.read': true,
-  'workflow.manage': false,
-  'workflow.read': false,
-};
+function buildDashboardCapabilities(): Record<DashboardCompatCapability, boolean> {
+  const capabilities: Partial<Record<DashboardCompatCapability, boolean>> = {};
+  for (const spec of Object.values(DASHBOARD_MODULE_SPECS)) {
+    for (const capability of spec.capabilities) {
+      capabilities[capability] = spec.supported;
+    }
+  }
+  return capabilities as Record<DashboardCompatCapability, boolean>;
+}
+
+function buildDashboardRoutes(): string[] {
+  return Object.values(DASHBOARD_MODULE_SPECS)
+    .filter((spec): spec is DashboardModuleSpec & { route: string } =>
+      spec.supported && 'route' in spec)
+    .map(spec => spec.route);
+}
 
 export function buildCompatManifest(options: BuildCompatManifestOptions = {}): DesktopCompatManifest {
-  const machineId = normalizeMachineId(
-    options.machineId === undefined
-      ? readPlatformBinding()?.machineId
-      : options.machineId,
-  );
+  const machineId = normalizeMachineId(options.machineId);
 
   return {
     schemaVersion: 1,
@@ -172,9 +131,9 @@ export function buildCompatManifest(options: BuildCompatManifestOptions = {}): D
       ? { runtimeIdentity: { source: 'platform-binding' as const, machineId } }
       : {}),
     features: [...DASHBOARD_COMPAT_FEATURES],
-    routes: [...DASHBOARD_CORE_ROUTES],
-    modules: structuredClone(DASHBOARD_MODULES),
-    capabilities: { ...DASHBOARD_CAPABILITIES },
+    routes: buildDashboardRoutes(),
+    modules: buildDashboardModules(),
+    capabilities: buildDashboardCapabilities(),
   };
 }
 
@@ -183,8 +142,22 @@ function normalizeMachineId(value: string | null | undefined): string | undefine
   return machineId ? machineId : undefined;
 }
 
-export function handleDesktopCompat(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
+export function compatMachineIdForAuthenticatedRequest(
+  presentedToken: string | undefined,
+  activeToken: string | null | undefined,
+  boundMachineId: string | null | undefined,
+): string | null {
+  if (!activeToken || presentedToken !== activeToken) return null;
+  return normalizeMachineId(boundMachineId) ?? null;
+}
+
+export function handleDesktopCompat(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  options: BuildCompatManifestOptions = {},
+): boolean {
   if (req.method !== 'GET' || url.pathname !== '/__desktop/compat') return false;
-  jsonRes(res, 200, buildCompatManifest());
+  jsonRes(res, 200, buildCompatManifest(options));
   return true;
 }

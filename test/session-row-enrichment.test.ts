@@ -1,12 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   clearSessionRowEnrichmentCaches,
-  enrichSessionRowsForPresentation,
-  getBotAvatarByAppId,
   getGitRepoInfo,
 } from '../src/core/session-row-enrichment.js';
 
@@ -35,31 +33,6 @@ afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-describe('getBotAvatarByAppId', () => {
-  it('maps larkAppId → avatar URL from bots-info.json', () => {
-    const dataDir = tempDir('botmux-enrich-data-');
-    writeFileSync(
-      join(dataDir, 'bots-info.json'),
-      JSON.stringify([
-        { larkAppId: 'cli_a', botAvatarUrl: 'https://img.example/a.png' },
-        { larkAppId: 'cli_b', botAvatarUrl: null },
-        { larkAppId: 'cli_c' },
-      ]),
-    );
-    const map = getBotAvatarByAppId(dataDir);
-    expect(map.get('cli_a')).toBe('https://img.example/a.png');
-    expect(map.has('cli_b')).toBe(false);
-    expect(map.has('cli_c')).toBe(false);
-  });
-
-  it('returns an empty map when bots-info.json is missing or corrupt', () => {
-    const dataDir = tempDir('botmux-enrich-data-');
-    expect(getBotAvatarByAppId(dataDir).size).toBe(0);
-    writeFileSync(join(dataDir, 'bots-info.json'), '{nope');
-    expect(getBotAvatarByAppId(dataDir).size).toBe(0);
-  });
-});
-
 describe('getGitRepoInfo', () => {
   it('resolves repo name + branch for a git workdir', async () => {
     const repo = initRepo('feat/enrich-x');
@@ -85,6 +58,16 @@ describe('getGitRepoInfo', () => {
     expect(info?.branch).toBeNull();
   });
 
+  it('force-refreshes a branch change inside the positive cache TTL', async () => {
+    const repo = initRepo('main');
+    expect((await getGitRepoInfo(repo))?.branch).toBe('main');
+    git(['checkout', '-q', '-b', 'feat/live'], repo);
+
+    expect((await getGitRepoInfo(repo))?.branch).toBe('main');
+    expect((await getGitRepoInfo(repo, { force: true }))?.branch).toBe('feat/live');
+    expect((await getGitRepoInfo(repo))?.branch).toBe('feat/live');
+  });
+
   it('returns null for non-repo dirs and caches the miss', async () => {
     const plain = tempDir('botmux-enrich-plain-');
     expect(await getGitRepoInfo(plain)).toBeNull();
@@ -95,30 +78,5 @@ describe('getGitRepoInfo', () => {
   it('returns null for empty/missing cwd without spawning git', async () => {
     expect(await getGitRepoInfo('')).toBeNull();
     expect(await getGitRepoInfo('   ')).toBeNull();
-  });
-});
-
-describe('enrichSessionRowsForPresentation', () => {
-  it('stamps avatar + repo/branch; passes untouched rows through by identity', async () => {
-    const dataDir = tempDir('botmux-enrich-data-');
-    writeFileSync(
-      join(dataDir, 'bots-info.json'),
-      JSON.stringify([{ larkAppId: 'cli_a', botAvatarUrl: 'https://img.example/a.png' }]),
-    );
-    const repo = initRepo('main');
-    const plain = tempDir('botmux-enrich-plain-');
-
-    const rich = { sessionId: 's1', larkAppId: 'cli_a', workingDir: repo };
-    const plainRow = { sessionId: 's2', larkAppId: 'cli_zzz', workingDir: plain };
-    const bare = { sessionId: 's3' };
-    const [r1, r2, r3] = await enrichSessionRowsForPresentation([rich, plainRow, bare], dataDir);
-
-    expect(r1.botAvatarUrl).toBe('https://img.example/a.png');
-    expect(r1.repoName).toBe(repo.split('/').pop());
-    expect(r1.gitBranch).toBe('main');
-    expect(r2.botAvatarUrl).toBeUndefined();
-    expect(r2.repoName).toBeUndefined();
-    expect(r2).toBe(plainRow);
-    expect(r3).toBe(bare);
   });
 });

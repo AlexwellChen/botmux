@@ -30,6 +30,7 @@ import { initFloatingScrollbars } from './floating-scrollbars.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 import { updateAndRestartBotmux, type BotmuxUpdatePhase } from './update-action.js';
 import {
+  canonicalDashboardClientShellUrl,
   dashboardClientShellRedirect,
   readDashboardClientShell,
 } from './client-shell.js';
@@ -1354,6 +1355,10 @@ function initOwnerAvatar(): void {
 }
 
 void (async () => {
+  const canonicalClientShellUrl = canonicalDashboardClientShellUrl(window.location.href);
+  if (canonicalClientShellUrl) {
+    window.history.replaceState(window.history.state, '', canonicalClientShellUrl);
+  }
   ui.init();
   applyShellLocaleFromHash();
   const host = document.getElementById('app-root');

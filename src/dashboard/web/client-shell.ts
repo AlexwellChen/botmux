@@ -10,6 +10,32 @@ function normalizeClientShell(value: string | null): DashboardClientShell | null
 }
 
 /**
+ * Upgrade a legacy hash-scoped shell marker into the durable URL query.
+ * Returns the replacement URL, or null when no rewrite is needed/possible.
+ */
+export function canonicalDashboardClientShellUrl(href: string): string | null {
+  try {
+    const url = new URL(href);
+    if (normalizeClientShell(url.searchParams.get(CLIENT_SHELL_PARAM))) return null;
+
+    const queryIndex = url.hash.indexOf('?');
+    if (queryIndex < 0) return null;
+    const hashParams = new URLSearchParams(url.hash.slice(queryIndex + 1));
+    const shell = normalizeClientShell(hashParams.get(CLIENT_SHELL_PARAM));
+    if (!shell) return null;
+
+    const hashPath = url.hash.slice(0, queryIndex) || '#/';
+    hashParams.delete(CLIENT_SHELL_PARAM);
+    const remainingHashQuery = hashParams.toString();
+    url.searchParams.set(CLIENT_SHELL_PARAM, shell);
+    url.hash = remainingHashQuery ? `${hashPath}?${remainingHashQuery}` : hashPath;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Detect the restricted Desktop/Mobile dashboard shell.
  *
  * The query-string form is canonical because hash navigation must not clear

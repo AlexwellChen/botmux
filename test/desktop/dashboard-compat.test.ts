@@ -2,7 +2,11 @@ import { readFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { buildCompatManifest, handleDesktopCompat } from '../../src/dashboard/compat.js';
+import {
+  buildCompatManifest,
+  compatMachineIdForAuthenticatedRequest,
+  handleDesktopCompat,
+} from '../../src/dashboard/compat.js';
 
 let server: Server | null = null;
 
@@ -18,7 +22,6 @@ describe('dashboard desktop compat manifest', () => {
   it('builds the v2 manifest while retaining the v1 compatibility fields', () => {
     const manifest = buildCompatManifest({
       runtimeVersion: '2.95.0',
-      machineId: null,
     });
 
     expect(manifest).toMatchObject({
@@ -53,6 +56,7 @@ describe('dashboard desktop compat manifest', () => {
       workflow: { supported: false },
     });
     expect(manifest.capabilities).toMatchObject({
+      'overview.read': true,
       'sessions.read': true,
       'sessions.manage': true,
       'asks.answer': true,
@@ -64,6 +68,11 @@ describe('dashboard desktop compat manifest', () => {
       'workflow.manage': false,
     });
     expect(manifest.routes).not.toContain('#/workflows');
+    expect(manifest.routes).toEqual(
+      Object.values(manifest.modules)
+        .filter(module => module.supported && module.route)
+        .map(module => module.route),
+    );
   });
 
   it('only exposes a machine identity when a reliable id is supplied', () => {
@@ -79,6 +88,29 @@ describe('dashboard desktop compat manifest', () => {
       runtimeVersion: '2.95.0',
       machineId: '   ',
     }).runtimeIdentity).toBeUndefined();
+  });
+
+  it('only releases the bound machine identity to the active dashboard token', () => {
+    expect(compatMachineIdForAuthenticatedRequest(
+      'active-token',
+      'active-token',
+      ' machine-123 ',
+    )).toBe('machine-123');
+    expect(compatMachineIdForAuthenticatedRequest(
+      undefined,
+      'active-token',
+      'machine-123',
+    )).toBeNull();
+    expect(compatMachineIdForAuthenticatedRequest(
+      'stale-token',
+      'active-token',
+      'machine-123',
+    )).toBeNull();
+    expect(compatMachineIdForAuthenticatedRequest(
+      'active-token',
+      undefined,
+      'machine-123',
+    )).toBeNull();
   });
 
   it('serves GET /__desktop/compat as read-only JSON', async () => {

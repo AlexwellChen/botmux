@@ -92,6 +92,7 @@ import { validateTriggerRequest, type TriggerResponse } from '../services/trigge
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
+import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
 
 // 机器人真·改名 renamer，由 daemon 启动时注册（开放平台自动化 + daemon 侧
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
@@ -339,6 +340,49 @@ ipcRoute('POST', DEVICE_ISOLATION_COMMIT_PATH, (req, res) =>
   handleDeviceIsolationActivationRoute(req, res, commitDeviceIsolationActivation));
 ipcRoute('POST', DEVICE_ISOLATION_RELEASE_PATH, (req, res) =>
   handleDeviceIsolationActivationRoute(req, res, releaseDeviceIsolationActivation));
+
+// ─── Pending asks (trusted Desktop/dashboard operator only) ─────────────────
+
+ipcRoute('GET', '/api/asks/pending', (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  const asks = listPendingAsks().map((ask) => ({
+    askId: ask.askId,
+    sessionId: ask.sessionId,
+    larkAppId: ask.larkAppId,
+    chatId: ask.chatId,
+    rootMessageId: ask.rootMessageId,
+    questions: ask.questions,
+    deadlineAt: ask.deadlineAt,
+    createdAt: ask.createdAt,
+  }));
+  return jsonRes(res, 200, { asks });
+});
+
+ipcRoute('POST', '/api/asks/answer', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  let body: { askId?: string; selections?: string[][]; by?: string };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body.askId || !Array.isArray(body.selections)) {
+    return jsonRes(res, 400, { ok: false, error: 'askId_and_selections_required' });
+  }
+  const outcome = submitAskFromDesktop({
+    askId: body.askId,
+    selections: body.selections,
+    by: typeof body.by === 'string' ? body.by : 'desktop',
+  });
+  if (outcome !== 'accepted') {
+    return jsonRes(res, 409, { ok: false, error: outcome });
+  }
+  return jsonRes(res, 200, { ok: true, outcome });
+});
 
 ipcRoute('GET', '/api/sessions', (_req, res) => {
   // Active first (live state), closed appended (historical)
