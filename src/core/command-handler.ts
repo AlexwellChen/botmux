@@ -35,6 +35,7 @@ import {
   ensureSessionWhiteboard,
   getAvailableBots,
 } from './session-manager.js';
+import { markInitialUserTurnPending } from './initial-user-turn.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
@@ -1467,6 +1468,11 @@ export async function handleCommand(
               pendingPrompt.trim().length > 0 ||
               (ds!.pendingAttachments?.length ?? 0) > 0 ||
               (ds!.pendingFollowUps?.length ?? 0) > 0;
+            // Nothing to submit at all (bare `/repo`: the message IS the command).
+            // The CLI boots idle, so the user's NEXT real message is its first
+            // turn and must carry the full new-topic opening — see
+            // markInitialUserTurnPending below.
+            const emptyStart = !pendingRawInput && !hasBufferedInput;
             if (hasBufferedInput) ensureSessionWhiteboard(ds!);
             const wrappedInput = hasBufferedInput
               ? buildNewTopicCliInput(
@@ -1526,6 +1532,11 @@ export async function handleCommand(
             if (pendingRawInput || hasBufferedInput) {
               rememberLastCliInput(ds!, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
             }
+            // Durable, one-shot: the CLI is up but has never received a real user
+            // turn, so the next business message must be built as a NEW TOPIC
+            // (routing + built-in skill discovery + identity), not a follow-up.
+            // Set after the fork so a throwing fork leaves the session untouched.
+            if (emptyStart) markInitialUserTurnPending(ds!);
             ds!.pendingPrompt = undefined;
             ds!.pendingCodexAppText = undefined;
             ds!.pendingCodexAppApplicationContext = undefined;
@@ -1647,6 +1658,10 @@ export async function handleCommand(
             sessionStore.updateSession(ds!.session);
             ds!.hasHistory = false;
             forkWorker(ds!, '', false);
+            // Brand-new CLI in a brand-new session record: it has never seen the
+            // botmux opening context either, so the next real business message
+            // is its new-topic first turn (same invariant as the pending path).
+            markInitialUserTurnPending(ds!);
             try {
               await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
             } catch (e) {

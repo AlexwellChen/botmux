@@ -1412,6 +1412,15 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
     announceSessionRow(ds);
 
+    if (session.initialUserTurnPending) {
+      // `hasHistory: true` above means "there may be a CLI process/transcript to
+      // reattach or resume", NOT "a user has ever spoken to it". This session's
+      // CLI was booted idle by the repo flow and never received a real turn, so
+      // the next business message still routes through the new-topic opening
+      // builder and cold-spawns instead of `--resume`. See core/initial-user-turn.ts.
+      logger.info(`[${session.sessionId.substring(0, 8)}] Restored empty-started session — its first real user turn still opens as a new topic`);
+    }
+
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
   }
 

@@ -71,6 +71,7 @@ import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
+import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
@@ -454,8 +455,14 @@ export async function commitRepoSelection(
         pendingPrompt.trim().length > 0 ||
         (ds.pendingAttachments?.length ?? 0) > 0 ||
         (ds.pendingFollowUps?.length ?? 0) > 0;
+      // Nothing to submit at all (session created by a bare `/repo`, i.e. the
+      // message IS the command). Boot the CLI idle instead of burning an empty
+      // `<user_message>` opening on it, and mark the session so the user's NEXT
+      // real message becomes the new-topic first turn. Mirrors the text
+      // `/repo` path in command-handler's forkPendingCli.
+      const emptyStart = !pendingRawInput && !hasBufferedInput;
       if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
-      const wrappedInput = (!pendingRawInput || hasBufferedInput)
+      const wrappedInput = hasBufferedInput
         ? buildNewTopicCliInput(
             pendingPrompt,
             ds.session.sessionId,
@@ -508,8 +515,11 @@ export async function commitRepoSelection(
           forkWorker(ds, '', false);
         } else if (pendingTurnId && hasBufferedInput) {
           forkWorker(ds, prompt, { turnId: pendingTurnId });
-        } else {
+        } else if (hasBufferedInput) {
           forkWorker(ds, prompt);
+        } else {
+          // Empty start — idle boot, no turn submitted.
+          forkWorker(ds, '', false);
         }
       } catch (e) {
         ds.pendingRepo = true;
@@ -517,7 +527,12 @@ export async function commitRepoSelection(
         publishAttentionPatch(ds);
         throw e;
       }
-      rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
+      if (pendingRawInput || hasBufferedInput) {
+        rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
+      }
+      // Durable, one-shot: the CLI is up but has never received a real user turn.
+      // Set after the fork so a throwing fork leaves the session untouched.
+      if (emptyStart) markInitialUserTurnPending(ds);
       ds.pendingPrompt = undefined;
       ds.pendingCodexAppText = undefined;
       ds.pendingCodexAppApplicationContext = undefined;
@@ -655,6 +670,9 @@ export async function commitRepoSelection(
     ds.lastScreenContent = undefined;
     ds.lastScreenStatus = undefined;
     forkWorker(ds, '', false);
+    // Brand-new CLI in a brand-new session record: the next real business
+    // message is its new-topic first turn (same invariant as the pending path).
+    markInitialUserTurnPending(ds);
     if (!opts?.suppressConfirmReply) {
       try {
         await sessionReply(rootId, t('cmd.repo.switched_to', { name: dirLabel }, locTarget));
