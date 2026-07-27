@@ -100,8 +100,7 @@ export const store = new Store();
 
 export async function bootstrap() {
   // Establish SSE before fetching snapshots, then buffer events while each
-  // authoritative snapshot is installed. Waiting for `open` matters: merely
-  // constructing EventSource does not mean the server listener exists yet.
+  // authoritative snapshot is installed.
   const buffered: Array<{ type: string; body: any }> = [];
   let snapshotReady = false;
   const es = new EventSource('/events');
@@ -155,39 +154,24 @@ export async function bootstrap() {
     return syncInFlight;
   };
 
-  let firstOpen = true;
-  let resolveFirstOpen!: () => void;
-  let rejectFirstOpen!: (error: Error) => void;
-  const opened = new Promise<void>((resolve, reject) => {
-    resolveFirstOpen = resolve;
-    rejectFirstOpen = reject;
-  });
-  const openTimer = setTimeout(() => {
-    rejectFirstOpen(new Error('dashboard event stream open timed out'));
-  }, 10_000);
   es.onerror = () => store.setOnline(false);
   es.onopen = () => {
     store.setOnline(true);
-    if (firstOpen) {
-      firstOpen = false;
-      clearTimeout(openTimer);
-      resolveFirstOpen();
-      return;
-    }
-    // EventSource reconnects automatically. Reconcile instead of replaying
-    // every historical row so changes from the disconnected window converge
-    // with one render, including deletes and closed sessions.
+    // Reconcile on EVERY open, first one included. Constructing an EventSource
+    // does not mean the server-side listener exists yet, so a snapshot taken
+    // before this point can miss whatever happened in that window; a reconnect
+    // can additionally miss deletes, which only a fresh snapshot converges.
+    // reconcileSnapshot coalesces, so overlapping calls collapse into one extra
+    // round instead of a fetch per event.
     void reconcileSnapshot().catch(() => {
-      // The live stream remains useful; the next reconnect retries the snapshot.
+      // The live stream remains useful; the next open retries the snapshot.
     });
   };
 
-  try {
-    await opened;
-    await reconcileSnapshot();
-  } catch (error) {
-    clearTimeout(openTimer);
-    es.close();
-    throw error;
-  }
+  // Never gate the first snapshot on `onopen`: a buffering reverse proxy can
+  // delay the stream indefinitely, and a board with slightly stale rows beats
+  // an empty one. On failure the stream is deliberately left open so
+  // EventSource keeps retrying on its own and the open handler above recovers
+  // without a manual refresh.
+  await reconcileSnapshot();
 }

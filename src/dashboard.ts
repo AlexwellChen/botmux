@@ -303,8 +303,10 @@ const aggregator = new Aggregator();
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
 
 // Keep Git-derived fields in the central read-model so REST snapshots and SSE
-// share one row shape. Idle/limited turn boundaries force a low-frequency
-// branch refresh after the CLI has had a chance to change repositories.
+// share one row shape. Idle/limited turn boundaries force a branch refresh
+// after the CLI has had a chance to change repositories — that is one
+// `git rev-parse` per session per turn, bounded by the resolver's concurrency
+// cap, NOT a slow background poll.
 aggregator.on(sessionPresentation.onEvent);
 
 // 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
@@ -1306,14 +1308,15 @@ function syncSubscriptions(): void {
     if (!subs.has(d.larkAppId)) {
       void attachDaemon(d);
     }
-    if (d.botAvatarUrl) {
-      for (const row of aggregator.getSessions()) {
-        if (row.larkAppId !== d.larkAppId || row.botAvatarUrl === d.botAvatarUrl) continue;
-        aggregator.applyEvent(d.larkAppId, {
-          type: 'session.update',
-          body: { sessionId: row.sessionId, patch: { botAvatarUrl: d.botAvatarUrl } },
-        });
-      }
+    // Push avatar changes in BOTH directions: gating on `d.botAvatarUrl` would
+    // leave the stale image on every row when a bot's avatar is cleared.
+    const avatar = d.botAvatarUrl ?? null;
+    for (const row of aggregator.getSessions()) {
+      if (row.larkAppId !== d.larkAppId || (row.botAvatarUrl ?? null) === avatar) continue;
+      aggregator.applyEvent(d.larkAppId, {
+        type: 'session.update',
+        body: { sessionId: row.sessionId, patch: { botAvatarUrl: avatar } },
+      });
     }
   }
   // Close subscriptions for daemons that went offline. Cache entries are
