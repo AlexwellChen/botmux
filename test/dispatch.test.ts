@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { findAncestorSessionContext } from '../src/core/session-marker.js';
 import {
   acceptedDispatchBotAppIds,
+  activeConversationBotOpenIds,
   appendDispatchReportProtocol,
   appendLegacyDispatchReportProtocol,
   parseDispatchBotSpec,
@@ -216,6 +217,61 @@ describe('findSubBotTopic', () => {
   });
 });
 
+describe('activeConversationBotOpenIds', () => {
+  const botEntries = [
+    { larkAppId: 'cli_orchestrator', botName: 'AI Bear' },
+    { larkAppId: 'cli_reviewer', botName: 'TraeX' },
+  ];
+  const crossRef = {
+    'AI Bear': 'ou_orchestrator',
+    'TraeX': 'ou_reviewer',
+  };
+
+  it('finds a peer active in the current topic and excludes the same peer in another topic', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_old', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      currentRootMessageId: 'om_current',
+      chatScope: false,
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set(['ou_reviewer']));
+  });
+
+  it('does not treat a peer active only in another topic as reachable here', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_old', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      currentRootMessageId: 'om_current',
+      chatScope: false,
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set());
+  });
+
+  it('uses the whole chat as the anchor for chat-scope sessions', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_reviewer' },
+        { status: 'active', scope: 'chat', chatId: 'oc_else', rootMessageId: 'oc_else', larkAppId: 'cli_orchestrator' },
+      ],
+      targetChatId: 'oc_main',
+      currentRootMessageId: 'om_irrelevant',
+      chatScope: true,
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set(['ou_reviewer']));
+  });
+});
+
 describe('eligibleAutoMentionAliases', () => {
   const selfAliases = new Set<string>(['claude', 'claude-code']);
   const convo = new Set<string>(['cli_reviewer_in_topic']);
@@ -253,6 +309,17 @@ describe('offTopicSubBotTopic', () => {
 
   it('allows the current interlocutor (quoteTargetSender) even if it is a dispatched sub-bot', () => {
     expect(offTopicSubBotTopic({ mentionOpenId: 'ou_subbot', quoteTargetSenderOpenId: 'ou_subbot', chatId: 'oc_main', registry, activeSeeds })).toBeNull();
+  });
+
+  it('does not recommend an old dispatch topic when the bot is already active here', () => {
+    expect(offTopicSubBotTopic({
+      mentionOpenId: 'ou_subbot',
+      quoteTargetSenderOpenId: 'ou_human',
+      reachableOpenIds: new Set(['ou_subbot']),
+      chatId: 'oc_main',
+      registry,
+      activeSeeds,
+    })).toBeNull();
   });
 
   it('allows a bot that is not a dispatched sub-bot', () => {

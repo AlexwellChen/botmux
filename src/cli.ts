@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -7488,6 +7488,21 @@ async function cmdSend(rest: string[]): Promise<void> {
   // topic — defeating the whole point of chat-scope routing.
   const isChatScope = s.scope === 'chat';
 
+  // Load the sender-scoped bot identity map once. Besides prose @Name
+  // injection below, it lets the sub-bot hint recognize peers that already
+  // have an active session in THIS conversation.
+  let botEntries: BotMentionEntry[] = [];
+  let crossRef: Record<string, string> = {};
+  try {
+    const dataDir = resolveDataDir();
+    const botInfoPath = join(dataDir, 'bots-info.json');
+    botEntries = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
+    const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
+    crossRef = existsSync(crossRefPath)
+      ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
+      : {};
+  } catch { /* best-effort identity map */ }
+
   // ── Footgun guard: orchestrator → sub-bot ──
   // A dispatched sub-bot's session lives in its sub-topic; @-ing it from the main
   // chat spawns a fresh, context-less one. The check is computed ONCE and applied
@@ -7500,18 +7515,30 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (existsSync(regPath)) dispatchReg = JSON.parse(readFileSync(regPath, 'utf-8'));
   } catch { /* no/!corrupt registry → no guard */ }
   const dispatchActiveSeeds = new Set<string>();
+  let allSessions: SessionData[] = [];
   if (Object.keys(dispatchReg).length > 0) {
-    for (const sess of loadSessions().values()) {
-      if (sess.status === 'active' && sess.scope !== 'chat' && sess.rootMessageId) {
+    allSessions = [...loadSessions().values()];
+    for (const sess of allSessions) {
+      if (sess.status !== 'active') continue;
+      if (sess.scope !== 'chat' && sess.rootMessageId) {
         dispatchActiveSeeds.add(sess.rootMessageId);
       }
     }
   }
+  const reachableOpenIds = activeConversationBotOpenIds({
+    sessions: allSessions,
+    targetChatId,
+    currentRootMessageId: s.rootMessageId,
+    chatScope: isChatScope,
+    botEntries,
+    crossRef,
+  });
   // Sub-topic seed if `openId` is a dispatched sub-bot in an active topic that is
-  // NOT reachable in the current conversation; else null. The bot I'm replying to
-  // here (quoteTargetSenderOpenId) is reachable, so it's never treated as off-topic.
+  // NOT reachable in the current conversation; else null. Both the bot I'm
+  // replying to and any peer with an active session at this conversation anchor
+  // are reachable, so an unrelated old dispatch topic must not be recommended.
   const offTopicSubBotSeed = (openId: string): string | null =>
-    offTopicSubBotTopic({ mentionOpenId: openId, quoteTargetSenderOpenId: replyTargetSenderOpenId, chatId: targetChatId, registry: dispatchReg, activeSeeds: dispatchActiveSeeds });
+    offTopicSubBotTopic({ mentionOpenId: openId, quoteTargetSenderOpenId: replyTargetSenderOpenId, reachableOpenIds, chatId: targetChatId, registry: dispatchReg, activeSeeds: dispatchActiveSeeds });
   // Explicit --mention / --mention-back of an off-topic sub-bot → block + point to
   // the right command (--anyway overrides). Prose @Name injection is filtered
   // (dropped, not blocked) at its own site below.
@@ -7769,16 +7796,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // "获取群组中其他机器人和用户@当前机器人的消息"权限），不再走任何本地
     // 转发——botmux 历史上为绕过 Lark 不投递跨 bot 事件搞过 signal-file，
     // 那套已经在该权限上线后整体下线。
-    let botEntries: BotMentionEntry[] = [];
-    let crossRef: Record<string, string> = {};
     try {
-      const dataDir = resolveDataDir();
-      const botInfoPath = join(dataDir, 'bots-info.json');
-      botEntries = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
-      const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
-      crossRef = existsSync(crossRefPath)
-        ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
-        : {};
       // --no-mention 显式不 @ 任何人：跳过正文 @BotName 的自动注入，否则正文里
       // 出现的 @名字 仍会被注入成 <at>，破坏 --no-mention 语义、还可能误触发对方
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。

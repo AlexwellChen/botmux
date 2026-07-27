@@ -225,6 +225,47 @@ export function findSubBotTopic(input: {
 }
 
 /**
+ * Resolve sender-scoped open_ids for bots that already have an active session
+ * at the current conversation anchor. These peers are reachable here, so an
+ * older dispatch record for the same bot must not be presented as the target.
+ */
+export function activeConversationBotOpenIds(input: {
+  sessions: Iterable<{
+    status: 'active' | 'closed';
+    scope?: 'thread' | 'chat';
+    chatId: string;
+    rootMessageId: string;
+    larkAppId?: string;
+  }>;
+  targetChatId: string;
+  currentRootMessageId: string;
+  chatScope: boolean;
+  botEntries: Array<{ larkAppId: string; botName: string | null }>;
+  crossRef: Record<string, string>;
+}): Set<string> {
+  const activeAppIds = new Set<string>();
+  for (const session of input.sessions) {
+    if (session.status !== 'active'
+      || !session.larkAppId
+      || session.chatId !== input.targetChatId) continue;
+    const here = input.chatScope
+      ? session.scope === 'chat'
+      : session.scope !== 'chat'
+        && !!input.currentRootMessageId
+        && session.rootMessageId === input.currentRootMessageId;
+    if (here) activeAppIds.add(session.larkAppId);
+  }
+
+  const openIds = new Set<string>();
+  for (const entry of input.botEntries) {
+    if (!entry.botName || !activeAppIds.has(entry.larkAppId)) continue;
+    const openId = input.crossRef[entry.botName];
+    if (openId) openIds.add(openId);
+  }
+  return openIds;
+}
+
+/**
  * Resolve where a `botmux report` should go + who to @, so report-back works
  * even when the orchestrator is on a DIFFERENT machine.
  *
@@ -418,20 +459,21 @@ export function acceptedDispatchBotAppIds(input: {
  * a dispatched sub-bot in an active topic that is NOT reachable in the current
  * conversation (so @-ing it here would spawn a context-less session), else null.
  *
- * The bot I'm replying to (`quoteTargetSenderOpenId`) is reachable right here, so
- * it's never treated as off-topic — that's the boundary that stops the guard from
- * blocking a normal reply to a bot conversing with me. Callers block (explicit
- * --mention) or drop (prose injection) on a non-null result, and skip the whole
- * check under `--anyway`.
+ * The bot I'm replying to (`quoteTargetSenderOpenId`) and bots in
+ * `reachableOpenIds` are reachable right here, so an unrelated older dispatch
+ * topic is never recommended for them.
  */
 export function offTopicSubBotTopic(input: {
   mentionOpenId: string;
   quoteTargetSenderOpenId?: string;
+  reachableOpenIds?: Set<string>;
   chatId: string;
   registry: Record<string, { orchChatId?: string; bots?: string[] }>;
   activeSeeds: Set<string>;
 }): string | null {
-  if (!input.mentionOpenId || input.mentionOpenId === input.quoteTargetSenderOpenId) return null;
+  if (!input.mentionOpenId
+    || input.mentionOpenId === input.quoteTargetSenderOpenId
+    || input.reachableOpenIds?.has(input.mentionOpenId)) return null;
   return findSubBotTopic({
     mentionOpenId: input.mentionOpenId,
     chatId: input.chatId,
