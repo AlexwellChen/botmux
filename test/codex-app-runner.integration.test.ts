@@ -42,6 +42,7 @@ function startRunner(
   logPath: string,
   version: string,
   behavior: string,
+  extraArgs: string[] = [],
 ): Harness {
   let stdout = '';
   let stderr = '';
@@ -55,6 +56,7 @@ function startRunner(
     fakeCodex,
     '--cwd',
     cwd,
+    ...extraArgs,
   ], {
     cwd: resolve('.'),
     env: {
@@ -370,6 +372,31 @@ describe('codex-app-runner app-server protocol integration', () => {
       ));
       expect(lastAccepted?.index).toBeLessThan(finalIndex);
       expect(harness.stdout.match(/\x1b\]777;botmux:final:/g)).toHaveLength(1);
+    } finally {
+      await stopChild(harness.child);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards --model + --reasoning-effort into thread/start (top-level model + config.model_reasoning_effort, xhigh verbatim)', async () => {
+    // Runs the REAL codex-app-runner against the fake app-server and asserts the
+    // actual thread/start params — the hop the adapter-flag test cannot cover.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-effort-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', [
+      '--model', 'gpt-5.6-terra', '--reasoning-effort', 'xhigh',
+    ]);
+    try {
+      await waitForOutput(harness, output => output.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitForOutput(harness, output => FINAL_MARKER.test(output));
+      const threadStart = readRequests(logPath).find(r => r.method === 'thread/start');
+      expect(threadStart).toBeTruthy();
+      expect(threadStart.params.model).toBe('gpt-5.6-terra');            // top-level model
+      expect(threadStart.params.config?.model_reasoning_effort).toBe('xhigh'); // NOT downgraded
     } finally {
       await stopChild(harness.child);
       rmSync(dir, { recursive: true, force: true });

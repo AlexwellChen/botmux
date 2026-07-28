@@ -8,6 +8,7 @@
  * receives, using existing fixtures — no live process needed.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 // codex-app buildArgs resolves the codex binary via resolveCommand; return the
 // path as-is so we can assert the emitted flags without shelling out.
@@ -63,5 +64,22 @@ describe('codex-app adapter buildArgs — runner flags', () => {
     const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE });
     expect(args).not.toContain('--model');
     expect(args).not.toContain('--reasoning-effort');
+  });
+});
+
+describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
+  // Source-wiring guard: the RPC engine unit test constructs the engine directly,
+  // so it would still pass if worker.ts stopped forwarding reasoningEffort. This
+  // locks the actual construction site — deleting the line fails here, catching
+  // exactly the regression codex caught last round (effort never reaching the
+  // real execution engine).
+  it('worker constructs CodexRpcEngine with reasoningEffort: cfg.reasoningEffort', () => {
+    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+    const ctor = source.indexOf('new CodexRpcEngine({');
+    expect(ctor).toBeGreaterThan(0);
+    const end = source.indexOf('});', ctor);
+    const body = source.slice(ctor, end);
+    expect(body).toContain('model: cfg.model');
+    expect(body).toContain('reasoningEffort: cfg.reasoningEffort');
   });
 });
