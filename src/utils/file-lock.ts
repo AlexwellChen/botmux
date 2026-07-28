@@ -276,8 +276,13 @@ function pinnedHolderMetadataState(
   }
 
   // Content-relevant metadata changing on a non-empty identity is not a
-  // normal owner lifecycle transition. In particular, a same-size rewrite
-  // followed by mtime restoration still changes ctime and fails closed below.
+  // normal owner lifecycle transition. A size or mtime change fails closed
+  // here. Note we cannot detect a same-size rewrite that also restores mtime
+  // purely from metadata: ctime often does not advance within it at ms
+  // resolution (e.g. ext4), so ctime is not a reliable content-tamper signal.
+  // The legitimate owner protocol never rewrites an epoch in place (O_EXCL
+  // once, then a new epoch pathname), so this residual window is defense in
+  // depth rather than a live hazard.
   if (sizeChanged || mtimeChanged) return 'untrusted';
 
   // link(2)/unlink(2) legitimately change ctime and nlink without touching

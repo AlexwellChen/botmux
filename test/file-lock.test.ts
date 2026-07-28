@@ -491,15 +491,20 @@ describe('withFileLock', () => {
     expect(lstatSync(lockPath).ino).toBe(staleInode);
   });
 
-  it('fails closed when async owner content changes with the same size and mtime', async () => {
-    const { ownerPath, old } = plantStaleClaimOwner(target, '99999998');
+  // A same-length in-flight rewrite of the owner payload is caught via mtime
+  // moving off the planted age. We deliberately do NOT restore mtime here:
+  // relying on ctime to advance is not portable (ext4's ms-resolution ctime
+  // frequently does not tick within a same-size+same-mtime rewrite, so that
+  // assertion was ~64% flaky on Linux). mtime advancing off `old` is a
+  // deterministic, cross-platform signal for the untrusted fail-closed path.
+  it('fails closed when async owner content is rewritten in flight', async () => {
+    const { ownerPath } = plantStaleClaimOwner(target, '99999998');
     let changed = false;
     __testOnly_setFileLockHooks({
       afterPinnedHolderFirstStat: path => {
         if (path !== ownerPath || changed) return;
         changed = true;
         writeFileSync(ownerPath, '99999997', 'utf8');
-        utimesSync(ownerPath, old, old);
       },
     });
 
@@ -508,15 +513,14 @@ describe('withFileLock', () => {
     expect(changed).toBe(true);
   });
 
-  it('fails closed when sync owner content changes with the same size and mtime', () => {
-    const { ownerPath, old } = plantStaleClaimOwner(target, '99999998');
+  it('fails closed when sync owner content is rewritten in flight', () => {
+    const { ownerPath } = plantStaleClaimOwner(target, '99999998');
     let changed = false;
     __testOnly_setFileLockHooks({
       afterPinnedHolderFirstStatSync: path => {
         if (path !== ownerPath || changed) return;
         changed = true;
         writeFileSync(ownerPath, '99999997', 'utf8');
-        utimesSync(ownerPath, old, old);
       },
     });
 
