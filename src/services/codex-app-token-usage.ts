@@ -1,0 +1,135 @@
+/**
+ * Per-turn token-usage accumulator for the codex app-server protocol.
+ *
+ * codex emits token usage via `thread/tokenUsage/updated` notifications, NOT on
+ * `turn/completed` (whose Turn object carries no usage). A single codex turn can
+ * produce MANY upstream completions (tool-call loops), so the notification's
+ * `tokenUsage.last` is only the LAST completion's usage — never the whole turn.
+ * The authoritative per-turn figure is a delta of the cumulative `total`:
+ *
+ *   - on the first notification for a turn, derive baseline = total - last
+ *     (per field), so a resumed session needs no prior session-total knowledge;
+ *   - the turn's usage so far = latestTotal - baseline (per field);
+ *   - later notifications only advance latestTotal (total-delta is idempotent
+ *     against duplicate notifications — never sum `last`, never overwrite).
+ *
+ * Fail-closed: if `total` regresses or any derived field goes negative, the
+ * usage is dropped (returns null) and the caller logs a protocol warning rather
+ * than reporting corrupt numbers.
+ *
+ * Ref: codex protocol TokenUsageInfo::append_last_usage (total += last; last =
+ * this completion) and app-server ThreadTokenUsageUpdatedNotification /
+ * TokenUsageBreakdown (0.145 generated types).
+ */
+
+/** codex TokenUsageBreakdown (0.145). All numbers; cumulative on `total`. */
+export interface CodexTokenBreakdown {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+}
+
+/** riff-facing four-bucket usage (mutually exclusive input buckets). */
+export interface TurnTokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreateTokens: number;
+}
+
+function isFiniteNum(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+/** Validate a raw notification payload's breakdown into a typed one, or null. */
+export function parseCodexTokenBreakdown(raw: unknown): CodexTokenBreakdown | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const keys: (keyof CodexTokenBreakdown)[] = [
+    'totalTokens', 'inputTokens', 'cachedInputTokens',
+    'cacheWriteInputTokens', 'outputTokens', 'reasoningOutputTokens',
+  ];
+  const out = {} as CodexTokenBreakdown;
+  for (const k of keys) {
+    // Missing fields default to 0 (older/partial payloads); present-but-nonnumeric is invalid.
+    if (r[k] === undefined) { out[k] = 0; continue; }
+    if (!isFiniteNum(r[k])) return null;
+    out[k] = r[k] as number;
+  }
+  return out;
+}
+
+/** Map a cumulative-delta codex breakdown to riff's four mutually-exclusive
+ *  buckets. codex `inputTokens` INCLUDES cached-read + cache-write, so the
+ *  fresh-input bucket subtracts both. Returns null if the split is incoherent
+ *  (buckets exceed input) — caller drops usage + warns rather than emit garbage. */
+export function toFourBucket(d: CodexTokenBreakdown): TurnTokenUsage | null {
+  const cacheReadTokens = d.cachedInputTokens;
+  const cacheCreateTokens = d.cacheWriteInputTokens;
+  const outputTokens = d.outputTokens; // reasoningOutputTokens is a subset — never add
+  const inputTokens = d.inputTokens - cacheReadTokens - cacheCreateTokens;
+  if (cacheReadTokens < 0 || cacheCreateTokens < 0 || outputTokens < 0 || inputTokens < 0) return null;
+  return { inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens };
+}
+
+/** Accumulates per-turn usage from `thread/tokenUsage/updated` notifications for
+ *  ONE appTurnId, using the total-delta algorithm. */
+export class TurnTokenUsageAccumulator {
+  private baseline: CodexTokenBreakdown | null = null;
+  private latestTotal: CodexTokenBreakdown | null = null;
+  private protocolWarning: string | undefined;
+
+  /** Feed a notification's `tokenUsage` = { total, last, ... }. `total` is
+   *  cumulative; `last` is the most recent completion's usage. */
+  update(total: CodexTokenBreakdown, last: CodexTokenBreakdown): void {
+    if (this.baseline === null) {
+      // baseline = total - last, per field. This lets a mid-session / resumed
+      // turn measure only its own tokens without knowing prior session totals.
+      this.baseline = subtract(total, last);
+    }
+    // total must be monotonic non-decreasing vs the last seen; a regression is a
+    // protocol anomaly → fail closed (stop trusting usage for this turn).
+    if (this.latestTotal && !isGreaterOrEqual(total, this.latestTotal)) {
+      this.protocolWarning = 'tokenUsage.total regressed';
+      return;
+    }
+    this.latestTotal = total;
+  }
+
+  /** The turn's usage so far as four buckets, or null if no usage seen / a
+   *  protocol anomaly was detected / the bucket split is incoherent. */
+  result(): TurnTokenUsage | null {
+    if (this.protocolWarning || !this.baseline || !this.latestTotal) return null;
+    const delta = subtract(this.latestTotal, this.baseline);
+    if (!allNonNegative(delta)) return null;
+    return toFourBucket(delta);
+  }
+
+  /** Non-null when the accumulator gave up on usage for a protocol reason. */
+  get warning(): string | undefined { return this.protocolWarning; }
+}
+
+function subtract(a: CodexTokenBreakdown, b: CodexTokenBreakdown): CodexTokenBreakdown {
+  return {
+    totalTokens: a.totalTokens - b.totalTokens,
+    inputTokens: a.inputTokens - b.inputTokens,
+    cachedInputTokens: a.cachedInputTokens - b.cachedInputTokens,
+    cacheWriteInputTokens: a.cacheWriteInputTokens - b.cacheWriteInputTokens,
+    outputTokens: a.outputTokens - b.outputTokens,
+    reasoningOutputTokens: a.reasoningOutputTokens - b.reasoningOutputTokens,
+  };
+}
+
+function isGreaterOrEqual(a: CodexTokenBreakdown, b: CodexTokenBreakdown): boolean {
+  return a.totalTokens >= b.totalTokens
+    && a.inputTokens >= b.inputTokens
+    && a.outputTokens >= b.outputTokens;
+}
+
+function allNonNegative(d: CodexTokenBreakdown): boolean {
+  return d.totalTokens >= 0 && d.inputTokens >= 0 && d.cachedInputTokens >= 0
+    && d.cacheWriteInputTokens >= 0 && d.outputTokens >= 0 && d.reasoningOutputTokens >= 0;
+}
