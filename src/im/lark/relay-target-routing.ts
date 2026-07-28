@@ -59,8 +59,9 @@ export function resolveRelayTargetRouting(input: {
     return { scope: 'thread', anchor: message.rootId };
   }
 
-  // 私聊默认（thread 模式）顶层消息：/relay 消息本身种一个新 DM 话题 — 跟
-  // decideRouting 对 top-level DM 的处理同款。
+  // 私聊显式 thread 模式顶层消息：/relay 消息本身种一个新 DM 话题 — 跟
+  // decideRouting 对 top-level DM 的处理同款。（默认 chat 已在上面的规则 1 返回，
+  // 走到这里说明 p2pMode 显式为 thread。）
   if (chatMode === 'p2p') {
     return { scope: 'thread', anchor: message.messageId };
   }
