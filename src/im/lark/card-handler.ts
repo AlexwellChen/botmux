@@ -2664,7 +2664,24 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return discoverAdoptableZellijSessions(botCfg.cliId)
           .find(s => s.zellijSession === selected.zellijSession && s.zellijPaneId === selected.zellijPaneId);
       }
-      const { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, adoptTargetKey } = await import('../../core/session-discovery.js');
+      const { discoverAdoptableSessions, discoverAdoptableSessionByTarget, excludeOwnedHerdrAdoptTargets, adoptTargetKey } = await import('../../core/session-discovery.js');
+
+      const matchesSelected = (s: import('../../core/session-discovery.js').AdoptableSession) => selected.key
+        ? adoptTargetKey(s) === selected.key
+        : s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid;
+
+      // 快路径：卡片 option 里已经带着 tmux 地址，先只解析那一个 pane。
+      // 全量扫描要对每个 pane 走进程树、且树里每个节点都拉一次全量 `ps`，pane 一多
+      // 就是数秒级同步阻塞（31 个 pane 实测 5.4s）。这里是卡片回调，飞书只给 3s
+      // 且**不会重推**，超时用户就看到「目标回调服务超时未响应」；更糟的是同步
+      // execSync 会把事件循环整个冻住，连 2500ms 提前 ACK 的保险丝都发不出去。
+      // 只收窄候选集、判定谓词与全量路径完全一致，没命中就原样回落全量扫描，
+      // 因此不改变任何既有结果，最差只多一次廉价的 tmux display。
+      if (selected.source !== 'herdr' && selected.tmuxTarget) {
+        const fast = discoverAdoptableSessionByTarget(selected.tmuxTarget, botCfg.cliId);
+        if (fast && matchesSelected(fast)) return fast;
+      }
+
       const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
         const target = active.session.persistentBackendTarget;
         return active.session.status === 'active'
@@ -2677,9 +2694,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return excludeOwnedHerdrAdoptTargets(
         discoverAdoptableSessions(botCfg.cliId),
         ownedHerdrTargets,
-      ).find(s => selected.key
-          ? adoptTargetKey(s) === selected.key
-          : s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
+      ).find(matchesSelected);
     }
     // Discovery scans a live process tree and can transiently miss a pane under
     // load (a racing `ps` snapshot); retry a few times before giving up so a
