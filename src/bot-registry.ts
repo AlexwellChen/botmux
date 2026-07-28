@@ -2160,9 +2160,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.receivedReactionEmoji.trim() : undefined,
       doneReactionEmoji: typeof entry.doneReactionEmoji === 'string' && entry.doneReactionEmoji.trim()
         ? entry.doneReactionEmoji.trim() : undefined,
-      // Only 'chat' is meaningful; 'thread' (and anything else) normalizes to
-      // undefined — the legacy thread-per-message default. Keeps bots.json clean.
-      p2pMode: entry.p2pMode === 'chat' ? 'chat' : undefined,
+      // Default is now 'chat' (flat continuous DM session). Only 'thread' is
+      // meaningful and persists; 'chat' (and anything else) normalizes to
+      // undefined so bots.json stays clean.
+      p2pMode: entry.p2pMode === 'thread' ? 'thread' : undefined,
       noCardChats: Array.isArray(entry.noCardChats)
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,
@@ -2180,12 +2181,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
-      // Per-bot regular-group default mode. Only the non-default modes
-      // ('chat-topic' | 'new-topic' | 'shared') are meaningful; 'chat' (the flat
-      // default) and anything else normalize to undefined so bots.json stays clean.
+      // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺
+      // 连续会话；群内原生话题各自独立会话), so only the NON-default modes
+      // ('chat' | 'new-topic' | 'shared') are meaningful and persist; 'chat-topic'
+      // and anything else normalize to undefined so bots.json stays clean.
       regularGroupReplyMode: (() => {
         const mode = normalizeChatReplyModeConfig(entry.regularGroupReplyMode);
-        return mode === 'new-topic' || mode === 'shared' || mode === 'chat-topic' ? mode : undefined;
+        return mode === 'chat' || mode === 'new-topic' || mode === 'shared' ? mode : undefined;
       })(),
       // 4-tier @ policy. Only 'topic' | 'never' | 'ambient' are meaningful;
       // 'always' (the default) and anything else normalize to undefined so

@@ -3808,8 +3808,14 @@ describe('handleCommand', () => {
 
     it('renders the picker in a thread-mode DM with a thread-scope target seeded on the /relay message', async () => {
       // p2p detection is via ds.chatType (authoritative, no Lark API hit).
-      // Default DM mode is thread: the /relay message seeds a fresh DM 话题,
-      // so the baked target is thread-scope anchored at the message id.
+      // Thread mode is now the explicit DM opt-out (default is 'chat'): the
+      // /relay message seeds a fresh DM 话题, so the baked target is thread-scope
+      // anchored at the message id.
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        const bot = defaultGetBot(id);
+        (bot.config as any).p2pMode = 'thread';
+        return bot;
+      }) as any);
       const { getChatNameAndMode } = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({
         session: makeSession({ ownerOpenId: 'ou_sender', chatType: 'p2p' }),

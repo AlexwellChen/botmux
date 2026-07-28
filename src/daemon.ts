@@ -4084,7 +4084,7 @@ async function adoptCodexNotifierEvent(
   signal.throwIfAborted();
 
   const botCfg = getBot(larkAppId).config;
-  const scope: 'thread' | 'chat' = botCfg.p2pMode === 'chat' ? 'chat' : 'thread';
+  const scope: 'thread' | 'chat' = botCfg.p2pMode === 'thread' ? 'thread' : 'chat';
   const anchor = scope === 'chat' ? chatId : cardMessageId;
   const activeKey = sessionKey(anchor, larkAppId);
   let ds = activeSessions.get(activeKey);
