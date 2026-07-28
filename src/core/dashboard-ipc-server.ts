@@ -138,6 +138,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import { ChatRenameCooldown, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, type DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
@@ -399,7 +400,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
@@ -783,6 +784,52 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
     return jsonRes(res, 502, { ok: false, error: 'worker_send_failed' });
   }
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, queued: v.command });
+});
+
+const proactiveChatRenameCooldown = new ChatRenameCooldown();
+
+/** Session-scoped external mutation used by the botmux-chat-rename Skill. */
+ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params) => {
+  const body = await readJsonBody<{ name?: unknown; proactive?: unknown } & Record<string, unknown>>(req)
+    .catch(() => ({} as { name?: unknown; proactive?: unknown } & Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (ds.chatType !== 'group') return jsonRes(res, 400, { ok: false, error: 'not_group_chat' });
+  const normalized = normalizeLarkChatName(body.name);
+  if (!normalized.ok) return jsonRes(res, 400, normalized);
+
+  const proactive = body.proactive === true;
+  const cooldownKey = `${ds.larkAppId}:${ds.chatId}`;
+  const now = Date.now();
+  const cooldown = proactiveChatRenameCooldown.check(cooldownKey, now);
+  if (proactive && !cooldown.ok) {
+    return jsonRes(res, 429, {
+      ok: false,
+      error: 'rate_limited',
+      retryAfterSeconds: cooldown.retryAfterSeconds,
+    });
+  }
+
+  const result = await groupsStore.renameChat(ds.larkAppId, ds.chatId, normalized.name);
+  if (!result.ok) {
+    const status = result.error === 'bot_not_in_chat' ? 403
+      : result.error === 'permission_denied' ? 403
+        : 502;
+    logger.warn(`[chat-rename:audit] failed session=${ds.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} proactive=${proactive} error=${result.error} detail=${result.detail ?? '-'}`);
+    return jsonRes(res, status, result);
+  }
+  if (result.changed) {
+    if (proactive) proactiveChatRenameCooldown.record(cooldownKey, now);
+    for (const active of getActiveSessionsRegistry()?.values() ?? []) {
+      if (active.chatId !== ds.chatId) continue;
+      active.session.chatDisplayName = result.newName;
+      sessionStore.updateSession(active.session);
+    }
+    logger.info(`[chat-rename:audit] success session=${ds.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} proactive=${proactive} old=${JSON.stringify(result.oldName)} new=${JSON.stringify(result.newName)}`);
+  }
+  jsonRes(res, 200, { ...result, chatId: ds.chatId });
 });
 
 /** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）

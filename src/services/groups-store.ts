@@ -74,6 +74,75 @@ export async function isInChat(larkAppId: string, chatId: string): Promise<boole
   }
 }
 
+export type RenameChatResult =
+  | { ok: true; oldName: string; newName: string; changed: boolean }
+  | { ok: false; error: 'bot_not_in_chat' | 'permission_denied' | 'lark_api_error'; detail?: string };
+
+/**
+ * Rename one chat using exactly the supplied bot identity.
+ *
+ * Deliberately does not try another configured bot on failure: callers use
+ * this for session-scoped AI actions, where credential fallback would violate
+ * the "the acting bot must itself be in the chat" boundary.
+ */
+export async function renameChat(
+  larkAppId: string,
+  chatId: string,
+  newName: string,
+): Promise<RenameChatResult> {
+  const client = getBotClient(larkAppId);
+  if (!await isInChat(larkAppId, chatId)) {
+    return { ok: false, error: 'bot_not_in_chat' };
+  }
+  try {
+    const current: any = await larkGet(
+      client,
+      `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`,
+      { user_id_type: 'open_id' },
+    );
+    if (current.code !== 0 && current.code !== undefined) {
+      return {
+        ok: false,
+        error: classifyRenameChatError(current.code),
+        detail: `${current.msg ?? 'unknown'} (code: ${current.code})`,
+      };
+    }
+    const oldName = typeof current.data?.name === 'string' ? current.data.name.trim() : '';
+    if (oldName === newName) return { ok: true, oldName, newName, changed: false };
+
+    const updated: any = await (client as any).im.v1.chat.update({
+      path: { chat_id: chatId },
+      data: { name: newName },
+    });
+    if (updated.code !== 0 && updated.code !== undefined) {
+      return {
+        ok: false,
+        error: classifyRenameChatError(updated.code),
+        detail: `${updated.msg ?? 'unknown'} (code: ${updated.code})`,
+      };
+    }
+    return { ok: true, oldName, newName, changed: true };
+  } catch (e: any) {
+    const detail = e?.message ?? String(e);
+    return {
+      ok: false,
+      error: /permission|forbidden|99991672|2300\d/i.test(detail)
+        ? 'permission_denied'
+        : 'lark_api_error',
+      detail,
+    };
+  }
+}
+
+function classifyRenameChatError(code: unknown): 'permission_denied' | 'lark_api_error' {
+  const numeric = Number(code);
+  // Lark uses 99991672 for missing app scope; 230xxx errors cover common
+  // chat-role / operation-permission failures.
+  return numeric === 99991672 || (numeric >= 230000 && numeric < 231000)
+    ? 'permission_denied'
+    : 'lark_api_error';
+}
+
 /**
  * Create a brand-new chat with `bot_id_list` as initial bot members.  The
  * `creatorLarkAppId` bot becomes the chat's owner and an implicit member; the

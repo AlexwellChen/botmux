@@ -1,0 +1,45 @@
+import { describe, expect, it } from 'vitest';
+import {
+  CHAT_NAME_MAX_CODE_POINTS,
+  ChatRenameCooldown,
+  normalizeLarkChatName,
+} from '../src/core/chat-rename.js';
+import { BUILTIN_SKILLS } from '../src/skills/definitions.js';
+
+describe('chat rename', () => {
+  it('normalizes valid names and preserves Unicode', () => {
+    expect(normalizeLarkChatName('  支付排障｜待验证  ')).toEqual({
+      ok: true,
+      name: '支付排障｜待验证',
+    });
+  });
+
+  it('rejects empty, control, invisible and overlong names', () => {
+    expect(normalizeLarkChatName('   ')).toEqual({ ok: false, error: 'invalid_chat_name' });
+    expect(normalizeLarkChatName('bad\nname')).toEqual({ ok: false, error: 'invalid_chat_name' });
+    expect(normalizeLarkChatName('bad\u200bname')).toEqual({ ok: false, error: 'invalid_chat_name' });
+    expect(normalizeLarkChatName('名'.repeat(CHAT_NAME_MAX_CODE_POINTS + 1))).toEqual({
+      ok: false,
+      error: 'invalid_chat_name',
+    });
+  });
+
+  it('applies a per-key proactive cooldown with retry metadata', () => {
+    const cooldown = new ChatRenameCooldown(60_000);
+    expect(cooldown.check('app:chat', 100_000)).toEqual({ ok: true });
+    cooldown.record('app:chat', 100_000);
+    expect(cooldown.check('app:chat', 110_000)).toEqual({
+      ok: false,
+      retryAfterSeconds: 50,
+    });
+    expect(cooldown.check('other:chat', 110_000)).toEqual({ ok: true });
+    expect(cooldown.check('app:chat', 160_000)).toEqual({ ok: true });
+  });
+
+  it('ships an on-demand built-in Skill with the scoped CLI contract', () => {
+    const skill = BUILTIN_SKILLS.find(item => item.name === 'botmux-chat-rename');
+    expect(skill?.content).toContain('botmux chat rename');
+    expect(skill?.content).toContain('--proactive');
+    expect(skill?.content).toContain('只能修改当前会话所在群');
+  });
+});
