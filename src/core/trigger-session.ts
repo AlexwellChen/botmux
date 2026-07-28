@@ -574,6 +574,16 @@ export async function triggerSessionTurn(
   session.lastMessageAt = new Date(now).toISOString();
   session.workingDir = wd.workingDir;
   session.cliId = bot.config.cliId;
+  // Per-turn model / reasoning-effort override (fresh spawn only). Stamped
+  // before the first fork so sessionAgentConfig freezes the chosen model and the
+  // init message carries the effort. A fold-in to an existing worker never
+  // reaches here, so overrides only apply to a newly-created session.
+  if (typeof req.options?.model === 'string' && req.options.model.trim()) {
+    session.model = req.options.model.trim();
+  }
+  if (req.options?.reasoningEffort) {
+    session.reasoningEffort = req.options.reasoningEffort;
+  }
   sessionStore.updateSession(session);
 
   messageQueue.ensureQueue(anchor);
