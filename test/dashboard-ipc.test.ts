@@ -638,6 +638,74 @@ describe('GET /api/sessions/:sessionId', () => {
   });
 });
 
+describe('GET /api/sessions/:sessionId/usage', () => {
+  it('returns the daemon-cached native usage snapshot for an active Session', async () => {
+    const ds = { session: { sessionId: 's-usage' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const usageSpy = vi.spyOn(workerPool, 'getDaemonReplyCardUsageSnapshot').mockReturnValue({
+      context: { usedTokens: 12_345, windowTokens: 100_000, percentUsed: 12 },
+      tokens: { in: 67_890, out: 123 },
+    });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-usage/usage`);
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        usage: {
+          context: { usedTokens: 12_345, windowTokens: 100_000, percentUsed: 12 },
+          tokens: { in: 67_890, out: 123 },
+        },
+      });
+      expect(usageSpy).toHaveBeenCalledWith(ds);
+    } finally {
+      findSpy.mockRestore();
+      usageSpy.mockRestore();
+    }
+  });
+
+  it('returns the card-specific empty snapshot when footer usage is disabled', async () => {
+    const ds = { session: { sessionId: 's-usage-hidden' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const rawSpy = vi.spyOn(workerPool, 'getDaemonSessionUsageSnapshot').mockReturnValue({
+      context: { usedTokens: 12_345 },
+      tokens: { in: 67_890, out: 123 },
+    });
+    const cardSpy = vi.spyOn(workerPool, 'getDaemonReplyCardUsageSnapshot').mockReturnValue({
+      context: null,
+      tokens: null,
+    });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(
+        `http://127.0.0.1:${handle.port}/api/sessions/s-usage-hidden/usage`,
+      );
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        usage: { context: null, tokens: null },
+      });
+      expect(cardSpy).toHaveBeenCalledWith(ds);
+      expect(rawSpy).not.toHaveBeenCalled();
+    } finally {
+      findSpy.mockRestore();
+      rawSpy.mockRestore();
+      cardSpy.mockRestore();
+    }
+  });
+
+  it('returns 404 when the Session is not active', async () => {
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/missing/usage`);
+      expect(res.status).toBe(404);
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+});
+
 describe('POST /api/sessions/:sessionId/rename', () => {
   it('updates the canonical title and requests native sync from a live Codex worker', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-session-rename-'));

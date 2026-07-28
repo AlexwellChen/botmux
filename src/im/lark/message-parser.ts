@@ -627,9 +627,25 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
  * too — vanishingly rare versus the value of a simple format-agnostic anchor.
  */
 const BOTMUX_FOOTER_MARKER = 'github.com/deepcoldy/botmux';
+const BOTMUX_HIDDEN_FOOTER_MARKER = /github\.com\/deepcoldy\/bot%6dux#reply-card-footer/i;
 
-function isBotmuxFooterLine(line: string): boolean {
-  return line.includes(BOTMUX_FOOTER_MARKER);
+// Defense in depth for Lark clients that discard the footer's zero-width link
+// while producing Format A. This intentionally matches only a complete
+// usage footer line carrying Bot addressing chrome; the caller additionally
+// restricts it to the final non-empty paragraph after real body content.
+// A pure usage-shaped line is ambiguous without the stable marker, so it is
+// deliberately preserved rather than risking silent body-data loss.
+const BOTMUX_CONTEXT_USAGE_PATTERN =
+  String.raw`(?:上下文|Context)\s+(?:不可用|unavailable|\d+(?:\.\d+)?[KMB]?(?:\/\d+(?:\.\d+)?[KMB]?(?:\s+\(\d+%\))?)?)`;
+const BOTMUX_TOKEN_USAGE_PATTERN =
+  String.raw`(?:Token|Tokens)\s+(?:不可用|unavailable|↑\d+(?:\.\d+)?[KMB]?\s+↓\d+(?:\.\d+)?[KMB]?)`;
+const BOTMUX_USAGE_FOOTER_PATTERN = new RegExp(
+  String.raw`^(?:${BOTMUX_CONTEXT_USAGE_PATTERN}(?:\s*·\s*${BOTMUX_TOKEN_USAGE_PATTERN})?|${BOTMUX_TOKEN_USAGE_PATTERN})\s*·\s*(?:发送给：|Sent to:\s*).+$`,
+);
+
+function hasBotmuxFooterMarker(line: string): boolean {
+  return line.includes(BOTMUX_FOOTER_MARKER)
+    || BOTMUX_HIDDEN_FOOTER_MARKER.test(line);
 }
 
 /**
@@ -738,11 +754,29 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
     // Drop the botmux footer chrome so a receiving bot's prompt isn't polluted
     // by the grey `botmux` badge / `发送给：@owner` line. Line-level (not
     // part-level) so a footer never takes adjacent real content with it.
-    const cleaned = parts
-      .join('\n')
-      .split('\n')
-      .filter(line => !isBotmuxFooterLine(line))
-      .join('\n');
+    // Stable markers may occur inside a multiline element, so remove only
+    // their exact line first. Keep the remaining element as one paragraph:
+    // splitting it into global lines would make a body paragraph ending in a
+    // usage-shaped line indistinguishable from a standalone footer paragraph.
+    const visibleParts = parts
+      .map(part => part
+        .split('\n')
+        .filter(line => !hasBotmuxFooterMarker(line))
+        .join('\n'))
+      .filter(part => !!part.trim());
+    const lastPartIndex = visibleParts.length - 1;
+    // The marker-less fallback is permitted only for a standalone final
+    // paragraph with recipient chrome after a substantive body paragraph (a
+    // title alone does not count). In ambiguous cases, preserve user data.
+    const hasBodyBeforeUsageCandidate = visibleParts
+      .slice(0, Math.max(0, lastPartIndex))
+      .some(part => !part.trim().startsWith('[卡片:'));
+    if (lastPartIndex >= 0
+      && hasBodyBeforeUsageCandidate
+      && BOTMUX_USAGE_FOOTER_PATTERN.test(visibleParts[lastPartIndex].trim())) {
+      visibleParts.pop();
+    }
+    const cleaned = visibleParts.join('\n');
     return cleaned || '[卡片]';
   } catch {
     return '[卡片]';

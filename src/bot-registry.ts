@@ -1198,6 +1198,12 @@ export interface BotConfig {
    */
   brandLabel?: string;
   /**
+   * Whether ordinary reply-card footers show native Context Usage and Token
+   * Usage. Missing/true preserves the default display; false hides both metrics
+   * without disabling Usage Ledger accounting or other footer chrome.
+   */
+  showUsageInCardFooter?: boolean;
+  /**
    * botmux slash 可注入的 CLI 原生斜杠命令 allowlist（如 ["/compact","/model"]）。
    * 缺省/空 = 通用注入关闭。/cd 永远被拒（见 core/slash-inject.ts）。
    */
@@ -1400,6 +1406,7 @@ export function __testOnly_resetBotRegistry(): void {
   loadedConfigPath = undefined;
   oncallChatCache = null;
   brandLabelCache = null;
+  showUsageInCardFooterCache = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
@@ -1721,6 +1728,7 @@ export function isChatOncallBoundForAnyBot(chatId: string): boolean {
 // Per-bot brand label, mtime-cached for the disk fallback. Keyed by larkAppId →
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
+let showUsageInCardFooterCache: { mtimeMs: number; map: Map<string, boolean> } | null = null;
 
 /** Resolve the bots.json path the same way loadBotConfigs does, without
  *  requiring the registry to have been loaded (works in one-shot CLI processes
@@ -1770,6 +1778,41 @@ export function resolveBrandLabel(larkAppId: string): string | undefined {
     return brandLabelCache.map.get(larkAppId);
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Resolve the per-bot, default-on reply-card usage visibility. A freshly loaded
+ * registry wins over the spawn-time env so long-lived panes observe `/botconfig`
+ * hot updates; sandboxed/env-only processes carry the same field in their
+ * synthetic registered bot and otherwise fall back to the injected env.
+ */
+export function resolveShowUsageInCardFooter(larkAppId: string): boolean {
+  const inMem = bots.get(larkAppId);
+  if (inMem) return inMem.config.showUsageInCardFooter !== false;
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && 'BOTMUX_SHOW_USAGE_IN_CARD_FOOTER' in process.env) {
+    return process.env.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER !== 'false';
+  }
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (!path) return true;
+  try {
+    const stat = statSync(path);
+    if (!showUsageInCardFooterCache || showUsageInCardFooterCache.mtimeMs !== stat.mtimeMs) {
+      const raw = JSON.parse(readFileSync(path, 'utf-8'));
+      const map = new Map<string, boolean>();
+      if (Array.isArray(raw)) {
+        for (const entry of raw) {
+          if (entry && typeof entry.larkAppId === 'string') {
+            map.set(entry.larkAppId, entry.showUsageInCardFooter !== false);
+          }
+        }
+      }
+      showUsageInCardFooterCache = { mtimeMs: stat.mtimeMs, map };
+    }
+    return showUsageInCardFooterCache.map.get(larkAppId) ?? true;
+  } catch {
+    return true;
   }
 }
 
@@ -2333,6 +2376,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
+      // Default ON: only explicit false is meaningful/persisted.
+      showUsageInCardFooter: entry.showUsageInCardFooter === false ? false : undefined,
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
       silentTurnReactions: entry.silentTurnReactions === true || undefined,
       receivedReactionEmoji: typeof entry.receivedReactionEmoji === 'string' && entry.receivedReactionEmoji.trim()

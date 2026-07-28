@@ -182,7 +182,7 @@ describe('getCliDisplayName', () => {
 });
 
 describe('buildConfigCard', () => {
-  it('renders silentTurnReactions as a card-behaviour toggle', () => {
+  it('renders card-behaviour toggles, including default-on usage visibility', () => {
     const card = parse(buildConfigCard({
       larkAppId: 'app_cfg',
       botName: 'Config Bot',
@@ -201,6 +201,7 @@ describe('buildConfigCard', () => {
       quota: null,
       admins: 1,
       booleans: [
+        { key: 'showUsageInCardFooter', on: true },
         { key: 'disableStreamingCard', on: false },
         { key: 'silentTurnReactions', on: true },
         { key: 'writableTerminalLinkInCard', on: false },
@@ -217,6 +218,14 @@ describe('buildConfigCard', () => {
     expect(toggle.value.action).toBe('config_toggle');
     expect(toggle.type).toBe('primary');
     expect(toggle.text.content).toContain('Disable status reactions');
+
+    const usageToggle = allActions(card).find(
+      (a: any) => a.value?.field === 'showUsageInCardFooter',
+    );
+    expect(usageToggle).toBeTruthy();
+    expect(usageToggle.value.action).toBe('config_toggle');
+    expect(usageToggle.type).toBe('primary');
+    expect(usageToggle.text.content).toContain('Usage in card footer');
   });
 });
 

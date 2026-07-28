@@ -942,11 +942,17 @@ describe('getBot / getBotClient', () => {
 
 describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
-  const saved = { app: process.env.BOTMUX_LARK_APP_ID, brand: process.env.BOTMUX_BRAND_LABEL };
+  const saved = {
+    app: process.env.BOTMUX_LARK_APP_ID,
+    brand: process.env.BOTMUX_BRAND_LABEL,
+    showUsage: process.env.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER,
+  };
   beforeEach(async () => { mod = await freshImport(); });
   afterEach(() => {
     if (saved.app === undefined) delete process.env.BOTMUX_LARK_APP_ID; else process.env.BOTMUX_LARK_APP_ID = saved.app;
     if (saved.brand === undefined) delete process.env.BOTMUX_BRAND_LABEL; else process.env.BOTMUX_BRAND_LABEL = saved.brand;
+    if (saved.showUsage === undefined) delete process.env.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER;
+    else process.env.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER = saved.showUsage;
   });
 
   it('returns the injected env brandLabel for the own appId WITHOUT reading bots.json (the sandbox path)', () => {
@@ -966,6 +972,35 @@ describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () =>
     process.env.BOTMUX_LARK_APP_ID = 'app_self';
     process.env.BOTMUX_BRAND_LABEL = '[self]()';
     expect(mod.resolveBrandLabel('app_other')).toBeUndefined();
+  });
+
+  it('resolves the default-on usage-footer switch from registry or sandbox env', () => {
+    expect(mod.resolveShowUsageInCardFooter('app_default')).toBe(true);
+
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_registered_off',
+      showUsageInCardFooter: false,
+    }));
+    expect(mod.resolveShowUsageInCardFooter('app_registered_off')).toBe(false);
+
+    process.env.BOTMUX_LARK_APP_ID = 'app_sbx';
+    process.env.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER = 'false';
+    expect(mod.resolveShowUsageInCardFooter('app_sbx')).toBe(false);
+    expect(mod.resolveShowUsageInCardFooter('app_other')).toBe(true);
+  });
+
+  it('prefers freshly loaded registry config over a frozen pane env for the same app', () => {
+    process.env.BOTMUX_LARK_APP_ID = 'app_hot';
+    process.env.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER = 'true';
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_hot',
+      showUsageInCardFooter: false,
+    }));
+    expect(mod.resolveShowUsageInCardFooter('app_hot')).toBe(false);
+
+    process.env.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER = 'false';
+    mod.registerBot(makeCfg({ larkAppId: 'app_hot' }));
+    expect(mod.resolveShowUsageInCardFooter('app_hot')).toBe(true);
   });
 });
 

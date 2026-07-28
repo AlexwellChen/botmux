@@ -83,6 +83,16 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('BOTMUX_OWNER_OPEN_ID='))).toBe(false);
   });
 
+  it('forwards the reply-card usage visibility into persistent CLI panes', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_SHOW_USAGE_IN_CARD_FOOTER: 'false',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_SHOW_USAGE_IN_CARD_FOOTER=false');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
   it('forwards CLAUDE_CODE_RESUME_TOKEN_THRESHOLD so the resume-summary bypass reaches the tmux pane (issue #62)', () => {
     // The worker injects this for claude-code to suppress Claude Code 2.1.x's
     // blocking resume-summary menu. Under the tmux backend it ONLY reaches the

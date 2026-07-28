@@ -390,6 +390,32 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
   });
 
+  it('showUsageInCardFooter defaults on and persists only the false override', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('showUsageInCardFooter')!;
+    expect(spec.effect).toBe('immediate');
+    expect(store.getConfigCardData('app_default')?.booleans.find(
+      b => b.key === 'showUsageInCardFooter',
+    )?.on).toBe(true);
+
+    const disabled = await store.applyConfigField('app_default', spec, false);
+    expect(disabled).toMatchObject({
+      ok: true,
+      oldText: 'on',
+      newText: 'off',
+      effect: 'immediate',
+    });
+    expect(readConfig().showUsageInCardFooter).toBe(false);
+    expect(registry.getBot('app_default').config.showUsageInCardFooter).toBe(false);
+
+    await store.applyConfigField('app_default', spec, true);
+    expect(readConfig().showUsageInCardFooter).toBeUndefined();
+    expect(registry.getBot('app_default').config.showUsageInCardFooter).toBeUndefined();
+    expect(store.getConfigCardData('app_default')?.booleans.find(
+      b => b.key === 'showUsageInCardFooter',
+    )?.on).toBe(true);
+  });
+
   it('codexAppCleanInput is immediate, default-off, and deletes its key when disabled', async () => {
     const { registry, store } = await loaded({ cliId: 'codex-app' });
     const spec = store.findConfigField('codexAppCleanInput')!;

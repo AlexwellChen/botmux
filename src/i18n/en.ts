@@ -421,6 +421,7 @@ export const messages: Record<string, string> = {
   'card.config.p2p.thread': '🧵 thread (separate session/DM)',
   'card.config.p2p.chat': '💬 chat (continuous session, default)',
   'config.label.disableStreamingCard': 'Disable live card',
+  'config.label.showUsageInCardFooter': 'Usage in card footer',
   'config.label.silentTurnReactions': 'Disable status reactions',
   'config.label.writableTerminalLinkInCard': 'Writable terminal in card',
   'config.label.privateCard': 'Private snapshot card',
@@ -1107,6 +1108,8 @@ export const messages: Record<string, string> = {
   // Markdown / contextual reply card chrome
   'card.you': 'You',
   'card.sent_to': 'Sent to: ',
+  'card.usage.context': 'Context',
+  'card.usage.tokens': 'Tokens',
 
   // Adopt preamble card title
   'card.adopt_last_round': '📜 Last exchange before /adopt',

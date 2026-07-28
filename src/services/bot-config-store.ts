@@ -45,6 +45,9 @@ export interface ConfigFieldSpec {
   clearable: boolean;
   /** kind==='enum' 时的合法取值（已小写）。 */
   enumValues?: readonly string[];
+  /** kind==='boolean' 的缺省值。省略时为 false；默认开启的开关设为 true，
+   *  持久化层只保存与缺省值不同的显式覆盖。 */
+  booleanDefault?: boolean;
   /** kind==='string' 的最大长度（trim 后计），超出 coerce 报 too_long。缺省不限。 */
   maxLen?: number;
   /** kind==='stringList' 的自定义解析器（自由文本 → 归一化数组）。缺省用
@@ -69,6 +72,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'skillInjection', configKey: 'skillInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['global', 'prompt', 'off'], hint: 'botmux skills 注入方式（仅影响 codex/gemini 等全局 skills 目录的 CLI）：prompt=注入会话不落全局盘(默认)｜global=装进 CLI 全局目录(会被独立 CLI 看到)｜off=只留提示+botmux --help；切到/离开 global 需重启 daemon 才完全生效；unset 回机器级默认' },
   { key: 'defaultWorkingDir', configKey: 'defaultWorkingDir', kind: 'dir', effect: 'next-session', clearable: true, hint: '新话题默认工作目录（跳过仓库选择卡片）' },
   { key: 'brandLabel', configKey: 'brandLabel', kind: 'string', effect: 'immediate', clearable: true, hint: '卡片页脚品牌文案；unset 回默认 botmux 链接' },
+  { key: 'showUsageInCardFooter', configKey: 'showUsageInCardFooter', kind: 'boolean', effect: 'immediate', clearable: false, booleanDefault: true, hint: '回复卡片页脚展示 Context / Token 用量 on|off；缺失项仍自动省略' },
   { key: 'autoStartPrompt', configKey: 'autoStartOnGroupJoinPrompt', kind: 'string', effect: 'immediate', clearable: true, hint: '被拉进新群主动开工的首轮 prompt（配合 autoStartOnGroupJoin）' },
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
@@ -111,9 +115,20 @@ export function parseBooleanValue(raw: string): boolean | undefined {
   return undefined;
 }
 
+/** 解析布尔配置的有效值。默认关闭字段缺省为 false；`booleanDefault: true`
+ * 的字段缺省为 true。所有 UI / 持久化入口共用，避免把“未落盘”误判为关闭。 */
+export function resolveConfigBooleanValue(
+  spec: Pick<ConfigFieldSpec, 'kind' | 'booleanDefault'>,
+  value: unknown,
+): boolean {
+  return value === undefined ? spec.booleanDefault === true : value === true;
+}
+
 /** 展示某字段当前值的人类可读文本。 */
 function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
-  if (spec.kind === 'boolean') return value === true ? 'on' : 'off';
+  if (spec.kind === 'boolean') {
+    return resolveConfigBooleanValue(spec, value) ? 'on' : 'off';
+  }
   if (spec.kind === 'allowedUsers' || spec.kind === 'stringList') {
     const arr = Array.isArray(value) ? value : [];
     return arr.length ? arr.join(', ') : '∅';
@@ -214,9 +229,9 @@ export async function applyConfigField(
     if (effective === null) {
       delete entry[spec.configKey];
     } else if (spec.kind === 'boolean') {
-      // 与 parseBotConfigsFromText 一致：true 才写，false → 删 key（bots.json 保持干净）。
-      if (effective === true) entry[spec.configKey] = true;
-      else delete entry[spec.configKey];
+      // 只保存与缺省值不同的覆盖：default-off 写 true，default-on 写 false。
+      if (effective === (spec.booleanDefault === true)) delete entry[spec.configKey];
+      else entry[spec.configKey] = effective;
     } else if (spec.kind === 'json') {
       entry[spec.configKey] = effective as any;
     } else {
@@ -230,7 +245,8 @@ export async function applyConfigField(
   if (effective === null) {
     (bot.config as any)[spec.configKey] = undefined;
   } else if (spec.kind === 'boolean') {
-    (bot.config as any)[spec.configKey] = effective || undefined;
+    (bot.config as any)[spec.configKey] =
+      effective === (spec.booleanDefault === true) ? undefined : effective;
   } else if (spec.kind === 'json') {
     (bot.config as any)[spec.configKey] = effective;
   } else {
@@ -436,7 +452,8 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
     quota: typeof q === 'number' && Number.isInteger(q) && q > 0 ? q : null,
     admins: bot.resolvedAllowedUsers.length,
     booleans: CONFIG_FIELDS.filter(f => f.kind === 'boolean').map(f => ({
-      key: f.key, on: (cfg as any)[f.configKey] === true,
+      key: f.key,
+      on: resolveConfigBooleanValue(f, (cfg as any)[f.configKey]),
     })),
   };
 }

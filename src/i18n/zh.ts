@@ -424,6 +424,7 @@ export const messages: Record<string, string> = {
   'card.config.p2p.thread': '🧵 thread（每条 DM 独立会话）',
   'card.config.p2p.chat': '💬 chat（连续单聊会话，默认）',
   'config.label.disableStreamingCard': '关闭实时卡片',
+  'config.label.showUsageInCardFooter': '卡片页脚用量',
   'config.label.silentTurnReactions': '关闭状态 reaction',
   'config.label.writableTerminalLinkInCard': '卡内嵌可写终端',
   'config.label.privateCard': '私有快照卡',
@@ -1110,6 +1111,8 @@ export const messages: Record<string, string> = {
   // Markdown / contextual reply card chrome
   'card.you': '你',
   'card.sent_to': '发送给：',
+  'card.usage.context': '上下文',
+  'card.usage.tokens': 'Token',
 
   // Adopt preamble card title
   'card.adopt_last_round': '📜 /adopt 前最后一轮',

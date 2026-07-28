@@ -303,6 +303,147 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).not.toContain('botmux');
   });
 
+  it('drops a Format A usage-only footer when the bot brand is disabled', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: '上下文 159.9K/258.4K (62%)' },
+          { tag: 'text', text: ' · Token ↑3.7M ↓23.3K · 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('上下文 159.9K');
+    expect(result.content).not.toContain('Token ↑3.7M');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('drops a Format A token-only footer when context is missing', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: 'Token ↑3.7M ↓23.3K · 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Token ↑3.7M');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('drops a Format A context-only footer when cumulative tokens are missing', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: '上下文 159.9K/258.4K (62%) · 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('上下文 159.9K');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('drops a Format A custom-brand footer through its stable hidden marker', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: 'Acme · 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+          {
+            tag: 'a',
+            text: '\u200B',
+            href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer',
+          },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Acme');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('keeps ordinary prose that mentions context and tokens', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '上下文和 Token 是两个不同指标，请分别分析。' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('上下文和 Token 是两个不同指标');
+  });
+
+  it('keeps a usage-shaped body paragraph when it is not the final paragraph', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '上下文 12.3K/100K (12%) · Token ↑67.9K ↓123' }],
+        [{ tag: 'text', text: '这是正文中的观测值，不是页脚。' }],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('上下文 12.3K/100K (12%)');
+    expect(result.content).toContain('这是正文中的观测值');
+  });
+
+  it('keeps a pure usage-shaped final body paragraph when no recipient chrome proves it is a footer', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '本轮统计如下：' }],
+        [{ tag: 'text', text: '上下文 12.3K/100K (12%) · Token ↑67.9K ↓123' }],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('本轮统计如下');
+    expect(result.content).toContain('上下文 12.3K/100K (12%)');
+  });
+
+  it('keeps a single usage-shaped body paragraph instead of reducing the card to a placeholder', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '上下文 12.3K/100K (12%) · Token ↑67.9K ↓123' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('上下文 12.3K/100K (12%)');
+    expect(result.content).not.toBe('[卡片]');
+  });
+
+  it('keeps a sentence that merely contains the compact usage shape', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '请记录：上下文 12.3K/100K (12%) · Token ↑67.9K ↓123，稍后对比。' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('请记录：上下文');
+    expect(result.content).toContain('稍后对比');
+  });
+
+  it('keeps a usage-shaped final line when it belongs to the same body paragraph', () => {
+    const card = {
+      elements: [[
+        {
+          tag: 'text',
+          text: '正文中的指标如下：\n上下文 12.3K/100K (12%) · Token ↑67.9K ↓123',
+        },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文中的指标如下');
+    expect(result.content).toContain('上下文 12.3K/100K (12%)');
+  });
+
   it('round-trips a real buildMarkdownCard output without footer leakage', () => {
     const raw = buildMarkdownCard('帮我看下这个 bug', 'ou_owner');
     const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));

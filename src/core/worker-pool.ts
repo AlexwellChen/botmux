@@ -30,7 +30,13 @@ import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
-import { buildMarkdownCard, buildContextualReplyCard, type LocalHomeLinkMode } from '../im/lark/md-card.js';
+import {
+  buildMarkdownCard,
+  buildContextualReplyCard,
+  type CardUsageSnapshot,
+  type LocalHomeLinkMode,
+} from '../im/lark/md-card.js';
+import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
@@ -65,6 +71,61 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
     || sandboxEnabled()
     ? 'lexical'
     : 'filesystem';
+}
+
+/** Read one frozen native-usage snapshot at the reply boundary. Card delivery
+ * remains best-effort even when a CLI has no supported transcript or a usage
+ * resolver fails. */
+export function getDaemonSessionUsageSnapshot(
+  ds: DaemonSession,
+  effectiveCliId?: CliId,
+): CardUsageSnapshot {
+  try {
+    const resolvedCliId = effectiveCliId ?? (
+      ds.session.cliId
+      ?? ds.session.adoptedFrom?.cliId
+      ?? ds.adoptedFrom?.cliId
+      ?? getBot(ds.larkAppId).config.cliId
+    ) as CliId;
+    return getSessionUsageSnapshot({
+      cliId: resolvedCliId,
+      sessionId: ds.session.sessionId,
+      cliSessionId:
+        ds.session.cliSessionId
+        ?? ds.session.adoptedFrom?.sessionId
+        ?? ds.adoptedFrom?.sessionId,
+      cwd:
+        ds.workingDir
+        ?? ds.session.workingDir
+        ?? ds.session.adoptedFrom?.cwd
+        ?? ds.adoptedFrom?.cwd,
+      fresh: true,
+    });
+  } catch (error) {
+    logger.warn(
+      `[${ds.session.sessionId.slice(0, 8)}] Failed to read card usage snapshot: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return { context: null, tokens: null };
+  }
+}
+
+/** Card-specific usage acquisition. Keep the display preference out of the
+ * native usage reader so accounting and dashboard consumers remain intact.
+ * A concrete empty snapshot (rather than undefined) also freezes "hidden" over
+ * final-output retries. */
+export function getDaemonReplyCardUsageSnapshot(
+  ds: DaemonSession,
+  effectiveCliId?: CliId,
+): CardUsageSnapshot {
+  try {
+    if (getBot(ds.larkAppId).config.showUsageInCardFooter === false) {
+      return { context: null, tokens: null };
+    }
+  } catch {
+    // Missing runtime config must preserve the backwards-compatible default ON.
+  }
+  return getDaemonSessionUsageSnapshot(ds, effectiveCliId);
 }
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -4099,6 +4160,7 @@ function setupWorkerHandlers(
           locale: localeForBot(ds.larkAppId),
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
+          usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId),
         });
         scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
@@ -4277,7 +4339,9 @@ function deliverFinalOutput(
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   attempt: number,
+  frozenUsage?: CardUsageSnapshot,
 ): void {
+  let cardUsage = frozenUsage;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   // Wait Mode / HTTP Sync Override:
   // If this turn is being waited for by an HTTP webhook request, intercept the
@@ -4469,6 +4533,7 @@ function deliverFinalOutput(
         : imOrigin?.replyTargetSenderOpenId
           ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
+      cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
@@ -4482,6 +4547,7 @@ function deliverFinalOutput(
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
+            usage: cardUsage,
           })
         : buildMarkdownCard(
             safeAssistantText,
@@ -4490,6 +4556,7 @@ function deliverFinalOutput(
             localeForBot(ds.larkAppId),
             ds.workingDir,
             localHomeLinkMode,
+            cardUsage,
           );
 
       const proposedOutput = {
@@ -4623,7 +4690,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next);
+      deliverFinalOutput(ds, msg, t, next, cardUsage);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

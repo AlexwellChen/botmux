@@ -32,6 +32,32 @@ const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
 
 export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
 
+/** Native usage facts rendered in a Bot reply-card footer. Context is the
+ * latest context-window measurement; tokens are cumulative for the Session.
+ * Missing facts are omitted independently and must never be estimated. */
+export interface CardUsageSnapshot {
+  context: {
+    usedTokens: number;
+    windowTokens?: number;
+    percentUsed?: number;
+  } | null;
+  tokens: {
+    in: number;
+    out: number;
+  } | null;
+}
+
+export interface ReplyCardFooter {
+  /** Fully wrapped markdown content, reusable inside the voice-button row. */
+  content: string;
+  /** Standalone footer element used by ordinary reply cards. */
+  element: {
+    tag: 'markdown';
+    text_size: 'notation_small_v2';
+    content: string;
+  };
+}
+
 interface LocalHomeCandidate {
   id: number;
   start: number;
@@ -227,6 +253,12 @@ export function normalizeLocalHomeLinks(
 /** Default footer brand when a bot has no custom `brandLabel` configured. */
 export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
 
+/** A visually empty link that survives Lark's simplified card representation.
+ * It lets message-parser identify our footer even when brandLabel is disabled
+ * or custom, without exposing implementation text in the rendered card. */
+export const REPLY_CARD_FOOTER_MARKER =
+  '[\u200B](https://github.com/deepcoldy/bot%6Dux#reply-card-footer)';
+
 /**
  * Resolve the brand segment to render in a card footer from a bot's configured
  * `brandLabel` (see {@link resolveBrandLabel}):
@@ -239,6 +271,87 @@ export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux
 export function brandFooterSegment(brand: string | undefined): string | null {
   if (brand === undefined) return DEFAULT_BRAND_LABEL;
   return brand.trim() ? brand : null;
+}
+
+function compactTokenCount(value: number): string {
+  const units = [
+    { threshold: 1_000_000_000, suffix: 'B' },
+    { threshold: 1_000_000, suffix: 'M' },
+    { threshold: 1_000, suffix: 'K' },
+  ] as const;
+  const unit = units.find(candidate => value >= candidate.threshold);
+  if (!unit) return Math.round(value).toString();
+  return `${(value / unit.threshold).toFixed(1).replace(/\.0$/, '')}${unit.suffix}`;
+}
+
+function isNonNegativeFinite(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/** Format usage as one footer segment shared by direct `botmux send` cards and
+ * daemon fallback cards. The caller supplies native facts; this module only
+ * formats them and never infers a context window or token count. Returns null
+ * when no valid native metric is available. */
+export function cardUsageFooterSegment(usage: CardUsageSnapshot, locale?: Locale): string | null {
+  const parts: string[] = [];
+  if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
+    const used = compactTokenCount(usage.context.usedTokens);
+    const window = usage.context.windowTokens;
+    const windowSuffix = isNonNegativeFinite(window) && window > 0
+      ? `/${compactTokenCount(window)}`
+      : '';
+    const percentSuffix = isNonNegativeFinite(usage.context.percentUsed)
+      ? ` (${Math.min(100, Math.round(usage.context.percentUsed))}%)`
+      : '';
+    const suffix = `${windowSuffix}${percentSuffix}`;
+    parts.push(`${t('card.usage.context', undefined, locale)} ${used}${suffix}`);
+  }
+  if (usage.tokens
+    && isNonNegativeFinite(usage.tokens.in)
+    && isNonNegativeFinite(usage.tokens.out)) {
+    parts.push(
+      `${t('card.usage.tokens', undefined, locale)} `
+      + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
+    );
+  }
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+/** Build the one canonical footer shared by all Bot Session reply cards.
+ * Ordering, i18n, the parser marker, grey styling, and recipient rendering live
+ * here so direct sends and daemon fallbacks cannot drift apart. */
+export function buildReplyCardFooter(opts: {
+  brand?: string;
+  recipientOpenIds?: readonly string[];
+  usage?: CardUsageSnapshot;
+  locale?: Locale;
+}): ReplyCardFooter | null {
+  const parts: string[] = [];
+  const brandSeg = brandFooterSegment(opts.brand);
+  if (brandSeg) parts.push(brandSeg);
+  if (opts.usage) {
+    const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
+    if (usageSeg) parts.push(usageSeg);
+  }
+  const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
+  if (recipientOpenIds.length > 0) {
+    parts.push(
+      `${t('card.sent_to', undefined, opts.locale)}`
+      + recipientOpenIds.map(id => `<at id=${id}></at>`).join(' '),
+    );
+  }
+  if (parts.length === 0) return null;
+
+  const content =
+    `<font color='grey'>${parts.join(' · ')}${REPLY_CARD_FOOTER_MARKER}</font>`;
+  return {
+    content,
+    element: {
+      tag: 'markdown',
+      text_size: 'notation_small_v2',
+      content,
+    },
+  };
 }
 
 /** Build a Feishu native `table` element from a `table_open … table_close` token slice. */
@@ -644,8 +757,8 @@ export function hasMarkdown(text: string): boolean {
  *
  * `brand` is the sending bot's configured `brandLabel` (see
  * {@link brandFooterSegment}): unset → default botmux link, `''` → brand
- * suppressed, else custom. When brand and recipient are both absent the whole
- * footer (HR included) is omitted.
+ * suppressed, else custom. When brand, usage, and recipient are all absent the
+ * whole footer (HR included) is omitted.
  */
 export function buildMarkdownCard(
   md: string,
@@ -654,20 +767,19 @@ export function buildMarkdownCard(
   locale?: Locale,
   workingDir?: string,
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  usage?: CardUsageSnapshot,
 ): string {
   const elements = md ? buildCardBodyElements(md, workingDir, localHomeLinkMode) : [];
-  const footerParts: string[] = [];
-  const brandSeg = brandFooterSegment(brand);
-  if (brandSeg) footerParts.push(brandSeg);
-  if (recipientOpenId) footerParts.push(`${t('card.sent_to', undefined, locale)}<at id=${recipientOpenId}></at>`);
-  // Empty brand + no recipient → no footer at all (skip the orphan HR too).
-  if (footerParts.length > 0) {
+  const footer = buildReplyCardFooter({
+    brand,
+    recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
+    usage,
+    locale,
+  });
+  // No brand, usage, or recipient → no footer at all (skip the orphan HR too).
+  if (footer) {
     elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'markdown',
-      text_size: 'notation_small_v2',
-      content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
-    });
+    elements.push(footer.element);
   }
   return JSON.stringify({
     schema: '2.0',
@@ -710,6 +822,7 @@ export function buildContextualReplyCard(opts: {
   locale?: Locale;
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
+  usage?: CardUsageSnapshot;
 }): string {
   const {
     title,
@@ -721,6 +834,7 @@ export function buildContextualReplyCard(opts: {
     locale,
     workingDir,
     localHomeLinkMode = 'filesystem',
+    usage,
   } = opts;
   const elements: any[] = [];
 
@@ -749,17 +863,15 @@ export function buildContextualReplyCard(opts: {
     : [{ tag: 'markdown', content: `*${t('common.empty_paren', undefined, locale)}*` }];
   for (const el of bodyElements) elements.push(el);
 
-  const footerParts: string[] = [];
-  const brandSeg = brandFooterSegment(brand);
-  if (brandSeg) footerParts.push(brandSeg);
-  if (recipientOpenId) footerParts.push(`${t('card.sent_to', undefined, locale)}<at id=${recipientOpenId}></at>`);
-  if (footerParts.length > 0) {
+  const footer = buildReplyCardFooter({
+    brand,
+    recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
+    usage,
+    locale,
+  });
+  if (footer) {
     elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'markdown',
-      text_size: 'notation_small_v2',
-      content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
-    });
+    elements.push(footer.element);
   }
 
   return JSON.stringify({

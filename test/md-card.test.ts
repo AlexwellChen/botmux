@@ -15,6 +15,7 @@ import {
   buildImageCardElements,
   buildMarkdownCard,
   buildContextualReplyCard,
+  buildReplyCardFooter,
   brandFooterSegment,
   DEFAULT_BRAND_LABEL,
   hasMarkdown,
@@ -659,6 +660,86 @@ describe('normalizeLocalHomeLinks', () => {
 });
 
 describe('buildMarkdownCard', () => {
+  it('renders native context and cumulative token usage in the footer', () => {
+    const json = buildMarkdownCard('hello', 'ou_abc', undefined, 'zh', undefined, 'filesystem', {
+      context: { usedTokens: 159_861, windowTokens: 258_400, percentUsed: 62 },
+      tokens: { in: 3_739_570, out: 23_299 },
+    });
+    const card = JSON.parse(json);
+    const footer = card.body.elements.at(-1).content;
+
+    expect(footer).toContain('上下文 159.9K/258.4K (62%)');
+    expect(footer).toContain('Token ↑3.7M ↓23.3K');
+    expect(footer).toContain('<at id=ou_abc></at>');
+  });
+
+  it('omits malformed native usage instead of rendering NaN or Infinity', () => {
+    const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
+      context: { usedTokens: Number.NaN, windowTokens: 258_400 },
+      tokens: { in: Number.POSITIVE_INFINITY, out: 23_299 },
+    });
+    const card = JSON.parse(json);
+    const rendered = JSON.stringify(card);
+
+    expect(card.body.elements.map((element: any) => element.tag)).not.toContain('hr');
+    expect(rendered).not.toContain('上下文');
+    expect(rendered).not.toContain('Token');
+    expect(rendered).not.toContain('NaN');
+    expect(rendered).not.toContain('Infinity');
+  });
+
+  it('does not invent a percentage when the native snapshot has no percentage', () => {
+    const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
+      context: { usedTokens: 12_345, windowTokens: 100_000 },
+      tokens: null,
+    });
+    const footer = JSON.parse(json).body.elements.at(-1).content;
+
+    expect(footer).toContain('上下文 12.3K/100K');
+    expect(footer).not.toContain('(12%)');
+    expect(footer).not.toContain('Token');
+  });
+
+  it('omits missing context while retaining cumulative token usage', () => {
+    const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
+      context: null,
+      tokens: { in: 67_890, out: 123 },
+    });
+    const footer = JSON.parse(json).body.elements.at(-1).content;
+
+    expect(footer).toContain('Token ↑67.9K ↓123');
+    expect(footer).not.toContain('上下文');
+    expect(footer).not.toContain('不可用');
+  });
+
+  it('omits the usage footer when the Agent CLI reports neither metric', () => {
+    const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
+      context: null,
+      tokens: null,
+    });
+    const card = JSON.parse(json);
+    const rendered = JSON.stringify(card);
+
+    expect(card.body.elements.map((element: any) => element.tag)).not.toContain('hr');
+    expect(rendered).not.toContain('上下文');
+    expect(rendered).not.toContain('Token');
+    expect(rendered).not.toContain('不可用');
+  });
+
+  it('keeps brand and recipient chrome when usage is entirely missing', () => {
+    const json = buildMarkdownCard('hello', 'ou_abc', undefined, 'zh', undefined, 'filesystem', {
+      context: null,
+      tokens: null,
+    });
+    const footer = JSON.parse(json).body.elements.at(-1).content;
+
+    expect(footer).toContain('[botmux](');
+    expect(footer).toContain('<at id=ou_abc></at>');
+    expect(footer).not.toContain('上下文');
+    expect(footer).not.toContain('Token');
+    expect(footer).not.toContain('不可用');
+  });
+
   it('appends footer hr + grey link element', () => {
     const json = buildMarkdownCard('hello');
     const card = JSON.parse(json);
@@ -680,6 +761,31 @@ describe('buildMarkdownCard', () => {
     const card = JSON.parse(json);
     const last = card.body.elements[card.body.elements.length - 1];
     expect(last.content).not.toContain('<at id=');
+  });
+});
+
+describe('buildReplyCardFooter', () => {
+  it('centralizes brand, usage, and ordered recipients for every reply-card path', () => {
+    const footer = buildReplyCardFooter({
+      brand: 'Acme',
+      usage: {
+        context: { usedTokens: 12_345 },
+        tokens: { in: 67_890, out: 123 },
+      },
+      recipientOpenIds: ['ou_owner', 'ou_reviewer'],
+      locale: 'zh',
+    });
+
+    expect(footer?.content).toContain(
+      "Acme · 上下文 12.3K · Token ↑67.9K ↓123 · "
+      + '发送给：<at id=ou_owner></at> <at id=ou_reviewer></at>',
+    );
+    expect(footer?.content).toContain('https://github.com/deepcoldy/bot%6Dux#reply-card-footer');
+    expect(footer?.element).toMatchObject({
+      tag: 'markdown',
+      text_size: 'notation_small_v2',
+      content: footer?.content,
+    });
   });
 });
 
@@ -877,6 +983,24 @@ describe('buildImageCardElements', () => {
 });
 
 describe('buildContextualReplyCard footer brand', () => {
+  it('renders the same native usage footer as a regular reply card', () => {
+    const els = JSON.parse(buildContextualReplyCard({
+      title: 'T',
+      assistantText: 'a',
+      assistantLabel: 'Codex',
+      recipientOpenId: 'ou_x',
+      usage: {
+        context: { usedTokens: 159_861, windowTokens: 258_400, percentUsed: 62 },
+        tokens: { in: 3_739_570, out: 23_299 },
+      },
+    })).body.elements;
+    const footer = els.at(-1).content;
+
+    expect(footer).toContain('上下文 159.9K/258.4K (62%)');
+    expect(footer).toContain('Token ↑3.7M ↓23.3K');
+    expect(footer).toContain('<at id=ou_x></at>');
+  });
+
   it('custom brand renders; default botmux omitted', () => {
     const els = JSON.parse(buildContextualReplyCard({
       title: 'T', assistantText: 'a', assistantLabel: 'Claude', recipientOpenId: 'ou_x', brand: 'Acme',

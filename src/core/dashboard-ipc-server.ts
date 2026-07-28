@@ -66,7 +66,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
@@ -603,6 +603,16 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
   const closed = sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
   if (closed) return jsonRes(res, 200, { session: composeRowFromClosed(closed) });
   jsonRes(res, 404, { error: 'not_found' });
+});
+
+/** Low-frequency card-display read used by `botmux send`. Keeping the
+ * transcript reader and per-bot visibility decision in the resident daemon
+ * preserves its incremental cache and live config instead of making every
+ * short-lived CLI process rescan the Session or guess from sandboxed files. */
+ipcRoute('GET', '/api/sessions/:sessionId/usage', (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { error: 'not_found' });
+  jsonRes(res, 200, { usage: getDaemonReplyCardUsageSnapshot(ds) });
 });
 
 /** Canonical daemon-side close used by the dashboard and `botmux delete`.

@@ -64,6 +64,19 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[3].brandLabel).toBeUndefined();         // non-string ignored
   });
 
+  it('parses showUsageInCardFooter as a default-on strict boolean', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'usage-default', larkAppSecret: 's' },
+      { larkAppId: 'usage-on', larkAppSecret: 's', showUsageInCardFooter: true },
+      { larkAppId: 'usage-off', larkAppSecret: 's', showUsageInCardFooter: false },
+      { larkAppId: 'usage-invalid', larkAppSecret: 's', showUsageInCardFooter: 'false' },
+    ]));
+    expect(cfgs[0].showUsageInCardFooter).toBeUndefined();
+    expect(cfgs[1].showUsageInCardFooter).toBeUndefined();
+    expect(cfgs[2].showUsageInCardFooter).toBe(false);
+    expect(cfgs[3].showUsageInCardFooter).toBeUndefined();
+  });
+
   it('getOwnerOpenId returns first ou_ in resolvedAllowedUsers', () => {
     registerBot({ larkAppId: 'a2', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['x@y.com', 'ou_owner', 'ou_2'] });
     expect(getOwnerOpenId('a2')).toBe('ou_owner');

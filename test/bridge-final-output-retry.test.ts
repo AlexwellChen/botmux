@@ -55,6 +55,14 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 
+vi.mock('../src/core/cost-calculator.js', () => ({
+  getSessionTokenUsage: vi.fn(() => null),
+  getSessionUsageSnapshot: vi.fn(() => ({
+    context: { usedTokens: 12_345, windowTokens: 100_000, percentUsed: 12 },
+    tokens: { in: 67_890, out: 123 },
+  })),
+}));
+
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
@@ -95,6 +103,8 @@ import {
 } from '../src/services/vc-meeting-delivery-store.js';
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
+import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
+import { getBot } from '../src/bot-registry.js';
 
 // Build a fake worker child process whose IPC `message` event we can fire
 // manually, then wire it through setupWorkerHandlers via forkAdoptWorker.
@@ -198,6 +208,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    } as any);
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     mkdirSync('/tmp/test-sessions', { recursive: true });
   });
@@ -1275,6 +1291,50 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(15000);
     expect(sessionReply).toHaveBeenCalledTimes(3);
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(getSessionUsageSnapshot).toHaveBeenCalledTimes(1);
+    expect(getSessionUsageSnapshot).toHaveBeenCalledWith({
+      cliId: 'claude-code',
+      sessionId: 'sid-final-out',
+      cliSessionId: 'claude-session-xyz',
+      cwd: '/tmp',
+      fresh: true,
+    });
+    const cards = sessionReply.mock.calls.map(call => call[1] as string);
+    expect(new Set(cards)).toHaveLength(1);
+    expect(cards[0]).toContain('上下文 12.3K/100K (12%)');
+    expect(cards[0]).toContain('Token ↑67.9K ↓123');
+  });
+
+  it('does not read or render usage when this bot disables the card-footer switch', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        larkAppId: 'app_test',
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        showUsageInCardFooter: false,
+      },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    } as any);
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(getSessionUsageSnapshot).not.toHaveBeenCalled();
+    const card = sessionReply.mock.calls[0]?.[1] as string;
+    expect(card).toContain('[botmux](');
+    expect(card).not.toContain('上下文');
+    expect(card).not.toContain('Token');
   });
 
   it('gives up after 3 attempts and does NOT commit dedup', async () => {

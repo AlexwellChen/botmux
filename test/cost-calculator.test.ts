@@ -81,6 +81,7 @@ import { findTraexRolloutBySessionId } from '../src/services/traex-transcript.js
 import {
   getSessionJsonlPath,
   getSessionCost,
+  getSessionUsageSnapshot,
   getSessionTokenUsage,
   formatNumber,
   __resetSessionUsageCachesForTest,
@@ -410,6 +411,37 @@ describe('getSessionTokenUsage', () => {
     });
   });
 
+  it('reports Claude latest prompt-side context without inventing a window', () => {
+    setupJsonl([
+      assistantLine({ input: 100, output: 50, cacheRead: 10, cacheCreate: 5 }),
+      assistantLine({ input: 200, output: 80, cacheRead: 20, cacheCreate: 7 }),
+    ].join('\n'));
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 227 },
+      tokens: { in: 342, out: 130 },
+    });
+  });
+
+  it('keeps the last valid Claude context across an all-zero synthetic record', () => {
+    setupJsonl([
+      assistantLine({ input: 200, output: 80, cacheRead: 20, cacheCreate: 7 }),
+      assistantLine({ input: 0, output: 0, cacheRead: 0, cacheCreate: 0 }),
+    ].join('\n'));
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    }).context).toEqual({ usedTokens: 227 });
+  });
+
   it('returns null when an Agent CLI has no native token usage available', () => {
     vi.mocked(existsSync).mockReturnValue(false);
 
@@ -498,6 +530,101 @@ describe('getSessionTokenUsage', () => {
     });
     expect(findCodexSessionIdByBotmuxSessionId).toHaveBeenCalledWith('botmux-sid');
     expect(findCodexRolloutBySessionId).toHaveBeenCalledWith('codex-sid');
+  });
+
+  it('keeps Codex latest context usage separate from cumulative Session tokens', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl([
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: 3_579_709, cached_input_tokens: 3_404_544, output_tokens: 22_920 },
+            last_token_usage: {
+              input_tokens: 159_508,
+              cached_input_tokens: 158_464,
+              output_tokens: 308,
+              reasoning_output_tokens: 148,
+              total_tokens: 159_816,
+            },
+            model_context_window: 258_400,
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: 3_739_570, cached_input_tokens: 3_563_008, output_tokens: 23_299 },
+            last_token_usage: {
+              input_tokens: 159_861,
+              cached_input_tokens: 158_464,
+              output_tokens: 379,
+              reasoning_output_tokens: 100,
+              total_tokens: 160_240,
+            },
+            model_context_window: 258_400,
+          },
+        },
+      }),
+    ].join('\n'));
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      fresh: true,
+    })).toEqual({
+      context: { usedTokens: 160_240, windowTokens: 258_400, percentUsed: 62 },
+      tokens: {
+        in: 3_739_570,
+        out: 23_299,
+        inputTokens: 176_562,
+        outputTokens: 23_299,
+        cacheReadTokens: 3_563_008,
+        cacheCreateTokens: 0,
+        turns: 0,
+        model: '',
+      },
+    });
+  });
+
+  it('keeps the last valid Codex context when a later cumulative snapshot omits last usage', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl([
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: 100, output_tokens: 10 },
+            last_token_usage: { input_tokens: 80, output_tokens: 10, total_tokens: 90 },
+            model_context_window: 1_000,
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: 120, output_tokens: 12 },
+          },
+        },
+      }),
+    ].join('\n'));
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 90, windowTokens: 1_000, percentUsed: 9 },
+      tokens: { in: 120, out: 12 },
+    });
   });
 
   it('reports TraeX rollouts via the codex fold, capturing the turn_context model', () => {

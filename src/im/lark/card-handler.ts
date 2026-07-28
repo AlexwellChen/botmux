@@ -10,7 +10,13 @@ import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
-import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
+import {
+  findConfigField,
+  applyConfigField,
+  coerceConfigValue,
+  getConfigCardData,
+  resolveConfigBooleanValue,
+} from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
@@ -1415,7 +1421,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     let r;
     if (value.action === 'config_toggle') {
       if (spec.kind !== 'boolean') return { toast: { type: 'error', content: t('cmd.config.invalid_bool', { field: spec.key, value: '' }, loc) } };
-      const cur = (cbot.config as any)[spec.configKey] === true;
+      const cur = resolveConfigBooleanValue(spec, (cbot.config as any)[spec.configKey]);
       r = await applyConfigField(larkAppId, spec, !cur);
     } else {
       const raw = (action as any)?.option ?? (action as any)?.input_value ?? '';

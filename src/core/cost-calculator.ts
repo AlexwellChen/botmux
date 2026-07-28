@@ -28,6 +28,24 @@ export interface SessionTokenUsage extends SessionCost {
   out: number;
 }
 
+/** Latest Context Usage reported by the Agent CLI. A missing window means the
+ * CLI reported usage but not its model's context capacity. `percentUsed`, when
+ * present, is produced by the source parser from native facts and remains
+ * consistent with the displayed measurement; the card renderer never infers
+ * it. */
+export interface SessionContextUsage {
+  usedTokens: number;
+  windowTokens?: number;
+  percentUsed?: number;
+}
+
+/** Card-facing usage snapshot. Context is latest-turn state while Token Usage
+ * is cumulative for the Session; neither value is inferred from the other. */
+export interface SessionUsageSnapshot {
+  context: SessionContextUsage | null;
+  tokens: SessionTokenUsage | null;
+}
+
 export interface SessionTokenUsageQuery {
   cliId?: CliId | 'unknown';
   sessionId: string;
@@ -37,7 +55,7 @@ export interface SessionTokenUsageQuery {
    *  (CLI-data-redirected) bots' transcripts under BOT_HOME. */
   larkAppId?: string;
   /** Bypass the reparse throttle (stat short-circuit and incremental folding
-   *  still apply). Use at low-frequency exact points like ledger snapshots. */
+   *  still apply). Use at low-frequency exact points like ledger/card snapshots. */
   fresh?: boolean;
 }
 
@@ -144,6 +162,33 @@ function extractCodexTokenCountUsage(entry: any): SessionTokenUsage | null {
   };
 }
 
+function extractCodexContextUsage(entry: any): SessionContextUsage | null {
+  if (entry?.type !== 'event_msg' || entry?.payload?.type !== 'token_count') return null;
+  const info = entry.payload?.info;
+  const last = info?.last_token_usage;
+  if (!last || typeof last !== 'object') return null;
+  // Codex's native absolute gauge is last_token_usage.total_tokens. Cached
+  // input is already a subset of input and must never be added again.
+  const totalTokens = pickNum(last, ['total_tokens', 'totalTokens']);
+  const usedTokens = totalTokens > 0
+    ? totalTokens
+    : pickNum(last, ['input_tokens', 'inputTokens']);
+  if (usedTokens <= 0) return null;
+  const windowTokens = pickNum(info, ['model_context_window', 'modelContextWindow']);
+  // This card reports raw Context Usage, so keep the percentage consistent
+  // with the displayed numerator/denominator. Codex's TUI separately exposes
+  // a "user-controllable remaining" meter that subtracts fixed baseline
+  // prompts/tools; that is a different metric and does not belong here.
+  const percentUsed = windowTokens > 0
+    ? Math.round(Math.max(0, Math.min(1, usedTokens / windowTokens)) * 100)
+    : undefined;
+  return {
+    usedTokens,
+    ...(windowTokens > 0 ? { windowTokens } : {}),
+    ...(percentUsed !== undefined ? { percentUsed } : {}),
+  };
+}
+
 interface TokenUsageAggregate {
   inputTokens: number;
   outputTokens: number;
@@ -152,6 +197,7 @@ interface TokenUsageAggregate {
   model: string;
   turns: number;
   latestCodexUsage: SessionTokenUsage | null;
+  latestContextUsage: SessionContextUsage | null;
 }
 
 /** Per-CLI transcript dialect. Each kind only counts the events that dialect
@@ -180,7 +226,16 @@ function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
 }
 
 function newTokenUsageAggregate(): TokenUsageAggregate {
-  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0, model: '', turns: 0, latestCodexUsage: null };
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreateTokens: 0,
+    model: '',
+    turns: 0,
+    latestCodexUsage: null,
+    latestContextUsage: null,
+  };
 }
 
 /** Claude Code / Seed: one JSONL line per content block; blocks of the same
@@ -199,6 +254,15 @@ function foldClaudeLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, e
   agg.outputTokens += num(u.output_tokens);
   agg.cacheReadTokens += num(u.cache_read_input_tokens);
   agg.cacheCreateTokens += num(u.cache_creation_input_tokens);
+  const contextTokens =
+    num(u.input_tokens)
+    + num(u.cache_read_input_tokens)
+    + num(u.cache_creation_input_tokens);
+  // Synthetic/empty assistant records around compaction must not erase the
+  // last native context measurement.
+  if (contextTokens > 0) {
+    agg.latestContextUsage = { usedTokens: contextTokens };
+  }
   if (!agg.model && typeof msg.model === 'string') agg.model = msg.model;
   agg.turns++;
 }
@@ -210,6 +274,8 @@ function foldCodexLine(agg: TokenUsageAggregate, entry: any): void {
   const codexUsage = extractCodexTokenCountUsage(entry);
   if (codexUsage) {
     agg.latestCodexUsage = codexUsage;
+    const contextUsage = extractCodexContextUsage(entry);
+    if (contextUsage) agg.latestContextUsage = contextUsage;
     return;
   }
   const m = entry?.payload?.model ?? entry?.payload?.collaboration_mode?.settings?.model;
@@ -558,7 +624,7 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
   };
 }
 
-export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
+function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   if (q.cliId === 'aiden') {
     const sid = q.cliSessionId || q.sessionId;
     const checkpointPath = cachedTranscriptPathLookup(
@@ -571,11 +637,23 @@ export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsa
       { retryMiss: q.fresh, refreshHit: q.fresh },
     );
     if (!checkpointPath || !existsSync(checkpointPath)) return null;
-    return readSessionTokenUsageFile(checkpointPath, 'aiden', { fresh: q.fresh });
+    return readSessionTokenAggregateCached(checkpointPath, 'aiden', { fresh: q.fresh });
   }
   const resolved = resolveSessionTranscriptPath(q);
   if (!resolved || !existsSync(resolved.path)) return null;
-  return readSessionTokenUsageFile(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
+  return readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
+}
+
+export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
+  return readSessionUsage(q)?.result ?? null;
+}
+
+export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsageSnapshot {
+  const read = readSessionUsage(q);
+  return {
+    context: read?.agg.latestContextUsage ?? null,
+    tokens: read?.result ?? null,
+  };
 }
 
 export function formatNumber(n: number): string {
