@@ -4,7 +4,9 @@
  * in-memory registry sync so the daemon's own card builders pick up the change
  * without a restart.
  *
- * Three independent toggles:
+ * Per-bot card and related session preferences:
+ *   • showUsageInCardFooter      — show native Context / Token usage in ordinary
+ *                                  reply-card footers (default true)
  *   • disableStreamingCard      — suppress the live streaming session card
  *   • silentTurnReactions       — in card-off sessions, also drop the ✋→✅
  *                                  lightweight status reactions on the trigger
@@ -23,6 +25,8 @@ import { getBot, type ChatReplyMode } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
 
 export interface BotCardPrefs {
+  /** Ordinary reply-card footers show native Context / Token usage. Default true. */
+  showUsageInCardFooter: boolean;
   disableStreamingCard: boolean;
   silentTurnReactions: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
@@ -53,11 +57,13 @@ export interface BotCardPrefs {
   docSubscribeDefaultMode: 'mention-only' | 'all';
 }
 
-/** Current card prefs for a bot (booleans default false, prompt defaults '' when unset). */
+/** Current card prefs for a bot (`showUsageInCardFooter` and
+ * `botToBotSameDir` default true; other booleans default false). */
 export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
   try {
     const c = getBot(larkAppId).config;
     return {
+      showUsageInCardFooter: c.showUsageInCardFooter !== false,
       disableStreamingCard: c.disableStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
@@ -75,6 +81,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     };
   } catch {
     return {
+      showUsageInCardFooter: true,
       disableStreamingCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
@@ -145,6 +152,7 @@ export async function updateBotCardPrefs(
   };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
+    applyDefaultTrue(entry, 'showUsageInCardFooter', patch.showUsageInCardFooter);
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
@@ -161,6 +169,7 @@ export async function updateBotCardPrefs(
     return {
       write: true,
       result: {
+        showUsageInCardFooter: entry.showUsageInCardFooter !== false,
         disableStreamingCard: entry.disableStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
@@ -184,6 +193,10 @@ export async function updateBotCardPrefs(
   if (!r.ok) return { ok: false, reason: r.reason };
 
   // Sync in-memory config so live card builders / routing react without a restart.
+  if (patch.showUsageInCardFooter !== undefined) {
+    // Default true: store false explicitly, clear (→ default on) when true.
+    bot.config.showUsageInCardFooter = patch.showUsageInCardFooter === false ? false : undefined;
+  }
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
   }
@@ -229,7 +242,8 @@ export async function updateBotCardPrefs(
     bot.config.docSubscribeDefaultMode = patch.docSubscribeDefaultMode === 'all' ? 'all' : undefined;
   }
   logger.info(
-    `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
+    `[card-prefs:${larkAppId}] showUsageInCardFooter=${r.result.showUsageInCardFooter} ` +
+    `disableStreamingCard=${r.result.disableStreamingCard} ` +
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +

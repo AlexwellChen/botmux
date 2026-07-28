@@ -2,7 +2,7 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
-import { BotAgentSection, CodexAppDisplaySection } from '../src/dashboard/web/bot-defaults-page.js';
+import { BotAgentSection, CardBehaviorSection, CodexAppDisplaySection } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -200,6 +200,65 @@ describe('Codex App history switch', () => {
 
     expect(renderer.root.findByProps({ 'data-action': 'toggle-codex-app-clean-input' }).props.checked).toBe(false);
     expect(renderer.root.findByProps({ 'data-codex-app-clean-input-status': '' }).children.join(''))
+      .toContain('write_failed');
+  });
+});
+
+describe('reply-card usage footer switch', () => {
+  it('is default-on and persists explicit off/on changes', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_usage' },
+        putCardPref,
+      }));
+    });
+
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-show-usage-in-card-footer' });
+    expect(toggle().props.checked).toBe(true);
+
+    await act(async () => {
+      toggle().props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ showUsageInCardFooter: false });
+    expect(toggle().props.checked).toBe(false);
+
+    await act(async () => {
+      toggle().props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ showUsageInCardFooter: true });
+    expect(toggle().props.checked).toBe(true);
+  });
+
+  it('rolls back when persistence fails', async () => {
+    const putCardPref = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      body: { error: 'write_failed' },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_usage' },
+        putCardPref,
+      }));
+    });
+
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-show-usage-in-card-footer' });
+    await act(async () => {
+      toggle().props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+
+    expect(toggle().props.checked).toBe(true);
+    expect(renderer.root.findByProps({ 'data-card-pref-status': '' }).children.join(''))
       .toContain('write_failed');
   });
 });

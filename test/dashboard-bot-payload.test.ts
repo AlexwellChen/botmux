@@ -86,6 +86,13 @@ describe('dashboard bot payload helpers', () => {
       .toMatchObject({ codexAppCleanInput: true });
   });
 
+  it('projects reply-card usage footer visibility as an explicit default-on boolean', () => {
+    const daemon = { larkAppId: 'app_usage', botName: 'Usage', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ showUsageInCardFooter: true });
+    expect(botDefaultsPayload(daemon, { showUsageInCardFooter: false }))
+      .toMatchObject({ showUsageInCardFooter: false });
+  });
+
   it('projects sandboxPaths three tiers, defaulting to null when absent or malformed', () => {
     const daemon = { larkAppId: 'app_sbx', botName: 'Sbx', cliId: 'claude-code' };
     // Absent → null (pure deny-by-default baseline, no rules to render).

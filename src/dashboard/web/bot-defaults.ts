@@ -59,6 +59,7 @@ export type BotDefaultsRow = {
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
   readIsolationSupported?: boolean;
   backendType?: string | null;
+  showUsageInCardFooter?: boolean;
   disableStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;

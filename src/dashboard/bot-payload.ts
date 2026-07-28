@@ -55,6 +55,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     readIsolation: j?.readIsolation === true,
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
+    showUsageInCardFooter: j?.showUsageInCardFooter !== false,
     disableStreamingCard: j?.disableStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,
