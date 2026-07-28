@@ -1,5 +1,10 @@
 import { parse } from 'dotenv';
 
+// Keys baked into the PM2 env block (see ecosystemConfig in cli.ts). This list
+// MUST stay mirrored by detachedRestartEnv() in src/core/maintenance.ts: any key
+// added here also has to be stripped there, or a detached restart (dashboard
+// update/restart, maintenance auto-update) reuses the stale baked value instead
+// of reloading it from ~/.botmux/.env.
 const DAEMON_ENV_KEYS = [
   'WEB_EXTERNAL_HOST',
   'BOTMUX_DASHBOARD_EXTERNAL_HOST',
