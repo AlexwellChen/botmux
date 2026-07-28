@@ -919,23 +919,45 @@ function resolveAdoptableSessionForPane(
  *
  * `filterCliId` 语义与 `discoverAdoptableSessions` 完全一致，调用方必须原样传入
  * 同一个值 —— 卡片 option 是用户可控输入，丢掉过滤等于允许把 bot 切到别的 CLI。
+ *
+ * ⚠️ `tmux display -t` 是**模糊解析**，且失败时不报错。实测（tmux 3.6a）：
+ *   请求 `nonexist:0.0` → exit 0，stdout 只有分隔符、pane_pid 为空串
+ *   请求 `claude:99.0`（window 索引不存在）→ exit 0，解析到 `claude:2.3`
+ *   请求 `claude:1.99`（pane 索引不存在）→ exit 0，解析到 `claude:1.1`
+ *   请求 `clau:1.3`（会话名前缀）→ exit 0，解析到 `claude:1.3`
+ * 所以既不能靠 exit code 判死活，也不能相信「拿到一个正数 pid」就等于命中了
+ * 请求的那个 pane。这里让同一条 display 连 canonical 地址一起回显，再要求它与
+ * 请求的 target **严格相等**：一次同时挡掉「空 pid」和「静默命中别的 pane」。
+ * 格式串与 `discoverAdoptableSessions` 的 list-panes 完全一致，两边可直接比较。
  */
 export function discoverAdoptableSessionByTarget(
   tmuxTarget: string,
   filterCliId?: CliId,
 ): AdoptableSession | undefined {
+  let canonicalTarget: string;
   let panePid: number;
   try {
     const out = execSync(
-      `tmux display -t ${shellescape(tmuxTarget)} -p '#{pane_pid}'`,
+      `tmux display -t ${shellescape(tmuxTarget)} -p '#{session_name}:#{window_index}.#{pane_index} #{pane_pid}'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: tmuxEnv() },
     ).trim();
-    panePid = Number(out);
-    if (isNaN(panePid)) return undefined;
+    // 必须按**最后**一个空格切：会话名本身可能含空格（如「AD 智投星:0.0 651511」）。
+    // 与 discoverAdoptableSessions 解析 list-panes 的规则一致。
+    const spaceIdx = out.lastIndexOf(' ');
+    if (spaceIdx === -1) return undefined;
+    canonicalTarget = out.slice(0, spaceIdx);
+    panePid = Number(out.slice(spaceIdx + 1));
   } catch {
     // pane 已经不在了（或 tmux server 没起来）——交给调用方回落全量扫描。
     return undefined;
   }
+  // tmux 解析到了别的 pane（前缀命中 / 索引不存在时回落到活动 pane）→ 当作没找到。
+  if (canonicalTarget !== tmuxTarget) return undefined;
+  // 死目标下 pane_pid 是空串，`Number('') === 0` 且 `isNaN(0) === false`——必须显式
+  // 挡掉 0 与负数，否则 findCliProcess(0, ...) 会从 pid 0 开始遍历整棵进程树，
+  // 每个节点再 fork 一次全量 `ps`，实测 >45s 同步冻结（比它要优化掉的 5.4s 更糟，
+  // 且直接冻住 daemon 事件循环、波及所有 bot）。
+  if (!Number.isInteger(panePid) || panePid <= 0) return undefined;
   return resolveAdoptableSessionForPane(tmuxTarget, panePid, filterCliId);
 }
 

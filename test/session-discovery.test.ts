@@ -194,15 +194,21 @@ function setupMocks(opts: {
     if (displayMatch) {
       const target = displayMatch[1];
 
-      // pane_pid query (for validateAdoptTarget / discoverAdoptableSessionByTarget)
+      // pane_pid query. 两种形态：
+      //   validateTmuxAdoptTarget          → 只要 '#{pane_pid}'
+      //   discoverAdoptableSessionByTarget → '#{session_name}:...pane_index} #{pane_pid}'
+      //                                      （连 canonical 地址一起回显，用来核对
+      //                                        tmux 有没有模糊命中别的 pane）
       if (cmdStr.includes('pane_pid')) {
+        const wantsCanonical = cmdStr.includes('session_name');
         // Extract the target and find matching pane from paneLines.
         // 取 pid 必须按**最后**一个空格切：会话名本身可能含空格
         // （如「AD 智投星:0.0 651511」），按第一个空格切会把 pid 取成会话名的后半段。
         // 这与 discoverAdoptableSessions 解析 list-panes 输出的规则一致。
         for (const line of paneLines.split('\n')) {
           if (line.startsWith(target + ' ')) {
-            return line.slice(line.lastIndexOf(' ') + 1) + '\n';
+            // paneLines 的格式与 canonical query 的格式串完全相同，可整行回显。
+            return (wantsCanonical ? line : line.slice(line.lastIndexOf(' ') + 1)) + '\n';
           }
         }
         throw new Error('pane not found');
@@ -969,6 +975,64 @@ describe('discoverAdoptableSessionByTarget', () => {
   it('pane 已经不存在时返回 undefined，由调用方回落全量扫描', () => {
     setupMocks(threePanes);
     expect(discoverAdoptableSessionByTarget('gone:9.9')).toBeUndefined();
+  });
+
+  // ── 死目标 / 模糊命中：tmux display -t 失败时不报错，必须靠回显内容判断 ──
+  //
+  // 真机实测（tmux 3.6a），以下全部 exit 0、stderr 为空：
+  //   nonexist:0.0  → 地址回显为 ':.'、pane_pid 为空串
+  //   claude:99.0   → 解析到 claude:2.3（window 索引不存在 → 回落活动 window）
+  //   claude:1.99   → 解析到 claude:1.1（pane 索引不存在 → 回落活动 pane）
+  //   clau:1.3      → 解析到 claude:1.3（会话名前缀匹配）
+  // 所以既不能靠 exit code 判死活，也不能相信「拿到正数 pid」= 命中了请求的 pane。
+
+  it('死目标返回空 pane_pid + exit 0 时返回 undefined，绝不落到 pid 0 的进程树遍历', () => {
+    // 回归：Number('') === 0 且 isNaN(0) === false。少了正数校验就会调
+    // findCliProcess(0, 3)，从 pid 0 开始 BFS 整棵进程树、每个节点 fork 一次全量
+    // ps，实测 >45s 同步冻结 —— 比它要优化掉的 5.4s 更糟，且直接冻住 daemon
+    // 事件循环。注意这条路径不抛异常，与上面 'gone:9.9' 那条（mock 抛错）不同。
+    mockExecSync.mockImplementation((cmd: unknown) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('pane_pid')) return ':. \n';  // 真机对死目标的原样回显
+      throw new Error(`unexpected command: ${cmdStr}`);
+    });
+
+    expect(discoverAdoptableSessionByTarget('nonexist:0.0', 'claude-code')).toBeUndefined();
+
+    const cmds = mockExecSync.mock.calls.map(([c]) => String(c));
+    expect(cmds).toHaveLength(1);                                  // 只问了一次 tmux
+    expect(cmds.some(c => c.includes('ps '))).toBe(false);         // 没碰进程树
+    expect(cmds.some(c => c.includes('list-panes'))).toBe(false);  // 也没回落全量扫描
+  });
+
+  it('tmux 模糊命中别的 pane 时返回 undefined（canonical 地址与请求不符）', () => {
+    // 回归：只补 panePid > 0 挡不住这条 —— 长会话 foobarX 会让短 target foobar
+    // 拿到一个**真实正数** pid。若把请求的 target 原样回填，得到的对象就是
+    // 「地址是用户选的、数据是另一个 pane 的」，端到端可导致接管错误会话。
+    mockExecSync.mockImplementation((cmd: unknown) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('pane_pid')) return 'foobarX:0.0 4242\n';
+      throw new Error(`unexpected command: ${cmdStr}`);
+    });
+
+    expect(discoverAdoptableSessionByTarget('foobar:0.0', 'claude-code')).toBeUndefined();
+
+    const cmds = mockExecSync.mock.calls.map(([c]) => String(c));
+    expect(cmds).toHaveLength(1);
+    expect(cmds.some(c => c.includes('ps '))).toBe(false);
+  });
+
+  it('canonical 地址与请求严格相等时才继续解析（含空格会话名也能对上）', () => {
+    // 反向断言上一条不是「无脑返回 undefined」：地址对得上就正常走下去。
+    setupMocks({
+      paneLines: 'AD 智投星核心指标:0.0 1000\n',
+      commMap: { 1000: 'fish', 1001: 'claude' },
+      childMap: { 1000: [1001] },
+      cwdMap: { 1001: '/home/user/project' },
+      dimsMap: { 'AD 智投星核心指标:0.0': '210 61' },
+    });
+
+    expect(discoverAdoptableSessionByTarget('AD 智投星核心指标:0.0')?.cliPid).toBe(1001);
   });
 
   it('会话名含空格时同样能解析（与全量扫描的切分规则一致）', () => {
