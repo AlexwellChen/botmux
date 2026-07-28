@@ -1654,13 +1654,12 @@ async function maybeApplySharedTopicSeed(input: {
   messageId: string;
   routing: { scope: 'thread' | 'chat'; anchor: string };
   forceTopicApplied?: boolean;
-  independentTopicSeed?: boolean;
 }): Promise<string | undefined> {
   const {
     larkAppId, chatId, chatType, message, senderOpenId, messageId, routing,
-    forceTopicApplied, independentTopicSeed,
+    forceTopicApplied,
   } = input;
-  if (forceTopicApplied || independentTopicSeed) return undefined;
+  if (forceTopicApplied) return undefined;
   // This helper only seeds a shared reply topic. A message with both fields is
   // already a reply inside a native thread; folding it would divert an owned
   // thread session back into the group lobby and split one topic's context.
@@ -1707,9 +1706,12 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   if (!rootId || !threadId) return undefined;
   // A genuine native Lark topic is an explicit user-created context boundary,
   // even when this bot first enters on a later reply rather than on the seed.
-  // Synthetic/shared reply aliases do not use an omt_* thread id and continue
-  // through the regular-group fold below.
-  if (threadId.startsWith('omt_')) return undefined;
+  // In `chat-topic` mode that boundary is honored — don't fold it into the group
+  // lobby. chat / shared are documented to fold native topics into the group
+  // session, so they must fall through to the regular-group fold below.
+  // Synthetic/shared reply aliases do not use an omt_* thread id and always
+  // continue through the fold below regardless of mode.
+  if (threadId.startsWith('omt_') && resolveRegularGroupMode(larkAppId, chatId) === 'chat-topic') return undefined;
   const rawText = extractMessageTextForRouting(message);
   if (rawText) {
     const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
@@ -1739,17 +1741,20 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
 /** Compute the scope + anchor for an inbound message:
  *   - root_id + thread_id     → thread-scope, anchor = root_id (real Lark 话题)
  *   - 话题群 + no real thread → thread-scope, anchor = message_id (thread seed)
- *   - 普通群 + thread_id only → thread-scope, anchor = message_id (a native
- *                               user-created topic seed)
- *   - p2p + no real thread    → thread-scope, anchor = message_id (each DM
- *                               top-level message starts a fresh topic; a
- *                               reply inside an existing thread carries
+ *   - 普通群 chat-topic + thread_id only → thread-scope, anchor = message_id
+ *                               (a native user-created topic seed; other regular
+ *                               -group modes fold it per regularGroupRouting)
+ *   - p2p (chat, default)     → chat-scope, anchor = chat_id (整段 DM 共用一个
+ *                               连续会话)
+ *   - p2p thread + no real thread → thread-scope, anchor = message_id (explicit
+ *                               opt-out: each DM top-level message starts a fresh
+ *                               topic; a reply inside an existing thread carries
  *                               root_id+thread_id and threads into its session)
  *   - 普通群 + no real thread  → resolved regular-group mode:
  *                               new-topic uses thread-scope anchored at
- *                               message_id; chat / shared stay chat-scope
- *                               anchored at chat_id (shared folds into a topic
- *                               post-routing, see maybeApplySharedTopicSeed).
+ *                               message_id; chat / shared / chat-topic stay
+ *                               chat-scope anchored at chat_id (shared folds into
+ *                               a topic post-routing, see maybeApplySharedTopicSeed).
  *
  *  Why we gate on thread_id (not root_id alone): Lark 客户端的引用气泡 / 快速
  *  回复 UI 有时会给"用户视角的顶层消息"塞 root_id 但**不会**塞 thread_id。
@@ -1789,19 +1794,20 @@ async function decideRoutingWithSource(
   const messageId: string = message.message_id;
   const chatId: string = message.chat_id;
 
-  // 私聊 chat 模式：整段 DM 一律折进同一个扁平 chat-scope 会话。必须先于下面的
-  // real-thread（root_id+thread_id）分支判断 —— 否则用户在 DM 里"回复某条消息"
-  // 形成的 thread 形态消息会被提前分流到 thread-scope，破坏"连续单聊会话"语义
-  // （典型触发：thread→chat 模式切换后回复旧 thread，或 Lark 给 DM 回复塞了
-  // thread_id）。仅 p2p 且 p2pMode==='chat' 命中，群聊 / p2p 默认 thread 模式不受影响。
-  if (chatType === 'p2p' && getBot(larkAppId)?.config?.p2pMode === 'chat') {
+  // 私聊 chat 模式（默认）：整段 DM 一律折进同一个扁平 chat-scope 会话。必须先于
+  // 下面的 real-thread（root_id+thread_id）分支判断 —— 否则用户在 DM 里"回复某条
+  // 消息"形成的 thread 形态消息会被提前分流到 thread-scope，破坏"连续单聊会话"
+  // 语义（典型触发：thread→chat 模式切换后回复旧 thread，或 Lark 给 DM 回复塞了
+  // thread_id）。p2pMode 默认 'chat'；只有显式 'thread' 才回到每条 DM 独立话题的
+  // 旧行为。群聊不受影响。
+  if (chatType === 'p2p' && getBot(larkAppId)?.config?.p2pMode !== 'thread') {
     return { scope: 'chat', anchor: chatId, source: 'p2p' };
   }
 
   if (rootId && threadId) return { scope: 'thread', anchor: rootId, source: 'real-thread' };
 
-  // 私聊默认（thread 模式）：每条 top-level DM 都视为新话题 — 跟话题群同款，匹配
-  // Lark DM 的话题化默认行为，避免无限把 1:1 对话塞进同一个 CLI 进程里。
+  // 私聊 thread 模式（显式 opt-out）：每条 top-level DM 都视为新话题 — 跟话题群
+  // 同款，匹配 Lark DM 的话题化行为，把 1:1 对话按消息拆成独立 CLI 进程。
   if (chatType === 'p2p') {
     return { scope: 'thread', anchor: messageId, source: 'p2p' };
   }
@@ -1812,10 +1818,22 @@ async function decideRoutingWithSource(
     return { scope: 'thread', anchor: messageId, source: 'topic-chat' };
   }
   // A native topic root in a regular group carries thread_id=omt_* but no
-  // root_id. It must start its own session instead of sharing the group lobby
-  // session. Keep this after the topic-chat check so topic-group seeds retain
-  // source=topic-chat (and therefore autoStartOnNewTopic semantics).
-  if (threadId?.startsWith('omt_')) {
+  // root_id. In `chat-topic` mode (顶层平铺连续会话；群内原生话题各自独立会话)
+  // this seed must start its own thread-scope session instead of folding into
+  // the group lobby — otherwise the topic's opening message lands in the shared
+  // chat session and only later replies (which carry root_id and hit the
+  // real-thread branch above) isolate, breaking chat-topic's own contract.
+  //
+  // Gated on `chat-topic` ONLY, by design (遵循 /reply-mode 配置):
+  //   • chat / shared  — documented to fold native topics into the group session
+  //                      (see /reply-mode help); must NOT isolate here.
+  //   • new-topic      — regularGroupRouting already returns thread-scope anchored
+  //                      at messageId for top-level messages, with the correct
+  //                      source=regular-group-thread; letting it fall through keeps
+  //                      that source (and its downstream summary/forward semantics).
+  // Keep this after the topic-chat check so 话题群 seeds retain source=topic-chat
+  // (and therefore autoStartOnNewTopic semantics).
+  if (threadId?.startsWith('omt_') && resolveRegularGroupMode(larkAppId, chatId) === 'chat-topic') {
     return { scope: 'thread', anchor: messageId, source: 'real-thread' };
   }
   return regularGroupRouting(larkAppId, messageId, chatId);
@@ -2307,7 +2325,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (!replyRootId) {
           replyRootId = await maybeApplySharedTopicSeed({
             larkAppId, chatId, chatType, message, senderOpenId, messageId, routing: ctx, forceTopicApplied: forcedTopic,
-            independentTopicSeed: decision.source === 'real-thread' && !!message.thread_id && !message.root_id,
           });
         }
         // Foreign-bot @mention gate: apply the same vetted-peer/talk-only
@@ -2602,7 +2619,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       } else {
         const seedReplyRootId = await maybeApplySharedTopicSeed({
           larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
-          independentTopicSeed: decision.source === 'real-thread' && !!message.thread_id && !message.root_id,
         });
         if (seedReplyRootId) {
           replyRootId = seedReplyRootId;
