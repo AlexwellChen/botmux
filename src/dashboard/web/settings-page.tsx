@@ -10,6 +10,7 @@ interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
 
 interface DashboardSettings {
+  groupNamePrefix: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -124,6 +125,7 @@ function traexInstallMessage(install: any, tr: (k: string) => string): StatusMes
 
 function parseSettings(s: any): DashboardSettings {
   return {
+    groupNamePrefix: typeof s?.groupNamePrefix === 'string' ? s.groupNamePrefix : '',
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
     enableLocalCliOpen: s?.enableLocalCliOpen === true,
@@ -598,6 +600,10 @@ function SettingsBody(props: {
           <p className="hint-warn">{tr('settings.readOnlyVisitor')}</p>
         </article>
       )}
+      <SettingsModule
+        title={tr('settings.moduleGeneral')}
+        description={tr('settings.moduleGeneralHelp')}
+      >
       <SettingsGroup className="settings-group-main">
         <SettingsBlock title={tr('settings.sectionAccess')}>
           <ToggleRow
@@ -646,6 +652,17 @@ function SettingsBody(props: {
               }}
             />
           </div>
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionGroupCreation')}>
+          <GroupNamePrefixRow
+            value={settings.groupNamePrefix}
+            disabled={dis || savingKey === 'groupNamePrefix'}
+            onSave={value => props.onSave(
+              'groupNamePrefix',
+              { groupNamePrefix: value },
+              s => ({ ...s, groupNamePrefix: value }),
+            )}
+          />
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionExperimental')}>
           <ToggleRow
@@ -725,6 +742,14 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
+      </SettingsGroup>
+      </SettingsModule>
+      <SettingsModule
+        className="settings-module-meeting"
+        title={tr('settings.moduleMeeting')}
+        description={tr('settings.moduleMeetingHelp')}
+      >
+      <SettingsGroup className="settings-group-meeting">
         <SettingsBlock className="settings-vc-block" title={tr('settings.sectionVcMeetingAgent')}>
           <ToggleRow
             title={tr('settings.vcMeetingAgent')}
@@ -780,6 +805,11 @@ function SettingsBody(props: {
           ) : null}
         </SettingsBlock>
       </SettingsGroup>
+      </SettingsModule>
+      <SettingsModule
+        title={tr('settings.moduleSystem')}
+        description={tr('settings.moduleSystemHelp')}
+      >
       <SettingsGroup className="settings-group-ops">
         <SettingsBlock
           title={tr('settings.sectionMaintenance')}
@@ -841,10 +871,29 @@ function SettingsBody(props: {
         </SettingsBlock>
         {props.updateBlock}
       </SettingsGroup>
+      </SettingsModule>
       <div className="settings-status-row">
         <span className={`oncall-status ${props.message?.cls ?? ''}`} data-settings-status>{props.message?.text ?? ''}</span>
       </div>
     </div>
+  );
+}
+
+function SettingsModule(props: {
+  className?: string;
+  title: string;
+  description: string;
+  children: ReactNode;
+}): JSX.Element {
+  const cls = ['settings-module', props.className].filter(Boolean).join(' ');
+  return (
+    <section className={cls}>
+      <header className="settings-module-heading">
+        <h2>{props.title}</h2>
+        <p>{props.description}</p>
+      </header>
+      {props.children}
+    </section>
   );
 }
 
@@ -1105,6 +1154,59 @@ function ToggleRow(props: {
         <strong><FieldTitle className="settings-toggle-title" help={props.help}>{props.title}</FieldTitle></strong>
       </span>
     </label>
+  );
+}
+
+const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
+
+export function GroupNamePrefixRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const hasVisibleContent = draft.trim().length > 0;
+  const valid = draft === '' || hasVisibleContent;
+  const dirty = draft !== props.value;
+  const submit = () => {
+    if (props.disabled || !dirty || !valid) return;
+    void props.onSave(draft);
+  };
+
+  return (
+    <div className="settings-subfield settings-group-prefix-editor">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.groupNamePrefixHelp')}>{tr('settings.groupNamePrefix')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          value={draft}
+          maxLength={GROUP_NAME_PREFIX_INPUT_MAX_LENGTH}
+          placeholder={tr('settings.groupNamePrefixPlaceholder')}
+          disabled={props.disabled}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-group-name-prefix-preview>
+        {hasVisibleContent
+          ? tr('settings.groupNamePrefixPreview', { name: `${draft}${tr('settings.groupNamePrefixPreviewName')}` })
+          : tr('settings.groupNamePrefixDisabled')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          disabled={props.disabled || !dirty || !valid}
+          onClick={submit}
+        >
+          {tr('settings.groupNamePrefixSave')}
+        </button>
+      </div>
+    </div>
   );
 }
 

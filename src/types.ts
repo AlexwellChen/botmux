@@ -9,6 +9,14 @@ export type VcMeetingConsumerManagedSink = 'meeting_text' | 'meeting_voice';
 
 export type VcMeetingConsumerResponseMode = 'silent' | 'listener_thread';
 
+/** How an automatic listener-visible consumer reply is placed inside the
+ * listener chat. `auto` preserves the historical session routing behavior. */
+export type VcMeetingListenerOutputPlacement = 'auto' | 'chat' | 'topic';
+
+export interface VcMeetingListenerDeliveryConfig {
+  placement: VcMeetingListenerOutputPlacement;
+}
+
 /** Host-derived authority for one explicit Lark message routed into a
  * dedicated meeting receiver. Entries are keyed by `larkMessageId` on the
  * persisted session so queued human turns cannot overwrite each other's
@@ -46,6 +54,10 @@ export interface VcMeetingConsumerProfileConfig {
   instructions?: string;
   filter?: VcMeetingConsumerProfileFilter;
   responseMode: VcMeetingConsumerResponseMode;
+  /** Presentation policy for automatic listener-visible output. This is
+   * orthogonal to responseMode: silent consumers never auto-post regardless
+   * of placement. Omitted means the backward-compatible `auto` behavior. */
+  listenerDelivery?: VcMeetingListenerDeliveryConfig;
   /** Capability names are snapshotted onto runtime membership. */
   capabilities: string[];
   /** Only managed meeting text/voice sinks are accepted in MA-P1 slice 1A. */
@@ -104,6 +116,8 @@ export type StreamStatus = ScreenStatus | 'starting';
 
 export interface Session {
   sessionId: string;
+  /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
+  runnerBuildId?: string;
   chatId: string;
   chatType?: 'group' | 'p2p';
   /** Thread-scope: an actual root message id under which all replies thread.
@@ -176,6 +190,26 @@ export interface Session {
   /** Dashboard-created image files retained while the session is active so
    * the CLI can read them, then removed by session-store on close. */
   dashboardAttachments?: LarkAttachment[];
+  /**
+   * 「CLI 已经空启动，但还没收到过任何真实用户轮」的一次性状态。
+   *
+   * `/repo <name>` / 选仓卡 / 跳过 / mid-session 切仓这几条路径会在**没有**任何
+   * buffered 用户输入（pendingPrompt/attachments/follow-ups/pendingRawInput 全空）
+   * 的情况下 `forkWorker(ds, '', false)` 把 CLI 拉起来待命。此时 CLI 进程活着，
+   * 但它从未见过 `<botmux_routing>` / `<botmux_builtin_skills>` / `<identity>` 这套
+   * 开场上下文——那套东西只由 `buildNewTopicCliInput` 产出。
+   *
+   * 没有这个标记时，下一条真实业务消息会被 worker 存活性判定成 follow-up
+   * （`buildFollowUpCliInput` / `buildReforkCliInput`），开场上下文永久丢失。
+   * 置位后，下一条**真实业务消息**（不含 botmux 控制命令 / 卡片回调 / raw
+   * passthrough）走与普通 new topic 完全相同的构造路径，成功投递后一次性清除。
+   *
+   * 持久化（而非只挂内存 DaemonSession）是为了扛 daemon 重启：空启动之后、首条
+   * 业务消息之前重启，重启后那条消息仍必须是 opening。它同时也是「CLI 空启动过」
+   * 与「已有真实用户历史」的判据——refork 时据此关掉 `--resume`，不去 resume 一个
+   * 从未产生过真实轮的 CLI 会话。
+   */
+  initialUserTurnPending?: boolean;
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
@@ -347,7 +381,7 @@ export interface Session {
   /** Exact persistent host/agent selected by the worker for restore and cleanup. */
   persistentBackendTarget?: PersistentBackendTarget;
   /**
-   * Sandbox decision RECORDED AT SESSION CREATION (overlay file-isolation). The
+   * Sandbox decision RECORDED AT SESSION CREATION (fs-policy file-isolation). The
    * live bot flag (BotConfig.sandbox) can be toggled later, but a session's
    * sandbox status is frozen here at creation so a restore/restart never
    * retroactively sandboxes (or un-sandboxes) a historical session. Undefined on
@@ -569,7 +603,7 @@ export interface CliTurnPayload {
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -584,7 +618,11 @@ export type DaemonToWorker =
   | { type: 'rename_session'; title: string }
   | { type: 'close' }
   | { type: 'suspend' }
-  | { type: 'restart' }
+  /** Kill the CLI and respawn it with --resume. `updateWorkingDir`（可选）
+   *  用于角色切换的 cwd-move respawn：respawn 前把 worker 侧 lastInitConfig
+   *  收敛到新目录，让 CLI 在新 cwd 冷启动（新 CLAUDE.md/记忆索引开场注入）
+   *  同时 --resume 续回对话上下文。`attemptId` 关联手工 restart 的完成回执。 */
+  | { type: 'restart'; attemptId?: string; updateWorkingDir?: string }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
    * advance is ignored worker-side. */
@@ -598,10 +636,9 @@ export type DaemonToWorker =
   // onExit so transient auto-restarted exits don't park-then-tear-down.
   | { type: 'park_diagnostic' }
   | { type: 'tui_keys'; keys: string[]; isFinal: boolean; rearmStuckDetector?: boolean; stuckNonce?: number; stuckCliLifetime?: number; stuckPageType?: string }
-  // updateWorkingDir：会话内 /cd 移动 cwd 后随附的新目录，worker 记入
-  // lastInitConfig.workingDir，使内部三条 respawn 路径（claude_exit 自动重启 /
-  // IM /restart / dashboard restart）收敛到新目录而非陈旧的初始 cwd。
-  | { type: 'inject_command'; command: string; updateWorkingDir?: string }
+  // 白名单 TUI 命令注入（/slash 路由）。cwd 移动不走注入——角色切换用
+  // restart+updateWorkingDir 的 respawn，避免绕过 cd 路由的角色库硬校验。
+  | { type: 'inject_command'; command: string }
   | { type: 'tui_text_input'; keys: string[]; text: string }
   // CoCo AskUserQuestion 作答：daemon 在 ask 结算后下发，worker 等原生 picker 渲染后
   // 用 navKeys 驱动它选择+导航。needsReviewSubmit=true（多题）时 navKeys 停在 Review
@@ -640,6 +677,13 @@ export type WorkerToDaemon =
   | { type: 'native_session_title_generated'; title: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'prompt_ready' }
+  | { type: 'runner_build_ready'; runnerBuildId: string }
+  | {
+      type: 'restart_result';
+      attemptId: string;
+      status: 'succeeded' | 'failed' | 'timed_out';
+      category: 'prompt_ready' | 'spawn_failed' | 'runner_exited' | 'readiness_timeout';
+    }
   /** Worker 已处理 SessionStart 信号并建立 post-hook prompt evidence fence。
    *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
   | { type: 'session_ready_ack'; requestId: string }
@@ -653,6 +697,10 @@ export type WorkerToDaemon =
   | { type: 'tui_keys_delivered'; nonce: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
+  /** A normal success acknowledgement for one app-server accepted steer.
+   * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
+   * botmux/Lark reply route. This must never enter the attention path. */
+  | { type: 'steer_accepted'; appTurnId: string; turnId: string }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt
    * was either removed from the worker queue or its owned CLI was fenced. */

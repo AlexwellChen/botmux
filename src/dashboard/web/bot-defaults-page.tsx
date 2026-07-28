@@ -532,13 +532,14 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
             <RuntimeEnvironmentSection bot={bot} patchBot={patchBot} />
           </section>
           <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
+          <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
         </div>
         <div className="bd-column">
           <section className="bd-tile">
             <SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
             <SubstituteModeSection bot={bot} patchBot={patchBot} />
             <CrossBotSection bot={bot} putCardPref={putCardPref} />
-            <SessionCapSection bot={bot} patchBot={patchBot} />
+            <SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
           </section>
           <section className="bd-tile">
             <CardBehaviorSection bot={bot} putCardPref={putCardPref} />
@@ -1419,7 +1420,7 @@ const SBX_RESTRICTIVENESS: Record<SandboxTier, number> = { readWrite: 0, readOnl
  *  RESTRICTIVE tier wins — mirrors fs-policy.ts accessForPath + mergeFsRules so
  *  the UI's live labels + path tester agree with what the sandbox enforces.
  *  `home` expands a leading `~` the same way the worker does before matching, so
- *  recommendation entries like `~/.claude` line up with absolute tree nodes. */
+ *  `~`-relative entries line up with absolute tree nodes. */
 export function effectiveAccess(tiers: SandboxTiers, path: string, home: string): { access: SandboxTier | 'none'; rule?: string } {
   const expand = (p: string) => (p === '~' || p.startsWith('~/')) ? home.replace(/\/+$/, '') + p.slice(1) : p;
   const norm = (p: string) => expand(p).replace(/\/+$/, '') || '/';
@@ -1442,22 +1443,6 @@ export function effectiveAccess(tiers: SandboxTiers, path: string, home: string)
   for (const p of tiers.readOnly) consider('readOnly', p);
   for (const p of tiers.deny) consider('deny', p);
   return best ? { access: best.access, rule: best.rule } : { access: 'none' };
-}
-
-/** Per-CLI recommended sandbox paths — the "Claude recommends adding ~/.claude"
- *  one-click starters. Keyed by cliId family; falls back to a generic set. */
-function recommendedTiers(cliId: string | undefined): { tiers: SandboxTiers; labelKey: string } {
-  const id = (cliId ?? '').toLowerCase();
-  if (id.includes('claude')) {
-    return { labelKey: 'botDefaults.sbxPathsRecommendClaude', tiers: { readWrite: [], readOnly: ['~/.claude'], deny: [] } };
-  }
-  if (id.includes('codex')) {
-    return { labelKey: 'botDefaults.sbxPathsRecommendCodex', tiers: { readWrite: [], readOnly: ['~/.codex'], deny: [] } };
-  }
-  if (id.includes('gemini')) {
-    return { labelKey: 'botDefaults.sbxPathsRecommendGemini', tiers: { readWrite: [], readOnly: ['~/.gemini'], deny: [] } };
-  }
-  return { labelKey: 'botDefaults.sbxPathsRecommendGeneric', tiers: { readWrite: [], readOnly: [], deny: [] } };
 }
 
 function emptyTiers(): SandboxTiers { return { readWrite: [], readOnly: [], deny: [] }; }
@@ -1509,8 +1494,8 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [roots, setRoots] = useState<{ name: string; path: string }[]>([]);
   // Canonical $HOME (first fs-list root) — used to expand `~` in tiers/tester
-  // the SAME way the worker does, so recommendation entries (~/.claude) match
-  // absolute tree nodes and effective-access labels are accurate.
+  // the SAME way the worker does, so `~`-relative entries match absolute tree
+  // nodes and effective-access labels are accurate.
   const [homeRoot, setHomeRoot] = useState<string>('~');
 
   const saved = useMemo(() => normTiers(bot.sandboxPaths), [bot.sandboxPaths]);
@@ -1557,21 +1542,6 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       return t;
     });
   }, [explicitTier]);
-
-  function applyRecommended() {
-    const rec = recommendedTiers(bot.cliId);
-    setStatus(null);
-    setTiers(prev => {
-      const merge = (base: string[], add: string[]) => [...new Set([...base, ...add])];
-      const t: SandboxTiers = {
-        readWrite: merge(prev.readWrite, rec.tiers.readWrite),
-        readOnly: merge(prev.readOnly, rec.tiers.readOnly),
-        deny: merge(prev.deny, rec.tiers.deny),
-      };
-      setText(tiersToText(t));
-      return t;
-    });
-  }
 
   function syncFromText(next: string) {
     setText(next);
@@ -1649,9 +1619,6 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       <h3 className="bd-section-title">{tr('botDefaults.sectionSandboxPaths')}</h3>
       <p className="bd-section-note">{tr('botDefaults.sbxPathsHelp')}</p>
       <div className="actions" style={{ gap: 8, flexWrap: 'wrap' }}>
-        <button type="button" className="bd-btn" data-action="apply-sandbox-recommended" onClick={applyRecommended}>
-          {tr(recommendedTiers(bot.cliId).labelKey)}
-        </button>
         <button type="button" className="bd-btn" onClick={() => setTextMode(m => !m)}>
           {textMode ? tr('botDefaults.sbxPathsTreeMode') : tr('botDefaults.sbxPathsTextMode')}
         </button>
@@ -2764,7 +2731,7 @@ function mentionMode(bot: BotDefaultsRow): string {
     : 'always';
 }
 
-function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const initial = typeof props.bot.maxLiveWorkers === 'number' ? props.bot.maxLiveWorkers : null;
   const logical = Number.isFinite(props.bot.logicalSessionCount) ? Number(props.bot.logicalSessionCount) : 0;
@@ -2775,12 +2742,39 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const [input, setInput] = useState(initial == null ? '' : String(initial));
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  const [overloadAlert, setOverloadAlert] = useState(props.bot.overloadAlert === true);
+  const [overloadBusy, setOverloadBusy] = useState(false);
 
   useEffect(() => {
     const next = typeof props.bot.maxLiveWorkers === 'number' ? props.bot.maxLiveWorkers : null;
     setCap(next);
     setInput(next == null ? '' : String(next));
   }, [props.bot.maxLiveWorkers]);
+
+  useEffect(() => {
+    setOverloadAlert(props.bot.overloadAlert === true);
+  }, [props.bot.overloadAlert]);
+
+  async function saveOverloadAlert(next: boolean): Promise<void> {
+    setOverloadBusy(true);
+    setStatus(null);
+    setOverloadAlert(next); // optimistic
+    try {
+      const res = await props.putCardPref({ overloadAlert: next });
+      if (res.ok && res.body.ok) {
+        props.patchBot(props.bot.larkAppId, { overloadAlert: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setOverloadAlert(!next); // revert
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setOverloadAlert(!next); // revert
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setOverloadBusy(false);
+    }
+  }
 
   async function save(value: number | null): Promise<void> {
     setStatus(null);
@@ -2833,6 +2827,14 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         <button type="button" data-action="off-session-cap" disabled={busy} onClick={() => { setInput(''); void save(null); }}>{tr('botDefaults.maxLiveWorkersOff')}</button>
         <StatusSpan status={status} attr={{ 'data-session-cap-status': '' }} />
       </div>
+      <ToggleRow
+        checked={overloadAlert}
+        disabled={overloadBusy}
+        dataAction="toggle-overload-alert"
+        title={tr('botDefaults.overloadAlert')}
+        help={tr('botDefaults.overloadAlertHelp')}
+        onChange={checked => void saveOverloadAlert(checked)}
+      />
     </div>
   );
 }
@@ -2881,6 +2883,101 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         <StatusSpan status={status} attr={{ 'data-startup-commands-status': '' }} />
       </div>
     </div>
+  );
+}
+
+// Slash 命令权限：把 /botconfig 的 customPassthroughCommands（透传给 CLI）与
+// canTalkDaemonCommands（daemon 命令降到 canTalk）搬到 Dashboard 可视化编辑。
+// 两者都是 stringList immediate 字段，走各自的 PUT 代理路由，空串＝清除回默认。
+function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [passthrough, setPassthrough] = useState(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
+  const [canTalk, setCanTalk] = useState(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPassthrough(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
+  }, [props.bot.customPassthroughCommands]);
+  // 分开两个 effect：只让「被保存的那个字段」的 prop 变化重置对应输入框，否则保存
+  // 一个字段触发 patchBot 重渲染会连带把另一个字段的未保存草稿一并清空。
+  useEffect(() => {
+    setCanTalk(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
+  }, [props.bot.canTalkDaemonCommands]);
+
+  async function savePassthrough(): Promise<void> {
+    setStatus(null);
+    setBusy('passthrough');
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/custom-passthrough`, { customPassthroughCommands: passthrough });
+      if (res.ok && res.body.ok) {
+        const next = typeof res.body.customPassthroughCommands === 'string' ? res.body.customPassthroughCommands : '';
+        setPassthrough(next);
+        props.patchBot(props.bot.larkAppId, { customPassthroughCommands: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveCanTalk(): Promise<void> {
+    setStatus(null);
+    setBusy('cantalk');
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/cantalk-daemon-commands`, { canTalkDaemonCommands: canTalk });
+      if (res.ok && res.body.ok) {
+        const next = typeof res.body.canTalkDaemonCommands === 'string' ? res.body.canTalkDaemonCommands : '';
+        setCanTalk(next);
+        props.patchBot(props.bot.larkAppId, { canTalkDaemonCommands: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.sectionSlashCommandsHelp')}>{tr('botDefaults.sectionSlashCommands')}</FieldTitle></h3>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.customPassthroughHelp')}>{tr('botDefaults.customPassthrough')}</FieldTitle></h4>
+        <textarea
+          data-input="customPassthroughCommands"
+          rows={2}
+          placeholder={tr('botDefaults.customPassthroughPlaceholder')}
+          value={passthrough}
+          disabled={busy === 'passthrough'}
+          onChange={event => setPassthrough(event.currentTarget.value)}
+        />
+        <div className="actions">
+          <button type="button" className="primary" data-action="save-custom-passthrough" disabled={busy === 'passthrough'} onClick={() => void savePassthrough()}>{tr('botDefaults.customPassthroughSave')}</button>
+        </div>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.canTalkDaemonHelp')}>{tr('botDefaults.canTalkDaemon')}</FieldTitle></h4>
+        <textarea
+          data-input="canTalkDaemonCommands"
+          rows={2}
+          placeholder={tr('botDefaults.canTalkDaemonPlaceholder')}
+          value={canTalk}
+          disabled={busy === 'cantalk'}
+          onChange={event => setCanTalk(event.currentTarget.value)}
+        />
+        <div className="actions">
+          <button type="button" className="primary" data-action="save-cantalk-daemon" disabled={busy === 'cantalk'} onClick={() => void saveCanTalk()}>{tr('botDefaults.canTalkDaemonSave')}</button>
+        </div>
+      </div>
+      <StatusSpan status={status} attr={{ 'data-slash-commands-status': '' }} />
+    </section>
   );
 }
 

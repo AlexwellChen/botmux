@@ -19,6 +19,11 @@ import {
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
+import {
+  parseDashboardAskAnswerRequest,
+  proxyDashboardAskAnswer,
+} from './dashboard/desktop-asks.js';
 import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
@@ -36,6 +41,8 @@ import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
   redactGroupsForPublic,
   redactSchedulesForPublic,
+  redactSessionEventForPublic,
+  redactSessionsForPublic,
   redactSettingsForPublic,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
@@ -59,6 +66,7 @@ import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
+import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -165,7 +173,10 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
-import { handleDesktopCompat } from './dashboard/compat.js';
+import {
+  compatMachineIdForAuthenticatedRequest,
+  handleDesktopCompat,
+} from './dashboard/compat.js';
 import { isDashboardChunkJsPath, missingDashboardChunkModule } from './dashboard/stale-chunk-module.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
@@ -289,6 +300,14 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
+const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
+
+// Keep Git-derived fields in the central read-model so REST snapshots and SSE
+// share one row shape. Idle/limited turn boundaries force a branch refresh
+// after the CLI has had a chance to change repositories — that is one
+// `git rev-parse` per session per turn, bounded by the resolver's concurrency
+// cap, NOT a slow background poll.
+aggregator.on(sessionPresentation.onEvent);
 
 // 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
@@ -333,7 +352,7 @@ function listDirLocally(rawPath: string): {
   // worker's sandbox binds use. On a symlinked-$HOME host (/home/u →
   // /data00/home/u) the lexical homedir() would make `~/.claude` expand to
   // /home/u/.claude while the tree's child nodes come back as /data00/... — the
-  // picker would then never match its own recommendation entries.
+  // picker would then never match `~`-relative tier entries.
   let home = homedir();
   try { home = realpathSync(home); } catch { /* lexical fallback if unresolvable */ }
   if (!rawPath) {
@@ -477,6 +496,8 @@ const subs = new Map<string, () => void>();
 const attaching = new Set<string>();   // dedup concurrent attaches per appId
 
 interface ResolvedDashboardSettings {
+  /** Machine-wide prefix applied only by the `/group` and `/g` slash commands. */
+  groupNamePrefix: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -998,6 +1019,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   const codexNotifierState = readCodexNotifierWorkerState(config.session.dataDir);
   const larkCli = checkLarkCliVersion();
   return {
+    groupNamePrefix: global.groupNamePrefix ?? '',
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
     enableLocalCliOpen: dashboard.enableLocalCliOpen === true,
@@ -1252,7 +1274,11 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
       ]);
       const s = await sRes.json() as { sessions: any[] };
       const sch = await schRes.json() as { schedules: any[] };
-      aggregator.hydrateSessions(d.larkAppId, s.sessions ?? []);
+      const rows = (s.sessions ?? []).map((row) => (
+        d.botAvatarUrl ? { ...row, botAvatarUrl: d.botAvatarUrl } : row
+      ));
+      aggregator.hydrateSessions(d.larkAppId, rows);
+      for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
       aggregator.hydrateSchedules(sch.schedules ?? []);
     } catch (e: any) {
       logger.warn(`[dashboard] hydrate ${d.larkAppId}: ${e.message ?? e}`);
@@ -1273,13 +1299,24 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
 }
 
 function syncSubscriptions(): void {
-  const online = new Set(registry.list().map(d => d.larkAppId));
+  const daemons = registry.list();
+  const online = new Set(daemons.map(d => d.larkAppId));
   // Attach (hydrate + subscribe) any newly-online daemon. Fire-and-forget
   // because the registry callback is sync and the attach is per-daemon
   // independent.
-  for (const d of registry.list()) {
+  for (const d of daemons) {
     if (!subs.has(d.larkAppId)) {
       void attachDaemon(d);
+    }
+    // Push avatar changes in BOTH directions: gating on `d.botAvatarUrl` would
+    // leave the stale image on every row when a bot's avatar is cleared.
+    const avatar = d.botAvatarUrl ?? null;
+    for (const row of aggregator.getSessions()) {
+      if (row.larkAppId !== d.larkAppId || (row.botAvatarUrl ?? null) === avatar) continue;
+      aggregator.applyEvent(d.larkAppId, {
+        type: 'session.update',
+        body: { sessionId: row.sessionId, patch: { botAvatarUrl: avatar } },
+      });
     }
   }
   // Close subscriptions for daemons that went offline. Cache entries are
@@ -2382,7 +2419,17 @@ const server = createServer(async (req, res) => {
     // Desktop shell compatibility probe (read-only, no token required). Keep it
     // outside the browser auth gate so packaged desktop apps can decide whether
     // this runtime speaks their dashboard protocol before loading the SPA.
-    if (handleDesktopCompat(req, res, url)) {
+    if (req.method === 'GET' && url.pathname === '/__desktop/compat') {
+      const presentedToken = authedToken(req, url);
+      const boundMachineId = activeToken && presentedToken === activeToken
+        ? readPlatformBinding()?.machineId
+        : null;
+      const compatMachineId = compatMachineIdForAuthenticatedRequest(
+        presentedToken,
+        activeToken,
+        boundMachineId,
+      );
+      handleDesktopCompat(req, res, url, { machineId: compatMachineId ?? undefined });
       return;
     }
 
@@ -2642,7 +2689,51 @@ const server = createServer(async (req, res) => {
           ? { ...s, botName: n }
           : s;
       });
-      return jsonRes(res, 200, { sessions });
+      return jsonRes(res, 200, {
+        sessions: authed ? sessions : redactSessionsForPublic(sessions),
+      });
+    }
+
+    // Desktop / operator UI: aggregate pending ask-hooks across daemons.
+    if (req.method === 'GET' && url.pathname === '/api/asks/pending') {
+      const daemons = registry.list();
+      const asks: unknown[] = [];
+      await Promise.all(daemons.map(async (d) => {
+        try {
+          const upstream = await fetchDaemonIpc(d.ipcPort, '/api/asks/pending', {
+            signal: AbortSignal.timeout(2_000),
+          });
+          if (!upstream.ok) return;
+          const body = await upstream.json() as { asks?: unknown[] };
+          for (const a of body.asks ?? []) {
+            asks.push({
+              ...(typeof a === 'object' && a ? a : {}),
+              botName: d.botName,
+              larkAppId: d.larkAppId,
+            });
+          }
+        } catch {
+          /* offline daemon */
+        }
+      }));
+      return jsonRes(res, 200, { asks });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/asks/answer') {
+      let body: unknown;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const parsed = parseDashboardAskAnswerRequest(body);
+      if (!parsed.ok) {
+        return jsonRes(res, 400, { ok: false, error: parsed.error });
+      }
+      const upstream = await proxyDashboardAskAnswer(parsed.value, proxyToDaemon);
+      res.writeHead(upstream.status, { 'content-type': upstream.contentType });
+      res.end(upstream.body);
+      return;
     }
     if (req.method === 'POST' && url.pathname === '/api/sessions/cleanup-idle') {
       let body: { olderThanHours?: unknown; sessionIds?: unknown };
@@ -3664,6 +3755,35 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 单会话元信息（状态/标题/cli/工作目录等）。dashboard 之前只代理了
+    // GET /api/sessions（列表），没有单会话 :id 路由，编程式调用方（如任务
+    // 编排器的「任务详情」面板）走 getMeta 会落到最底的 404 not_found_yet。
+    // owner-only；ownerOf 对已关闭会话仍可解析。放在 trigger-result 之后，
+    // 避免把 /trigger-result、/insight 等子路径吞进这个单段匹配。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。
+    // 四态 running/completed/failed/not_found，daemon 重启后从持久化结果兜底
+    // 重建 completed。owner-only（写权限 cookie），代理到 owner daemon 同名 IPC。
+    // ownerOf 对已关闭会话仍可解析（aggregator 的 /api/sessions 含 closed）。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/trigger-result$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/trigger-result${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // 会话 insight（只读 trace 分析：动作 span / 失败聚合 / 规则建议）。
     // owner-only：不在公开读白名单 → decideDashboardAuth 已对只读访客 401，
     // 公开/联邦访客看不到 tab 也拿不到 span。代理到 owner daemon 的同名 IPC。
@@ -4226,6 +4346,42 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-startup-commands`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/custom-passthrough — proxy to that bot's daemon. Body
+    // `{ customPassthroughCommands: string }` (raw text, comma/space separated; '' = clear).
+    let mBotPassthrough: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotPassthrough = url.pathname.match(/^\/api\/bots\/([^/]+)\/custom-passthrough$/))) {
+      const appId = decodeURIComponent(mBotPassthrough[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-custom-passthrough`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/cantalk-daemon-commands — proxy to that bot's daemon. Body
+    // `{ canTalkDaemonCommands: string }` (raw text, comma/space separated; '' = clear).
+    let mBotCanTalk: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotCanTalk = url.pathname.match(/^\/api\/bots\/([^/]+)\/cantalk-daemon-commands$/))) {
+      const appId = decodeURIComponent(mBotCanTalk[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-cantalk-daemon-commands`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -4821,7 +4977,9 @@ const server = createServer(async (req, res) => {
         // full task object — strip the prompt AND workingDir for anonymous SSE
         // listeners, or the REST-side scrub would be trivially bypassed by
         // `/events`.
-        let body = ev.body;
+        let body = authed
+          ? ev.body
+          : redactSessionEventForPublic(ev.type, ev.body) as typeof ev.body;
         if (!authed && (ev.type === 'schedule.created' || ev.type === 'schedule.updated')) {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {

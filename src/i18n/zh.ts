@@ -3,6 +3,7 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'worker.steer_accepted': '收到，引导成功',
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ 打开 Web 终端',
   'card.btn.open_writable_terminal': '🖥️ 打开可操作 Web 终端',
@@ -230,6 +231,9 @@ export const messages: Record<string, string> = {
   'cmd.substitute.owner_only': '⚠️ 只有 owner/allowedUsers 可以修改替身模式开关。',
   'cmd.substitute.usage': '用法：@我 /substitute status｜on｜off',
   'cmd.restart.in_progress': '🔄 正在重启 {cliName}...',
+  'cmd.restart.succeeded': '✅ {cliName} 已恢复就绪。',
+  'cmd.restart.failed': '❌ {cliName} 重启失败。',
+  'cmd.restart.timed_out': '⌛ {cliName} 重启超时，尚未恢复就绪。',
   'cmd.restart.terminated': '{cliName} 进程已终止，下次发消息时将自动恢复。',
   'cmd.cd.usage': '用法：/cd <path>\n例如：/cd ~/projects/my-app',
   'cmd.cd.switched': '工作目录已切换到 {path}，下次发消息时将在新目录下恢复。',
@@ -717,6 +721,7 @@ export const messages: Record<string, string> = {
   'worker.crash_recent_output': '最近终端输出：',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
+  'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',

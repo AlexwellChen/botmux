@@ -164,6 +164,12 @@ export interface DaemonSession {
    *  Entries outlive turn_terminal briefly to cover trailing worker events and
    *  are pruned by age/size when new silent turns are armed. */
   silentScheduledTurns?: Map<string, number>;
+  /** Turn-exact ids for loud external triggers whose connector opted into
+   *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
+   *  (the streaming card / start notice still show); keyed on the trigger turn
+   *  id so a normal user turn on the same session is unaffected. Bounded +
+   *  age-pruned like silentScheduledTurns. */
+  suppressedTriggerFinalTurns?: Map<string, number>;
   /** Session-scoped override: when true, the streaming card is posted/patched
    *  even if the bot has `disableStreamingCard` set. Flipped on by the `/card`
    *  command so a user can manually summon a live card in an otherwise-quiet

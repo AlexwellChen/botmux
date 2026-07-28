@@ -298,14 +298,14 @@ describe('dashboard sessions filters', () => {
 
   it('formats session location labels for group chats and direct chats', () => {
     expect(sessionLocationText({ chatType: 'group', chatId: 'oc_group' })).toBe('群聊 · oc_group');
-    expect(sessionLocationText({ chatType: 'p2p', chatId: 'oc_dm', chatDisplayName: '韩毅' })).toBe('单聊 · 韩毅');
-    expect(sessionLocationText({ chatType: 'p2p', chatId: 'oc_dm' })).toBe('单聊 · oc_dm');
+    expect(sessionLocationText({ chatType: 'p2p', chatId: 'oc_dm', chatDisplayName: '韩毅', botName: 'Nil-RD' })).toBe('单聊 · 韩毅 - Nil-RD');
+    expect(sessionLocationText({ chatType: 'p2p', chatId: 'oc_dm', botName: 'Nil-RD' })).toBe('单聊 · oc_dm - Nil-RD');
     expect(sessionLocationText({})).toBe('未知聊天');
   });
 
   it('treats sessions with chatId but no resolved chat title as unknown chats', () => {
     const row = { chatType: 'group', chatId: 'oc_stale' };
-    const namedDirect = { chatType: 'p2p', chatId: 'oc_dm', chatDisplayName: '韩毅' };
+    const namedDirect = { chatType: 'p2p', chatId: 'oc_dm', chatDisplayName: '韩毅', botName: 'Nil-RD' };
 
     expect(isUnknownChatSession(row, () => null)).toBe(true);
     expect(isUnknownChatSession(row, () => 'SellerIM Agent 集中营')).toBe(false);
@@ -399,5 +399,30 @@ describe('dashboard sessions kanban react view', () => {
     expect(html).not.toContain('data-id="cluster-a"');
     expect((html.match(/data-id="closed-/g) ?? []).length).toBe(50);
     expect(html).toContain('还有 5 个未显示');
+  });
+
+  it('omits the terminal action when the embedding shell does not provide it', () => {
+    const html = renderToStaticMarkup(createElement(SessionsKanbanView, {
+      host: null,
+      ...kanbanCallbacks,
+      onOpenTerminal: undefined,
+      rows: [{
+        sessionId: 'embedded-session',
+        status: 'working',
+        cliId: 'codex',
+        title: 'Embedded',
+        botName: 'Bot A',
+        lastMessageAt: 1000,
+        webPort: 3001,
+      }],
+      groupBy: 'flow',
+      teams: [],
+      teamsLoaded: true,
+      teamKey: '',
+      teamBoardData: null,
+      teamBoardKey: '',
+    }));
+
+    expect(html).not.toContain('data-action="terminal"');
   });
 });

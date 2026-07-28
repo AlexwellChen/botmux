@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -24,9 +25,11 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
+  normalizeHiddenTableColumns,
   normalizeSessionsViewMode,
   readStoredBoardOrder,
   readStoredCreateKeepOpen,
+  readStoredHiddenTableColumns,
   readStoredKanbanGroupBy,
   readStoredSessionsShowUnknownChats,
   readStoredSessionsViewMode,
@@ -34,6 +37,7 @@ import {
   type SessionsViewMode,
   writeStoredBoardOrder,
   writeStoredCreateKeepOpen,
+  writeStoredHiddenTableColumns,
   writeStoredKanbanGroupBy,
   writeStoredSessionsShowUnknownChats,
   writeStoredSessionsViewMode,
@@ -71,6 +75,7 @@ import {
   type SessionTopicGroup,
 } from './sessions.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
+import { dashboardShellAllowsWebTerminal } from './client-shell.js';
 import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
 import {
   filterMentionBots,
@@ -238,7 +243,7 @@ function IconActionButton(props: {
 }
 
 function TerminalControls(props: { row: any; url: string | null }): JSX.Element | null {
-  if (!props.url) return null;
+  if (!props.url || !dashboardShellAllowsWebTerminal()) return null;
   const readOnly = !shouldOpenWritableTerminal();
   return (
     <span className={`term-pill${readOnly ? ' readonly' : ' writable'}`}>
@@ -658,12 +663,15 @@ function BulkBar(props: {
   const busy = !!props.closeProgress || !!props.lockProgress;
   const lockText = props.lockProgress?.locked ? `${props.lockProgress.done}/${props.lockProgress.total}` : t('sessions.lockSelected');
   const unlockText = props.lockProgress && !props.lockProgress.locked ? `${props.lockProgress.done}/${props.lockProgress.total}` : t('sessions.unlockSelected');
+  const webTerminalAvailable = dashboardShellAllowsWebTerminal();
   return (
     <div id="bulk-bar" className="bulk-bar" hidden={props.selectedCount === 0}>
       <span id="bulk-count">{t('sessions.selectedCount', { count: props.selectedCount })}</span>
-      <button type="button" id="bulk-monitor-room" disabled={busy || props.selectedCount === 0} onClick={props.onAddToMonitorRoom}>
-        {props.monitorRoomText ?? t('sessions.addToMonitorRoom')}
-      </button>
+      {webTerminalAvailable ? (
+        <button type="button" id="bulk-monitor-room" disabled={busy || props.selectedCount === 0} onClick={props.onAddToMonitorRoom}>
+          {props.monitorRoomText ?? t('sessions.addToMonitorRoom')}
+        </button>
+      ) : null}
       <button type="button" id="bulk-lock" disabled={busy || props.lockDisabled} onClick={() => props.onLock(true)}>{lockText}</button>
       <button type="button" id="bulk-unlock" disabled={busy || props.unlockDisabled} onClick={() => props.onLock(false)}>{unlockText}</button>
       <button type="button" id="bulk-close" className="contrast" disabled={busy} onClick={props.onClose}>
@@ -837,6 +845,9 @@ function SessionsTable(props: {
   selectAllChecked: boolean;
   selectAllIndeterminate: boolean;
   selectAllDisabled: boolean;
+  hiddenColumns: Set<string>;
+  onToggleColumn: (colId: string) => void;
+  onResetColumns: () => void;
   onOpen: (row: any) => void;
   onSelect: (id: string, selected: boolean) => void;
   onSelectAll: (selected: boolean) => void;
@@ -847,19 +858,22 @@ function SessionsTable(props: {
     if (selectAllRef.current) selectAllRef.current.indeterminate = props.selectAllIndeterminate;
   }, [props.selectAllIndeterminate]);
 
-  const headers = [
-    ['botName', t('sessions.bot')],
-    ['cliId', t('sessions.cli')],
-    ['status', t('sessions.status')],
-    ['chat', t('sessions.location')],
-    ['tokenIn', t('sessions.tokenIn')],
-    ['tokenOut', t('sessions.tokenOut')],
-    ['title', t('sessions.titleCol')],
-    ['workingDir', t('sessions.workingDir')],
-    ['spawnedAt', t('sessions.created')],
-    ['lastMessageAt', t('sessions.last')],
-    ['adopt', t('sessions.adopt')],
-  ] as const;
+  const allColumns: Array<{ id: string; label: string }> = [
+    { id: 'botName', label: t('sessions.bot') },
+    { id: 'cliId', label: t('sessions.cli') },
+    { id: 'status', label: t('sessions.status') },
+    { id: 'chat', label: t('sessions.location') },
+    { id: 'tokenIn', label: t('sessions.tokenIn') },
+    { id: 'tokenOut', label: t('sessions.tokenOut') },
+    { id: 'title', label: t('sessions.titleCol') },
+    { id: 'workingDir', label: t('sessions.workingDir') },
+    { id: 'spawnedAt', label: t('sessions.created') },
+    { id: 'lastMessageAt', label: t('sessions.last') },
+    { id: 'adopt', label: t('sessions.adopt') },
+  ];
+  const visibleColumns = allColumns.filter(c => !props.hiddenColumns.has(c.id));
+  // select + visible data + actions
+  const colSpan = 2 + visibleColumns.length;
   const labels = {
     select: t('sessions.selectSession'),
     botName: t('sessions.bot'),
@@ -876,6 +890,36 @@ function SessionsTable(props: {
     actions: t('sessions.actions'),
   };
 
+  // 单元格渲染：按列 id 返回对应的 JSX，隐藏列不渲染。
+  function renderCell(row: any, colId: string): JSX.Element | null {
+    switch (colId) {
+      case 'botName':
+        return <td data-label={labels.botName}>{botDisplayName(row)}</td>;
+      case 'cliId':
+        return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span></td>;
+      case 'status':
+        return <td data-label={labels.status}><StatusBadge status={row.status} /><LockChip row={row} /></td>;
+      case 'chat':
+        return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
+      case 'tokenIn':
+        return <td className="token-cell" data-label={labels.tokenIn}>{formatTokenCount(row.tokenUsage?.in)}</td>;
+      case 'tokenOut':
+        return <td className="token-cell" data-label={labels.tokenOut}>{formatTokenCount(row.tokenUsage?.out)}</td>;
+      case 'title':
+        return <td className="sessions-table-text-cell" data-label={labels.title} title={String(row.title ?? '')}>{stripMentionPrefix(row.title ?? '').slice(0, 48)}</td>;
+      case 'workingDir':
+        return <td className="sessions-table-path-cell" data-label={labels.workingDir} title={row.workingDir ?? ''}>{String(row.workingDir ?? '').slice(-34)}</td>;
+      case 'spawnedAt':
+        return <td data-label={labels.spawnedAt}>{relTime(row.spawnedAt)}</td>;
+      case 'lastMessageAt':
+        return <td data-label={labels.lastMessageAt}>{relTime(row.lastMessageAt)}</td>;
+      case 'adopt':
+        return <td data-label={labels.adopt}>{row.adopt ? <span className="badge">adopt</span> : null}</td>;
+      default:
+        return null;
+    }
+  }
+
   return (
     <table id="sessions-table" hidden={props.hidden}>
       <thead>
@@ -891,10 +935,35 @@ function SessionsTable(props: {
               onChange={event => props.onSelectAll(event.currentTarget.checked)}
             />
           </th>
-          {headers.map(([sort, label]) => (
-            <SortHeader key={sort} sort={sort} label={label} sortKey={props.sortKey} sortDir={props.sortDir} onSort={props.onSort} />
+          {visibleColumns.map(col => (
+            <SortHeader key={col.id} sort={col.id} label={col.label} sortKey={props.sortKey} sortDir={props.sortDir} onSort={props.onSort} />
           ))}
-          <th>{t('sessions.actions')}</th>
+          <th className="session-table-columns-th">
+            <details className="session-table-columns-menu">
+              <summary title={t('sessions.columns')}>
+                <span className="session-table-columns-icon" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
+                </span>
+                {t('sessions.columns')}
+              </summary>
+              <div className="session-table-columns-dropdown" role="menu">
+                <div className="session-table-columns-header">
+                  <span>{t('sessions.columnsMenu')}</span>
+                  <button type="button" className="session-table-columns-reset" onClick={props.onResetColumns}>{t('sessions.columnsReset')}</button>
+                </div>
+                {allColumns.map(col => (
+                  <label key={col.id} className="session-table-columns-item">
+                    <input
+                      type="checkbox"
+                      checked={!props.hiddenColumns.has(col.id)}
+                      onChange={() => props.onToggleColumn(col.id)}
+                    />
+                    {col.label}
+                  </label>
+                ))}
+              </div>
+            </details>
+          </th>
         </tr>
       </thead>
       <tbody>
@@ -912,22 +981,14 @@ function SessionsTable(props: {
                   onChange={event => props.onSelect(id, event.currentTarget.checked)}
                 />
               </td>
-              <td data-label={labels.botName}>{botDisplayName(row)}</td>
-              <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span></td>
-              <td data-label={labels.status}><StatusBadge status={row.status} /><LockChip row={row} /></td>
-              <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>
-              <td className="token-cell" data-label={labels.tokenIn}>{formatTokenCount(row.tokenUsage?.in)}</td>
-              <td className="token-cell" data-label={labels.tokenOut}>{formatTokenCount(row.tokenUsage?.out)}</td>
-              <td className="sessions-table-text-cell" data-label={labels.title} title={String(row.title ?? '')}>{stripMentionPrefix(row.title ?? '').slice(0, 48)}</td>
-              <td className="sessions-table-path-cell" data-label={labels.workingDir} title={row.workingDir ?? ''}>{String(row.workingDir ?? '').slice(-34)}</td>
-              <td data-label={labels.spawnedAt}>{relTime(row.spawnedAt)}</td>
-              <td data-label={labels.lastMessageAt}>{relTime(row.lastMessageAt)}</td>
-              <td data-label={labels.adopt}>{row.adopt ? <span className="badge">adopt</span> : null}</td>
+              {visibleColumns.map(col => (
+                <Fragment key={col.id}>{renderCell(row, col.id)}</Fragment>
+              ))}
               <td className="sessions-table-action-cell" data-label={labels.actions}><button className="open" type="button">{t('sessions.details')}</button></td>
             </tr>
           );
         }) : (
-          <tr><td colSpan={13} className="empty">{t('sessions.empty')}</td></tr>
+          <tr><td colSpan={colSpan} className="empty">{t('sessions.empty')}</td></tr>
         )}
       </tbody>
     </table>
@@ -1616,9 +1677,7 @@ function Drawer(props: {
             {canRestartSession(row) ? (
               <button id="restart-btn" type="button" onClick={async event => { if (await props.restartSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.restart')}</button>
             ) : null}
-            {row.status !== 'closed' ? (
-              <button id="lock-btn" type="button" onClick={event => void props.setSessionLocked(row, !row.locked, event.currentTarget)}>{lockActionLabel(row)}</button>
-            ) : null}
+            <button id="lock-btn" type="button" onClick={event => void props.setSessionLocked(row, !row.locked, event.currentTarget)}>{lockActionLabel(row)}</button>
             {row.queued && row.status !== 'closed' ? (
               <button id="start-btn" type="button" className="primary" onClick={async event => { if (await props.startSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.create.start')}</button>
             ) : null}
@@ -2127,6 +2186,7 @@ function SessionsPage(): JSX.Element {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [sortKey, setSortKey] = useState('lastMessageAt');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(() => new Set(readStoredHiddenTableColumns(windowStorage())));
   const [viewMode, setViewMode] = useState<SessionsViewMode>(() => readStoredSessionsViewMode(windowStorage()));
   const [boardOrder, setBoardOrder] = useState<string[]>(() => readStoredBoardOrder(windowStorage()));
   const [boardAnimated, setBoardAnimated] = useState(false);
@@ -2659,6 +2719,7 @@ function SessionsPage(): JSX.Element {
   }, []);
 
   const openTerminalModal = useCallback((row: any): void => {
+    if (!dashboardShellAllowsWebTerminal()) return;
     const readonlyUrl = terminalHref(row);
     if (!readonlyUrl) {
       setDrawerSessionId(row.sessionId);
@@ -2987,9 +3048,11 @@ function SessionsPage(): JSX.Element {
           </div>
         </div>
         <div className="page-heading-actions sessions-page-actions">
-          <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
-            {t('sessions.monitorRoom')}
-          </button>
+          {dashboardShellAllowsWebTerminal() ? (
+            <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
+              {t('sessions.monitorRoom')}
+            </button>
+          ) : null}
           {ui.authed ? (
             <button
               type="button"
@@ -3058,6 +3121,24 @@ function SessionsPage(): JSX.Element {
           selectAllChecked={selectAllChecked}
           selectAllIndeterminate={selectAllIndeterminate}
           selectAllDisabled={selectableRows.length === 0}
+          hiddenColumns={hiddenColumns}
+          onToggleColumn={(colId) => {
+            const willHide = !hiddenColumns.has(colId);
+            const next = new Set(hiddenColumns);
+            if (willHide) next.add(colId);
+            else next.delete(colId);
+            writeStoredHiddenTableColumns(windowStorage(), Array.from(next));
+            setHiddenColumns(next);
+            // 如果当前排序列被隐藏，回退到默认 lastMessageAt desc
+            if (willHide && colId === sortKey) {
+              setSortKey('lastMessageAt');
+              setSortDir('desc');
+            }
+          }}
+          onResetColumns={() => {
+            setHiddenColumns(new Set());
+            writeStoredHiddenTableColumns(windowStorage(), []);
+          }}
           onOpen={row => setDrawerSessionId(row.sessionId)}
           onSelect={(id, checked) => setSelected(prev => {
             const next = new Set(prev);
@@ -3156,7 +3237,7 @@ function SessionsPage(): JSX.Element {
               onMoveRows={handleKanbanMoves}
               onNeedTeamBoard={team => { void ensureTeamBoard(team); }}
               onNeedTeams={() => { void loadKanbanTeams(); }}
-              onOpenTerminal={openTerminalModal}
+              onOpenTerminal={dashboardShellAllowsWebTerminal() ? openTerminalModal : undefined}
               onRename={(row, title) => { const s = store.sessions.get(String(row.sessionId)); if (s) void persistRename(s, title); }}
               onRestart={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void restartSession(s, button); }}
               onTeamScope={scope => setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '')}

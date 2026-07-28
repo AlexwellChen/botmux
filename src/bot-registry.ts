@@ -252,6 +252,8 @@ const VC_MEETING_CONSUMER_MANAGED_SINKS = [
   'meeting_voice',
 ] as const satisfies readonly VcMeetingConsumerManagedSink[];
 
+const VC_MEETING_LISTENER_OUTPUT_PLACEMENTS = ['auto', 'chat', 'topic'] as const;
+
 const VC_MEETING_OUTPUT_CAPABILITY = 'meeting.output.request';
 const VC_MEETING_LISTENER_OUTPUT_CAPABILITY = 'listener.output.request';
 const VC_MEETING_CONSUMER_PROFILE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -341,6 +343,25 @@ function normalizeVcMeetingConsumerOwnedSinks(
   return sinks.length > 0 ? sinks as VcMeetingConsumerManagedSink[] : undefined;
 }
 
+function normalizeVcMeetingListenerDelivery(
+  raw: unknown,
+  path: string,
+): VcMeetingConsumerProfileConfig['listenerDelivery'] | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    strictConfigError(path, 'must be an object');
+  }
+  const entry = raw as Record<string, unknown>;
+  const unknownKeys = Object.keys(entry).filter(key => key !== 'placement');
+  if (unknownKeys.length > 0) {
+    strictConfigError(path, `unknown field(s): ${unknownKeys.join(', ')}`);
+  }
+  if (!(VC_MEETING_LISTENER_OUTPUT_PLACEMENTS as readonly unknown[]).includes(entry.placement)) {
+    strictConfigError(`${path}.placement`, 'must be auto, chat, or topic');
+  }
+  return { placement: entry.placement as 'auto' | 'chat' | 'topic' };
+}
+
 function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProfileConfig[] {
   const path = 'vcMeetingAgent.meetingConsumer.consumerProfiles';
   if (!Array.isArray(raw)) strictConfigError(path, 'must be an array');
@@ -358,6 +379,7 @@ function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProf
       'instructions',
       'filter',
       'responseMode',
+      'listenerDelivery',
       'capabilities',
       'ownedSinks',
     ]);
@@ -396,6 +418,10 @@ function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProf
       `${profilePath}.ownedSinks`,
       capabilities,
     );
+    const listenerDelivery = normalizeVcMeetingListenerDelivery(
+      entry.listenerDelivery,
+      `${profilePath}.listenerDelivery`,
+    );
     return {
       id,
       agentAppId,
@@ -406,6 +432,7 @@ function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProf
         : {}),
       ...(filter ? { filter } : {}),
       responseMode: entry.responseMode,
+      ...(listenerDelivery ? { listenerDelivery } : {}),
       capabilities,
       ...(ownedSinks ? { ownedSinks } : {}),
     };
@@ -956,6 +983,17 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /**
+   * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
+   * when the machine crosses into (and back out of) an overloaded state — a
+   * heads-up that botmux session cold-starts may time out and false-die. Host
+   * metrics are machine-wide, so designate ONE bot as the alerter; if several
+   * have it on, a shared episode lock de-dups so the machine only DMs once per
+   * edge. Missing/false = off. Hot-reloaded (no restart) once the daemon build
+   * that ships the watcher is running. See core/host-overload-alert.ts and the
+   * watcher in daemon.ts. BOTMUX_OVERLOAD_ALERT=0 force-disables regardless.
+   */
+  overloadAlert?: boolean;
   /** Native Lark VC bot meeting copilot bridge. Push is primary; polling remains gate/backfill. */
   vcMeetingAgent?: VcMeetingAgentConfig;
   workingDir?: string;
@@ -1442,6 +1480,36 @@ export function getOwnerOpenId(larkAppId: string): string | undefined {
 /** Admins = all resolved allowedUsers, matching `/botconfig`'s permission model. */
 export function getDashboardAdminOpenIds(larkAppId: string): string[] {
   return [...(bots.get(larkAppId)?.resolvedAllowedUsers ?? [])];
+}
+
+/**
+ * Hook the daemon registers so runtime allowedUsers mutations (set / revoke)
+ * can republish the dashboard descriptor's `resolvedAllowedUsers` without the
+ * services layer importing daemon internals. No-op until the daemon registers
+ * it (e.g. in one-shot CLI paths that never publish a descriptor).
+ */
+let republishResolvedAllowedUsersHook: ((larkAppId: string, resolved: string[]) => void) | undefined;
+export function setResolvedAllowedUsersRepublishHook(
+  fn: (larkAppId: string, resolved: string[]) => void,
+): void {
+  republishResolvedAllowedUsersHook = fn;
+}
+export function republishResolvedAllowedUsersDescriptor(larkAppId: string, resolved: string[]): void {
+  try { republishResolvedAllowedUsersHook?.(larkAppId, resolved); } catch { /* best effort */ }
+}
+
+/**
+ * Hook the daemon registers so a runtime allowedUsers mutation that hit a
+ * TRANSIENT contact failure for some entry can schedule the same background
+ * resolve-retry the startup path uses (heal-when-API-recovers). No-op until the
+ * daemon registers it (e.g. one-shot CLI paths with no retry loop).
+ */
+let allowedUsersResolveRetryHook: ((larkAppId: string) => void) | undefined;
+export function setAllowedUsersResolveRetryHook(fn: (larkAppId: string) => void): void {
+  allowedUsersResolveRetryHook = fn;
+}
+export function scheduleAllowedUsersResolveRetryFromMutation(larkAppId: string): void {
+  try { allowedUsersResolveRetryHook?.(larkAppId); } catch { /* best effort */ }
 }
 
 /** Bot 自身的 open_id（用于在 mention 解析时排除自己）。 */
@@ -2047,6 +2115,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
         : undefined,
+      // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
+      overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,

@@ -1,5 +1,6 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'worker.steer_accepted': 'Got it — guidance accepted',
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ Open Web Terminal',
   'card.btn.open_writable_terminal': '🖥️ Open Writable Web Terminal',
@@ -227,6 +228,9 @@ export const messages: Record<string, string> = {
   'cmd.substitute.owner_only': '⚠️ Only owner/allowedUsers can change substitute mode.',
   'cmd.substitute.usage': 'Usage: @me /substitute status | on | off',
   'cmd.restart.in_progress': '🔄 Restarting {cliName}…',
+  'cmd.restart.succeeded': '✅ {cliName} is ready again.',
+  'cmd.restart.failed': '❌ Failed to restart {cliName}.',
+  'cmd.restart.timed_out': '⌛ {cliName} restart timed out before becoming ready.',
   'cmd.restart.terminated': '{cliName} has been terminated; it will auto-resume on your next message.',
   'cmd.cd.usage': 'Usage: /cd <path>\nExample: /cd ~/projects/my-app',
   'cmd.cd.switched': 'Working directory switched to {path}. It will resume there on your next message.',
@@ -714,6 +718,7 @@ export const messages: Record<string, string> = {
   'worker.crash_recent_output': 'Recent terminal output:',
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
+  'worker.empty_final_completed': '⚠️ {cliName} reported this turn as completed, but botmux captured no final text from the terminal transcript and saw no tracked reply for this turn. If you already replied via a redirected send (--top-level / --into / --override-chat), you can ignore this. Otherwise open the web terminal to inspect the last output, or resend a message to continue the session.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',

@@ -11,32 +11,33 @@
 - per-bot 手动：`bots.json` 里给该 bot 加 `"sandbox": true`
 - 临时/测试：环境变量 `BOTMUX_SANDBOX=1`（对该 daemon 的所有会话强制开）
 
-仅 Linux 生效（依赖 bubblewrap）；非 Linux 自动跳过。需要 PTY 后端（tmux/zellij 后端暂不包裹，自动回退直跑）。macOS 的 `sandbox-exec` 后端是后续工作。
+Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`sandbox-exec`）落地；两平台统一走 fs-policy 三档白名单。除 riff 外的本地后端（pty/tmux/zellij…）都会包裹。
 
 ## 工作原理
 
 ```
 worker spawnCli
-  └─ prepareSandbox()                      adapters/backend/sandbox.ts
-       ├─ 每会话目录 <dataDir>/sandboxes/<sid>/{home,work,outbox,shimbin}
-       ├─ git clone --no-hardlinks 源项目 → work（独立 .git，动不了源仓库）
-       ├─ seedScopedConfig(cliId)          只拷认证(auth.json/config…)，剔历史
-       ├─ 写 botmux shim → PATH 头（让沙盒内 botmux 走本 build 的 relay）
-       └─ buildSandboxArgs()               bwrap 参数
-  └─ bwrap … -- <cli> <原 args>            把 CLI 关进沙盒
-  └─ startOutboxWatcher()                  daemon 侧代投递（持凭证）
+  └─ buildFsPolicy(cliId)                   adapters/cli/fs-policy.ts（单一真源，Linux+macOS 共用）
+       ├─ baseline 预设（平台）+ 适配器声明的 authPaths/execPaths + botmux 内部注入 + 用户 sandboxPaths
+       └─ 产出 deny-by-default 三档白名单：readWrite / readOnly / deny
+  └─ prepareDirectSandbox(policy)           adapters/backend/sandbox.ts
+       ├─ compileToBwrap()                  白名单编译成 bwrap argv
+       ├─ 每会话目录 <dataDir>/sandboxes/<sid>/{outbox,shimbin,empties,empty}
+       ├─ 写 botmux shim → /run/sbxbin（PATH 头，让沙盒内 botmux 走本 build 的 relay）
+       └─ 预建 deny-mask 挂载点 + 持久化 cleanup manifest（fail-closed）
+  └─ bwrap … -- <cli> <原 args>             把 CLI 关进沙盒
+  └─ startOutboxWatcher()                   daemon 侧代投递（持凭证）
 ```
 
-**bwrap 绑定策略**（`buildSandboxArgs`）：
+**沙盒模型**（2026-07-16「文件沙盒重构」，取代旧的 overlayfs+landing 模型）：
 
-- `--ro-bind` 系统工具链（`/usr` `/bin` …）+ fnm node/CLI 安装目录 + botmux dist + node_modules
-- `--bind scopedHome → $HOME`：脱敏家目录盖住真实家目录，于是 `~/.codex`、`~/.claude` 等都落在脱敏区
-- `--bind 项目副本 → 原 workingDir`：副本挂在 CLI 原本认得的路径上，所以 `codex -C <dir>` 之类参数无需改写
-- `--bind outbox`：沙盒内回消息的**唯一** IPC 出口
-- 不绑：`~/.ssh`、`~/.aws`、`bots.json`、别的会话/项目、各 CLI 历史
-- `--unshare-user/pid/ipc/uts/cgroup`，默认保留网络
+- 沙盒根是**全新 tmpfs**（`--tmpfs /`），`/tmp` `/run` `/var/tmp` `/dev/shm` 同为全新 tmpfs，`/dev` `/proc` 走 bwrap 原语——**不再把 `$HOME` 整体 overlay 挂回**。
+- 只有白名单里的规则路径被 bind 进来：`readWrite` → `--bind`（真实读写直达宿主），`readOnly` → `--ro-bind`。白名单**之外**的一切在沙盒里不存在。
+- CLI **直接写宿主真实路径**（在 readWrite 区内），没有 upper changeset、不需要 landing、没有 bridge 重定向——CLI 的 data dir 就是真实宿主路径。
+- `deny` 规则用 mode-000 空源 `--ro-bind` 遮罩（真实内容不可读、只读）；outbox 这类「deny 内部的更深 readWrite carve-out」用一层每会话 `--tmpfs` 遮罩承接嵌套 `--bind` 再 `--remount-ro` 收口（tmpfs 写在内存、绝不落宿主）。
+- `--unshare-user/pid/ipc/uts`，默认保留网络。
 
-**per-CLI 脱敏配置**（`seedScopedConfig` + `CONFIG_SCOPE`）：每会话新建配置目录，**只**拷该 CLI 启动所需的认证/配置，历史/会话/日志一律不进沙盒。已覆盖 codex、claude-code；新 CLI 加一条 `CONFIG_SCOPE` 即可。
+**per-CLI authPaths**：每个适配器用 `authPaths` 声明自己的认证/登录状态目录，沙盒把它们真实 `--bind` 进来，token refresh / login 直接持久化到宿主。默认窄（仅 auth）；CLI 若在 `$HOME` 下放 SQLite DB（codex 系），把整个状态目录加进 `authPaths`（否则该路径不在白名单 → 沙盒里不存在 → DB 打不开或拿不到 fcntl 锁）。macOS 用同一份 policy 经 Seatbelt（`compileToSeatbelt`）落地。
 
 ## botmux send 中转（关键）
 
@@ -48,22 +49,19 @@ worker spawnCli
 
 → **所有飞书密钥全程不进沙盒**。
 
-## 落盘（把改动交回）
+## 落盘（改动去向）
 
-agent 在副本上改完，用 `botmux send --files <patch>`（`git diff` 出来的补丁）把改动交回话题，owner review 后手动应用。**交互式「应用到磁盘」确认卡是后续工作**（复用现有授权卡基建）。
+fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接写宿主真实文件**——改动即时落盘，不再是「副本 + 补丁交回」。沙盒的作用是把可写面收敛到白名单：项目目录可写、认证目录可写，白名单之外（别的项目、别的会话、`~/.ssh`/`~/.aws`、`bots.json`、各类密钥）一律读不到写不了。
 
 ## 已验证（本机实测）
 
-- 文件隔离：宿主密钥/家目录读不到，原文件未动
-- per-CLI 脱敏：codex `auth.json` 进得去、`history.jsonl` 进不去
-- 项目副本独立（`git clone --no-hardlinks`）
+- 文件隔离：白名单之外的宿主密钥/家目录读不到，未授权路径不存在
+- authPaths：codex `~/.codex`（含 SQLite DB）真实 `--bind` 进得去、能起；未授权的兄弟会话/项目进不去
 - send 中转：沙盒内 `botmux send`（含文件附件）→ outbox → daemon 代投 → 真实到达飞书，全程零凭证入沙盒
 - 真实 worker：codex 经 worker spawn 钩子在 bwrap 内正常启动运行
+- macOS：同一份 policy 经 Seatbelt（`sandbox-exec -f <profile>`）落地，deny 路径被挡、正常路径可跑
 
 ## 后续
 
-- 交互式落盘确认卡（apply/discard 按钮 + `git apply`）
-- macOS `sandbox-exec` 后端
-- tmux/zellij 后端支持
 - 沙盒目录 GC / 生命周期
 - 出口网络管控（升级到「不止隔离文件」时）

@@ -7,7 +7,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
-import { repoPickerScanOptions } from '../global-config.js';
+import { readGlobalConfig, repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -24,7 +24,7 @@ import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -35,6 +35,7 @@ import {
   ensureSessionWhiteboard,
   getAvailableBots,
 } from './session-manager.js';
+import { markInitialUserTurnPending } from './initial-user-turn.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
@@ -113,6 +114,24 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  */
 export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
 
+const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
+
+/** Apply the machine-wide prefix used only by `/group` and `/g`, then keep the
+ *  existing Lark headroom. The legacy limit is measured in UTF-16 code units;
+ *  iterating by code point keeps that limit without slicing an emoji's
+ *  surrogate pair. */
+export function formatSlashGroupName(name: string, prefix = ''): string {
+  const prefixed = prefix && !name.startsWith(prefix) ? `${prefix}${name}` : name;
+  if (prefixed.length <= SLASH_GROUP_NAME_MAX_UTF16_LENGTH) return prefixed;
+
+  let truncated = '';
+  for (const character of prefixed) {
+    if (truncated.length + character.length > SLASH_GROUP_NAME_MAX_UTF16_LENGTH) break;
+    truncated += character;
+  }
+  return `${truncated}…`;
+}
+
 /**
  * Daemon commands that operate on an ALREADY-EXISTING session and must never
  * pre-create one. `/rename` renames the current session — with no session there
@@ -187,20 +206,19 @@ export { validateWorkingDir };
  *   1. Build candidate absolute paths — absolute / `~` taken as-is; relative or
  *      bare names resolved against each scan dir, then the daemon cwd (mirrors
  *      how the card's project list is rooted).
- *   2. Prefer a candidate matching a scanned git project (carries a branch label).
- *   3. For a bare name, also match a scanned project by basename (covers projects
- *      nested deeper than the scan-dir top level).
- *   4. Fall back to any existing directory — lenient like `/cd`, whose trust model
- *      is "owner explicitly chose a dir"; the CLI already runs with full FS access.
+ *   2. Return the first directly existing candidate, describing its git ref
+ *      without scanning unrelated roots. This is lenient like `/cd`, whose trust
+ *      model is "owner explicitly chose a dir"; the CLI already runs with full
+ *      FS access.
+ *   3. Only for a bare name that did not directly resolve, scan projects and
+ *      match by basename (covers projects nested deeper than the scan-dir top
+ *      level).
  * Returns null when nothing resolves to an existing directory.
  */
 export function resolveRepoSelection(
   repoArg: string,
   scanDirs: string[],
 ): { path: string; displayName: string } | null {
-  const existingScanDirs = scanDirs.filter((d) => existsSync(d));
-  const projects = existingScanDirs.length > 0 ? scanMultipleProjects(existingScanDirs) : [];
-
   const isExplicitPath =
     repoArg.startsWith('/') ||
     repoArg.startsWith('~') ||
@@ -215,18 +233,9 @@ export function resolveRepoSelection(
     candidates.push(resolve(expandHome(repoArg))); // daemon-cwd fallback (matches /cd)
   }
 
-  // 1) Exact scanned-project match — preferred, gives the "name (branch)" label.
-  for (const cand of candidates) {
-    const proj = projects.find((p) => resolve(p.path) === cand);
-    if (proj) return { path: proj.path, displayName: `${proj.name} (${proj.branch})` };
-  }
-  // 2) Bare name → match a scanned project by basename.
-  if (!isExplicitPath) {
-    const byName = projects.find((p) => p.name === repoArg);
-    if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
-  }
-  // 3) Lenient fallback: any existing directory. Label it with a git ref when
-  //    it's a repo (covers explicit paths outside the scan roots), else basename.
+  // Direct candidates must win before any recursive scan. Besides avoiding
+  // unnecessary traversal (especially a legacy HOME fallback), describing just
+  // the selected directory preserves the same "name (branch)" label for repos.
   for (const cand of candidates) {
     try {
       if (!statSync(cand).isDirectory()) continue;
@@ -238,6 +247,17 @@ export function resolveRepoSelection(
       ? { path: cand, displayName: `${desc.name} (${desc.branch})` }
       : { path: cand, displayName: basename(cand) };
   }
+
+  // Explicit and relative paths have no basename-search semantics: when their
+  // concrete candidates do not exist, a recursive project scan cannot resolve
+  // them. Bare names alone may refer to a repo nested below a scan root.
+  if (isExplicitPath) return null;
+
+  const existingScanDirs = scanDirs.filter((d) => existsSync(d));
+  const projects = existingScanDirs.length > 0 ? scanMultipleProjects(existingScanDirs) : [];
+  const byName = projects.find((p) => p.name === repoArg);
+  if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
+
   return null;
 }
 
@@ -1295,6 +1315,7 @@ export async function handleCommand(
           sessionId: ds.session.sessionId,
           cliSessionId: ds.session.cliSessionId,
           cwd: ds.session.workingDir,
+          larkAppId: ds.larkAppId ?? ds.session.larkAppId,
         }, { detail: 'summary' });
         await sessionReply(rootId, formatInsightCard(report, loc));
         break;
@@ -1325,15 +1346,17 @@ export async function handleCommand(
 
       case '/restart': {
         if (ds) {
-          if (ds.worker && !ds.worker.killed) {
-            ds.worker.send({ type: 'restart' } as DaemonToWorker);
-            const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
-            await sessionReply(rootId, t('cmd.restart.in_progress', { cliName }, loc));
-          } else {
-            killWorker(ds);
-            const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
-            await sessionReply(rootId, t('cmd.restart.terminated', { cliName }, loc));
+          if (ds.adoptedFrom) {
+            await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, loc));
+            break;
           }
+          const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+          requestSessionRestart(ds, {
+            source: 'slash',
+            notify: async status => {
+              await sessionReply(rootId, t(`cmd.restart.${status}`, { cliName }, loc));
+            },
+          });
           logger.info(`[${logTag}] Restart by /restart command`);
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -1449,6 +1472,11 @@ export async function handleCommand(
               pendingPrompt.trim().length > 0 ||
               (ds!.pendingAttachments?.length ?? 0) > 0 ||
               (ds!.pendingFollowUps?.length ?? 0) > 0;
+            // Nothing to submit at all (bare `/repo`: the message IS the command).
+            // The CLI boots idle, so the user's NEXT real message is its first
+            // turn and must carry the full new-topic opening — see
+            // markInitialUserTurnPending below.
+            const emptyStart = !pendingRawInput && !hasBufferedInput;
             if (hasBufferedInput) ensureSessionWhiteboard(ds!);
             const wrappedInput = hasBufferedInput
               ? buildNewTopicCliInput(
@@ -1508,6 +1536,11 @@ export async function handleCommand(
             if (pendingRawInput || hasBufferedInput) {
               rememberLastCliInput(ds!, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
             }
+            // Durable, one-shot: the CLI is up but has never received a real user
+            // turn, so the next business message must be built as a NEW TOPIC
+            // (routing + built-in skill discovery + identity), not a follow-up.
+            // Set after the fork so a throwing fork leaves the session untouched.
+            if (emptyStart) markInitialUserTurnPending(ds!);
             ds!.pendingPrompt = undefined;
             ds!.pendingCodexAppText = undefined;
             ds!.pendingCodexAppApplicationContext = undefined;
@@ -1629,6 +1662,10 @@ export async function handleCommand(
             sessionStore.updateSession(ds!.session);
             ds!.hasHistory = false;
             forkWorker(ds!, '', false);
+            // Brand-new CLI in a brand-new session record: it has never seen the
+            // botmux opening context either, so the next real business message
+            // is its new-topic first turn (same invariant as the pending path).
+            markInitialUserTurnPending(ds!);
             try {
               await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
             } catch (e) {
@@ -2597,15 +2634,15 @@ export async function handleCommand(
           rawArgs = rawArgs.replace(roleProfileArg[0], ' ');
         }
         const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
-        const MAX_NAME = 50; // Lark group names cap around 60; leave headroom for '…'
-        let groupName: string;
+        let baseGroupName: string;
         if (firstLine) {
-          groupName = firstLine.length > MAX_NAME ? firstLine.slice(0, MAX_NAME) + '…' : firstLine;
+          baseGroupName = firstLine;
         } else {
           const now = new Date();
           const ts = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-          groupName = t('cmd.group.empty_fallback', { ts }, loc);
+          baseGroupName = t('cmd.group.empty_fallback', { ts }, loc);
         }
+        const groupName = formatSlashGroupName(baseGroupName, readGlobalConfig().groupNamePrefix);
 
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).

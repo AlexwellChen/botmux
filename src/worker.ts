@@ -32,12 +32,12 @@ import {
   isolationPaneMarkerContent,
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
-import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields } from './adapters/cli/fs-policy.js';
+import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
   decideHardTimeoutAction,
   decideSettleMarkReady,
@@ -45,7 +45,14 @@ import {
   shouldWaitForPostSessionStartPromptEvidence,
   shouldWriteNow,
 } from './utils/input-gate.js';
+import {
+  decideCodexRunnerFreshness,
+  CodexRunnerFreshnessInputQueue,
+  shouldHoldCodexRunnerInput,
+  type CodexRunnerFreshnessState,
+} from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
+import { decideRestartFollowup, settleDurableTurnForRestart } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
@@ -164,7 +171,14 @@ import {
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
-import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
+import {
+  findLaunchedCliPid,
+  scheduleWrapperRealCliPid,
+  readComm,
+  isBareShellComm,
+  bareShellLaunchKind,
+  settleLaunchComm,
+} from './core/session-discovery.js';
 import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
@@ -205,7 +219,6 @@ import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
-import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { StuckDetector, matchHookReviewScreen } from './utils/stuck-detector.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
@@ -218,9 +231,9 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { detectCliUsageLimit, usageLimitStateKey, structuredRateLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
-import { redactChildEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { decideSubmitConfirmationAction, type SubmitActivityEvidence } from './services/submit-confirmation.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
 import * as sessionStore from './services/session-store.js';
@@ -237,6 +250,11 @@ import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
+import {
+  normalizeAppRunnerFinalMarker,
+  normalizeCodexAppLifecycleEvent,
+  projectAppRunnerFinalIds,
+} from './services/codex-app-runner-protocol.js';
 import {
   hasMatchingManagedOriginCapability,
   managedOriginCapabilityPath,
@@ -261,6 +279,12 @@ import { CodexRpcEngine } from './codex-rpc-engine.js';
 // default (~/.claude relocates Claude's state file → onboarding rerun) and
 // why GROK_HOME is exempt.
 scrubSessionCliHomeEnv(process.env);
+// Claude session-identity markers ride the same restart-from-a-session vector
+// and this process's env seeds childEnv AND the tmux client env — a marker
+// that survives to the first `tmux new-session` gets copied into the shared
+// server's global env and flips transcript saving off for every pane (see
+// CLAUDE_SESSION_MARKER_ENV_KEYS).
+scrubClaudeSessionMarkerEnv(process.env);
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -801,7 +825,7 @@ function armRpcStartupDialogDismiss(): void {
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
 let seatbeltProfilePath: string | null = null;       // per-session Seatbelt .sb profile to rm at exit (external-wrapper read isolation)
 let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
-let sandboxCleanup: (() => void) | null = null;      // unmount overlays + rm the per-session sandbox tree
+let sandboxCleanup: (() => void) | null = null;      // reclaim deny-mask mountpoints + rm the per-session sandbox tree
 let sandboxRelayOutbox: string | null = null;
 let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
@@ -1059,6 +1083,12 @@ const IDLE_PROBE_INTERVAL_MS = 3_500;
 const IDLE_PROBE_MAX_ATTEMPTS = 24;
 let busyPatternIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
+let codexRunnerFreshness: CodexRunnerFreshnessState = 'current';
+let persistCodexRunnerBuildOnReady = false;
+let activeRestartAttemptId: string | undefined;
+/** Distinguishes a replacement's synchronous ready signal (Riff) from a late
+ * idle callback emitted by the backend being torn down. */
+let replacementSpawnInProgress = false;
 /** The effectiveResume flag used by the most recent spawnCli call. Written
  *  immediately after the two-tier fallback check so late-attach timers
  *  (hermes, cursor, etc.) can read THE SAME semantics the spawn used,
@@ -1216,6 +1246,17 @@ let bareShellLaunchBlocked = false;
  *  one-shot so it also covers a reattach onto a pane that degraded to a bare
  *  shell. Reset per spawn in spawnCli. */
 let bareShellChecked = false;
+/** True only while detectBareShellLaunch() is inside its async launch-settle
+ *  window (settleLaunchComm's bounded ≤2s poll for a wrapper's final `exec
+ *  <cli>`). The message/injection flush paths already hold the isFlushing /
+ *  injectionFlushing mutexes across that await, but raw_input (passthrough
+ *  slash commands: /compact, /model, /btw) deliberately bypasses those to
+ *  preserve busy-delivery — so it would otherwise type into a pane whose leaf
+ *  is still the transient shell (or a shell already about to be blocked). This
+ *  latch lets raw_input defer for exactly that window without borrowing the
+ *  general isFlushing mutex (which would wrongly also block busy-delivery when
+ *  no settle is in progress). Reset per spawn in spawnCli. */
+let bareShellCheckInProgress = false;
 /** Ready-gate (Claude-family): holds the first prompt until the SessionStart
  *  hook proves a cjadk-style startup selector is behind us. Claude then needs
  *  fresh post-hook prompt evidence because sibling hooks may still be running.
@@ -1447,11 +1488,46 @@ async function runStartupCommands(): Promise<void> {
   idleDetector?.reset();
 }
 
-const pendingMessages: PendingCliInput[] = [];
+const freshnessInputQueue = new CodexRunnerFreshnessInputQueue<
+  PendingCliInput,
+  Extract<DaemonToWorker, { type: 'raw_input' }>
+>(
+  () => codexRunnerFreshness,
+  state => { codexRunnerFreshness = state; },
+);
+const pendingMessages = freshnessInputQueue.normal;
+/** Correlation ids that this worker actually wrote into the owned Codex App
+ * runner. Runner lifecycle/final markers may route only to ids in this bounded
+ * local set; model/user display bytes cannot add entries. */
+const submittedCodexAppReplyTurnIds = new Set<string>();
+const pendingCodexAppSteerAckIds = new Map<string, string>();
+const acknowledgedCodexAppSteers = new Set<string>();
+const CODEX_APP_CORRELATION_LIMIT = 256;
+function rememberBounded(set: Set<string>, value: string): void {
+  set.delete(value);
+  set.add(value);
+  while (set.size > CODEX_APP_CORRELATION_LIMIT) {
+    const oldest = set.values().next().value;
+    if (typeof oldest !== 'string') break;
+    set.delete(oldest);
+  }
+}
+function rememberBoundedMap(map: Map<string, string>, key: string, value: string): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > CODEX_APP_CORRELATION_LIMIT) {
+    const oldest = map.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    map.delete(oldest);
+  }
+}
+function shortCorrelationId(value: string | undefined): string {
+  return value?.slice(0, 12) ?? '-';
+}
 /** Literal commands that arrived while native /rename owned the TUI or while
  * an owned CLI restart was fenced. Normal raw_input commands are still
  * delivered immediately (including while busy). */
-const pendingRawInputs: Array<Extract<DaemonToWorker, { type: 'raw_input' }>> = [];
+const pendingRawInputs = freshnessInputQueue.raw;
 /** Latest requested canonical session title. Unlike a normal prompt this is an
  * administrative TUI command: never type-ahead while the agent is busy, never
  * open a model turn, and latest-wins if several renames arrive before idle. */
@@ -1801,6 +1877,25 @@ let lastStructuredBridgeActivityAtMs = 0;
 
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
 
+/**
+ * True when this CLI has an authoritative STRUCTURED rate-limit signal in its
+ * transcript (Claude family — `error:"rate_limit"`, surfaced by
+ * maybeEmitStructuredRateLimit). For those CLIs the screen-text `rate`
+ * heuristic is not just redundant but harmful: the model's own output or a dev
+ * editing rate-limit code/tests puts phrases like "429 Too Many Requests" /
+ * "exceeded retry limit" on screen, which the scraper cannot distinguish from a
+ * real limit. So we suppress the screen-scan `rate` verdict and let the
+ * structured path be the sole authority. `usage` (quota "hit your limit …")
+ * has no structured equivalent yet, so it still comes from the screen.
+ *
+ * reliableTurnTerminal is exactly the "transcript-backed" capability flag
+ * (claude-code / seed set it); non-transcript CLIs (Codex, gemini, …) keep the
+ * screen scanner as their only rate-limit signal.
+ */
+function structuredRateLimitAuthoritative(): boolean {
+  return cliAdapter?.reliableTurnTerminal === true;
+}
+
 // Per-turn usage-limit state machine. Owns the turn counter plus the
 // "did this turn hit a limit" / "suppress a stale retry-ready banner" flags, so
 // classify()'s state writes are explicit method calls rather than hidden
@@ -1820,7 +1915,7 @@ function createUsageLimitTracker() {
     beginTurn(snapshot: string): number {
       turnSeq++;
       detectedTurn = undefined;
-      const current = detectCliUsageLimit(snapshot);
+      const current = detectCliUsageLimit(snapshot, undefined, { suppressRateKind: structuredRateLimitAuthoritative() });
       suppressedRetryReadyKey = current.limited && current.retryReady
         ? usageLimitStateKey(current)
         : undefined;
@@ -1832,7 +1927,7 @@ function createUsageLimitTracker() {
       content: string,
       status: RuntimeScreenStatus,
     ): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
-      const detected = detectCliUsageLimit(content);
+      const detected = detectCliUsageLimit(content, undefined, { suppressRateKind: structuredRateLimitAuthoritative() });
       if (!detected.limited) return { status };
 
       const key = usageLimitStateKey(detected);
@@ -1846,6 +1941,15 @@ function createUsageLimitTracker() {
     },
     detectedThisTurn(seq: number): boolean {
       return detectedTurn === seq;
+    },
+    // Record a limit that came from a STRUCTURED signal (transcript error
+    // record) rather than screen text. Mirrors classify()'s state writes so
+    // the tracker stays coherent: mark this turn as having hit a limit (read
+    // by detectedThisTurn for the submit-confirmation recheck) and clear any
+    // stale retry-ready suppression. The actual emit is done by the caller.
+    noteStructuredLimit(): void {
+      suppressedRetryReadyKey = undefined;
+      detectedTurn = turnSeq;
     },
   };
 }
@@ -1919,6 +2023,11 @@ const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
+/** uuids of Claude transcript rate-limit records we've already turned into a
+ *  `limited` emit. drainTranscript re-reads from offset 0 on truncation /
+ *  rotation and emitReadyTurns re-drains from 0, so the same rate_limit record
+ *  can resurface; keying on the record's stable uuid makes the emit idempotent. */
+const emittedRateLimitUuids = new Set<string>();
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
 let herdrAdoptBridgeQuietTimer: NodeJS.Timeout | null = null;
@@ -2016,6 +2125,10 @@ function formatLocalTurnFields(userText: string, assistantText: string): { userT
 function formatHeadlessLocalTurnContent(assistantText: string): string | null {
   const a = truncatePreambleText(assistantText.trim(), LOCAL_TURN_ASSISTANT_MAX);
   return a || null;
+}
+
+function emptyCompletedBridgeFallbackContent(): string {
+  return t('worker.empty_final_completed', { cliName: cliName() });
 }
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
@@ -2798,10 +2911,43 @@ function bridgeIngest(): void {
   bridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   bridgeQueue.ingest(result.events, bridgeJsonlPath);
+  // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
+  // at the turn's terminal boundary. This is the authoritative "limited"
+  // signal — read it here (event-driven, once per record) instead of scraping
+  // the TUI. The queue already skips it as an assistant reply.
+  maybeEmitStructuredRateLimit(result.events);
   // Transcript terminal markers are authoritative and may settle a durable
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
   emitReadyTurns({ explicitTerminalOnly: true });
+}
+
+/** Scan newly-drained Claude transcript events for a structured rate-limit
+ *  record and, on the first unseen one, emit a `limited` screen_update so the
+ *  session surfaces in Dashboard「需要你」with a retry countdown — identical
+ *  wire shape to the screen-text detector's classify() output, so the daemon /
+ *  card / persistence paths need no change. Claude-only (bridgeQueue is the
+ *  Claude bridge; Codex uses codexBridgeQueue and has no structured 429). */
+function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void {
+  for (const ev of events) {
+    if (!ev.uuid || emittedRateLimitUuids.has(ev.uuid)) continue;
+    if (!isTranscriptRateLimitEvent(ev)) continue;
+    emittedRateLimitUuids.add(ev.uuid);
+    // Prefer a clock parsed from the record's own text ("... resets 10:40pm");
+    // fall back to the shared bucketed cooldown when it carries none.
+    const usageLimit = structuredRateLimitState(apiErrorMessageText(ev));
+    usageLimitTracker.noteStructuredLimit();
+    send({
+      type: 'screen_update',
+      content: currentUsageLimitSnapshot(),
+      status: 'limited',
+      usageLimit,
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+    log(`Structured rate-limit detected in Claude transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
+    return; // one limited emit per ingest is enough; state key is stable
+  }
 }
 
 function performBridgeIngestAndScheduleQuietEmit(): void {
@@ -3699,6 +3845,31 @@ function codexBridgeDrainAndMaybeEmit(opts: { signalIdle?: boolean } = {}): void
   emitReadyCodexTurns();
 }
 
+/** Before we emit a fail-closed `ambiguous` terminal for a durable turn that a
+ *  CLI kill is about to interrupt, give an already-persisted `completed` record
+ *  a chance to win the worker-local terminal deduper. `reliableTurnTerminal`
+ *  CLIs (claude-code / codex / grok / traex) durably append their terminal line
+ *  to the transcript; if that line landed microseconds before the kill but the
+ *  fs.watch/1s poller hasn't consumed it yet, an unconditional `ambiguous` would
+ *  claim the deduper first and needlessly mark a turn that actually completed →
+ *  same durable key re-dispatchable → external side effect executed twice.
+ *  Draining here publishes that `completed` (claiming the deduper) so the later
+ *  `ambiguous` becomes a no-op. Shared by the CLI `onExit` path and the daemon
+ *  `restart` IPC path — both must drain identically before their ambiguous emit. */
+function drainReliableTerminalBeforeInterrupt(): void {
+  if (cliAdapter?.reliableTurnTerminal !== true) return;
+  if (bridgeJsonlPath) {
+    try { bridgeDrainAndMaybeEmit(); } catch (err: any) {
+      log(`Bridge terminal drain failed: ${err.message}`);
+    }
+  }
+  if (codexBridgeFallbackActive()) {
+    try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch (err: any) {
+      log(`Codex bridge terminal drain failed: ${err.message}`);
+    }
+  }
+}
+
 function emitReadyCodexTurns(): void {
   const ready = codexBridgeQueue.drainEmittable();
   if (ready.length === 0) return;
@@ -3721,10 +3892,21 @@ function emitReadyCodexTurns(): void {
     : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
-    if (!turn.finalText) continue;
     const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: turn.finalText }, nextBoundaryMs, markers, adoptMode)) {
+    const gateInput = {
+      markTimeMs: turn.markTimeMs,
+      isLocal: turn.isLocal,
+      finalText: turn.finalText,
+      terminalStatus: turn.terminalStatus,
+    };
+    const content = turn.finalText && turn.finalText.trim()
+      ? turn.finalText
+      : shouldEmitEmptyCompletedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
+        ? emptyCompletedBridgeFallbackContent()
+        : '';
+    if (!content) continue;
+    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       continue;
     }
@@ -3733,7 +3915,7 @@ function emitReadyCodexTurns(): void {
       // so the Lark thread sees a complete exchange instead of an orphan
       // reply. formatLocalTurnFields caps both texts to keep within
       // Lark's per-message limit; daemon owns the card chrome.
-      const fields = formatLocalTurnFields(turn.userText ?? '', turn.finalText);
+      const fields = formatLocalTurnFields(turn.userText ?? '', content);
       if (!fields) continue;
       send({
         type: 'final_output',
@@ -3750,7 +3932,7 @@ function emitReadyCodexTurns(): void {
     send({
       type: 'final_output',
       ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
-      content: turn.finalText,
+      content,
       lastUuid: turn.turnId,
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
@@ -3872,8 +4054,9 @@ let renderRows = PTY_ROWS;
 
 let renderer: TerminalRenderer | null = null;
 /** Most recent unfiltered viewport text — kept in sync by the screen_update
- *  timer for pipe-pane backends so ScreenAnalyzer (which is synchronous) has
- *  a fresh snapshot to read without needing its own tmux capture-pane call. */
+ *  timer for pipe-pane backends so usage-limit detection and the CoCo picker
+ *  have a fresh snapshot to read without needing their own tmux capture-pane
+ *  call. (Historically also fed the AI ScreenAnalyzer, now removed.) */
 let lastAnalyzerSnapshot = '';
 let screenUpdateTimer: ReturnType<typeof setInterval> | null = null;
 const SCREEN_UPDATE_INTERVAL_MS = 2_000;
@@ -4052,16 +4235,16 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   // so the diagnostic shell stays visible. flushPending's retry path restarts
   // both when the next message respawns the CLI.
   stopScreenUpdates();
-  stopScreenAnalyzer();
   stopStuckDetector();
   log(`Crash diagnostic tmux session parked at ${TmuxBackend.diagnosticSessionName(sessionId)}`);
   return true;
 }
 
-// ─── Screen Analyzer (AI-based TUI prompt detection) ────────────────────────
+// ─── TUI prompt blocking state ──────────────────────────────────────────────
 
-let screenAnalyzer: ScreenAnalyzer | null = null;
-/** When true, user messages are queued because a TUI prompt is active */
+/** When true, user messages are queued because a TUI prompt is active. Set by
+ *  the ask-hook / CoCo picker paths (driveCocoPicker, handleTuiKeys); cleared
+ *  when the prompt resolves or a Lark/terminal input overrides it. */
 let tuiPromptBlocking = false;
 
 function isWorkflowWorker(): boolean {
@@ -4120,59 +4303,6 @@ function maybeEmitWorkflowTranscriptOutput(): void {
     turnId: currentBotmuxTurnId ?? `workflow-pty-${sessionId || 'unknown'}`,
   });
   log('Workflow PTY transcript final_output emitted');
-}
-
-function startScreenAnalyzer(): void {
-  const sa = config.screenAnalyzer;
-  log(`ScreenAnalyzer config: enabled=${sa.enabled}, baseUrl=${sa.baseUrl ? 'set' : 'empty'}, model=${sa.model || 'empty'}, extraHeaders=${JSON.stringify(sa.extraHeaders)}`);
-  if (!sa.enabled || !sa.baseUrl || !sa.apiKey || !sa.model) return;
-
-  screenAnalyzer = new ScreenAnalyzer(
-    {
-      baseUrl: sa.baseUrl,
-      apiKey: sa.apiKey,
-      model: sa.model,
-      intervalMs: sa.intervalMs,
-      stableCount: sa.stableCount,
-      snapshotMaxChars: sa.snapshotMaxChars,
-      extraHeaders: sa.extraHeaders,
-      extraBody: sa.extraBody,
-    },
-    {
-      getSnapshot: () => {
-        // ScreenAnalyzer is called every ~5s for TUI-prompt detection. We
-        // can't make this async without overhauling the analyzer, so cache
-        // the last pipe-pane text snapshot here and refresh it eagerly.
-        // For pipe-pane backends, the cache is repopulated by the screen
-        // update timer; for others, fall through to the long-lived renderer.
-        return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
-      },
-      onAnalyzing: () => { /* no-op: only block when prompt is actually detected */ },
-      onTuiPrompt: (description, options, multiSelect) => {
-        tuiPromptBlocking = true;
-        send({ type: 'tui_prompt', description, options, multiSelect, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
-      },
-      onTuiPromptResolved: (selectedText) => {
-        tuiPromptBlocking = false;
-        send({
-          type: 'tui_prompt_resolved',
-          selectedText,
-          turnId: currentBotmuxTurnId,
-          dispatchAttempt: currentBotmuxDispatchAttempt,
-        });
-        // Flush any messages that were queued during the prompt
-        flushPending();
-      },
-      log,
-    },
-  );
-  screenAnalyzer.start();
-}
-
-function stopScreenAnalyzer(): void {
-  screenAnalyzer?.dispose();
-  screenAnalyzer = null;
-  tuiPromptBlocking = false;
 }
 
 // ─── Stuck Detector (AI-free fallback for blocked CLI states) ───────────────
@@ -4351,7 +4481,6 @@ async function captureAndUpload(): Promise<void> {
   }
 
   let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
-  if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
   send({
     type: 'screenshot_uploaded',
     imageKey,
@@ -4436,14 +4565,12 @@ function handleTermAction(key: TermActionKey): void {
   } else if (PTY_SEQ_MAP[key]) {
     backend.write(PTY_SEQ_MAP[key]);
   }
-  // ESC/Ctrl-C/Enter likely ends an active TUI prompt. The analyzer
-  // won't re-analyze while promptActive=true, so un-wedge both flags here.
-  // Without this, dismissing an AskUserQuestion dialog via the quick-key
-  // button leaves tuiPromptBlocking=true forever and silently queues every
-  // subsequent user message.
+  // ESC/Ctrl-C/Enter likely ends an active TUI prompt. Un-wedge the blocking
+  // flag here — without this, dismissing an AskUserQuestion dialog via the
+  // quick-key button leaves tuiPromptBlocking=true forever and silently queues
+  // every subsequent user message.
   if (tuiPromptBlocking && (key === 'esc' || key === 'ctrlc' || key === 'enter')) {
     tuiPromptBlocking = false;
-    screenAnalyzer?.notifySelection(`term_action:${key}`);
     void flushPending();
   }
   log(`Term action: ${key}`);
@@ -4491,7 +4618,6 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean>
       isPromptReady = false;
       idleDetector?.reset();
     }
-    screenAnalyzer?.notifySelection('final');
   }
 
   log(`TUI keys: ${keys.join(' ')}${isFinal ? ' (final)' : ''}`);
@@ -4500,11 +4626,12 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean>
 
 // 待注入的 TUI 命令队列。生命周期绑定当前 CLI 进程：killCli() 会清空它，
 // 防止 restart 后残留命令重放进新 CLI——新增清理状态时记得同步那里。
-// barrier=true 标记该注入携带 updateWorkingDir（cwd-move，如 /cd）：markPromptReady
-// 里 barrier 注入必须先于本次 pending 用户消息落地，防止用户消息在「记录已是新
-// cwd、进程仍在旧 cwd」的窗口里被写进旧目录的 CLI。排队策略判定收敛到
-// core/inject-queue-policy.ts（shouldDeferUserFlush / shouldFlushInjectionsFirst）
-// 以获得可单测的纯函数单元——本文件只持有队列状态。
+// barrier 语义：barrier=true 的注入必须先于本次 pending 用户消息落地。历史上
+// 唯一的 barrier 来源是 cwd-move 的 /cd 注入；角色切换改为 restart respawn 后
+// 现存发送方（/slash 白名单注入）全部 barrier=false，机制保留供未来有顺序
+// 依赖的注入复用。排队策略判定收敛到 core/inject-queue-policy.ts
+// （shouldDeferUserFlush / shouldFlushInjectionsFirst）以获得可单测的纯函数
+// 单元——本文件只持有队列状态。
 const pendingInjections: PendingInjection[] = [];
 let injectionFlushing = false;
 
@@ -4540,8 +4667,16 @@ async function flushPendingInjections(): Promise<void> {
       // path sends first runs the detection.
       if (!bareShellChecked) {
         bareShellChecked = true;
-        if (detectBareShellLaunch()) return;  // finally{} releases the mutex; queue stays
+        if (await detectBareShellLaunch()) return;  // finally{} releases the mutex; queue stays
       }
+      // The detector's settle await can span a restart's tmux jitter window
+      // (cliRestartInProgress true, old backend still alive). Re-check the fence
+      // before shift()/write so a queued injection never lands in a CLI already
+      // being torn down. The pending injections are then handled by killCli's
+      // restart policy — which drops them (barrier /cd is already durable in
+      // workingDir; non-barrier injects are best-effort and not replayed
+      // cross-process), unlike pendingMessages which killCli preserves.
+      if (cliRestartInProgress) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
       isPromptReady = false;
@@ -4601,7 +4736,6 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
     isPromptReady = false;
     idleDetector?.reset();
   }
-  screenAnalyzer?.notifySelection('text-input');
 
   // Wait briefly so the cursor position is stable before pasting
   await new Promise(r => setTimeout(r, 200));
@@ -4756,9 +4890,89 @@ function handleCodexAppMarker(body: string): void {
     return;
   }
 
-  if (kind === 'final' && typeof payload.content === 'string') {
-    const startedAtMs = typeof payload.startedAtMs === 'number' ? payload.startedAtMs : undefined;
-    const completedAtMs = typeof payload.completedAtMs === 'number' ? payload.completedAtMs : Date.now();
+  if (kind === 'lifecycle') {
+    const event = normalizeCodexAppLifecycleEvent(payload);
+    if (!event) {
+      log(`${cliName()} rejected malformed lifecycle marker`);
+      return;
+    }
+    log(
+      `${cliName()} lifecycle kind=${event.kind}`
+      + ` appTurn=${shortCorrelationId(event.appTurnId)}`
+      + ` replyTurn=${shortCorrelationId(event.replyTurnId)}`
+      + `${event.queueLength !== undefined ? ` queue=${event.queueLength}` : ''}`,
+    );
+    if (!event.replyTurnId || !submittedCodexAppReplyTurnIds.has(event.replyTurnId)) return;
+    if (event.kind === 'steer_attempt') {
+      rememberBoundedMap(pendingCodexAppSteerAckIds, event.replyTurnId, event.appTurnId);
+      return;
+    }
+    const steerKey = `${event.appTurnId}\0${event.replyTurnId}`;
+    if (event.kind !== 'steer_accepted'
+      || pendingCodexAppSteerAckIds.get(event.replyTurnId) !== event.appTurnId
+      || acknowledgedCodexAppSteers.has(steerKey)) return;
+    pendingCodexAppSteerAckIds.delete(event.replyTurnId);
+    rememberBounded(acknowledgedCodexAppSteers, steerKey);
+    send({
+      type: 'steer_accepted',
+      appTurnId: event.appTurnId,
+      turnId: event.replyTurnId,
+    });
+    return;
+  }
+
+  if (kind === 'final') {
+    const marker = normalizeAppRunnerFinalMarker(payload);
+    if (!marker) {
+      log(`${cliName()} rejected malformed final marker`);
+      return;
+    }
+    const startedAtMs = marker.startedAtMs;
+    const completedAtMs = marker.completedAtMs ?? Date.now();
+    if (marker.appTurnId) {
+      const trustedReplyTurnId = marker.replyTurnId
+        && submittedCodexAppReplyTurnIds.has(marker.replyTurnId)
+        ? marker.replyTurnId
+        : undefined;
+      if (marker.replyTurnId && !trustedReplyTurnId) {
+        log(
+          `${cliName()} ignored unsubmitted final reply route `
+          + `(replyTurn=${shortCorrelationId(marker.replyTurnId)})`,
+        );
+      }
+      const identity = projectAppRunnerFinalIds(
+        { ...marker, replyTurnId: trustedReplyTurnId },
+        currentBotmuxTurnId,
+        `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`,
+      );
+      if (marker.appTurnId !== identity.turnId) {
+        log(
+          `${cliName()} app turn ${shortCorrelationId(marker.appTurnId)} mapped `
+          + `to botmux turn ${shortCorrelationId(identity.turnId)}`,
+        );
+      }
+      const dispatchAttempt = currentBotmuxDispatchAttempt;
+      if (startedAtMs !== undefined && shouldSuppressBridgeEmit(
+        { markTimeMs: startedAtMs, isLocal: false, finalText: marker.content },
+        completedAtMs + 5_001,
+        readSendMarkers(),
+        false,
+      )) {
+        log(`${cliName()} final_output suppressed (model already called botmux send)`);
+        emitTurnTerminal(identity.turnId, 'completed', undefined, dispatchAttempt);
+        return;
+      }
+      send({
+        type: 'final_output',
+        content: marker.content,
+        lastUuid: identity.lastUuid,
+        turnId: identity.turnId,
+        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      });
+      emitTurnTerminal(identity.turnId, 'completed', undefined, dispatchAttempt);
+      return;
+    }
+
     // Codex App keeps the app-server-generated id separately for diagnostics.
     // Routing must use its stable clientUserMessageId marker; legacy envelopes
     // intentionally omit it and fall back to the worker's frozen botmux turn.
@@ -4792,7 +5006,7 @@ function handleCodexAppMarker(body: string): void {
     const dispatchAttempt = currentBotmuxDispatchAttempt;
     if (startedAtMs !== undefined) {
       const sentByModel = shouldSuppressBridgeEmit(
-        { markTimeMs: startedAtMs, isLocal: false, finalText: payload.content },
+        { markTimeMs: startedAtMs, isLocal: false, finalText: marker.content },
         completedAtMs + 5_001,
         readSendMarkers(),
         false,
@@ -4805,7 +5019,7 @@ function handleCodexAppMarker(body: string): void {
     }
     send({
       type: 'final_output',
-      content: payload.content,
+      content: marker.content,
       lastUuid: turnId,
       turnId,
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
@@ -4964,6 +5178,10 @@ function markPromptReadyFromPty(): void {
 
 function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
+  if (cliRestartInProgress && !replacementSpawnInProgress) {
+    log('Ignoring prompt-ready from backend generation being replaced');
+    return;
+  }
   stopBusyPatternIdleProbe();
   // Ready-gate: a startup selector's ❯ (cjadk et al.) falsely matches
   // readyPattern → the IdleDetector fires idle while the CLI is NOT actually at
@@ -4993,6 +5211,13 @@ function markPromptReady(): void {
     log('Idle detected during ready-gate settle; deferring prompt-ready until settle completes');
     return;
   }
+  const freshnessAction = freshnessInputQueue.onPromptReady();
+  if (freshnessAction === 'reload') {
+    log('Stale Codex App runner became idle; replacing it before releasing queued input');
+    void restartCliProcess('stale runner reached idle', { immediate: true, preservePending: true });
+    return;
+  }
+  if (freshnessAction === 'ignore') return;
   isPromptReady = true;
   clearSessionRenameInFlight();
   // An old backend can still report idle while its async teardown is running.
@@ -5022,6 +5247,34 @@ function markPromptReady(): void {
     renderer?.markNewTurn();  // exclude history replay from streaming card
   }
   send({ type: 'prompt_ready' });
+  if (
+    persistCodexRunnerBuildOnReady
+    && lastInitConfig?.cliId === 'codex-app'
+    && lastInitConfig.runnerBuildId
+  ) {
+    send({ type: 'runner_build_ready', runnerBuildId: lastInitConfig.runnerBuildId });
+    persistCodexRunnerBuildOnReady = false;
+  }
+  if (activeRestartAttemptId) {
+    // Defense in depth: only report a successful restart when a replacement
+    // backend is actually installed. Every legitimate ready path assigns
+    // `backend` before firing (spawnCli sets it, then idle/PTY callbacks run);
+    // a stray callback that reached here with no backend (e.g. a late stale
+    // generation slipping through a future gate change) must NOT claim success
+    // and consume the attempt id — leave it for the real replacement or the
+    // coordinator timeout.
+    if (backend) {
+      send({
+        type: 'restart_result',
+        attemptId: activeRestartAttemptId,
+        status: 'succeeded',
+        category: 'prompt_ready',
+      });
+      activeRestartAttemptId = undefined;
+    } else {
+      log('prompt-ready with no backend installed — deferring restart success receipt');
+    }
+  }
   // Send immediate idle snapshot so Lark card reflects idle status.
   // BUT: skip when messages are pending — flushPending() will immediately
   // make the CLI busy, so the idle state is transient and shouldn't appear
@@ -5031,13 +5284,11 @@ function markPromptReady(): void {
     const { content } = renderer.snapshot();
     send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   }
-  // cwd-move 注入（barrier=true，如 /cd）必须先于本次 pending 用户消息落地：
-  // 用户在 bot 发完「已切换角色」确认后立刻发下一条消息是最常见路径——若
-  // flushPending 先跑，该消息会在 barrier 注入之前被写进旧 cwd 的 CLI（daemon
-  // 记录已是新目录，实际执行仍在旧目录）。跳过本次 flushPending 不会饿死用户
-  // 消息：flushPending 自身的 injectionFlushing 守卫会挡住并发写入，
-  // flushPendingInjections 的 finally 会在注入完成、CLI 重新 idle 后补踢一次
-  // flushPending 排空 pendingMessages。
+  // barrier 注入必须先于本次 pending 用户消息落地（现存发送方均 barrier=false，
+  // 该分支目前不触发；机制保留见 pendingInjections 声明处注释）。跳过本次
+  // flushPending 不会饿死用户消息：flushPending 自身的 injectionFlushing 守卫
+  // 会挡住并发写入，flushPendingInjections 的 finally 会在注入完成、CLI 重新
+  // idle 后补踢一次 flushPending 排空 pendingMessages。
   if (shouldFlushInjectionsFirst(pendingInjections)) {
     void flushPendingInjections();
   } else {
@@ -5265,15 +5516,36 @@ function scheduleSubmitFailureNotify(
  * and the pty/herdr backends (which `exec` the CLI directly — getChildPid is the
  * CLI itself, never a shell).
  *
- * Returns true when a bare-shell launch was detected (caller must NOT flush).
+ * Returns true when a persistent bare-shell launch was detected (caller must
+ * NOT flush). A transient wrapper shell gets a bounded chance to exec the CLI.
  */
-function detectBareShellLaunch(): boolean {
+async function detectBareShellLaunch(): Promise<boolean> {
   if (bareShellLaunchBlocked) return true;
   if (lastInitConfig?.adoptMode) return false;       // observing an existing pane, not launching
   if (lastInitConfig?.wrapperCli) return false;      // launcher legitimately wraps the CLI (transient shell shim)
-  const pid = backend?.getChildPid?.();
-  if (!pid) return false;
-  const comm = readComm(pid);
+  // Hold the raw_input passthrough latch across the bounded settle poll: the
+  // await below yields the event loop for up to 2s, and a concurrent raw_input
+  // IPC handler (which bypasses isFlushing to preserve busy-delivery) must not
+  // type into the pane while its leaf is still the unsettled shell.
+  bareShellCheckInProgress = true;
+  let comm: string | undefined;
+  try {
+    comm = await settleLaunchComm(() => {
+      const pid = backend?.getChildPid?.();
+      return pid ? readComm(pid) : undefined;
+    });
+  } finally {
+    bareShellCheckInProgress = false;
+  }
+  // A restart can begin while we're suspended in the settle await: tmux staggers
+  // teardown behind a 250–1999ms jitter, so cliRestartInProgress is already true
+  // but the old backend is still alive. Do NOT classify that torn-down pane as a
+  // failed launch — it would set the persistent bareShellLaunchBlocked and emit a
+  // misdiagnosis card for a CLI that's about to be replaced. Return healthy; the
+  // caller's own post-await restart fence keeps the queue intact for the
+  // replacement generation (whose spawnCli resets bareShellChecked and re-runs
+  // this check).
+  if (cliRestartInProgress) return false;
   if (!isBareShellComm(comm)) return false;          // CLI (rust/go/node) is running — healthy launch
 
   // Bare shell is the pane leaf → the CLI never launched. Tier the message on
@@ -5322,6 +5594,7 @@ async function flushPending(): Promise<void> {
   // old CLI. Never let a new flush (including one triggered by the old
   // backend's idle/task-done callback) write across that restart boundary.
   if (cliRestartInProgress) return;
+  if (shouldHoldCodexRunnerInput(codexRunnerFreshness)) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
   if (pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null) return;  // nothing to flush — keep isPromptReady
@@ -5424,10 +5697,18 @@ async function flushPending(): Promise<void> {
     // doesn't get them typed into the bare shell first.
     if (!bareShellChecked) {
       bareShellChecked = true;
-      if (detectBareShellLaunch()) {
+      if (await detectBareShellLaunch()) {
         return;  // finally{} releases the mutex; pendingMessages stay queued, untouched
       }
     }
+    // detectBareShellLaunch() awaits a bounded settle poll; a restart can begin
+    // during that yield (tmux staggers teardown behind a 250–1999ms jitter, so
+    // cliRestartInProgress flips true while the old backend is still alive). Do
+    // not write startup commands / rename / user prompts into a CLI already
+    // promised to teardown — re-check the restart fence now, before any shift or
+    // write. The queue is untouched; the replacement generation's markPromptReady
+    // re-invokes flushPending.
+    if (cliRestartInProgress) return;  // finally{} releases the mutex; queue stays
     // One-shot per spawn: type the bot's startup commands (e.g. `/effort
     // ultracode`) into the CLI before the first user prompt drains. Both ready
     // paths funnel through flushPending — the ready-gate settle for Claude-family
@@ -5442,7 +5723,8 @@ async function flushPending(): Promise<void> {
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
     // applying the canonical title last keeps the resume-picker label aligned.
     if (rawInputReady && pendingRawInputs.length > 0 && backend) {
-      const raw = pendingRawInputs.shift()!;
+      const raw = freshnessInputQueue.takeRaw();
+      if (!raw) return;
       await deliverRawInput(raw);
       return;
     }
@@ -5470,7 +5752,8 @@ async function flushPending(): Promise<void> {
       return;
     }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
-      const item = pendingMessages.shift()!;
+      const item = freshnessInputQueue.takeNormal();
+      if (!item) break;
       const durableWrite = item.dispatchAttempt !== undefined;
       if (durableWrite) durableTurnInFlight = true;
       // Track as in-flight until the CLI returns to idle (markPromptReady).
@@ -5530,7 +5813,14 @@ async function flushPending(): Promise<void> {
         log('Refused durable Claude submit: transcript terminal bridge is unavailable');
         break;
       }
-      log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
+      if (lastInitConfig?.cliId === 'codex-app') {
+        log(
+          `Writing Codex App input to PTY (flush): `
+          + `replyTurn=${shortCorrelationId(item.turnId)} chars=${msg.length}`,
+        );
+      } else {
+        log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
+      }
       // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
       // dead pane (they fire onExit instead), but writeInput can still throw
       // for other reasons (fs errors while resolving the JSONL, a future
@@ -5548,9 +5838,14 @@ async function flushPending(): Promise<void> {
           await codexRpcEngine.sendTurn(msg, item.turnId);
           result = { submitted: true };
         } else if (item.codexAppInput && cliAdapter.writeStructuredInput) {
-          result = await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput);
+          result = await cliAdapter.writeStructuredInput(
+            backend,
+            msg,
+            item.codexAppInput,
+            { turnId: item.turnId },
+          );
         } else {
-          result = await cliAdapter.writeInput(backend, msg);
+          result = await cliAdapter.writeInput(backend, msg, { turnId: item.turnId });
         }
         scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
       } catch (err: any) {
@@ -5575,6 +5870,11 @@ async function flushPending(): Promise<void> {
           item,
         );
         break;
+      }
+      if (lastInitConfig?.cliId === 'codex-app'
+        && item.turnId
+        && result?.submitted !== false) {
+        rememberBounded(submittedCodexAppReplyTurnIds, item.turnId);
       }
       // Persist any sessionId the adapter observed via authoritative sources
       // (Claude's pid file, Codex's history). Done independently of submit
@@ -5647,7 +5947,7 @@ function sendToPty(
   // old early-return silently dropped it after receiver had already persisted
   // DISPATCHED.
   if (cliRestartInProgress || !backend) {
-    pendingMessages.push(next);
+    freshnessInputQueue.enqueueNormal(next);
     log(`Queued message while CLI backend is restarting (${pendingMessages.length} pending)`);
     return true;
   }
@@ -5662,12 +5962,13 @@ function sendToPty(
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
+    holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   }) && cliAdapter.mergeQueuedInput === true;
   const mergedQueued = shouldMergeQueued && mergeQueuedCliInput(pendingMessages, next);
   if (mergedQueued) {
     log(`Merged queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
   } else {
-    pendingMessages.push(next);
+    freshnessInputQueue.enqueueNormal(next);
   }
   // User-override semantics: a fresh Lark message while a TUI prompt is "active"
   // takes precedence over the AI-detected prompt. The screen analyzer can be
@@ -5678,7 +5979,6 @@ function sendToPty(
   if (tuiPromptBlocking) {
     log(`User override: incoming Lark message clears tuiPromptBlocking — "${content.substring(0, 80)}"`);
     tuiPromptBlocking = false;
-    screenAnalyzer?.notifySelection('lark-input');
     // Tear down the prompt card so the user doesn't see stale options.
     send({
       type: 'tui_prompt_resolved',
@@ -5698,7 +5998,11 @@ function sendToPty(
   // delivers queued messages instead. See input-gate.ts; this fixes dispatch's
   // brief reaching Codex before its first idle and never landing.
   if (!sessionRenameInFlight && commandLineWritesPending === 0 && shouldWriteNow({
-    isPromptReady, isFlushing, supportsTypeAhead, awaitingFirstPrompt,
+    isPromptReady,
+    isFlushing,
+    supportsTypeAhead,
+    awaitingFirstPrompt,
+    holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   })) {
     if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
@@ -5732,7 +6036,6 @@ function startScreenUpdates(): void {
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) return;
     let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
-    if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
 
     void (async () => {
       let content = lastContent;
@@ -5761,8 +6064,9 @@ function startScreenUpdates(): void {
           const hash = pipeText.ansi;
           changed = hash !== lastTextSnapshotHash;
           lastTextSnapshotHash = hash;
-          // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
-          // tmux call would otherwise need to fire twice per tick.
+          // Refresh the unfiltered snapshot cache (lastAnalyzerSnapshot) that
+          // usage-limit detection and the CoCo picker read from. Same tmux
+          // call would otherwise need to fire twice per tick.
           if (changed) {
             const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
             if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
@@ -6528,8 +6832,8 @@ async function spawnCli(
   // the full in-memory conversation. In that case the resume-vs-fresh question
   // is moot: we must NOT run the pre-flight fallback (which would drop --resume
   // and post a misleading "started a fresh clean session — context lost" card
-  // on EVERY restart, e.g. for a sandboxed session whose transcript lives in
-  // an ephemeral overlay upper that the probe can't see). Computed here (not at
+  // on EVERY restart, e.g. for a sandboxed session whose transcript lives at a
+  // real host path the probe may not be able to stat). Computed here (not at
   // the spawn site below) so the pre-flight can short-circuit on it.
   let persistentSessionName = selectedBackend.persistentSessionName;
   // [read-isolation] Before we decide to reattach a persistent pane: a pane can
@@ -6602,6 +6906,28 @@ async function spawnCli(
     }
   }
 
+  const replacementExpectedFresh = codexRunnerFreshness === 'restarting_fresh';
+  const freshness = decideCodexRunnerFreshness({
+    cliId: cfg.cliId,
+    adoptMode: cfg.adoptMode === true,
+    persistentReattach: willReattachPersistent,
+    replacementExpectedFresh,
+    currentBuildId: cfg.runnerBuildId,
+    persistedBuildId: cfg.persistedRunnerBuildId,
+  });
+  codexRunnerFreshness = freshness.state;
+  persistCodexRunnerBuildOnReady = freshness.persistOnReady;
+  log(`Codex runner freshness=${freshness.state} reason=${freshness.reason}`);
+  if (freshness.reason === 'replacement_reattached' && activeRestartAttemptId) {
+    send({
+      type: 'restart_result',
+      attemptId: activeRestartAttemptId,
+      status: 'failed',
+      category: 'spawn_failed',
+    });
+    activeRestartAttemptId = undefined;
+  }
+
   // The plugin set is stable only for the lifetime of one real CLI process.
   // A warm worker reattach keeps the existing Gateway and catalog untouched;
   // every fresh/resumed CLI spawn atomically refreshes both from current Bot config.
@@ -6626,6 +6952,7 @@ async function spawnCli(
   // diagnostic instead of having the prompt typed into it.
   bareShellLaunchBlocked = false;
   bareShellChecked = false;
+  bareShellCheckInProgress = false;
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false
@@ -7070,6 +7397,19 @@ async function spawnCli(
     const canonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
     const sandboxHome = canonical(homedir());
     const expandTilde = (raw: string) => raw.replace(/^~(?=\/|$)/, sandboxHome);
+    // LEXICAL `~` expansion — uses the raw (NON-canonicalized) homedir(). Used ONLY
+    // for the redirect authPath CONTAINMENT decision below, where both sides of the
+    // coversPath check MUST live in the same namespace. `expandTilde` above resolves
+    // `~` to the CANONICAL home (correct for bwrap binds), but the rehomed roots we
+    // compare against are lexical (`cliAdapter.claudeDataDir` = join(homedir(),'.claude'),
+    // built from the un-canonicalized homedir()). Mixing the two silently fails the
+    // containment on a SYMLINKED $HOME (`/home/u` → `/data00/home/u`): the authPath
+    // canonicalizes to `/data00/home/u/.claude/...` while the root stays `/home/u/.claude`,
+    // coversPath misses, and the real host credential wrongly survives → RW-bound back
+    // into the redirected sandbox (codex #605 P1). Expanding BOTH sides lexically keeps
+    // them in one namespace; survivors are canonicalized afterwards by keepExisting.
+    const lexicalHome = homedir();
+    const expandTildeLexical = (raw: string) => raw.replace(/^~(?=\/|$)/, lexicalHome);
     const keepExisting = (paths: (string | undefined)[]) => {
       const out: string[] = [];
       for (const raw of paths) {
@@ -7165,10 +7505,8 @@ async function spawnCli(
       if (!existsSync(tsFile)) writeFileSync(tsFile, '');
     } catch { /* */ }
     try { mkdirSync(join(dataDir, 'attachments', cfg.larkAppId), { recursive: true }); } catch { /* */ }
-    // schedules.json is a shared RMW store (`botmux schedule`); pre-create as an
-    // empty map if absent (same content schedule-store itself writes) so a fresh
-    // install's first in-sandbox `schedule add` can bind+write it on bwrap too.
-    try { const sf = join(dataDir, 'schedules.json'); if (!existsSync(sf)) writeFileSync(sf, '{}'); } catch { /* */ }
+    // (Schedules moved into each bot's BOT_HOME — the whole dir is already
+    // bound readWrite for the owner, so no per-file pre-create is needed.)
 
     const mandatoryDenyPaths: string[] = [];
     const mandatoryDenyRegexes: string[] = [];
@@ -7251,7 +7589,37 @@ async function spawnCli(
         claudeDataDir ? `${sandboxHome}/.claude.lock` : undefined,
         claudeDataDir ? `${sandboxHome}/.local/state/claude` : undefined,
       ]),
-      authPaths: keepExisting([...(cliAdapter.authPaths ?? [])]),
+      // authPaths carries the CLI's REAL login/data surfaces (claude:
+      // ~/.claude/.credentials.json; codex/codex-app: the WHOLE ~/.codex;
+      // Seed/Relay: ~/.local/share/bytedcli SSO + <dataDir>/byted-cloud-auth.json).
+      // resolveRedirectedAdapterAuthPaths is the single source of truth (also unit-
+      // tested directly): not redirected → expose all; redirected → drop authPaths
+      // inside a rehomed host data root (their BOT_HOME copy is provisioned+covered,
+      // or — codex's whole ~/.codex — an active leak), keep data-root-external
+      // login sources (Seed/Relay bytedcli SSO) so cold-start login doesn't regress.
+      // rehomedHostRoots = the ORIGINAL host claudeDataDir (cliAdapter's, NOT the
+      // BOT_HOME value claudeDataDir was reassigned to above) + codex host ~/.codex.
+      //
+      // CONTAINMENT MUST USE LEXICAL (`~`-expanded, NOT realpath'd) paths on BOTH
+      // sides: if e.g. ~/.claude/.credentials.json is a symlink to an external
+      // dotfiles/creds dir, realpath-then-contain would resolve it OUTSIDE ~/.claude
+      // and wrongly KEEP it → the real host credential gets RW-bound back into the
+      // sandbox, defeating the redirect. AND the two sides must share ONE home
+      // namespace: expand declaredAuthPaths + rehomedHostRoots with `lexicalHome`
+      // (raw homedir()), NOT the canonical `sandboxHome` — else on a symlinked $HOME
+      // the authPath canonicalizes to /data00/home/u/... while `cliAdapter.claudeDataDir`
+      // (= join(homedir(),'.claude'), lexical) stays /home/u/..., coversPath misses,
+      // and the credential leaks (codex #605 P1). The codex host root is likewise
+      // `${lexicalHome}/.codex`, not `${sandboxHome}/.codex`, or the codex leak fix
+      // itself regresses under a symlinked home. Filter lexically first, THEN
+      // keepExisting (realpath + existence-filter) only the survivors for bwrap.
+      authPaths: keepExisting(resolveRedirectedAdapterAuthPaths({
+        declaredAuthPaths: [...(cliAdapter.authPaths ?? [])].map(expandTildeLexical),
+        willRedirectCliData,
+        rehomedHostRoots: [cliAdapter.claudeDataDir, isolatedCodexHome ? `${lexicalHome}/.codex` : undefined]
+          .filter((r): r is string => !!r)
+          .map(expandTildeLexical),
+      })),
       execPaths: keepExisting([...execDirs, ...execCarve]),
       readonlyRoots: keepExisting([
         ...(cfg.skillReadonlyRoots ?? []),
@@ -7935,6 +8303,15 @@ async function spawnCli(
   // prompt-ready — without this hook a follow-up arriving mid-task would sit
   // in pendingMessages forever once the task finishes.
   backend.onTaskDone?.(() => {
+    // Generation fence (matches the onAgentStatus above and the onExit below):
+    // a stale RiffBackend's `fetchAndEmitOutput(...).finally(taskDoneCb)` can
+    // resolve AFTER destroySession()/kill() during a restart (neither clears
+    // taskDoneCb nor awaits the in-flight fetch). If that late callback reached
+    // markPromptReady() while a replacement is spawning, it would ride through
+    // the global restart gate and emit a premature `restart_result: succeeded`,
+    // swallowing the replacement's true terminal outcome. Only the current
+    // backend generation may re-arm prompt-ready.
+    if (backend !== observedBackend) return;
     log(`${cliName()} task finished — re-arming prompt-ready for queued follow-ups`);
     markPromptReady();
   });
@@ -7976,16 +8353,7 @@ async function spawnCli(
       // before exiting while fs.watch/the 1s poller is still queued. Drain it
       // synchronously before claiming `cli_exit`; otherwise ambiguous wins the
       // deduper and needlessly replays a turn that actually completed.
-      if (bridgeJsonlPath) {
-        try { bridgeDrainAndMaybeEmit(); } catch (err: any) {
-          log(`Bridge exit drain failed: ${err.message}`);
-        }
-      }
-      if (codexBridgeFallbackActive()) {
-        try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch (err: any) {
-          log(`Codex bridge exit drain failed: ${err.message}`);
-        }
-      }
+      drainReliableTerminalBeforeInterrupt();
       // Race-safe with transcript final / submit-failure: the worker-local
       // terminal deduper lets exactly one status win for this attempt.
       emitTurnTerminal(
@@ -8029,6 +8397,16 @@ async function spawnCli(
     isPromptReady = false;
     currentBotmuxTurnId = undefined;
     currentBotmuxDispatchAttempt = undefined;
+    if (!intentionalRestart && activeRestartAttemptId) {
+      send({
+        type: 'restart_result',
+        attemptId: activeRestartAttemptId,
+        status: 'failed',
+        category: 'runner_exited',
+      });
+      activeRestartAttemptId = undefined;
+    }
+    if (!intentionalRestart) freshnessInputQueue.onReplacementFailed();
     if (intentionalRestart) {
       log('Suppressed claude_exit for intentional in-worker restart');
     } else {
@@ -8127,8 +8505,8 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   promptReadyDetectedDuringSettle = false;
   readyPatternSeenDuringHold = false;
   awaitingPostSessionStartPromptEvidence = false;
-  stopScreenAnalyzer();
   stopStuckDetector();
+  tuiPromptBlocking = false;
   stopScreenUpdates();
   backend?.kill();
   backend = null;
@@ -8147,10 +8525,10 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
     currentBotmuxTurnId,
     currentBotmuxDispatchAttempt,
   );
-  // Stop the sandbox outbox watcher, then unmount the overlays + remove the
-  // per-session sandbox tree. In the overlay model the upper layer (the
-  // changeset) must be landed BEFORE close — `/land` runs while the session is
-  // still active, so by cleanup time anything worth keeping is already applied.
+  // Stop the sandbox outbox watcher, then reclaim the deny-mask mountpoints +
+  // remove the per-session sandbox tree. In the fs-policy model the CLI writes
+  // the project DIRECTLY at real host paths (no upper changeset to land), so by
+  // close time everything worth keeping is already on disk.
   if (sandboxStopWatcher) {
     try { sandboxStopWatcher(); } catch { /* */ }
     sandboxStopWatcher = null;
@@ -8160,6 +8538,9 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   currentBotmuxTurnId = undefined;
   currentBotmuxDispatchAttempt = undefined;
   currentVcMeetingImTurnOrigin = undefined;
+  submittedCodexAppReplyTurnIds.clear();
+  pendingCodexAppSteerAckIds.clear();
+  acknowledgedCodexAppSteers.clear();
   if (sandboxCleanup) {
     try { sandboxCleanup(); } catch { /* */ }
     sandboxCleanup = null;
@@ -8188,7 +8569,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
 ): Promise<void> {
   if (lastInitConfig?.adoptMode) {
     log(`Restart ignored in adopt mode (${reason})`);
@@ -8199,6 +8580,7 @@ async function restartCliProcess(
   // of firing idle/task-done callbacks. Inputs accepted in that interval must
   // remain queued until a replacement backend has been installed.
   cliRestartInProgress = true;
+  replacementSpawnInProgress = false;
   rawInputRestartGate = true;
   // The Node worker stays alive through this restart, so the daemon will see
   // neither claude_exit nor worker-exit. Explicitly revoke the old turn's
@@ -8208,9 +8590,13 @@ async function restartCliProcess(
   revokeManagedTurnOriginForRestart();
   log(`Restart requested (${reason})`);
   // Tier-2 guard: 2nd consecutive in-worker restart forces FRESH. Tier-1
-  // adapter probing is still re-run on every spawn.
-  consecutiveInWorkerRestarts++;
-  log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
+  // adapter probing is still re-run on every spawn. skipRestartBudget（角色
+  // 切换的 cwd-move respawn）不计入：那是用户主动迁移不是崩溃恢复，计进去
+  // 会让「切角色 + 一次无关重启」无故触发强制 FRESH 丢上下文。
+  if (!opts.skipRestartBudget) {
+    consecutiveInWorkerRestarts++;
+    log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
+  }
   const restart = async (): Promise<void> => {
     try {
       tmuxRestartTimer = null;
@@ -8238,12 +8624,13 @@ async function restartCliProcess(
       killCli({ preservePending: opts.preservePending });
       awaitingFirstPrompt = true;
       setTimeout(async () => {
+        let spawnedWorkingDir: string | undefined;
         if (lastInitConfig) {
           startScreenUpdates();
-          startScreenAnalyzer();
           startStuckDetector();
           try {
             const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
+            spawnedWorkingDir = restartCfg.workingDir;
             // Re-engage RPC so the new --remote pane binds to the CURRENT app-server
             // (a fresh port), not the dead prior one. engageCodexRpc only sets
             // remote* on success, else spawnCli falls back to paste.
@@ -8254,23 +8641,59 @@ async function restartCliProcess(
               rpcPluginGenerationPrepared = true;
               await engageCodexRpc(restartCfg);
             }
+            replacementSpawnInProgress = true;
             await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
             await prepareCodexNativeTitleGeneration(restartCfg, codexRpcEngine);
+            replacementSpawnInProgress = false;
             if (codexRpcEngine) armRpcStartupDialogDismiss();
           } catch (err) {
+            replacementSpawnInProgress = false;
             cliRestartInProgress = false;
             await sendFatalWorkerErrorAndExit(err);
             return;
           }
         }
         cliRestartInProgress = false;
+        replacementSpawnInProgress = false;
+        // Follow-up decision (pure, unit-tested in restart-followup-policy.ts):
+        //  - cwd-move: a role-switch restart landed after restartCfg was
+        //    snapshotted → CLI came up in the old cwd while daemon repinned to
+        //    the new one. Respawn to converge (budget skipped only if the
+        //    backend is still alive; a dead one keeps the crash evidence).
+        //  - replacement-recovery: the freshly-spawned CLI exited inside the
+        //    window cliRestartInProgress still covers (spawnCli +
+        //    prepareCodexNativeTitleGeneration). onExit nulled `backend`
+        //    synchronously, so `!backend` is the ground-truth recovery signal —
+        //    NOT a merged daemon auto-restart (a restart message carries no
+        //    trustworthy source, so a healthy duplicate /restart during the
+        //    window must NOT be misread as a crash and force a budget-burning
+        //    second restart). Recover now or the session strands at
+        //    backend=null needing a manual /restart. Genuine crash recovery →
+        //    COUNTS toward tier-2 FRESH.
+        const followup = decideRestartFollowup({
+          spawnedWorkingDir,
+          currentWorkingDir: lastInitConfig?.workingDir,
+          backendAlive: !!backend,
+        });
+        if (followup.kind !== 'none') {
+          const reason = followup.kind === 'cwd-move'
+            ? `cwd-move follow-up respawn → ${lastInitConfig?.workingDir}`
+            : 'replacement-exit follow-up restart (replacement exited during in-flight restart)';
+          log(reason);
+          void restartCliProcess(reason, { preservePending: true, skipRestartBudget: followup.skipRestartBudget });
+          return;
+        }
         // Riff marks itself prompt-ready inside spawnCli(); that early flush is
         // intentionally held by the restart gate above. Release its raw-input
         // fence now; other backends keep it until their later markPromptReady().
         if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();
-        void flushPending();
+        // A local replacement process can exist before its TUI input box does.
+        // Only re-kick a prompt that became ready while the restart fence was
+        // still armed; otherwise markPromptReady() owns the first flush.
+        if (isPromptReady) void flushPending();
       }, 500);
     } catch (err) {
+      replacementSpawnInProgress = false;
       cliRestartInProgress = false;
       try {
         await sendFatalWorkerErrorAndExit(err);
@@ -8395,6 +8818,14 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
         const startAttach = (cols: number, rows: number) => {
           if (cp) return;
+          // Why: a prior web resize may leave the shared tmux window in manual mode.
+          // `largest` restores the shared default without letting a smaller/newer
+          // viewer resize every other attached client.
+          spawnSync('tmux', ['set-option', '-t', tmuxTarget, 'window-size', 'largest'], {
+            stdio: 'ignore',
+            env: tmuxEnv() as { [key: string]: string },
+            timeout: 3000,
+          });
           // Defense in depth: view-capability clients attach through tmux's
           // own read-only mode as well as the WebSocket input gate below.
           cp = pty.spawn('tmux', [
@@ -9489,6 +9920,15 @@ async function sendFatalWorkerErrorAndExit(
 ): Promise<void> {
   if (fatalWorkerErrorPending) return;
   fatalWorkerErrorPending = true;
+  if (activeRestartAttemptId) {
+    await sendAndFlush({
+      type: 'restart_result',
+      attemptId: activeRestartAttemptId,
+      status: 'failed',
+      category: 'spawn_failed',
+    });
+    activeRestartAttemptId = undefined;
+  }
   await sendAndFlush({
     type: 'error',
     message: err instanceof Error ? err.message : String(err),
@@ -9515,6 +9955,7 @@ process.on('message', async (raw: unknown) => {
       const initStartedAtMs = Date.now();
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
+      activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
       refreshTerminalViewToken();
       refreshTerminalWriteToken();
@@ -9560,7 +10001,6 @@ process.on('message', async (raw: unknown) => {
         if (!isWorkflowWorker()) {
           port = await startWebServer(config.web.workerHost, msg.webPort);
           startScreenUpdates();
-          startScreenAnalyzer();
           startStuckDetector();
         } else {
           // Workflow attempts still expose a read-only web terminal so the
@@ -9731,12 +10171,11 @@ process.on('message', async (raw: unknown) => {
       if (!backend && crashDiagnosticStopped && lastInitConfig && !lastInitConfig.adoptMode) {
         log('Message received after crash-loop stop; retrying CLI start');
         destroyCrashDiagnosticTerminal('retry after message');
-        stopScreenAnalyzer();
         stopStuckDetector();
+        tuiPromptBlocking = false;
         stopScreenUpdates();
         awaitingFirstPrompt = true;
         startScreenUpdates();
-        startScreenAnalyzer();
         startStuckDetector();
         try {
           const restartCfg = { ...lastInitConfig, resume: true, prompt: '' };
@@ -9862,9 +10301,18 @@ process.on('message', async (raw: unknown) => {
       // barrier（shouldDeferUserFlush——/cd 未落地前任何用户输入都不得写入，
       // 否则 passthrough 会执行在旧 cwd 的 CLI 里）时入队。注入排空后由
       // flushPendingInjections 的 finally 补踢 flushPending 送达。
+      // 第四个例外是启动稳定窗口：detectBareShellLaunch() 采到裸 shell 时会
+      // await settleLaunchComm() 最长 2s 等 wrapper 完成 `exec <cli>`——这段
+      // await 让出事件循环，而 IPC handler 不串行（见 raw-input-followup-
+      // atomicity.test.ts），若此刻放行 passthrough 就会打进尚未 exec 的临时
+      // shell。bareShellCheckInProgress 覆盖"检查进行中"、bareShellLaunchBlocked
+      // 覆盖"已确认裸 shell 启动失败"两种状态,一并入队。裸 shell 确认失败后
+      // 这些 pending 不会再被 flush（与 pendingMessages 同款处理），符合预期。
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight
-        || injectionFlushing || shouldDeferUserFlush(pendingInjections)) {
-        pendingRawInputs.push(msg);
+        || shouldHoldCodexRunnerInput(codexRunnerFreshness)
+        || injectionFlushing || shouldDeferUserFlush(pendingInjections)
+        || bareShellCheckInProgress || bareShellLaunchBlocked) {
+        freshnessInputQueue.enqueueRaw(msg);
         log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
       } else {
         await deliverRawInput(msg);
@@ -9901,7 +10349,60 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'restart': {
-      await restartCliProcess('daemon request', { preservePending: true });
+      // 角色切换的 cwd-move respawn：respawn 用 {...lastInitConfig, resume:true}，
+      // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
+      // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
+      // （COPY 最新 <sid>.jsonl 进新 cwd 桶，已在 master）接住，上下文不丢。
+      if (msg.updateWorkingDir && lastInitConfig) {
+        lastInitConfig.workingDir = msg.updateWorkingDir;
+      }
+      // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
+      // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、
+      // 把重启预算无故烧到 tier-2 强制 FRESH（丢上下文），非 tmux 路径还会
+      // 双 spawn。workingDir 已收敛进 lastInitConfig，pending 的 spawn 展开
+      // {...lastInitConfig} 时自然拿到新目录。
+      //
+      // 这里**只 break、不记任何 flag**：restart 消息不带可信来源，无法区分
+      // 「replacement 崩溃触发的 auto-restart」与「用户重复点了一次 restart」。
+      // replacement 真退出时 onExit 已同步把 backend 置 null，续体用 !backend 即可
+      // 补 recovery（见 decideRestartFollowup）；健康的重复 restart 就该被合并掉，
+      // 记 flag 反而会逼健康进程再重启一轮、烧预算丢 --resume（正是合并要防的）。
+      if (cliRestartInProgress || tmuxRestartTimer) {
+        log(`Restart request merged into in-flight restart${msg.updateWorkingDir ? ` (workingDir → ${msg.updateWorkingDir})` : ''}`);
+        break;
+      }
+      activeRestartAttemptId = msg.attemptId;
+      codexRunnerFreshness = 'restarting_fresh';
+      // restart 杀死 CLI，在飞的 durable turn 随之死亡。对被杀的那次投递，主动发一个
+      // 'ambiguous' 终端回执：CLI 被中途杀掉，副作用到底发没发是**真的无法证明**
+      // （故不能报 'cancelled'），交由 daemon 的重试策略即时对账。不发的话 receipt 会
+      // 悬着，等 daemon 租约到期走 expire_durable_turn 的「无法证明 → 扣 ACK → 超时
+      // fencing teardown」慢路径（还会把刚 respawn 的新 CLI 二次 teardown）。
+      // emitTurnTerminal 自带释放（复位 durableTurnInFlight、退休 inflight input、
+      // 撤销 turn-origin relay、丢弃 bridge 尝试）并对后续 CLI-exit 终端去重；它排的
+      // flushPending 微任务会因下面 restartCliProcess 同步置位 cliRestartInProgress 而空跑。
+      // 结算被 restart 打断的在飞 durable turn（编排见 settleDurableTurnForRestart，
+      // 已单测）：drain 已落盘可靠终态让「刚好在 kill 前完成、watcher 未消费」的 turn
+      // 以 completed 抢占 deduper → 复检仍在飞才补发 ambiguous（否则无条件 ambiguous
+      // 会误标已完成投递 → 同 key 可重派 → 副作用两次）→ 兜底释放 latch 免卡 respawn。
+      // emitTurnTerminal 自带释放（复位 durableTurnInFlight、退休 inflight input、撤销
+      // turn-origin relay、丢弃 bridge 尝试）；它排的 flushPending 微任务会因下面
+      // restartCliProcess 同步置位 cliRestartInProgress 而空跑。
+      settleDurableTurnForRestart({
+        hasInFlightTurn: durableTurnInFlight,
+        hasCurrentTurnId: !!currentBotmuxTurnId,
+        drain: () => drainReliableTerminalBeforeInterrupt(),
+        isStillInFlight: () => durableTurnInFlight,
+        emitAmbiguous: () => emitTurnTerminal(currentBotmuxTurnId!, 'ambiguous', undefined, currentBotmuxDispatchAttempt),
+        release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
+      });
+      await restartCliProcess(
+        msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : 'daemon request',
+        // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制
+        // FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
+        // auto-restart 那条裸 restart 的计数兜底。
+        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir },
+      );
       break;
     }
 
@@ -10041,12 +10542,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'inject_command': {
-      // 会话内 /cd 移动后，worker 内部 respawn（claude_exit 自动重启 / IM /restart /
-      // dashboard restart）必须收敛到新目录，而不是陈旧的 lastInitConfig.workingDir。
-      if (msg.updateWorkingDir && lastInitConfig) {
-        lastInitConfig.workingDir = msg.updateWorkingDir;
-      }
-      pendingInjections.push({ command: msg.command, barrier: !!msg.updateWorkingDir });
+      // 唯一发送方是 /slash 路由的白名单 TUI 命令注入。cwd 移动不再走注入
+      // （角色切换已改为 restart+updateWorkingDir 的 respawn），这里不接受
+      // 任何 workingDir 改写——那会绕过 cd 路由的角色库硬校验。
+      pendingInjections.push({ command: msg.command, barrier: false });
       void flushPendingInjections();
       break;
     }
@@ -10183,15 +10682,16 @@ process.on('message', async (raw: unknown) => {
       } catch { /* best-effort */ }
       backend = null;
       isPromptReady = false;
-      // Suspend INTENDS to resume later: preserve the sandbox overlay mount + the
-      // upper changeset across the suspension (on resume, prepareSandbox re-mounts
-      // over the SAME upper). So we stop the outbox watcher (no live CLI to serve)
-      // but DO NOT run sandboxCleanup (which would unmount + rm the changeset). We
+      // Suspend INTENDS to resume later: keep the per-session sandbox tree (the
+      // outbox + pre-created deny-mask mountpoints) intact across the suspension
+      // (on resume, prepareDirectSandbox re-binds over the SAME tree). So we stop
+      // the outbox watcher (no live CLI to serve) but DO NOT run sandboxCleanup
+      // (which would reclaim the mask mountpoints + rm the tree). We
       // also disarm the exit-time teardown so process.exit(0) below can't reclaim
       // it. (Crash/SIGKILL of a suspended-but-active session is still backstopped
       // by the daemon's periodic sandbox reconciler.)
       if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
-      sandboxCleanup = null;           // drop the ref WITHOUT calling it (keep the mount)
+      sandboxCleanup = null;           // drop the ref WITHOUT calling it (keep the tree)
       sandboxTeardownDone = true;      // make the process.on('exit') hook a no-op
       cleanup();
       process.exit(0);
@@ -10253,15 +10753,15 @@ setInterval(() => {
 }, 30_000).unref();
 
 // ─── Sandbox crash-time teardown ─────────────────────────────────────────────
-// killCli() (which unmounts the overlays + rm's the per-session tree) only runs
-// from the SIGTERM/SIGINT/disconnect/watchdog handlers and the close/suspend IPC
-// cases. An UNCAUGHT exception or unhandled rejection kills the process WITHOUT
-// any of those firing, so without this hook a crashed sandboxed worker would
-// leak BOTH overlay mounts (mount-table growth) + its upper/work dirs (disk leak)
-// per crash. We run a minimal, synchronous, best-effort sandbox teardown here so
-// the overlay/dir residue is reclaimed even on an abnormal exit. (SIGKILL still
-// can't be trapped — the daemon-side sweep + the periodic reconciler below are
-// the backstop for that.)
+// killCli() (which reclaims the deny-mask mountpoints + rm's the per-session
+// tree) only runs from the SIGTERM/SIGINT/disconnect/watchdog handlers and the
+// close/suspend IPC cases. An UNCAUGHT exception or unhandled rejection kills
+// the process WITHOUT any of those firing, so without this hook a crashed
+// sandboxed worker would leak its pre-created host mask mountpoints (empty dirs/
+// files) + the per-session tree (disk leak) per crash. We run a minimal,
+// synchronous, best-effort sandbox teardown here so that residue is reclaimed
+// even on an abnormal exit. (SIGKILL still can't be trapped — the daemon-side
+// sweep + the periodic reconciler below are the backstop for that.)
 function teardownSandboxBestEffort(): void {
   if (sandboxTeardownDone) return;
   sandboxTeardownDone = true;

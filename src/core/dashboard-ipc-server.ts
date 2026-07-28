@@ -10,6 +10,8 @@ import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-re
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
 import * as sessionStore from '../services/session-store.js';
+import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
@@ -66,6 +68,7 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
+import { isSessionStopped } from './session-liveness.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
@@ -92,6 +95,7 @@ import { validateTriggerRequest, type TriggerResponse } from '../services/trigge
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
+import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
 
 let exactChatGrantHandler: typeof applyExactChatGrantRequest = applyExactChatGrantRequest;
 /** Test seam: replace the exact-grant service without touching live Feishu/config state. */
@@ -132,7 +136,6 @@ import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
-import type { CliId } from '../adapters/cli/types.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
@@ -149,6 +152,12 @@ import {
   releaseDeviceIsolationActivation,
   type DeviceIsolationDaemonResult,
 } from './device-isolation-daemon.js';
+
+// Daemon process start (module load ≈ daemon boot). Used by the SSE snapshot
+// replay to bound the "recently closed" set to sessions that flipped
+// active→closed during THIS run — i.e. restore-time zombies — without replaying
+// the entire closed-session history on every connect.
+const PROCESS_START_MS = Date.now();
 
 export interface IpcServerHandle {
   port: number;
@@ -385,11 +394,12 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
   if (method === 'POST' && pathname === '/api/asks') return true;
-  // botmux slash / botmux cd（角色切换）：合法调用方是会话内的 CLI 自身，沙箱 /
-  // 读隔离下读不到 host secret。两个 handler 内验证该会话的 rotating per-turn
+  // botmux slash / botmux role switch（角色切换）/ botmux delete（关闭自身）：合法调用方
+  // 是会话内的 CLI 自身，沙箱 / 读隔离下读不到 host secret。handler 内验证
+  // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
@@ -482,6 +492,49 @@ ipcRoute('POST', DEVICE_ISOLATION_COMMIT_PATH, (req, res) =>
 ipcRoute('POST', DEVICE_ISOLATION_RELEASE_PATH, (req, res) =>
   handleDeviceIsolationActivationRoute(req, res, releaseDeviceIsolationActivation));
 
+// ─── Pending asks (trusted Desktop/dashboard operator only) ─────────────────
+
+ipcRoute('GET', '/api/asks/pending', (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  const asks = listPendingAsks().map((ask) => ({
+    askId: ask.askId,
+    sessionId: ask.sessionId,
+    larkAppId: ask.larkAppId,
+    chatId: ask.chatId,
+    rootMessageId: ask.rootMessageId,
+    questions: ask.questions,
+    deadlineAt: ask.deadlineAt,
+    createdAt: ask.createdAt,
+  }));
+  return jsonRes(res, 200, { asks });
+});
+
+ipcRoute('POST', '/api/asks/answer', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  let body: { askId?: string; selections?: string[][]; by?: string };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body.askId || !Array.isArray(body.selections)) {
+    return jsonRes(res, 400, { ok: false, error: 'askId_and_selections_required' });
+  }
+  const outcome = submitAskFromDesktop({
+    askId: body.askId,
+    selections: body.selections,
+    by: typeof body.by === 'string' ? body.by : 'desktop',
+  });
+  if (outcome !== 'accepted') {
+    return jsonRes(res, 409, { ok: false, error: outcome });
+  }
+  return jsonRes(res, 200, { ok: true, outcome });
+});
+
 ipcRoute('GET', '/api/sessions', (_req, res) => {
   // Active first (live state), closed appended (historical)
   const active = listActiveSessions().map(composeRowFromActive);
@@ -500,7 +553,15 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
   jsonRes(res, 404, { error: 'not_found' });
 });
 
-ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
+/** Canonical daemon-side close used by the dashboard and `botmux delete`.
+ *  Host callers authenticate with HMAC; a read-isolated CLI may close only its
+ *  exact live session with the rotating per-turn capability. */
+ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req)
+    .catch(() => ({} as Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   const r = await closeSession(params.sessionId);
   jsonRes(res, 200, r);
 });
@@ -586,6 +647,83 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: true });
 });
 
+/**
+ * Count host-overload降压 candidates for THIS daemon's scope, so the alert card
+ * can show "僵尸 N / 闲置 M" before the owner clicks. `stopped` counts zombies
+ * from the SHARED session store (same answer on every daemon — the card handler
+ * only takes it from one), `idle` counts THIS daemon's own idle live workers
+ * (owning-daemon-authoritative — the handler sums across daemons). Mirrors the
+ * exact classification the sweep uses so the preview matches what a click does.
+ */
+ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
+  const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s)).length;
+  let idle = 0;
+  for (const ds of listActiveSessions()) {
+    if (!ds.worker || ds.worker.killed) continue;
+    if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;
+    if (ds.lastScreenStatus !== 'idle') continue;
+    idle++;
+  }
+  jsonRes(res, 200, { ok: true, stopped, idle });
+});
+
+/**
+ * Bulk host-overload降压 sweep, driven by the overload-alert card buttons.
+ * `mode`:
+ *   - `clean_stopped`: close stopped zombie sessions (dead CLI + no tmux) from
+ *     the SHARED session store — machine-wide, so a single daemon's sweep is
+ *     enough (the alert-owning daemon calls this once, no fan-out needed).
+ *   - `suspend_idle`: suspend THIS daemon's own idle (non-busy, suspendable,
+ *     non-adopt) live workers. Live workers only exist in their owning daemon's
+ *     process, so the card handler fans this mode out to every online daemon.
+ * Returns `{ ok, mode, affected }` — `affected` counts sessions acted on here.
+ */
+ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
+  let body: { mode?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const mode = body?.mode;
+
+  if (mode === 'clean_stopped') {
+    const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s));
+    let affected = 0;
+    for (const s of stopped) {
+      try {
+        const r = await closeSession(s.sessionId);
+        // Only count sessions this call actually closed. A shared-store session
+        // already closed by another daemon's concurrent sweep returns
+        // alreadyClosed=true — counting it would inflate `affected` by the
+        // number of daemons that raced on the same zombie.
+        if (r.ok && !r.alreadyClosed) affected++;
+      } catch (err) {
+        logger.warn(`[overload-sweep] close failed for ${s.sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    logger.info(`[overload-sweep] clean_stopped: closed ${affected}/${stopped.length} zombie session(s)`);
+    return jsonRes(res, 200, { ok: true, mode, affected });
+  }
+
+  if (mode === 'suspend_idle') {
+    // This daemon's own idle live workers only. Correctness guards mirror the
+    // idle-worker sweeper: never touch adopt sessions or mid-turn (busy) ones.
+    let affected = 0;
+    for (const ds of listActiveSessions()) {
+      if (!ds.worker || ds.worker.killed) continue;             // no live worker
+      if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;  // never suspend adopt
+      if (ds.lastScreenStatus !== 'idle') continue;              // never cut an in-flight reply
+      try {
+        if (suspendWorker(ds, 'host_overload_suspend')) affected++;
+      } catch (err) {
+        logger.warn(`[overload-sweep] suspend failed for ${ds.session.sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    logger.info(`[overload-sweep] suspend_idle: suspended ${affected} idle worker(s)`);
+    return jsonRes(res, 200, { ok: true, mode, affected });
+  }
+
+  return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
+});
+
 /** 会话级 CLI IPC（slash/cd）的调用方证明：trusted-host（.dashboard-secret HMAC，
  *  外层 gate 已验）直接放行；否则（沙箱/读隔离 CLI 读不到 secret，走
  *  routeHasNarrowUntrustedAuth 窄孔进来）必须出示该会话当前轮换的 capability，
@@ -648,7 +786,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
 });
 
 /** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）
- *  → 按能力位选择 idle 注入 /cd（进程不死）或杀进程冷启动兜底。
+ *  → 活 worker 走「带 --resume 的进程重启、respawn 在新 cwd」，无活 worker 杀残留
+ *  pane 让下条消息冷启动。
+ *
+ *  为什么是 respawn 而不是向活进程注入 /cd（旧实现）：CLI 的系统上下文（CLAUDE.md、
+ *  记忆路径/索引）是开场按启动 cwd 注入一次的静态快照，/cd 只改 cwd 不重刷——注入
+ *  切换后模型仍拿着旧角色的记忆索引读写（读旧索引、写错桶）。respawn 让「开场」在
+ *  新 cwd 重新发生：新角色的 CLAUDE.md/记忆索引开场即注入，--resume 回放对话历史
+ *  保留上下文（“换角色外壳、留对话内核”）。旧桶 transcript 由 claude-code 适配器的
+ *  resume 预检 syncClaudeResumeTargetToCwd（worker.ts 每次 resume respawn、probe 之前
+ *  把最新 <sid>.jsonl COPY 进新 cwd 的 project 目录，已在 master）接住，不会探空丢
+ *  上下文。故本改动可独立部署，不硬依赖任何跨桶迁移专项 PR。
+ *
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating
  *  capability；目录面由 validateRoleLibraryPath 硬校验承担（realpath 归一 +
  *  dev/ino 包含判断，角色库根之外一律拒）。
@@ -670,17 +819,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     return jsonRes(res, v.error === 'outside_role_library' ? 403 : 400, { ok: false, error: v.error });
   }
   repinSessionWorkingDir(ds, v.resolvedPath);
-  const cliId = ds.session.cliId;
-  let canInject = false;
-  try { canInject = !!(cliId && createCliAdapterSync(cliId as CliId).supportsSessionCwdMove); } catch { /* unknown cli */ }
-  if (ds.worker && !ds.worker.killed && canInject) {
-    // updateWorkingDir 随 inject_command 带给 worker：会话内 /cd 后 worker 内部的
-    // respawn（claude_exit 自动重启 / IM /restart / dashboard restart）必须收敛到
-    // 新目录，而不是陈旧的 lastInitConfig.workingDir。daemon 侧的 ds.initConfig 同步
-    // 更新，保持与 worker 侧一致（下次 forkWorker 用它重建 init 消息）。
+  if (ds.worker && !ds.worker.killed) {
+    // updateWorkingDir 随 restart 带给 worker：respawn 必须收敛到新目录，而不是
+    // 陈旧的 lastInitConfig.workingDir。daemon 侧的 ds.initConfig 同步更新，保持
+    // 与 worker 侧一致（下次 forkWorker 用它重建 init 消息）。
     if (ds.initConfig) ds.initConfig.workingDir = v.resolvedPath;
     try {
-      ds.worker.send({ type: 'inject_command', command: `/cd ${v.resolvedPath}`, updateWorkingDir: v.resolvedPath } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath } as DaemonToWorker);
     } catch {
       // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
       // repinSessionWorkingDir 已经把记录改成了新目录——绝不能留下「记录新、
@@ -688,7 +833,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
       killWorker(ds);
       return jsonRes(res, 200, { ok: true, mode: 'cold-restart', dir: v.resolvedPath });
     }
-    return jsonRes(res, 200, { ok: true, mode: 'inject', dir: v.resolvedPath });
+    return jsonRes(res, 200, { ok: true, mode: 'respawn-resume', dir: v.resolvedPath });
   }
   // Unconditional (no `ds.worker` guard), matching the IM `/cd` command handler
   // (src/core/command-handler.ts) — killWorker() already no-ops safely when there
@@ -708,45 +853,65 @@ function findSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
 }
 
+/** Four-state async lookup with durable fallback (design A).
+ *
+ *  In-memory `asyncTriggerResults` lives only on the active DaemonSession and is
+ *  lost on daemon restart / idle-suspend. To keep a poller from misreading an
+ *  already-completed turn as `not_found`, this resolves against BOTH the live
+ *  session and the on-disk stores:
+ *   - completed (mem or disk)          → completed + output.content + finishedAt
+ *   - pending in mem / session active  → running
+ *   - session record closed, no output → failed (no_output; soft terminal —
+ *                                         may be a real failure OR a caller close)
+ *   - no session record AND no result  → not_found (never existed / invalid id)
+ *
+ *  Legacy `action`/`async` fields are still populated so existing webhook
+ *  consumers keep working; new callers branch on `state`. */
 function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
   const ds = findActiveBySessionId(sessionId);
-  if (!ds) {
-    return { ok: false, errorCode: 'session_not_found', error: `active session not found: ${sessionId}` };
-  }
-  const resolvedTriggerId = triggerId || ds.latestAsyncTriggerId;
-  if (!resolvedTriggerId) {
-    return { ok: false, errorCode: 'bad_request', error: 'no async trigger recorded for this session' };
-  }
-  const state = ds.asyncTriggerResults?.get(resolvedTriggerId);
-  if (!state) {
-    return { ok: false, errorCode: 'bad_request', error: `async trigger not found for session: ${resolvedTriggerId}` };
-  }
-  if (state.status === 'completed') {
+  const storedRaw = ds?.session ?? sessionStore.getSession(sessionId);
+  const persistedRaw = asyncTriggerStore.lookup(sessionId, triggerId);
+
+  // Cross-bot isolation (fail-closed / positive-proof) — see decideAsyncOwnership.
+  // Both sessionStore.getSession() (cross-scans every bot's sessions-*.json) and
+  // the async store (machine-wide shared dir) can surface another bot's data for
+  // a sessionId routed to THIS daemon; keep only sources positively proven ours.
+  const decision = decideAsyncOwnership({
+    owner: cachedLarkAppId,
+    liveDs: !!ds,
+    storedOwner: storedRaw?.larkAppId,
+    storedExists: !!storedRaw,
+    persistedOwner: persistedRaw?.ownerLarkAppId,
+    persistedExists: !!persistedRaw,
+  });
+  const stored = decision.keepStored ? storedRaw : undefined;
+  const persisted = decision.keepPersisted ? persistedRaw : undefined;
+
+  if (decision.foreignLeak) {
     return {
       ok: true,
-      triggerId: resolvedTriggerId,
-      action: 'completed',
-      target: { kind: 'turn', sessionId, chatId: ds.chatId },
-      output: state.content ? { content: state.content } : undefined,
-      async: {
-        status: 'completed',
-        sessionId,
-        completedAt: state.completedAt ? new Date(state.completedAt).toISOString() : undefined,
-      },
-      message: 'async trigger completed',
+      state: 'not_found',
+      triggerId,
+      errorCode: 'session_not_found',
+      error: `no session record for: ${sessionId}`,
+      message: 'no session found',
     };
   }
-  return {
-    ok: true,
-    triggerId: resolvedTriggerId,
-    action: 'queued',
-    target: { kind: 'turn', sessionId, chatId: ds.chatId },
-    async: {
-      status: 'pending',
-      sessionId,
-    },
-    message: 'async trigger pending',
-  };
+
+  const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
+  const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
+
+  return resolveAsyncTriggerState({
+    sessionId,
+    liveActive: !!ds,
+    chatId: ds?.chatId ?? stored?.chatId,
+    memResult: memResult ? { status: memResult.status, content: memResult.content, completedAt: memResult.completedAt } : undefined,
+    memTriggerId: memResult ? memTriggerId : undefined,
+    persisted,
+    storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,
+    closedAt: stored?.closedAt,
+    requestedTriggerId: triggerId,
+  });
 }
 
 // 看板放置：dashboard 看板视图拖拽卡片后持久化列 + 列内排序位置。
@@ -932,12 +1097,10 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   const url = new URL(req.url ?? '/', 'http://localhost');
   const triggerId = url.searchParams.get('triggerId') ?? undefined;
   const result = buildAsyncTriggerLookupResponse(params.sessionId, triggerId);
-  const status = result.ok
-    ? 200
-    : result.errorCode === 'session_not_found'
-      ? 404
-      : 400;
-  jsonRes(res, status, result);
+  // Four-state semantics: the query itself succeeds (HTTP 200) for every
+  // resolved state including not_found — task state lives in `result.state`,
+  // not the HTTP status. Only a malformed lookup (ok:false) maps to non-200.
+  jsonRes(res, result.ok ? 200 : 400, result);
 });
 
 // 会话 insight：只读解析本会话的 transcript，产出动作 span / 失败聚合 / 规则建议
@@ -964,6 +1127,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/insight', (req, res, params) => {
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId,
       cwd: session.workingDir,
+      larkAppId: session.larkAppId,
     }, {
       offset,
       limit,
@@ -982,6 +1146,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/insight', (req, res, params) => {
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId,
       cwd: session.workingDir,
+      larkAppId: session.larkAppId,
     }, { detail });
     jsonRes(res, 200, { ok: true, report });
   } catch (err: any) {
@@ -1001,6 +1166,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/insight/turn/:turnIndex', (req, res, p
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId,
       cwd: session.workingDir,
+      larkAppId: session.larkAppId,
     }, parseInt(params.turnIndex, 10) || 0, { offset, limit });
     jsonRes(res, 200, { ok: true, turn });
   } catch (err: any) {
@@ -2188,6 +2354,19 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const sc = getBot(cachedLarkAppId).config.startupCommands;
     if (Array.isArray(sc) && sc.length) startupCommands = sc.join('\n');
   } catch { /* none */ }
+  // customPassthroughCommands / canTalkDaemonCommands → space-joined for the
+  // dashboard slash-command editors. Empty string = not configured (回默认).
+  let customPassthroughCommands = '';
+  let canTalkDaemonCommands = '';
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    if (Array.isArray(cfg.customPassthroughCommands) && cfg.customPassthroughCommands.length) {
+      customPassthroughCommands = cfg.customPassthroughCommands.join(' ');
+    }
+    if (Array.isArray(cfg.canTalkDaemonCommands) && cfg.canTalkDaemonCommands.length) {
+      canTalkDaemonCommands = cfg.canTalkDaemonCommands.join(' ');
+    }
+  } catch { /* none */ }
   // Per-bot env → pretty JSON for the dashboard textarea. The dashboard is
   // owner-authenticated, so showing the real values here is acceptable (same
   // as editing bots.json directly); the chat-facing /config get masks them.
@@ -2241,6 +2420,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
+    overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
@@ -2263,6 +2443,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     residentSessionCount,
     dormantSessionCount,
     startupCommands,
+    customPassthroughCommands,
+    canTalkDaemonCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
     riff: redactRiffForClient(getBot(cachedLarkAppId).config.riff),
@@ -2280,6 +2462,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
+    overloadAlert?: unknown;
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -2290,6 +2473,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
+    overloadAlert?: boolean;
   } = {};
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
   if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
@@ -2297,6 +2481,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.codexAppCleanInput === 'boolean') patch.codexAppCleanInput = body.codexAppCleanInput;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
+  if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
@@ -2675,6 +2860,58 @@ ipcRoute('PUT', '/api/bot-startup-commands', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, startupCommands: (value ?? []).join('\n') });
+});
+
+// Per-bot 透传 slash 命令 customPassthroughCommands。Body `{ customPassthroughCommands: string }`
+// （原始文本，逗号/空格分隔；空白＝清除→回仅内置白名单）。走 stringList 的
+// coerceConfigValue（用字段自带 parseList，与 /botconfig 同口径）+ applyConfigField
+// （写盘 + 内存热更新），immediate 生效。回包 space-joined 供输入框回填。
+ipcRoute('PUT', '/api/bot-custom-passthrough', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { customPassthroughCommands?: unknown };
+  try { body = await readJsonBody<{ customPassthroughCommands?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('customPassthroughCommands');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.customPassthroughCommands === 'string' ? body.customPassthroughCommands : '';
+  let value: string[] | null;
+  if (!raw.trim()) {
+    value = null;  // 清除 → 回仅内置白名单
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string[];
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, customPassthroughCommands: (value ?? []).join(' ') });
+});
+
+// Per-bot daemon 命令降权名单 canTalkDaemonCommands。Body
+// `{ canTalkDaemonCommands: string }`（原始文本，逗号/空格分隔；空白＝清除→回全部
+// 仅管理员）。走 stringList 的 coerceConfigValue（字段自带 parseList 只认 daemon
+// 命令，透传/拼错条目被滤掉）+ applyConfigField（写盘 + 内存热更新），immediate 生效。
+ipcRoute('PUT', '/api/bot-cantalk-daemon-commands', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { canTalkDaemonCommands?: unknown };
+  try { body = await readJsonBody<{ canTalkDaemonCommands?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('canTalkDaemonCommands');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.canTalkDaemonCommands === 'string' ? body.canTalkDaemonCommands : '';
+  let value: string[] | null;
+  if (!raw.trim()) {
+    value = null;  // 清除 → 回全部仅管理员
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string[];
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, canTalkDaemonCommands: (value ?? []).join(' ') });
 });
 
 // Per-bot launch-shell override launchShell。Body `{ launchShell: string }`：
@@ -3238,8 +3475,30 @@ ipcRoute('GET', '/api/events', (_req, res) => {
   // aggregator and the browser store upsert by sessionId, so any row also
   // delivered live just refreshes the same entry.
   try {
+    const activeIds = new Set<string>();
     for (const ds of listActiveSessions()) {
+      activeIds.add(ds.session.sessionId);
       res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromActive(ds) })}\n\n`);
+    }
+    // Also replay sessions CLOSED during this run as `session.spawned` carrying a
+    // closed row. The active-only replay above can't cover a restore-time zombie:
+    // restoreActiveSessions registers it, announces it, then immediately probes it
+    // 'missing' and closeSession()s it (evicting it from the active Map) — all
+    // before a racing dashboard's SSE subscription exists. By connect time it is
+    // neither in the active Map nor was it a closed row at the dashboard's early
+    // (pre-restore) hydrate, so without this it stays invisible (or, if the
+    // dashboard cached it active from before the restart, lingers as a stale
+    // active row — hydrateSessions only upserts, never deletes absent rows).
+    // Bounded to closedAt >= PROCESS_START_MS so we replay only this run's
+    // closures (the full closed history is already served by GET /api/sessions
+    // on hydrate). `session.spawned` (not session.update) because the row may be
+    // unknown to the client — both consumers upsert by sessionId, and the closed
+    // row's status:'closed' overwrites any stale active entry.
+    for (const s of sessionStore.listSessions()) {
+      if (s.status !== 'closed' || activeIds.has(s.sessionId)) continue;
+      const closedMs = s.closedAt ? Date.parse(s.closedAt) : NaN;
+      if (!Number.isFinite(closedMs) || closedMs < PROCESS_START_MS) continue;
+      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromClosed(s) })}\n\n`);
     }
   } catch (err) {
     logger.warn(`[dashboard-ipc] /api/events snapshot replay failed: ${err}`);

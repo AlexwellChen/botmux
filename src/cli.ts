@@ -77,7 +77,7 @@ import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interac
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
-import { scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
@@ -243,6 +243,10 @@ function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
   // stale dumps (see SESSION_CLI_HOME_ENV_KEYS for the full story, including
   // why GROK_HOME is exempt and why deleting beats pinning a default).
   scrubSessionCliHomeEnv(env);
+  // Claude session markers ride the same pm2 env-persistence vector; baked in
+  // they eventually flip transcript saving off fleet-wide once the tmux server
+  // respawns from a poisoned daemon (see CLAUDE_SESSION_MARKER_ENV_KEYS).
+  scrubClaudeSessionMarkerEnv(env);
   return env;
 }
 
@@ -3413,6 +3417,90 @@ function adoptedCliPid(s: SessionData): number | undefined {
   return typeof pid === 'number' && pid > 0 ? pid : undefined;
 }
 
+type SessionDeleteCloseResult =
+  | { ok: true; via: 'daemon' | 'offline' }
+  | { ok: false; error: string };
+
+/** Offline-only fallback for `botmux delete`. When the owning daemon is live,
+ *  it must own the whole close transition so its activeSessions registry,
+ *  persistent row, lifecycle hooks, subscriptions, and backend teardown stay
+ *  coherent. This legacy local path is safe only when there is no daemon
+ *  process whose in-memory state could be stranded. */
+function closeSessionOffline(s: SessionData): void {
+  const originalPid = adoptedCliPid(s);
+  // Adopted sessions own only the botmux worker/viewer, never the user's CLI.
+  if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
+    killProcess(s.pid);
+  }
+
+  // Adopted panes belong to the user. Ordinary bmx-* sessions are botmux-owned
+  // and still need direct cleanup when no daemon exists to run killWorker().
+  if (!isAdoptedSession(s)) {
+    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
+    try {
+      execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
+        stdio: 'ignore',
+        env: tmuxEnv(),
+      });
+    } catch { /* no tmux session */ }
+  }
+
+  s.status = 'closed';
+  s.closedAt = new Date().toISOString();
+  saveSession(s);
+}
+
+/** Close through the owning daemon whenever it is online. The IPC request is
+ *  deliberately sent BEFORE any local kill: deleting the current bmx-* tmux
+ *  first would terminate this very CLI before it can evict daemon memory.
+ *
+ *  Trusted host callers use the dashboard HMAC. A sandboxed/read-isolated CLI
+ *  can only authorize the exact current session with its rotating per-turn
+ *  capability, so `delete <other-id>` remains fail-closed. */
+async function closeSessionForDelete(
+  s: SessionData,
+  online = listOnlineDaemons(),
+): Promise<SessionDeleteCloseResult> {
+  // Legacy sessions without larkAppId live in sessions.json. A per-bot daemon
+  // writes only its own sessions-<appId>.json and silently no-ops on close
+  // (sessionStore.closeSession only touches the current file), so routing a
+  // legacy session to it yields "200 OK" with no actual state change. This must
+  // hold on BOTH ways a daemon port is discovered — the descriptor lookup AND
+  // the injected-port current-session fallback below — so gate the whole daemon
+  // path on larkAppId with one authoritative guard. A live daemon-spawned
+  // session always carries larkAppId, so this never diverts the legitimate
+  // sandboxed current-session close (which reaches its daemon via the injected
+  // port); it only keeps larkAppId-less legacy records on the offline fallback,
+  // whose saveSession() persists to the legacy file correctly.
+  if (!s.larkAppId) {
+    closeSessionOffline(s);
+    return { ok: true, via: 'offline' };
+  }
+
+  const daemon = online.find(d => d.larkAppId === s.larkAppId);
+  const isCurrentSession = process.env.BOTMUX_SESSION_ID === s.sessionId;
+  const injectedPort = isCurrentSession
+    ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
+    : undefined;
+  const ipcPort = daemon?.ipcPort ?? injectedPort;
+
+  if (ipcPort) {
+    try {
+      const res = await postSessionCliIpc(ipcPort, s.sessionId, 'close', {});
+      const body: any = await res.json().catch(() => ({}));
+      if (res.ok && body?.ok) return { ok: true, via: 'daemon' };
+      return { ok: false, error: body?.error ?? `HTTP ${res.status}` };
+    } catch (err: any) {
+      // A fresh daemon descriptor means there may still be authoritative
+      // in-memory state. Never fall back to a partial local kill in this case.
+      return { ok: false, error: `连接 daemon 失败: ${err?.message ?? err}` };
+    }
+  }
+
+  closeSessionOffline(s);
+  return { ok: true, via: 'offline' };
+}
+
 function adoptTargetLabel(s: SessionData): string {
   if (!isAdoptedSession(s)) return '';
   const a = s.adoptedFrom;
@@ -3628,26 +3716,16 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       process.stdout.write('\x1b[?1049l'); // leave alt screen
     }
 
-    function deleteSession(idx: number): void {
+    let deleteInFlight = false;
+
+    async function deleteSession(idx: number): Promise<void> {
       const r = rows[idx];
       const s = r.session;
-
-      // Kill botmux's worker process. For adopted sessions, never kill the
-      // user's original CLI pid if an old record stored it in `pid`.
-      const originalPid = adoptedCliPid(s);
-      if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
-        killProcess(s.pid);
+      const result = await closeSessionForDelete(s);
+      if (!result.ok) {
+        flashMsg = `\x1b[31m✗ 删除失败: ${result.error}\x1b[0m`;
+        return;
       }
-
-      // Kill only botmux-owned tmux sessions. Adopted panes belong to the user.
-      if (!r.isAdopt && r.hasTmux) {
-        try { execSync(`tmux kill-session -t '${r.tmuxName}' 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() }); } catch { /* */ }
-      }
-
-      // Mark closed & persist
-      s.status = 'closed';
-      s.closedAt = new Date().toISOString();
-      saveSession(s);
 
       // Remove from active list and TUI rows
       const activeIdx = active.indexOf(s);
@@ -3655,15 +3733,20 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       rows.splice(idx, 1);
 
       if (cursor >= rows.length) cursor = Math.max(0, rows.length - 1);
-      flashMsg = `\x1b[32m✓ 已删除 ${s.sessionId.substring(0, 8)}\x1b[0m`;
+      flashMsg = result.via === 'daemon'
+        ? `\x1b[32m✓ 已删除 ${s.sessionId.substring(0, 8)}\x1b[0m`
+        : `\x1b[33m✓ 已离线删除 ${s.sessionId.substring(0, 8)}\x1b[0m`;
     }
 
-    process.stdin.on('data', (key: string) => {
+    process.stdin.on('data', async (key: string) => {
+      if (deleteInFlight) return;
       // Delete confirmation mode
       if (confirmDelete) {
         confirmDelete = false;
         if (key === 'y' || key === 'Y') {
-          deleteSession(cursor);
+          deleteInFlight = true;
+          try { await deleteSession(cursor); }
+          finally { deleteInFlight = false; }
         } else {
           flashMsg = '\x1b[2m取消删除\x1b[0m';
         }
@@ -3801,7 +3884,7 @@ async function cmdList(): Promise<void> {
   await interactiveSessionPicker(live);
 }
 
-function cmdDelete(): void {
+async function cmdDelete(): Promise<void> {
   const target = process.argv[3];
   if (!target) {
     console.error('用法: botmux delete <session-id|all>');
@@ -3822,6 +3905,12 @@ function cmdDelete(): void {
     toDelete = active;
   } else if (target === 'stopped') {
     toDelete = active.filter(s => {
+      // A deliberately cap-suspended session has neither pid nor backing pane
+      // (that's how its memory is reclaimed) but must cold-resume on the next
+      // message — never a zombie. Mirrors the server-side isSessionStopped guard
+      // and the `list` prune disposition; without it `delete stopped` (which the
+      // overload alert text recommends) would drop a live-but-parked session.
+      if (isColdResumeDormant(s)) return false;
       if (isAdoptedSession(s)) {
         const pid = adoptedCliPid(s);
         return pid ? !isProcessAlive(pid) : !(s.pid && isProcessAlive(s.pid));
@@ -3851,33 +3940,30 @@ function cmdDelete(): void {
     }
   }
 
-  for (const s of toDelete) {
-    const originalPid = adoptedCliPid(s);
-
-    // Kill botmux's worker process if running. For adopted sessions, never
-    // kill the user's original CLI pid.
-    if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
-      killProcess(s.pid);
-      console.log(`  killed pid ${s.pid}`);
-    }
-
-    // Kill associated botmux-owned tmux session if it exists. Adopted panes
-    // belong to the user and must be left untouched.
-    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-    if (!isAdoptedSession(s)) {
-      try {
-        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() });
-        console.log(`  killed tmux ${tmuxName}`);
-      } catch { /* no tmux session */ }
-    }
-
-    // Mark session as closed
-    s.status = 'closed';
-    s.closedAt = new Date().toISOString();
-    saveSession(s);
-    console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}`);
+  // A self-delete may tear down the process running this loop. Put it last so
+  // `delete all` still closes every other target before the current session.
+  const currentSessionId = process.env.BOTMUX_SESSION_ID;
+  if (currentSessionId && toDelete.length > 1) {
+    toDelete.sort((a, b) => Number(a.sessionId === currentSessionId) - Number(b.sessionId === currentSessionId));
   }
-  console.log(`\n已关闭 ${toDelete.length} 个会话`);
+
+  const online = listOnlineDaemons();
+  let closed = 0;
+  let offline = 0;
+  let failed = 0;
+  for (const s of toDelete) {
+    const result = await closeSessionForDelete(s, online);
+    if (!result.ok) {
+      console.error(`✗ ${s.sessionId.substring(0, 8)} ${s.title}: ${result.error}`);
+      failed++;
+      continue;
+    }
+    closed++;
+    if (result.via === 'offline') offline++;
+    console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}${result.via === 'offline' ? '（daemon 离线，本地收口）' : ''}`);
+  }
+  console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}`);
+  if (failed > 0) process.exitCode = 1;
 }
 
 /**
@@ -3984,14 +4070,14 @@ async function cmdSuspend(): Promise<void> {
   if (failed > 0) process.exitCode = 1;
 }
 
-/** 会话级 CLI IPC（slash/cd）的 POST：与 postAsk 同款双路径——能读 host secret
+/** 会话级 CLI IPC（slash/cd/close）的 POST：与 postAsk 同款双路径——能读 host secret
  *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
  *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
  *  handler 与活跃记录比对。两条路都不读 bots.json。 */
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd',
+  route: 'slash' | 'cd' | 'close',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -4048,17 +4134,17 @@ async function cmdSlash(): Promise<void> {
   process.exit(1);
 }
 
-/** botmux cd <角色目录>：请求 daemon 重钉本话题工作目录（角色切换）。
- *  daemon 侧校验目录必须在 ~/botmux-roles 下；Claude 家族 idle 注入 /cd 不重启，
- *  其余 CLI 杀进程冷启动。协议要求本命令是该轮最后一个动作。 */
-async function cmdCd(): Promise<void> {
-  const argv = process.argv.slice(3);
+/** 角色切换（`botmux role switch <角色目录>`，唯一入口）。daemon 侧硬校验目录必须在
+ *  ~/botmux-roles 下。名字→目录的解析由调用方（模型读 _role-protocol.md）完成，本命令
+ *  只透传解析出的目标目录。argv 由 dispatch 传入 `process.argv.slice(4)`（跳过 `switch`
+ *  子命令词）。 */
+async function cmdRoleSwitch(argv: string[]): Promise<void> {
   const sIdx = argv.indexOf('--session');
   const explicitSid = sIdx >= 0 ? argv[sIdx + 1] : undefined;
   // 所有非 flag 位置参数 join(' ')，而不是只取第一个——路径含空格且未加引号时
-  // （如 `botmux cd ~/botmux-roles/我的 角色`）此前会被截断。
+  // （如 `botmux role switch ~/botmux-roles/我的 角色`）此前会被截断。
   const dir = argv.filter((a, i) => !a.startsWith('--') && !(sIdx >= 0 && i === sIdx + 1)).join(' ');
-  if (!dir) { console.error('用法: botmux cd <目标目录（含空格建议加引号）> [--session <id>]'); process.exit(1); }
+  if (!dir) { console.error(`用法: botmux role switch <目标角色目录（含空格建议加引号）> [--session <id>]`); process.exit(1); }
 
   const ctx = explicitSid ? null : findAncestorSessionContext();
   const sid = explicitSid ?? ctx?.sessionId;
@@ -4071,9 +4157,11 @@ async function cmdCd(): Promise<void> {
   const res = await postSessionCliIpc(daemon.ipcPort, s.sessionId, 'cd', { dir });
   const body: any = await res.json().catch(() => ({}));
   if (res.ok && body?.ok) {
-    console.log(body.mode === 'inject'
-      ? `✓ 已切换到 ${body.dir}（会话空闲时生效，进程不重启）`
-      : `✓ 已切换到 ${body.dir}（下条消息在新目录冷启动）`);
+    console.log(body.mode === 'respawn-resume'
+      ? `✓ 已切换到 ${body.dir}（进程即将在新目录重启并续回上下文）`
+      : body.mode === 'inject'  // 兼容旧 daemon 的注入模式
+        ? `✓ 已切换到 ${body.dir}（会话空闲时生效，进程不重启）`
+        : `✓ 已切换到 ${body.dir}（下条消息在新目录冷启动）`);
     return;
   }
   console.error(`✗ 切换被拒绝: ${body?.error ?? `HTTP ${res.status}`}`);
@@ -4707,7 +4795,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --isolated      挂起所有读隔离 bot（凭证轮换后用；下次冷启动自动同步最新凭证）
        --dry-run       只列出目标，不执行
   slash "<斜杠命令>"   会话空闲后向本会话 CLI 注入一条原生斜杠命令（需 bots.json 配 tuiSlashAllow；/cd 恒被拒）
-  cd <目录>        （会话内）切换本话题工作目录到角色库内的目录——角色切换用；
+  role switch <目录>  （会话内）切换本话题到角色库内的角色目录——角色切换用；
                    目录必须位于 ~/botmux-roles 之下
   term-link [id]   获取活跃会话的「可操作终端」（带写 token）。不回显链接，改由
                    daemon 把可操作卡片私密发给 owner（群内仅你可见，话题/单聊回退 DM）。
@@ -4792,6 +4880,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   skill show <name>                    读取某技能的完整 SKILL.md 说明（prompt 注入模式下按需拉取内置技能全文）
 
 编排 / workflow（v3）:
+  goal run <goal> [--run-id <id>] [--bot <id|name>] [--working-dir <dir>]
+                  [--timeout <seconds>] [--json]
+                                       在现有 v3 沙箱/worker 路径运行一个 headless goal；
+                                       同一 run-id 可安全重放终态或接续崩溃运行
   workflow save [last|runId] [名称]
                                        把成功 run 固化为 chat scope Saved Workflow；
                                        发布当前 Bot 全局版本 / 确认 unsafe lint 请由用户在飞书显式发送 /workflow save ...
@@ -5199,8 +5291,37 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   const scheduler = await import('./core/scheduler.js');
   const scheduleStore = await import('./services/schedule-store.js');
 
+  // Per-bot stores: bind this invocation to one bot's store — explicit
+  // --lark-app-id wins, else the surrounding session's bot (env/marker-derived;
+  // always present inside sandboxed sessions). A bare terminal without either
+  // binds to the primary bot (bots.json[0]) so mutations keep the legacy
+  // "ownerless task runs on bot-0" semantics; `list` without a bound bot
+  // aggregates every readable store instead.
+  const cliScopeAppId = argValue(rest, '--lark-app-id')
+    ?? detectCurrentSession()?.larkAppId
+    ?? process.env.BOTMUX_LARK_APP_ID;
+  // LAZY + sandbox-safe bots.json read: sandboxed sessions always carry a
+  // scope (env-injected appId) and must never touch bots.json — it is denied
+  // and `loadBotsJson()` process.exit(1)s on the read error. Only the bare
+  // unsandboxed terminal (aggregate list / cross-store id lookup) reads it,
+  // and even then failure degrades to "no other stores visible".
+  const allBotAppIds = (): string[] => {
+    try {
+      return parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE)
+        .map((b: { larkAppId?: unknown }) => b?.larkAppId)
+        .filter((x: unknown): x is string => typeof x === 'string');
+    } catch { return []; } // absent OR sandbox-denied → own scope only
+  };
+  if (cliScopeAppId) scheduleStore.setScheduleScope(cliScopeAppId);
+  else {
+    const first = allBotAppIds()[0];
+    if (first) scheduleStore.setScheduleScope(first);
+  }
+
   if (!sub || sub === 'list' || sub === 'ls') {
-    const tasks = scheduleStore.listTasks();
+    const tasks = cliScopeAppId
+      ? scheduleStore.listTasks()
+      : scheduleStore.listTasksForBots(allBotAppIds());
     if (tasks.length === 0) {
       console.log('暂无定时任务。\n\n用法:\n  botmux schedule add "每日17:50" "帮我看AI新闻"\n  botmux schedule add "every 2h" "检查构建"\n  botmux schedule add "0 9 * * *" "每天早安"');
       return;
@@ -5243,7 +5364,12 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const explicitRootMessageId = argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
       ?? (chatId && chatId === cur?.chatId ? cur.rootMessageId : undefined);
-    const larkAppId = argValue(rest, '--lark-app-id') ?? cur?.larkAppId;
+    // Owner resolution mirrors the store-scope resolution above (flag →
+    // session marker → daemon-injected env): a sandboxed session without a
+    // readable marker must still stamp its own bot as owner, or the task
+    // would land in this bot's store as OWNERLESS — which only the primary
+    // daemon executes — and never fire (codex review P1).
+    const larkAppId = cliScopeAppId;
     const workingDir = argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
     const name = argValue(rest, '--name') ?? (promptArg.length > 20 ? promptArg.slice(0, 20) + '…' : promptArg);
     const legacyDeliver = argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined;
@@ -5292,25 +5418,36 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const task = scheduler.addTask({
-      name,
-      schedule: rawSchedule,
-      parsed,
-      prompt: promptArg,
-      workingDir,
-      chatId,
-      rootMessageId,
-      larkAppId,
-      creatorChatId: cur?.chatId,
-      creatorRootMessageId: cur?.rootMessageId,
-      creatorLarkAppId: cur?.larkAppId,
-      chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
-      scope,
-      executionPosition,
-      topicTitle,
-      deliver,
-      silent,
-    });
+    let task;
+    try {
+      task = scheduler.addTask({
+        name,
+        schedule: rawSchedule,
+        parsed,
+        prompt: promptArg,
+        workingDir,
+        chatId,
+        rootMessageId,
+        larkAppId,
+        creatorChatId: cur?.chatId,
+        creatorRootMessageId: cur?.rootMessageId,
+        creatorLarkAppId: cur?.larkAppId,
+        chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
+        scope,
+        executionPosition,
+        topicTitle,
+        deliver,
+        silent,
+      });
+    } catch (err) {
+      // Sandboxed sessions can only write their OWN bot's store — a cross-bot
+      // `--lark-app-id` (or a scope pointing at another bot) fails closed here.
+      if (/EPERM|EACCES|not permitted/i.test(String(err))) {
+        console.error(`无法写入目标 bot 的定时任务存储（${larkAppId ?? '未指定'}）：沙盒会话只能管理自己 bot 的任务。`);
+        process.exit(1);
+      }
+      throw err;
+    }
 
     const next = task.nextRunAt ? new Date(task.nextRunAt).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }) : '—';
     console.log(`✅ 已创建定时任务 [${task.id}] ${task.name}`);
@@ -5329,29 +5466,51 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // Id-addressed op missed the bound store: locate the id across every
+  // READABLE bot store (bare-terminal admin usage) and rebind the scope to the
+  // owning bot for this one-shot process. Sandboxed callers cannot read
+  // sibling stores, so they stay confined to their own tasks by construction.
+  const retargetIfElsewhere = (): boolean => {
+    const hit = scheduleStore.findTaskAcrossBots(id, allBotAppIds());
+    if (!hit || hit.appId === scheduleStore.getScheduleScope()) return false;
+    scheduleStore.setScheduleScope(hit.appId);
+    console.log(`（任务属于 bot ${hit.appId} 的存储）`);
+    return true;
+  };
+
   switch (sub) {
     case 'remove':
     case 'rm':
     case 'delete':
-    case 'del':
-      if (scheduler.removeTask(id)) console.log(`已删除任务 ${id}`);
+    case 'del': {
+      let ok = scheduler.removeTask(id);
+      if (!ok && retargetIfElsewhere()) ok = scheduler.removeTask(id);
+      if (ok) console.log(`已删除任务 ${id}`);
       else { console.error(`未找到任务 ${id}`); process.exit(1); }
       break;
+    }
     case 'pause':
-    case 'disable':
-      if (scheduler.disableTask(id)) console.log(`已暂停任务 ${id}`);
+    case 'disable': {
+      let ok = scheduler.disableTask(id);
+      if (!ok && retargetIfElsewhere()) ok = scheduler.disableTask(id);
+      if (ok) console.log(`已暂停任务 ${id}`);
       else { console.error(`未找到任务 ${id}`); process.exit(1); }
       break;
+    }
     case 'resume':
-    case 'enable':
-      if (scheduler.enableTask(id)) console.log(`已恢复任务 ${id}`);
+    case 'enable': {
+      let ok = scheduler.enableTask(id);
+      if (!ok && retargetIfElsewhere()) ok = scheduler.enableTask(id);
+      if (ok) console.log(`已恢复任务 ${id}`);
       else { console.error(`未找到任务 ${id}`); process.exit(1); }
       break;
+    }
     case 'run':
       // Running requires the daemon (executeCallback is daemon-side).
       // CLI can only mark a task to run ASAP; daemon's next tick picks it up.
       {
-        const task = scheduleStore.getTask(id);
+        let task = scheduleStore.getTask(id);
+        if (!task && retargetIfElsewhere()) task = scheduleStore.getTask(id);
         if (!task) { console.error(`未找到任务 ${id}`); process.exit(1); }
         scheduleStore.updateTask(id, { nextRunAt: new Date().toISOString() });
         console.log(`已标记任务 ${id} 下次 tick 立即执行（< 30s）`);
@@ -9748,11 +9907,30 @@ switch (command) {
   case 'ls':      await cmdList(); break;
   case 'delete':
   case 'del':
-  case 'rm':      cmdDelete(); break;
+  case 'rm':      await cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
   case 'suspend': await cmdSuspend(); break;
   case 'slash':   await cmdSlash(); break;
-  case 'cd':      await cmdCd(); break;
+  case 'cd': {
+    // Tombstone for the removed `botmux cd`（改名为 `botmux role switch`）。**必须
+    // fail-loud**：存量部署里 _role-protocol.md 若还没刷新、模型仍发 `botmux cd`，
+    // 静默 exit 0 会让它以为切换成功（实际什么都没做）——「假切换成功」比明确报错
+    // 危险得多。所以这里打印迁移提示、退 1、绝不执行任何切换。
+    console.error('✗ `botmux cd` 已移除，改用 `botmux role switch <角色目录>`（同一切换语义）。');
+    console.error('  本次未执行任何切换。若你是角色协议（_role-protocol.md）触发的，请把命令刷新为 `botmux role switch`。');
+    process.exit(1);
+    break;
+  }
+  case 'role': {
+    // `botmux role switch <角色目录>` — 角色切换（唯一入口）。名字→目录的解析由
+    // 调用方（模型读 _role-protocol.md）完成，本命令只透传解析出的目标目录，daemon
+    // 侧硬校验目录必须在 ~/botmux-roles 下。
+    const sub = process.argv[3] ?? '';
+    if (sub === 'switch') { await cmdRoleSwitch(process.argv.slice(4)); break; }
+    console.error(`用法: botmux role switch <目标角色目录（含空格建议加引号）> [--session <id>]`);
+    process.exit(1);
+    break;
+  }
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
@@ -9889,6 +10067,11 @@ switch (command) {
     // real ephemeral worker pool, daemon-independent (dogfood path).
     const { cmdV3 } = await import('./workflows/v3/cli-run.js');
     await cmdV3(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
+  case 'goal': {
+    const { cmdGoal } = await import('./workflows/v3/goal-cli.js');
+    process.exitCode = await cmdGoal(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;

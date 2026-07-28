@@ -107,6 +107,16 @@ export function buildV3ProgressCard(
     appendSection(elements, '⚠️ 错误码', parts.length > 0 ? parts.join(' · ') : 'UNKNOWN');
   }
 
+  if (view.feishuHostFailed) {
+    appendSection(
+      elements,
+      'Feishu host 节点失败',
+      view.upstreamNonHostFinished
+        ? '上游非 host 节点已完成，失败发生在 Feishu host 节点。该节点可能是通知，也可能是业务交付；请按 DAG 语义核对后再决定是否重试。'
+        : '失败发生在 Feishu host 节点。该节点可能是通知，也可能是业务交付；其它业务节点状态请以节点进度为准。',
+    );
+  }
+
   if (view.uncertainHostEffectCount && view.uncertainHostEffectCount > 0) {
     appendSection(
       elements,

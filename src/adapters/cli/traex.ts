@@ -185,8 +185,9 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'traex',
     // Whole ~/.trae/cli kept REAL: traex is codex-based and keeps the same SQLite
-    // state/log DBs there (state_*.sqlite / logs_*.sqlite) — the sandbox home
-    // overlay lacks the fcntl locks SQLite needs (same failure as codex.ts).
+    // state/log DBs there (state_*.sqlite / logs_*.sqlite) — under the deny-by-
+    // default file sandbox a path not in authPaths doesn't exist, so the DBs are
+    // unreachable / lack the fcntl locks SQLite needs (same failure as codex.ts).
     authPaths: ['~/.trae/cli'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
