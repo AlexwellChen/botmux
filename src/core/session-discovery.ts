@@ -1027,7 +1027,14 @@ export function validateTmuxAdoptTarget(tmuxTarget: string, expectedPid: number,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: tmuxEnv() },
     ).trim();
     panePid = Number(out);
-    if (isNaN(panePid)) return false;
+    // 死/歧义目标下 `tmux display` 打印空 stdout 并以 exit 0 返回（不进 catch），
+    // 于是 `Number('') === 0` 且 `isNaN(0) === false`——必须显式挡掉 0 与负数，否则
+    // hasCliProcess(0, expectedPid, 6) 会从 pid 0 开始 BFS 整棵进程树、每个节点再
+    // fork 一次全量 `ps`（实测 >20s 同步冻结），并且一旦 expectedPid 恰好还活在机器
+    // 上任意位置就误报 alive。这条路径由 daemon 重启时对持久化 adopt 目标的校验触发
+    // （session-manager.ts 的 restore），目标 pane 可能已在两次重启间消失。
+    // 与 discoverAdoptableSessionByTarget 的守卫同源。
+    if (!Number.isInteger(panePid) || panePid <= 0) return false;
   } catch {
     return false;
   }

@@ -1090,6 +1090,25 @@ describe('validateAdoptTarget', () => {
     expect(result).toBe(false);
   });
 
+  it('死目标返回空 pane_pid + exit 0 时返回 false，绝不落到 pid 0 的进程树遍历', () => {
+    // 回归（与 discoverAdoptableSessionByTarget 同源）：`tmux display -t` 对死/歧义
+    // 目标不报错，只打印空 pane_pid，`Number('') === 0` 且 `isNaN(0) === false`。
+    // 少了正数校验就会调 hasCliProcess(0, expectedPid, 6)：从 pid 0 BFS 整棵进程树、
+    // 每个节点 fork 一次全量 `ps`（实测 >20s 同步冻结），且一旦 expectedPid 恰好还活在
+    // 机器上任意位置就误报 alive。这条路径由 daemon 重启对持久化 adopt 目标的校验触发。
+    // 注意与上面「pane not found」那条（mock 抛错）不同：这条不抛异常。
+    mockExecSync.mockImplementation((cmd: unknown) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('pane_pid')) return '\n';  // 真机对死目标的原样回显：空 pid
+      throw new Error(`unexpected command: ${cmdStr}`);
+    });
+
+    expect(validateAdoptTarget(tmuxTarget('nonexist:0.0', 1001))).toBe(false);
+
+    const cmds = mockExecSync.mock.calls.map(([c]) => String(c));
+    expect(cmds.some(c => c.includes('ps '))).toBe(false);  // 没碰进程树 → 没冻结
+  });
+
   it('should return false when CLI process has exited', () => {
     setupMocks({
       paneLines: 'mysession:0.0 1000\n',
