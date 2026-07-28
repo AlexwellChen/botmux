@@ -18,9 +18,8 @@ const textExtensions = new Set([
   '.html', '.css', '.sh', '.kdl',
 ]);
 const allowedHosts = new Set([
-  // Documented public integrations (keep intentional).
-  'riff.bytedance.net',
-  'riff-infra-boe.bytedance.net',
+  // Internal git host — appears in code comments and repo-parsing regexes;
+  // it is a well-known corporate hostname, not a private deployment endpoint.
   'code.byted.org',
   'tosv.byted.org',
 ]);

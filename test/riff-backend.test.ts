@@ -13,7 +13,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import { RiffBackend, parseRiffRepoName, deriveRiffRepoFromWorkingDir, deriveRiffReposFromDirs } from '../src/adapters/backend/riff-backend.js';
 
-const BASE = 'https://riff-infra-boe.bytedance.net';
+const BASE = 'https://riff-boe.example.com';
 
 type FetchCall = { url: string; init?: RequestInit };
 
@@ -675,7 +675,7 @@ describe('RiffBackend', () => {
       be.write('hi');
       await flush();
       resolvers.shift()!(taskResponse('task-1', {
-        accessUrl: 'https://riff.bytedance.net/sandbox-access?sessionId=abc&folder=%2Fx',
+        accessUrl: 'https://riff.example.com/sandbox-access?sessionId=abc&folder=%2Fx',
       }));
       await flush();
       expect(urls).toContain(`${BASE}/sandbox-access?sessionId=abc&folder=%2Fx`);
@@ -689,14 +689,14 @@ describe('RiffBackend', () => {
       be.write('hi');
       await flush();
       resolvers.shift()!(taskResponse('task-1', {
-        accessUrl: 'https://riff.bytedance.net/sandbox-access?sessionId=abc',
+        accessUrl: 'https://riff.example.com/sandbox-access?sessionId=abc',
         directAccessUrl: 'https://port-8080-v1-abc.cn-north.ai-sandbox-boe.byted.org/?folder=%2Fx',
       }));
       await flush();
       expect(urls[urls.length - 1]).toBe('https://port-8080-v1-abc.cn-north.ai-sandbox-boe.byted.org/?folder=%2Fx');
 
       // A later frontend-only URL must not replace the direct terminal URL.
-      (be as any).updateAccessUrl({ accessUrl: 'https://riff.bytedance.net/sandbox-access?sessionId=late' });
+      (be as any).updateAccessUrl({ accessUrl: 'https://riff.example.com/sandbox-access?sessionId=late' });
       expect(urls[urls.length - 1]).toBe('https://port-8080-v1-abc.cn-north.ai-sandbox-boe.byted.org/?folder=%2Fx');
     });
 
@@ -710,14 +710,14 @@ describe('RiffBackend', () => {
         calls.push({ url: u });
         if (u.includes('/api/task-detail')) {
           return Response.json({ success: true, data: { task: {
-            accessUrl: 'https://riff.bytedance.net/sandbox-access?sessionId=z',
+            accessUrl: 'https://riff.example.com/sandbox-access?sessionId=z',
             directAccessUrl: 'https://port-8080-z.cn-north.ai-sandbox-boe.byted.org/',
           } } });
         }
         return pendingSseResponse();
       });
       // Simulate the SSE init event carrying only the frontend accessUrl.
-      (be as any).handleSseEvent('event:init\ndata:{"accessUrl":"https://riff.bytedance.net/sandbox-access?sessionId=z"}', 'task-9');
+      (be as any).handleSseEvent('event:init\ndata:{"accessUrl":"https://riff.example.com/sandbox-access?sessionId=z"}', 'task-9');
       expect(urls[urls.length - 1]).toBe(`${BASE}/sandbox-access?sessionId=z`);
       await flush();
       expect(urls[urls.length - 1]).toBe('https://port-8080-z.cn-north.ai-sandbox-boe.byted.org/');

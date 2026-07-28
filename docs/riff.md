@@ -10,7 +10,7 @@
 
    | 字段 | 怎么填 |
    |------|--------|
-   | Base URL | **必填**。线上 `https://riff.bytedance.net`；BOE 测试环境 `https://riff-infra-boe.bytedance.net` |
+   | Base URL | **必填**。填你所在环境的 riff 服务地址（线上 / BOE 测试环境各一个域名，向 riff 团队或内部文档获取；形如 `https://riff.example.internal`） |
    | 运行环境 | 新任务使用的沙箱资源池：`BOE`（配置值 `boe`）或 `CN`（配置值 `cn`）；不配置时 Riff 默认 `boe`。该选择与 Base URL 所指向的 Riff 服务环境相互独立 |
    | 模型 | **留空**（默认 `gpt-5.5`）；推荐可选：`gpt-5.5` / `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.4` / `gpt-5.4-pro`（输入框有下拉建议） |
    | 思考等级 | codex 推理强度（low / medium / high / xhigh），留空跟随默认 medium |
@@ -25,7 +25,7 @@
 ```json
 {
   "riff": {
-    "baseUrl": "https://riff.bytedance.net",
+    "baseUrl": "https://riff.example.internal",
     "sandboxCluster": "cn"
   }
 }
