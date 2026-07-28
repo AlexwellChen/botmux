@@ -140,7 +140,7 @@ export function isValidRiffSandboxCluster(v: unknown): v is RiffSandboxCluster {
 }
 
 export interface RiffRepoRef {
-  /** Internal repo name, e.g. 'webinfra/agent-monorepo' (code.byted.org). */
+  /** Internal repo name, e.g. 'webinfra/agent-monorepo' (internal git host). */
   repoName: string;
   /** Branch to pin. Omitted → the repo's default branch. (The riff API
    *  ignores unknown fields like `branch`; `repoBranch` is the real one —
@@ -150,10 +150,10 @@ export interface RiffRepoRef {
 
 /**
  * Normalize a git origin URL / repo spec to riff's internal repoName.
- * Accepts `git@code.byted.org:group/repo.git`, `https://code.byted.org/group/repo(.git)`
- * and bare `group/repo`. Returns null for non-internal hosts (github.com etc.) —
- * the riff API validates repoName against the internal registry and cannot
- * clone external repos.
+ * Accepts the internal git host's SSH (`git@<host>:group/repo.git`) and HTTPS
+ * (`https://<host>/group/repo(.git)`) forms, plus bare `group/repo`. Returns
+ * null for non-internal hosts (github.com etc.) — the riff API validates
+ * repoName against the internal registry and cannot clone external repos.
  */
 export function parseRiffRepoName(spec: string): string | null {
   const s = spec.trim();
