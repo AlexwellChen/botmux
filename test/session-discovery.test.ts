@@ -33,6 +33,7 @@ import { execSync } from 'node:child_process';
 import { readFileSync, readlinkSync, existsSync, readdirSync } from 'node:fs';
 import {
   discoverAdoptableSessions,
+  discoverAdoptableSessionByTarget,
   validateAdoptTarget,
   isBareShellComm,
   bareShellLaunchKind,
@@ -193,12 +194,15 @@ function setupMocks(opts: {
     if (displayMatch) {
       const target = displayMatch[1];
 
-      // pane_pid query (for validateAdoptTarget)
+      // pane_pid query (for validateAdoptTarget / discoverAdoptableSessionByTarget)
       if (cmdStr.includes('pane_pid')) {
-        // Extract the target and find matching pane from paneLines
+        // Extract the target and find matching pane from paneLines.
+        // 取 pid 必须按**最后**一个空格切：会话名本身可能含空格
+        // （如「AD 智投星:0.0 651511」），按第一个空格切会把 pid 取成会话名的后半段。
+        // 这与 discoverAdoptableSessions 解析 list-panes 输出的规则一致。
         for (const line of paneLines.split('\n')) {
           if (line.startsWith(target + ' ')) {
-            return line.split(' ')[1] + '\n';
+            return line.slice(line.lastIndexOf(' ') + 1) + '\n';
           }
         }
         throw new Error('pane not found');
@@ -881,6 +885,107 @@ describe('discoverAdoptableSessions', () => {
     expect(results).toHaveLength(1);
     expect(results[0]!.cliId).toBe('traex');
     expect(results[0]!.cwd).toBe('/workspace/trae-proj');
+  });
+});
+
+describe('discoverAdoptableSessionByTarget', () => {
+  // 三个 pane，其中只有一个是我们要解析的目标。全量扫描会把三个都走一遍进程树，
+  // 快路径只碰目标那一个。
+  const threePanes = {
+    paneLines: 'dev:0.0 1000\ndev:0.1 2000\nother:0.0 3000\n',
+    commMap: { 1000: 'zsh', 1001: 'claude', 2000: 'zsh', 2001: 'codex', 3000: 'zsh', 3001: 'claude' },
+    childMap: { 1000: [1001], 2000: [2001], 3000: [3001] },
+    cwdMap: { 1001: '/project/a', 2001: '/project/b', 3001: '/project/c' },
+    dimsMap: { 'dev:0.0': '120 40', 'dev:0.1': '80 24', 'other:0.0': '200 50' },
+    claudeMeta: {
+      1001: JSON.stringify({ sessionId: 'sess-a', cwd: '/project/a', startedAt: 1700000000000 }),
+      3001: JSON.stringify({ sessionId: 'sess-c', cwd: '/project/c', startedAt: 1700000000000 }),
+    },
+  };
+
+  it('解析出的结果与全量扫描中同一 pane 的条目完全一致', () => {
+    // 这条是快路径的核心契约：只收窄候选集，不改判定结果。两者一旦漂移，
+    // /adopt 就会出现「卡片里能选、点了却接管不了」这类难查的偏差。
+    setupMocks(threePanes);
+    const fromFullScan = discoverAdoptableSessions().find(s => s.tmuxTarget === 'dev:0.0');
+
+    setupMocks(threePanes);
+    const fromFastPath = discoverAdoptableSessionByTarget('dev:0.0');
+
+    expect(fromFastPath).toEqual(fromFullScan);
+    expect(fromFastPath).toEqual({
+      source: 'tmux',
+      tmuxTarget: 'dev:0.0',
+      panePid: 1000,
+      cliPid: 1001,
+      cliId: 'claude-code',
+      sessionId: 'sess-a',
+      cwd: '/project/a',
+      startedAt: 1700000000000,
+      paneCols: 120,
+      paneRows: 40,
+    });
+  });
+
+  it('不执行 tmux list-panes —— 这正是它比全量扫描快的原因', () => {
+    setupMocks(threePanes);
+    discoverAdoptableSessionByTarget('dev:0.0');
+
+    const ranListPanes = mockExecSync.mock.calls.some(([cmd]) => String(cmd).includes('list-panes'));
+    expect(ranListPanes).toBe(false);
+  });
+
+  it('只解析目标 pane 的进程树，不碰其它 pane', () => {
+    setupMocks(threePanes);
+    discoverAdoptableSessionByTarget('dev:0.0');
+
+    // 其它两个 pane 的 shell pid 不应该出现在任何一条被执行的命令里
+    const allCmds = mockExecSync.mock.calls.map(([cmd]) => String(cmd)).join('\n');
+    expect(allCmds).not.toContain('2000');
+    expect(allCmds).not.toContain('3000');
+  });
+
+  it('与全量扫描一样跳过 bmx-* 会话（botmux 自己管的 pane）', () => {
+    setupMocks({
+      paneLines: 'bmx-managed:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'claude' },
+      childMap: { 1000: [1001] },
+      cwdMap: { 1001: '/project/a' },
+      dimsMap: { 'bmx-managed:0.0': '120 40' },
+    });
+
+    expect(discoverAdoptableSessionByTarget('bmx-managed:0.0')).toBeUndefined();
+  });
+
+  it('遵守 filterCliId —— 卡片 option 是用户可控输入，丢掉过滤等于允许切换 CLI 实现', () => {
+    setupMocks(threePanes);
+    // dev:0.1 跑的是 codex，一个 claude-code bot 不该解析得出它
+    expect(discoverAdoptableSessionByTarget('dev:0.1', 'claude-code')).toBeUndefined();
+
+    setupMocks(threePanes);
+    expect(discoverAdoptableSessionByTarget('dev:0.1', 'codex')?.cliId).toBe('codex');
+  });
+
+  it('pane 已经不存在时返回 undefined，由调用方回落全量扫描', () => {
+    setupMocks(threePanes);
+    expect(discoverAdoptableSessionByTarget('gone:9.9')).toBeUndefined();
+  });
+
+  it('会话名含空格时同样能解析（与全量扫描的切分规则一致）', () => {
+    setupMocks({
+      paneLines: 'AD 智投星核心指标:0.0 1000\n',
+      commMap: { 1000: 'fish', 1001: 'claude' },
+      childMap: { 1000: [1001] },
+      cwdMap: { 1001: '/home/user/project' },
+      dimsMap: { 'AD 智投星核心指标:0.0': '210 61' },
+      claudeMeta: {
+        1001: JSON.stringify({ sessionId: 'sess-spaced', cwd: '/home/user/project', startedAt: 1700000000000 }),
+      },
+    });
+
+    const result = discoverAdoptableSessionByTarget('AD 智投星核心指标:0.0');
+    expect(result?.tmuxTarget).toBe('AD 智投星核心指标:0.0');
+    expect(result?.sessionId).toBe('sess-spaced');
   });
 });
 
