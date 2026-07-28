@@ -11,14 +11,14 @@
  * in an independent 话题 instead (anchored on the `/relay` message).
  *
  * Rules (in order):
- *   1. p2p + p2pMode 'chat'  → chat-scope, anchor = chatId (扁平连续 DM; checked
- *      BEFORE the real-thread branch — same precedence as decideRouting, so a
- *      `/relay` typed inside a leftover DM thread still lands in the flat
+ *   1. p2p + p2pMode 'chat' (default) → chat-scope, anchor = chatId (扁平连续 DM;
+ *      checked BEFORE the real-thread branch — same precedence as decideRouting,
+ *      so a `/relay` typed inside a leftover DM thread still lands in the flat
  *      session rather than forking a thread-scope target)
  *   2. real thread reply     → thread-scope, anchor = message.rootId
  *      (`threadId && rootId`; covers 话题群 thread replies, DM 话题内回复, and
  *       any group's in-thread reply)
- *   3. p2p (thread default)  → thread-scope, anchor = message.messageId (the
+ *   3. p2p (explicit thread) → thread-scope, anchor = message.messageId (the
  *      `/relay` message seeds a fresh DM 话题 — same shape as a top-level DM
  *      message in decideRouting)
  *   4. 话题群 top-level       → thread-scope, anchor = message.messageId (seeds 话题)

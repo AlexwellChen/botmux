@@ -1193,8 +1193,8 @@ describe('decideRouting — p2p p2pMode (thread | chat)', () => {
   });
 
   it('chat/shared modes: a native topic seed stays chat-scope (folds into the group session, per /reply-mode contract)', async () => {
-    // The omt_ isolation is gated on chat-topic ONLY. chat (default) and shared
-    // are documented to fold native topics into the one group session, so the
+    // The omt_ isolation is gated on chat-topic ONLY. chat and shared are
+    // documented to fold native topics into the one group session, so the
     // seed must NOT escape to thread-scope here.
     mockGetChatMode.mockResolvedValue('group');
     for (const mode of ['chat', 'shared'] as const) {
@@ -1204,6 +1204,20 @@ describe('decideRouting — p2p p2pMode (thread | chat)', () => {
         root_id: undefined, thread_id: 'omt_native_topic',
       })).toEqual({ scope: 'chat', anchor: 'oc_group' });
     }
+  });
+
+  it('new-topic mode: a native topic seed is thread-scope via regularGroupRouting (not the omt_ branch)', async () => {
+    // new-topic forks a fresh thread-scope session for EVERY top-level message,
+    // so a native topic seed also lands thread-scope — but via regularGroupRouting
+    // (source=regular-group-thread), NOT the chat-topic-gated omt_ branch. This
+    // locks the "goes through regularGroupRouting yet still thread" semantic so a
+    // future omt_ gating change can't silently reroute new-topic seeds.
+    setupBotState({ regularGroupReplyMode: 'new-topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-nt-seed', chat_id: 'oc_group', chat_type: 'group',
+      root_id: undefined, thread_id: 'omt_native_topic',
+    })).toEqual({ scope: 'thread', anchor: 'msg-nt-seed' });
   });
 });
 
@@ -2039,7 +2053,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     // 的 `ctx.scope === 'chat' || source === 'regular-group-thread'` 两条件全 false
     // → 绕过 vetting → 静默 spawn 一个 thread-scope 会话。这条用例锁死「不能绕」。
     setupBotState({ allowedUsers: ['ou_owner'] });  // 受限态：gate 生效
-    mockGetChatMode.mockResolvedValueOnce('group');  // 普通群, regularGroupReplyMode unset(chat) → source=regular-group-chat
+    mockGetChatMode.mockResolvedValueOnce('group');  // 普通群, regularGroupReplyMode unset(chat-topic) → 顶层 @ 仍走 regularGroupRouting → source=regular-group-chat
     mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
     const event = makeBotMessageEvent({
       senderOpenId: OTHER_BOT_OPEN_ID,

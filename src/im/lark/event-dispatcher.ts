@@ -1774,9 +1774,9 @@ type RoutingDecision = {
 function regularGroupRouting(larkAppId: string, messageId: string, chatId: string): RoutingDecision {
   // Only `new-topic` forks a fresh thread-scope session for a TOP-LEVEL @.
   // `shared` stays chat-scope here (the topic fold happens post-routing, see
-  // maybeApplySharedTopicSeed); `chat` is the flat default; `chat-topic` is also
-  // flat at top level (it only diverges for native topics, where the fold is
-  // skipped — see maybeFoldMentionedRegularGroupThreadToChat). resolveRegularGroupMode
+  // maybeApplySharedTopicSeed); `chat` is flat top-level; `chat-topic` (the
+  // default) is also flat at top level (it only diverges for native topics,
+  // where the fold is skipped — see maybeFoldMentionedRegularGroupThreadToChat). resolveRegularGroupMode
   // is the single decision point so the modes never both fire.
   if (resolveRegularGroupMode(larkAppId, chatId) === 'new-topic') {
     return { scope: 'thread', anchor: messageId, source: 'regular-group-thread' };
