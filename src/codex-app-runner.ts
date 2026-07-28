@@ -359,8 +359,9 @@ async function ensureThread(): Promise<string> {
     config: {
       shell_environment_policy: { inherit: 'all' },
       // Per-turn reasoning effort → codex config key (ThreadStartParams accepts an
-      // arbitrary config map). 'xhigh' collapses to codex's max 'high'.
-      ...(args.reasoningEffort ? { model_reasoning_effort: args.reasoningEffort === 'xhigh' ? 'high' : args.reasoningEffort } : {}),
+      // arbitrary config map). Codex 0.145 accepts low/medium/high/xhigh and echoes
+      // xhigh back verbatim, so pass it through unchanged (no downgrade).
+      ...(args.reasoningEffort ? { model_reasoning_effort: args.reasoningEffort } : {}),
     },
     // Per-turn model override → ThreadStartParams top-level model. Only set on a
     // fresh thread/start, so a fold-in (existing thread) keeps its frozen model —

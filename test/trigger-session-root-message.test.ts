@@ -166,6 +166,33 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(buildExternalEventTopicMessage(request(), APP)).toBe('外部事件触发：alerts');
   });
 
+  it('stamps per-turn model + reasoningEffort onto a codex-family session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex-app', workingDir: '/tmp' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'gpt-5.6-terra', reasoningEffort: 'xhigh' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    // xhigh preserved verbatim (no downgrade — codex 0.145 accepts it)
+    expect(ds?.session.model).toBe('gpt-5.6-terra');
+    expect(ds?.session.reasoningEffort).toBe('xhigh');
+  });
+
+  it('does NOT stamp model/effort onto a non-codex (claude) session', async () => {
+    // Harness default bot is claude-code. The gate must keep the override from
+    // silently changing a non-codex bot's model.
+    const req = request();
+    (req.options as any) = { model: 'claude-opus-4-8', reasoningEffort: 'high' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.session.model).toBeUndefined();
+    expect(ds?.session.reasoningEffort).toBeUndefined();
+  });
+
   it('uses a connector-owned custom topic seed when opening a new topic', async () => {
     const req = request({ rootMessageId: undefined });
     req.presentation = { topicMessage: 'CI 构建失败，请检查发布流水线' };

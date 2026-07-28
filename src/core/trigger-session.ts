@@ -574,15 +574,20 @@ export async function triggerSessionTurn(
   session.lastMessageAt = new Date(now).toISOString();
   session.workingDir = wd.workingDir;
   session.cliId = bot.config.cliId;
-  // Per-turn model / reasoning-effort override (fresh spawn only). Stamped
-  // before the first fork so sessionAgentConfig freezes the chosen model and the
-  // init message carries the effort. A fold-in to an existing worker never
-  // reaches here, so overrides only apply to a newly-created session.
-  if (typeof req.options?.model === 'string' && req.options.model.trim()) {
-    session.model = req.options.model.trim();
-  }
-  if (req.options?.reasoningEffort) {
-    session.reasoningEffort = req.options.reasoningEffort;
+  // Per-turn model / reasoning-effort override — scoped to codex-family bots
+  // (the documented B-mode target) and to a freshly-created trigger session.
+  // Gating on cliId keeps the contract honest and bounded: it never silently
+  // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
+  // worker never reaches here. reasoningEffort is codex-only regardless (other
+  // adapters ignore it); model is gated here so it can't leak to non-codex CLIs.
+  const isCodexFamily = bot.config.cliId === 'codex' || bot.config.cliId === 'codex-app';
+  if (isCodexFamily) {
+    if (typeof req.options?.model === 'string' && req.options.model.trim()) {
+      session.model = req.options.model.trim();
+    }
+    if (req.options?.reasoningEffort) {
+      session.reasoningEffort = req.options.reasoningEffort;
+    }
   }
   sessionStore.updateSession(session);
 
