@@ -623,4 +623,71 @@ describe('empty-started session — first real business turn must use the new-to
     expect(forkInputs()[0]!.content).toContain('<botmux_routing>');
     expect(ds.session.initialUserTurnPending).toBe(true);
   });
+
+  // ─── regression: a FAILED delivery must not poison last* / --resume ──────────
+  //
+  // The refork branch decides `resume` from `hadPriorCliInput`, i.e. whether the
+  // session already has a real `lastCliInput`. An empty-started CLI never took a
+  // real turn, so lastCliInput is unset and the opening must COLD-SPAWN
+  // (resume:false). The bug: rememberLastCliInput ran BEFORE forkWorker, so a
+  // throwing fork left lastCliInput populated with an input that never launched;
+  // the retry then read it as prior history and wrongly resumed. The fix records
+  // last* only AFTER delivery is confirmed.
+
+  it('after a throwing cold fork, the RETRY still cold-spawns (resume:false), not resume:true', async () => {
+    const anchor = 'om_fork_boom_retry_root';
+    const ds = seedEmptyStarted(anchor, { live: false, hasHistory: true });
+    mocks.forkWorker.mockImplementationOnce(() => { throw new Error('fork boom'); });
+
+    await expect(handleThreadReply(
+      makeEventData('om_boom_first', '冷启失败的第一条', anchor),
+      makeCtx(anchor, 'om_boom_first'),
+    )).rejects.toThrow('fork boom');
+
+    // The failed attempt must NOT have recorded a phantom prior input …
+    expect(ds.session.initialUserTurnPending).toBe(true);
+    expect(ds.lastCliInput ?? ds.session.lastCliInput).toBeFalsy();
+
+    // … so the retry re-opens AND cold-spawns (never --resume a never-run CLI).
+    await handleThreadReply(
+      makeEventData('om_boom_retry', '重试', anchor),
+      makeCtx(anchor, 'om_boom_retry'),
+    );
+    const retryInput = forkInputs()[forkInputs().length - 1]!;
+    expect(retryInput.content).toContain('<botmux_routing>');
+    expect(mocks.forkWorker.mock.calls[mocks.forkWorker.mock.calls.length - 1]?.[2])
+      .toEqual({ resume: false, turnId: 'om_boom_retry' });
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  it('a rejected live send that loses its worker still cold-spawns on the refork retry (resume:false)', async () => {
+    // live worker rejects the opening (returns false) → marker restored. The
+    // worker then dies before the next message, so the retry hits the
+    // worker-null refork branch — which must still see no prior CLI input and
+    // cold-spawn, not resume the empty CLI.
+    const anchor = 'om_reject_then_dead_root';
+    const ds = seedEmptyStarted(anchor, { hasHistory: true });
+    mocks.sendWorkerInput.mockReturnValueOnce(false);
+
+    await handleThreadReply(
+      makeEventData('om_live_reject', '被拒的第一条', anchor),
+      makeCtx(anchor, 'om_live_reject'),
+    );
+    // Offered as an opening, refused, marker returned, no phantom prior input.
+    expect(liveInputs()[0]!.content).toContain('<botmux_routing>');
+    expect(ds.session.initialUserTurnPending).toBe(true);
+    expect(ds.lastCliInput ?? ds.session.lastCliInput).toBeFalsy();
+
+    // Worker dies; next message re-forks cold.
+    ds.worker = null;
+    await handleThreadReply(
+      makeEventData('om_after_death', '重试', anchor),
+      makeCtx(anchor, 'om_after_death'),
+    );
+    const retryInput = forkInputs()[forkInputs().length - 1]!;
+    expect(retryInput.content).toContain('<botmux_routing>');
+    expect(mocks.forkWorker.mock.calls[mocks.forkWorker.mock.calls.length - 1]?.[2])
+      .toEqual({ resume: false, turnId: 'om_after_death' });
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
 });

@@ -16566,10 +16566,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         });
     beginNewTurn(ds, parsed.content);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    rememberLastCliInput(ds, promptContent, cliInput);
     let accepted = false;
     try {
       accepted = sendWorkerInput(ds, cliInput, parsed.messageId);
+      // Record the input as the session's last real CLI turn ONLY after the
+      // worker accepted it. Recording before delivery (the old order) persisted
+      // lastCliInput / lastUserPrompt / Codex-App sidecar for a turn that never
+      // reached the CLI; a rejected send then left that poison behind, and the
+      // next message's worker-null refork would read it as `hadPriorCliInput`
+      // and wrongly `--resume` a CLI that never took a real turn.
+      if (accepted) rememberLastCliInput(ds, promptContent, cliInput);
     } finally {
       // The opening is one-shot: give it back when the worker died / refused,
       // so the next message re-opens instead of silently losing the context.
@@ -16704,8 +16710,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       );
     }
     await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    rememberLastCliInput(ds, promptContent, wrappedInput);
-    sessionStore.updateSession(ds.session);
     try {
       forkWorker(ds, wrappedInput, {
         // See `hadPriorCliInput` above — an opening on a CLI that never took any
@@ -16717,6 +16721,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       if (openingTurn) releaseInitialUserTurn(ds);
       throw e;
     }
+    // Record the input as the session's last real CLI turn ONLY after the fork
+    // succeeded. Recording before the fork (the old order) persisted lastCliInput
+    // for a turn that never launched when forkWorker threw; the retry then read
+    // that poison as `hadPriorCliInput` and wrongly `--resume`d a CLI that never
+    // took a real turn — breaking the empty-start invariant. forkWorker itself
+    // persists the session (clearing queued); this records last* + reply state.
+    rememberLastCliInput(ds, promptContent, wrappedInput);
+    sessionStore.updateSession(ds.session);
   }
 }
 
