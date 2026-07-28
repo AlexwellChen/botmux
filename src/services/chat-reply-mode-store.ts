@@ -3,9 +3,7 @@
  *
  * Four modes — unifies #116 + #131 into one knob so a chat resolves
  * to EXACTLY ONE mode and the two thread-reply mechanisms can never compete:
- *   • chat        — flat chat-scope replies in the group (default). A native
- *                    Lark topic the user opens here folds back into this one
- *                    chat-scope session too (see maybeFoldMentionedRegularGroupThreadToChat).
+ *   • chat        — flat chat-scope replies in the group (default).
  *   • topic/shared — 话题展示但复用同一个 session: reuse the bot's existing
  *                    chat-scope session/worker/cwd, but route this turn's reply
  *                    into the trigger message's thread (#131).
@@ -15,6 +13,11 @@
  *                    session (like `chat`), BUT a native Lark topic the user opens
  *                    runs its own independent thread-scope session (NOT folded).
  *                    "顶层平铺连续会话；群内原生话题各自独立会话".
+ *
+ * In every mode, a genuine native topic seed explicitly created by a user
+ * (`thread_id=omt_*`, no `root_id`) starts an independent thread-scope session.
+ * The modes above govern top-level bot replies and how an unowned existing
+ * topic is adopted; they never absorb a native topic session the bot owns.
  *
  * Resolution: per-chat override (`chatReplyModes[chatId]`) wins; otherwise fall
  * back to the per-bot default (`regularGroupReplyMode`, default 'chat'). The

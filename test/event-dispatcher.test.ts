@@ -1161,6 +1161,36 @@ describe('decideRouting — p2p p2pMode (thread | chat)', () => {
     expect(await decideRouting(MY_APP_ID, { message_id: 'msg-g', chat_id: 'oc_g', chat_type: 'group', root_id: 'root-g', thread_id: 'root-g' }))
       .toEqual({ scope: 'thread', anchor: 'root-g' });
   });
+
+  it('regular-group native topic seed starts an independent session at messageId', async () => {
+    setupBotState({});
+    mockGetChatMode.mockResolvedValue('group');
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-topic-root', chat_id: 'oc_group', chat_type: 'group',
+      root_id: undefined, thread_id: 'omt_native_topic',
+    })).toEqual({ scope: 'thread', anchor: 'msg-topic-root' });
+  });
+
+  it('a later reply in that native topic stays anchored at its root', async () => {
+    setupBotState({});
+    mockGetChatMode.mockResolvedValue('group');
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-topic-reply', chat_id: 'oc_group', chat_type: 'group',
+      root_id: 'msg-topic-root', thread_id: 'omt_native_topic',
+    })).toEqual({ scope: 'thread', anchor: 'msg-topic-root' });
+  });
+
+  it.each(['chat', 'shared', 'new-topic', 'chat-topic'] as const)(
+    'regular-group native topic seed stays independent in %s mode',
+    async (mode) => {
+      setupBotState({ regularGroupReplyMode: mode });
+      mockGetChatMode.mockResolvedValue('group');
+      expect(await decideRouting(MY_APP_ID, {
+        message_id: `msg-topic-${mode}`, chat_id: 'oc_group', chat_type: 'group',
+        root_id: undefined, thread_id: `omt_native_${mode}`,
+      })).toEqual({ scope: 'thread', anchor: `msg-topic-${mode}` });
+    },
+  );
 });
 
 describe('isBotMentioned', () => {
@@ -2669,34 +2699,34 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('folds an @ inside a regular-group topic into the chat-scope session when no thread session owns it', async () => {
-    // In chat/shared modes, a mentioned reply inside a regular-group topic should
-    // reuse the group chat-scope context and reply in that same topic, rather
-    // than spawning a new thread-scope session per topic.
-    const event = makeUserMessageEvent({
-      senderOpenId: USER_OPEN_ID,
-      content: JSON.stringify({ text: '@BotA new topic please' }),
-      rootId: 'real-topic-root',
-      threadId: 'omt_real_thread', // real Lark thread
-      chatId: 'chat-fallback-3',
-      chatType: 'group',
-      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
-    });
-    // Bot owns chat-scope at this chat — but we should NOT re-route into it.
-    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-fallback-3');
-    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+  it.each(['chat', 'shared', 'new-topic', 'chat-topic'] as const)(
+    'first entry into an unowned native topic stays independent in %s mode',
+    async (mode) => {
+      setupBotState({ regularGroupReplyMode: mode, allowedUsers: [USER_OPEN_ID] });
+      mockGetChatMode.mockResolvedValue('group');
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA join this native topic' }),
+        rootId: `real-topic-root-${mode}`,
+        threadId: `omt_real_thread_${mode}`,
+        chatId: 'chat-fallback-3',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      });
+      handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-fallback-3');
+      mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
 
-    await capturedHandlers['im.message.receive_v1'](event);
-    await flushEventWork();
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
 
-    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
-      scope: 'chat',
-      anchor: 'chat-fallback-3',
-      replyRootId: 'real-topic-root',
-      larkAppId: MY_APP_ID,
-    }));
-    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
-  });
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+        scope: 'thread',
+        anchor: `real-topic-root-${mode}`,
+        larkAppId: MY_APP_ID,
+      }));
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    },
+  );
 
   it('keeps thread-scope when root_id+thread_id are set and a thread session DOES exist', async () => {
     // Bot already owns a thread-scope session at this root → continue it.
@@ -2762,6 +2792,57 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       scope: 'chat',
       anchor: 'chat-reply-mode',
       replyRootId: 'msg-topic-alias-1',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('shared mode does not absorb an explicitly created native topic seed', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA work independently here' }),
+      messageId: 'msg-independent-topic',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      threadId: 'omt_independent_topic',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-independent-topic',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('shared mode keeps a native topic reply in its owned seed session', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue the independent work' }),
+      rootId: 'msg-independent-topic',
+      messageId: 'msg-independent-reply',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      threadId: 'omt_independent_topic',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'msg-independent-topic');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-independent-topic',
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
@@ -4870,6 +4951,28 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'thread',
       anchor: 'msg-topic-seed',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('话题群带 omt thread_id 的 seed 仍保留 autoStartOnNewTopic', async () => {
+    setupAutoTopicBot(true);
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '帮我处理这个新话题' }),
+      messageId: 'msg-topic-omt-seed',
+      chatId: 'chat-topic-omt',
+      chatType: 'group',
+      threadId: 'omt_topic_chat_seed',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-topic-omt-seed',
       larkAppId: MY_APP_ID,
     }));
   });

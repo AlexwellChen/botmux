@@ -1654,9 +1654,17 @@ async function maybeApplySharedTopicSeed(input: {
   messageId: string;
   routing: { scope: 'thread' | 'chat'; anchor: string };
   forceTopicApplied?: boolean;
+  independentTopicSeed?: boolean;
 }): Promise<string | undefined> {
-  const { larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied } = input;
-  if (forceTopicApplied) return undefined;
+  const {
+    larkAppId, chatId, chatType, message, senderOpenId, messageId, routing,
+    forceTopicApplied, independentTopicSeed,
+  } = input;
+  if (forceTopicApplied || independentTopicSeed) return undefined;
+  // This helper only seeds a shared reply topic. A message with both fields is
+  // already a reply inside a native thread; folding it would divert an owned
+  // thread session back into the group lobby and split one topic's context.
+  if (message?.root_id && message?.thread_id) return undefined;
   if (chatType !== 'group') return undefined;
   if (resolveRegularGroupMode(larkAppId, chatId) !== 'shared') return undefined;
   // Seeding a shared topic normally needs an @mention. But the 'never' and
@@ -1697,6 +1705,11 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   const rootId: string | undefined = message?.root_id;
   const threadId: string | undefined = message?.thread_id;
   if (!rootId || !threadId) return undefined;
+  // A genuine native Lark topic is an explicit user-created context boundary,
+  // even when this bot first enters on a later reply rather than on the seed.
+  // Synthetic/shared reply aliases do not use an omt_* thread id and continue
+  // through the regular-group fold below.
+  if (threadId.startsWith('omt_')) return undefined;
   const rawText = extractMessageTextForRouting(message);
   if (rawText) {
     const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
@@ -1726,6 +1739,8 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
 /** Compute the scope + anchor for an inbound message:
  *   - root_id + thread_id     → thread-scope, anchor = root_id (real Lark 话题)
  *   - 话题群 + no real thread → thread-scope, anchor = message_id (thread seed)
+ *   - 普通群 + thread_id only → thread-scope, anchor = message_id (a native
+ *                               user-created topic seed)
  *   - p2p + no real thread    → thread-scope, anchor = message_id (each DM
  *                               top-level message starts a fresh topic; a
  *                               reply inside an existing thread carries
@@ -1795,6 +1810,13 @@ async function decideRoutingWithSource(
   const mode = await getChatMode(larkAppId, chatId);
   if (mode === 'topic') {
     return { scope: 'thread', anchor: messageId, source: 'topic-chat' };
+  }
+  // A native topic root in a regular group carries thread_id=omt_* but no
+  // root_id. It must start its own session instead of sharing the group lobby
+  // session. Keep this after the topic-chat check so topic-group seeds retain
+  // source=topic-chat (and therefore autoStartOnNewTopic semantics).
+  if (threadId?.startsWith('omt_')) {
+    return { scope: 'thread', anchor: messageId, source: 'real-thread' };
   }
   return regularGroupRouting(larkAppId, messageId, chatId);
 }
@@ -2285,6 +2307,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (!replyRootId) {
           replyRootId = await maybeApplySharedTopicSeed({
             larkAppId, chatId, chatType, message, senderOpenId, messageId, routing: ctx, forceTopicApplied: forcedTopic,
+            independentTopicSeed: decision.source === 'real-thread' && !!message.thread_id && !message.root_id,
           });
         }
         // Foreign-bot @mention gate: apply the same vetted-peer/talk-only
@@ -2579,6 +2602,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       } else {
         const seedReplyRootId = await maybeApplySharedTopicSeed({
           larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
+          independentTopicSeed: decision.source === 'real-thread' && !!message.thread_id && !message.root_id,
         });
         if (seedReplyRootId) {
           replyRootId = seedReplyRootId;

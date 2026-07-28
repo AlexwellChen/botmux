@@ -213,7 +213,7 @@ export const messages: Record<string, string> = {
   'cmd.reply_mode.updated': '✅ Group reply mode updated to: {mode}',
   'cmd.reply_mode.unsupported': '⚠️ /reply-mode only works in regular groups and DMs; topic groups need no setting (they are already threaded).',
   'cmd.reply_mode.owner_only': '⚠️ Only owner/allowedUsers can change the session mode.',
-  'cmd.reply_mode.usage': 'Usage: /reply-mode chat | chat-topic | topic | new-topic\nchat = flat replies reusing the group session (even native topics fold into it); chat-topic = flat at top level reusing the group session, but each native topic runs its own independent session; topic = topic display while reusing the same group session (shared is a compatibility alias); new-topic = each @ opens a fresh topic + its own session.',
+  'cmd.reply_mode.usage': 'Usage: /reply-mode chat | chat-topic | topic | new-topic\nchat = flat top-level replies reusing the group session; chat-topic = flat at top level, while entry into an unowned native topic stays independent; topic = top-level topic display while reusing the same group session (shared is a compatibility alias); new-topic = each top-level @ opens a fresh topic + its own session. In every mode, a user-created native topic that the bot joins uses an independent session.',
   'cmd.reply_mode.failed': '⚠️ Failed to update reply mode: {reason}',
   'cmd.reply_mode.dm_status': 'Current DM session mode: {mode}\nCommands: /reply-mode chat | topic',
   'cmd.reply_mode.dm_updated': '✅ DM session mode updated to: {mode}',

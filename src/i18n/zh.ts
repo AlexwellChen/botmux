@@ -216,7 +216,7 @@ export const messages: Record<string, string> = {
   'cmd.reply_mode.updated': '✅ 已切换当前群回复模式为：{mode}',
   'cmd.reply_mode.unsupported': '⚠️ /reply-mode 仅支持普通群与私聊；话题群无需设置（本就是话题）。',
   'cmd.reply_mode.owner_only': '⚠️ 只有 owner/allowedUsers 可以修改会话模式。',
-  'cmd.reply_mode.usage': '用法：/reply-mode chat｜chat-topic｜topic｜new-topic\nchat=群内平铺回复且复用群会话（连原生话题也并进这个会话）；chat-topic=顶层平铺复用群会话，但群里原生话题各自独立会话；topic=回复落在话题里但复用同一个群 session（shared 是兼容别名）；new-topic=每次 @ 都开一个独立话题+独立会话。',
+  'cmd.reply_mode.usage': '用法：/reply-mode chat｜chat-topic｜topic｜new-topic\nchat=顶层消息平铺回复并复用群会话；chat-topic=顶层平铺复用群会话，进入尚未接管的原生话题时保持独立；topic=顶层回复落在话题里但复用同一个群 session（shared 是兼容别名）；new-topic=每次顶层 @ 都开一个独立话题+独立会话。所有模式下，用户显式创建并由 bot 接入的原生话题都会使用独立 session。',
   'cmd.reply_mode.failed': '⚠️ 切换失败：{reason}',
   'cmd.reply_mode.dm_status': '当前私聊会话模式：{mode}\n可用命令：/reply-mode chat｜topic',
   'cmd.reply_mode.dm_updated': '✅ 已切换私聊会话模式为：{mode}',
