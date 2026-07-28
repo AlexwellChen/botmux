@@ -1313,6 +1313,7 @@ export async function handleCommand(
           sessionId: ds.session.sessionId,
           cliSessionId: ds.session.cliSessionId,
           cwd: ds.session.workingDir,
+          larkAppId: ds.larkAppId ?? ds.session.larkAppId,
         }, { detail: 'summary' });
         await sessionReply(rootId, formatInsightCard(report, loc));
         break;
