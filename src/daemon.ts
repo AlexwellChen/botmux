@@ -111,6 +111,7 @@ import {
   initWorkerPool,
   setActiveSessionsRegistry,
   forkWorker,
+  forkAdoptWorker,
   sendWorkerInput,
   killWorker,
   reapOrphanWorkers,
@@ -16732,12 +16733,26 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     }
     await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     try {
-      forkWorker(ds, wrappedInput, {
-        // See `hadPriorCliInput` above — an opening on a CLI that never took any
-        // input cold-spawns rather than `--resume`-ing an empty session.
-        resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
-        turnId: parsed.messageId,
-      });
+      // Adopt sessions must re-fork via forkAdoptWorker, NOT forkWorker: the
+      // latter would spawn a fresh botmux-managed bmx-* CLI in the adopt cwd,
+      // losing the observe/bridge semantics and typing the wrapped prompt into a
+      // brand-new CLI instead of the user's original external pane. This branch
+      // is reachable whenever an adopt session's bridge worker has exited (crash,
+      // or the "adopted session ended" kill path) and a new Lark turn arrives.
+      // The turn's input rides in on the init prompt (bridge-formatted by
+      // buildReforkCliInput above); forkAdoptWorker queues it and the adopt idle
+      // detector flushes it to the observed pane. Adopt never --resumes a botmux
+      // session, so the openingTurn/hadPriorCliInput resume logic doesn't apply.
+      if (ds.adoptedFrom) {
+        forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId: parsed.messageId });
+      } else {
+        forkWorker(ds, wrappedInput, {
+          // See `hadPriorCliInput` above — an opening on a CLI that never took any
+          // input cold-spawns rather than `--resume`-ing an empty session.
+          resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+          turnId: parsed.messageId,
+        });
+      }
     } catch (e) {
       if (openingTurn) releaseInitialUserTurn(ds);
       throw e;
@@ -16966,7 +16981,17 @@ async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
     await noteTurnReceived(ds, commentId, text, sender, turnId);
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+    // Same adopt re-fork routing as handleThreadReply: an adopt session whose
+    // bridge worker exited must come back through forkAdoptWorker (observe +
+    // bridge), never forkWorker. buildDocCommentTurnInput(mode:'refork')
+    // delegates to buildReforkCliInput, which already bridge-formats the content
+    // when ds.adoptedFrom is set, so the doc-comment turn reaches the observed
+    // pane without a <user_message> wrapper.
+    if (ds.adoptedFrom) {
+      forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId });
+    } else {
+      forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+    }
   }
   return true;
   } catch (err) {
