@@ -167,6 +167,7 @@ import {
   ensureSessionWhiteboard,
 } from './core/session-manager.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
+import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
@@ -16011,6 +16012,15 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         // Mark a new turn so the CLI's response to /model, /clear, /compact, etc.
         // shows up as a fresh streaming card instead of silently PATCH-ing the
         // previous turn's card.
+        //
+        // Compatibility note (empty-start opening): a raw passthrough is a
+        // LITERAL CLI command — its contract is that the CLI sees exactly the
+        // bytes the user typed, never a botmux XML envelope. So it deliberately
+        // does NOT consume `Session.initialUserTurnPending`: wrapping `/model`
+        // in `<user_message>` would break the literal contract, and silently
+        // clearing the marker would lose the opening for the next real turn.
+        // `/model` on an empty-started session therefore stays literal and the
+        // FOLLOWING business message still opens as a new topic.
         beginNewTurn(ds, commandContent);
         ds.worker.send({
           type: 'raw_input',
@@ -16500,19 +16510,53 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const selfBot = getBot(ds.larkAppId);
     if (!isBridge) ensureSessionWhiteboard(ds);
     const effectiveCliId = ds.session.cliId ?? dsBotCfgForMsg.cliId;
+    // Empty-started session (repo select/skip/switch booted the CLI with no
+    // turn): a LIVE worker is not proof the CLI ever saw botmux's opening
+    // context — only `buildNewTopicCliInput` emits <botmux_routing> /
+    // <botmux_builtin_skills> / <identity>. Probe (non-consuming) before the
+    // awaits below, then claim SYNCHRONOUSLY right before building so two
+    // near-simultaneous first messages can only produce one opener; the loser
+    // degrades to an ordinary follow-up in queue order.
+    const wantsOpening = !isBridge && isInitialUserTurnPending(ds);
+    const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
+    const turnSender = await getThreadSender();
+    const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const cliInput = isBridge
       ? { content: buildBridgeInputContent(promptContent, {
           attachments,
           mentions: parsed.mentions,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         }) }
+      : openingTurn
+      ? buildNewTopicCliInput(
+          promptContent,
+          ds.session.sessionId,
+          effectiveCliId,
+          ds.session.cliPathOverride ?? dsBotCfgForMsg.cliPathOverride,
+          attachments,
+          parsed.mentions,
+          openingBots,
+          undefined,
+          { name: selfBot.botName, openId: selfBot.botOpenId },
+          localeForBot(larkAppId),
+          turnSender,
+          {
+            larkAppId,
+            chatId: ds.session.chatId,
+            whiteboardId: ds.session.whiteboardId,
+            substituteTrigger,
+            codexAppText: parsed.content,
+            codexAppApplicationContext,
+            codexAppMessageContext,
+          },
+        )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
           cliId: effectiveCliId,
           cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForMsg.cliPathOverride,
-          sender: await getThreadSender(),
+          sender: turnSender,
           larkAppId,
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
@@ -16522,9 +16566,22 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           codexAppMessageContext,
         });
     beginNewTurn(ds, parsed.content);
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    rememberLastCliInput(ds, promptContent, cliInput);
-    sendWorkerInput(ds, cliInput, parsed.messageId);
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    let accepted = false;
+    try {
+      accepted = sendWorkerInput(ds, cliInput, parsed.messageId);
+      // Record the input as the session's last real CLI turn ONLY after the
+      // worker accepted it. Recording before delivery (the old order) persisted
+      // lastCliInput / lastUserPrompt / Codex-App sidecar for a turn that never
+      // reached the CLI; a rejected send then left that poison behind, and the
+      // next message's worker-null refork would read it as `hadPriorCliInput`
+      // and wrongly `--resume` a CLI that never took a real turn.
+      if (accepted) rememberLastCliInput(ds, promptContent, cliInput);
+    } finally {
+      // The opening is one-shot: give it back when the worker died / refused,
+      // so the next message re-opens instead of silently losing the context.
+      if (openingTurn && !accepted) releaseInitialUserTurn(ds);
+    }
   } else {
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
     // any restored streaming-card reference; worker_ready will POST a fresh
@@ -16585,19 +16642,36 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       currentText: parsed.content,
       currentMessageContext: codexAppMessageContext,
     });
+    // Empty-started session that lost its worker (daemon restart, idle sweep,
+    // CLI exit) — same rule as the live branch: this is still the FIRST real
+    // user turn, so it must be built as a new topic. A queued(待办池) activation
+    // is excluded: its queuedPrompt already owns the first turn.
+    const wantsOpening = !ds.adoptedFrom && !queuedDashboardTurn && isInitialUserTurnPending(ds);
+    const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
+    const reforkSender = await getThreadSender();
+    // An empty-started CLI has nothing to resume: `hasHistory` is set
+    // unconditionally by restoreActiveSessions (and by claude_exit /
+    // suspendWorker), so it cannot tell "booted idle" from "has real history".
+    // `session.lastCliInput` can: rememberLastCliInput writes it on EVERY real
+    // CLI input, and the empty-start fork deliberately writes none. Snapshot it
+    // BEFORE this turn's own rememberLastCliInput below, so a session some
+    // non-IM path (scheduler / webhook trigger / doc comment) already fed keeps
+    // its normal `--resume` instead of being cold-spawned over.
+    const hadPriorCliInput = !!(ds.lastCliInput ?? ds.session.lastCliInput);
+    const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
       attachments,
       mentions: parsed.mentions,
       cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
       cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
-      sender: await getThreadSender(),
+      sender: reforkSender,
       substituteTrigger,
       codexAppText: reforkCodexApp.text,
       codexAppApplicationContext,
       codexAppMessageContext: reforkCodexApp.messageContext,
     });
-    const wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
+    let wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
       queued: queuedDashboardTurn,
       queuedText: queuedCodexAppText,
     });
@@ -16608,13 +16682,54 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // contain the reply and would silently discard the original task.
       logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
     }
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    if (openingTurn) {
+      // Replace the follow-up envelope built above with the real opening. The
+      // discarded build is pure string assembly (no side effects) — keeping the
+      // refork statement unconditional keeps the queued/substitute wiring, and
+      // its guard test, on a single code path.
+      wrappedInput = buildNewTopicCliInput(
+        reforkContent,
+        ds.session.sessionId,
+        ds.session.cliId ?? dsBotCfgForFork.cliId,
+        ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+        attachments,
+        parsed.mentions,
+        openingBots,
+        undefined,
+        { name: selfBot.botName, openId: selfBot.botOpenId },
+        localeForBot(larkAppId),
+        reforkSender,
+        {
+          larkAppId,
+          chatId: ds.session.chatId,
+          whiteboardId: ds.session.whiteboardId,
+          substituteTrigger,
+          codexAppText: reforkCodexApp.text,
+          codexAppApplicationContext,
+          codexAppMessageContext: reforkCodexApp.messageContext,
+        },
+      );
+    }
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    try {
+      forkWorker(ds, wrappedInput, {
+        // See `hadPriorCliInput` above — an opening on a CLI that never took any
+        // input cold-spawns rather than `--resume`-ing an empty session.
+        resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+        turnId: parsed.messageId,
+      });
+    } catch (e) {
+      if (openingTurn) releaseInitialUserTurn(ds);
+      throw e;
+    }
+    // Record the input as the session's last real CLI turn ONLY after the fork
+    // succeeded. Recording before the fork (the old order) persisted lastCliInput
+    // for a turn that never launched when forkWorker threw; the retry then read
+    // that poison as `hadPriorCliInput` and wrongly `--resume`d a CLI that never
+    // took a real turn — breaking the empty-start invariant. forkWorker itself
+    // persists the session (clearing queued); this records last* + reply state.
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, {
-      resume: ds.hasHistory,
-      turnId: parsed.messageId,
-    });
   }
 }
 
