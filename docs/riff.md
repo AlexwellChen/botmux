@@ -70,7 +70,7 @@ python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/ka
 - **自动复用**：会话工作目录是内部 Git 仓库 checkout 时，任务自动带上「该仓库 + 当前分支」。分支须已推送；本地未提交/未推送内容沙箱看不到（卡片状态行会提示）。
 - **仓库选择卡**：未配置默认工作目录时新会话弹卡选仓；「🔀 多仓库」可多选——批量建 worktree 全部带入，首仓为主仓（沙箱工作目录）。
 - **新建 worktree**：riff 机器人先自动把新分支 push 到远端再启动任务。
-- **限制**：仅支持内部 Git 仓库；GitHub 等外部仓自动跳过。
+- **限制**：只有 riff 服务端内部 registry 里的仓库能被 clone；GitHub 等外部仓无法进入沙箱。
 
 ## 卡片按钮说明
 
