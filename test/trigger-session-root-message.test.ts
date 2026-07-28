@@ -252,6 +252,28 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(send).toHaveBeenCalledWith({ type: 'message', content: expect.stringContaining('follow:') });
   });
 
+  it('fold-in to a live session does NOT overwrite its frozen model/effort', async () => {
+    // A per-turn override only applies to a freshly-created session. Folding into
+    // an existing worker must never rewrite the session's frozen model/effort
+    // (the existing-worker branch returns before the stamp; this locks that in).
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex-app', workingDir: '/tmp' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any });
+    ds.session.model = 'frozen-model';
+    ds.session.reasoningEffort = 'low';
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const req = request();
+    (req.options as any) = { model: 'new-model', reasoningEffort: 'xhigh' };
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(mockCreateSession).not.toHaveBeenCalled(); // folded in, not new
+    expect(ds.session.model).toBe('frozen-model');
+    expect(ds.session.reasoningEffort).toBe('low');
+  });
+
   it('uses an internal stable turn id without changing the public trigger schema', async () => {
     const send = vi.fn();
     const ds = existingDs({ worker: { killed: false, send } as any, workerGeneration: 7 });

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
 
@@ -57,6 +57,26 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await engine.setThreadName('[BotMux·Lark] final title');
     expect((await engine.readThreadMetadata()).name).toBe('[BotMux·Lark] final title');
     engine.stop();
+  }, 20_000);
+
+  it('forwards model + reasoningEffort (xhigh verbatim) into thread/start config', async () => {
+    // Guards the PR-A consumption gap codex caught: the engine must actually put
+    // model + model_reasoning_effort on thread/start config, and xhigh must NOT
+    // be downgraded (codex 0.145 accepts it).
+    const cfgFile = join(tmpdir(), `fake-thread-cfg-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'effort-wiring',
+      model: 'gpt-5.6-terra',
+      reasoningEffort: 'xhigh',
+      env: { ...process.env, FAKE_THREAD_CONFIG_FILE: cfgFile },
+    });
+    await engine.start();
+    await engine.startThread();
+    engine.stop();
+    const params = JSON.parse(readFileSync(cfgFile, 'utf8'));
+    rmSync(cfgFile, { force: true });
+    expect(params.config?.model).toBe('gpt-5.6-terra');
+    expect(params.config?.model_reasoning_effort).toBe('xhigh');
   }, 20_000);
 
   it('waits for resumed-thread metadata to advance before restoring its title', async () => {
