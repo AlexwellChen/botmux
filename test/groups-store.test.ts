@@ -65,7 +65,15 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
 }));
 
-import { listChats, isInChat, addBotToChat, createChat, transferChatOwner, getChatShareLink } from '../src/services/groups-store.js';
+import {
+  listChats,
+  isInChat,
+  addBotToChat,
+  createChat,
+  transferChatOwner,
+  getChatShareLink,
+  renameChat,
+} from '../src/services/groups-store.js';
 
 describe('groups-store wrappers', () => {
   beforeEach(() => { chatCreateStub.mockClear(); chatUpdateStub.mockClear(); chatLinkStub.mockReset(); });
@@ -83,6 +91,29 @@ describe('groups-store wrappers', () => {
 
   it('isInChat returns boolean', async () => {
     expect(await isInChat('appA', 'c1')).toBe(true);
+  });
+
+  it('renameChat reads the current chat then updates its name with the same bot identity', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 0 });
+    const result = await renameChat('appA', 'c1', '支付排障｜待验证');
+    expect(result).toEqual({
+      ok: true,
+      oldName: '',
+      newName: '支付排障｜待验证',
+      changed: true,
+    });
+    expect(chatUpdateStub).toHaveBeenCalledWith({
+      path: { chat_id: 'c1' },
+      data: { name: '支付排障｜待验证' },
+    });
+  });
+
+  it('renameChat maps a missing update scope to permission_denied', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 99991672, msg: 'scope missing' });
+    await expect(renameChat('appA', 'c1', '新群名')).resolves.toMatchObject({
+      ok: false,
+      error: 'permission_denied',
+    });
   });
 
   it('addBotToChat marks invalid_id_list as failed and rest as ok', async () => {
