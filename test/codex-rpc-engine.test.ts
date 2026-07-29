@@ -85,8 +85,9 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     // model-resume-override short-circuit drops the persisted {model, provider,
     // effort} triple to the current default. Fresh start still stamps both.
     // Asserts start-keeps AND resume-drops in ONE engine lifecycle so the two
-    // paths can't silently converge. (a) effort-only face is covered by the
-    // model-less test below; this locks the full-override face.
+    // paths can't silently converge. This locks the full-override face; the
+    // model-only and effort-only faces are locked independently below (each is a
+    // distinct short-circuit trigger, so no single test subsumes the others).
     const startFile = join(tmpdir(), `fake-start-cfg-${Math.round(performance.now())}.json`);
     const resumeFile = join(tmpdir(), `fake-resume-cfg-${Math.round(performance.now())}.json`);
     const engine = makeEngine({
@@ -120,6 +121,30 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     const engine = makeEngine({
       sessionId: 'resume-model-only',
       model: 'gpt-5.6-terra', // configured model, no reasoningEffort
+      env: { ...process.env, FAKE_RESUME_CONFIG_FILE: resumeFile },
+    });
+    await engine.start();
+    await engine.resumeThread('thread-fake-1');
+    engine.stop();
+    const resumeParams = JSON.parse(readFileSync(resumeFile, 'utf8'));
+    rmSync(resumeFile, { force: true });
+    expect(resumeParams.config?.model).toBeUndefined();
+    expect(resumeParams.config?.model_reasoning_effort).toBeUndefined();
+    // sanity: resume still carries the non-model params it must (env policy)
+    expect(resumeParams.config?.shell_environment_policy).toBeTruthy();
+  }, 20_000);
+
+  it('SUPPRESSES an effort-only override on thread/resume (the exact entry PR #639 newly activated)', async () => {
+    // The combination-sensitive face codex asked to lock independently: model
+    // ABSENT, reasoningEffort SET. This is the path PR #639 opened (worker.ts:709
+    // first fed effort into the engine), and it is a DISTINCT short-circuit
+    // trigger from model-only — the app-server early-returns on ANY single
+    // model-related key, so sending only model_reasoning_effort still drifts. The
+    // full-override and model-only tests above do NOT subsume it (both set model).
+    const resumeFile = join(tmpdir(), `fake-resume-effort-only-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'resume-effort-only',
+      reasoningEffort: 'xhigh', // effort set, model deliberately left unset
       env: { ...process.env, FAKE_RESUME_CONFIG_FILE: resumeFile },
     });
     await engine.start();
