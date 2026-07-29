@@ -4152,10 +4152,11 @@ function deliverFinalOutput(
     asyncResult.status = 'completed';
     asyncResult.content = msg.content;
     asyncResult.completedAt = completedAt;
+    if (msg.usage) asyncResult.usage = msg.usage;
     // Durably persist the outcome so trigger-result can rebuild `completed`
-    // (with content) after a daemon restart drops the in-memory Map. Stamp the
-    // owning bot for cross-bot isolation.
-    asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId);
+    // (with content + usage) after a daemon restart drops the in-memory Map.
+    // Stamp the owning bot for cross-bot isolation.
+    asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;

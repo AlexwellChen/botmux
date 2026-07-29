@@ -745,6 +745,14 @@ export type WorkerToDaemon =
       // which mixes presentation with payload).
       kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
       userText?: string;
+      /** Per-turn token usage (codex-app). Daemon persists it with the async
+       *  trigger result so trigger-result's completed state can report it. */
+      usage?: {
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadTokens: number;
+        cacheCreateTokens: number;
+      };
     }
   | {
       type: 'turn_terminal';

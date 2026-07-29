@@ -135,11 +135,11 @@ GET /api/sessions/:sessionId/trigger-result
 | `state` | Meaning | What to do | Key fields |
 |---------|---------|-----------|-----------|
 | `running` | still running | keep polling | — |
-| `completed` | final output ready | terminal; read `output.content` | `output.content`, `finishedAt` |
+| `completed` | final output ready | terminal; read `output.content` (codex-app also brings `usage`) | `output.content`, `finishedAt`, `usage?` |
 | `failed` | session terminated with no captured output (soft terminal) | see below | `errorCode:"no_output"`, `error`, `finishedAt` |
 | `not_found` | no such session (never existed / invalid id) | see two physical forms below | `errorCode:"session_not_found"` |
 
-`completed` example:
+`completed` example (`usage` present only for codex-app, and only when captured):
 
 ```json
 {
@@ -147,11 +147,19 @@ GET /api/sessions/:sessionId/trigger-result
   "state": "completed",
   "triggerId": "trg_87e7b415-...",
   "output": { "content": "ASYNC_DEMO_OK" },
+  "usage": { "inputTokens": 60, "outputTokens": 30, "cacheReadTokens": 40, "cacheCreateTokens": 0 },
   "finishedAt": "2026-07-24T08:43:17.126Z",
   "target": { "kind": "turn", "sessionId": "2eed60c4-...", "chatId": "http_async_..." },
   "async": { "status": "completed", "sessionId": "2eed60c4-...", "completedAt": "..." }
 }
 ```
+
+About `usage` (this turn's token usage, four mutually-exclusive buckets):
+- Present only for **codex-app tasks** and only when the turn's usage was captured; **omitted entirely** for other CLIs (including plain codex) or when not captured.
+- **omit ≠ 0**: no usage means no `usage` field, not four zeros — treat "field absent = unknown", don't read a missing field as a real 0.
+- Buckets: `inputTokens` (fresh input, cache read/write already subtracted), `outputTokens`, `cacheReadTokens`, `cacheCreateTokens`, all per-turn deltas (not session totals).
+- **Survives restart**: after a daemon restart, re-querying a completed session restores `usage` alongside `output` from disk.
+
 
 ### `failed` is a soft terminal — don't kill immediately
 

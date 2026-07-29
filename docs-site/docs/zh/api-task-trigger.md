@@ -135,11 +135,11 @@ GET /api/sessions/:sessionId/trigger-result
 | `state` | 含义 | 你该做什么 | 关键字段 |
 |---------|------|-----------|---------|
 | `running` | 任务还在跑 | 继续轮询 | — |
-| `completed` | 有最终产出 | 落终态，读 `output.content` | `output.content`、`finishedAt` |
+| `completed` | 有最终产出 | 落终态，读 `output.content`（codex-app 还会带 `usage`） | `output.content`、`finishedAt`、`usage?` |
 | `failed` | 会话已终止但没捕获到产出（软终态） | 见下方说明 | `errorCode:"no_output"`、`error`、`finishedAt` |
 | `not_found` | 查无此会话（从未存在/非法 id） | 见下方两种物理表现 | `errorCode:"session_not_found"` |
 
-`completed` 响应示例：
+`completed` 响应示例（`usage` 仅 codex-app、且成功采集到时出现）：
 
 ```json
 {
@@ -147,11 +147,19 @@ GET /api/sessions/:sessionId/trigger-result
   "state": "completed",
   "triggerId": "trg_87e7b415-...",
   "output": { "content": "ASYNC_DEMO_OK" },
+  "usage": { "inputTokens": 60, "outputTokens": 30, "cacheReadTokens": 40, "cacheCreateTokens": 0 },
   "finishedAt": "2026-07-24T08:43:17.126Z",
   "target": { "kind": "turn", "sessionId": "2eed60c4-...", "chatId": "http_async_..." },
   "async": { "status": "completed", "sessionId": "2eed60c4-...", "completedAt": "..." }
 }
 ```
+
+关于 `usage`（本轮 token 用量，四桶互斥）：
+- **仅 codex-app 任务**、且本轮成功采集到用量时出现；其它 CLI（含纯 codex）或未采集到时**整段省略**。
+- **omit ≠ 0**：拿不到用量就没有 `usage` 字段，而不是四个 0——请按"字段缺失=未知"处理，不要把缺失当成真实 0 用量。
+- 四桶：`inputTokens`（纯新增输入，已扣除缓存读/写）、`outputTokens`、`cacheReadTokens`、`cacheCreateTokens`，均为本轮增量（非会话累计）。
+- **随重启持久化**：daemon 重启后再查该已完成会话，`usage` 与 `output` 一并从磁盘恢复。
+
 
 ### `failed` 是软终态，不要立即判死
 

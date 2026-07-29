@@ -434,4 +434,88 @@ describe('codex-app-runner app-server protocol integration', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('folds thread/tokenUsage/updated into the final marker usage (four buckets)', async () => {
+    // Real runner + fake app-server emitting a token-usage notification; assert
+    // the emitted final marker carries the per-turn four-bucket usage.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-usage-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    let stdout = '';
+    const child = spawn(process.execPath, [
+      '--import', 'tsx', RUNNER_PATH, '--session-id', 'usage-int', '--codex-bin', fakeCodex, '--cwd', dir,
+    ], { cwd: resolve('.'), env: { ...process.env, FAKE_CODEX_LOG: logPath, FAKE_CODEX_VERSION: '0.144.6', FAKE_CODEX_BEHAVIOR: 'success', FAKE_TOKEN_USAGE: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    liveChildren.add(child);
+    child.stdout.on('data', c => { stdout += c.toString('utf8'); });
+    const harness: Harness = { child, get stdout() { return stdout; }, get stderr() { return ''; } };
+    try {
+      await waitForOutput(harness, o => o.includes('Codex App connected.'));
+      child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitForOutput(harness, o => FINAL_MARKER.test(o));
+      const final = decodeFinalMarker(harness.stdout);
+      // input=100 total incl cache; cached=40 → fresh input 60, output 30, cacheRead 40.
+      expect(final.usage).toEqual({ inputTokens: 60, outputTokens: 30, cacheReadTokens: 40, cacheCreateTokens: 0 });
+    } finally {
+      await stopChild(child);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('omits usage when a malformed tokenUsage notification poisons the turn (sticky)', async () => {
+    // malformed-then-valid same turn: the runner must NOT report only the later
+    // completion. Final marker usage is omitted.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-poison-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    let stdout = '';
+    const child = spawn(process.execPath, [
+      '--import', 'tsx', RUNNER_PATH, '--session-id', 'usage-poison', '--codex-bin', fakeCodex, '--cwd', dir,
+    ], { cwd: resolve('.'), env: { ...process.env, FAKE_CODEX_LOG: logPath, FAKE_CODEX_VERSION: '0.144.6', FAKE_CODEX_BEHAVIOR: 'success', FAKE_TOKEN_USAGE_POISON: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    liveChildren.add(child);
+    child.stdout.on('data', c => { stdout += c.toString('utf8'); });
+    const harness: Harness = { child, get stdout() { return stdout; }, get stderr() { return ''; } };
+    try {
+      await waitForOutput(harness, o => o.includes('Codex App connected.'));
+      child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitForOutput(harness, o => FINAL_MARKER.test(o));
+      const final = decodeFinalMarker(harness.stdout);
+      expect(final.usage).toBeUndefined();
+    } finally {
+      await stopChild(child);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('omits usage when asymmetric cacheWrite poisons the turn, even after a later valid packet (codex P1)', async () => {
+    // First packet: total carries cacheWriteInputTokens but last omits it. A
+    // 0-default on the missing side would misattribute cache-create into fresh
+    // input; the runner must poison. A subsequent symmetric packet must not
+    // resurrect a plausible-looking wrong split → final marker usage OMITTED.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-asym-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    let stdout = '';
+    const child = spawn(process.execPath, [
+      '--import', 'tsx', RUNNER_PATH, '--session-id', 'usage-asym', '--codex-bin', fakeCodex, '--cwd', dir,
+    ], { cwd: resolve('.'), env: { ...process.env, FAKE_CODEX_LOG: logPath, FAKE_CODEX_VERSION: '0.144.6', FAKE_CODEX_BEHAVIOR: 'success', FAKE_TOKEN_USAGE_ASYM: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    liveChildren.add(child);
+    child.stdout.on('data', c => { stdout += c.toString('utf8'); });
+    const harness: Harness = { child, get stdout() { return stdout; }, get stderr() { return ''; } };
+    try {
+      await waitForOutput(harness, o => o.includes('Codex App connected.'));
+      child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitForOutput(harness, o => FINAL_MARKER.test(o));
+      const final = decodeFinalMarker(harness.stdout);
+      expect(final.usage).toBeUndefined();
+    } finally {
+      await stopChild(child);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

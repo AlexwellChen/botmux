@@ -20,6 +20,10 @@ import {
   decodeCodexAppRunnerInput,
   type CodexAppRunnerInput,
 } from './services/codex-app-runner-protocol.js';
+import {
+  TurnTokenUsageAccumulator,
+  parseTokenUsagePair,
+} from './services/codex-app-token-usage.js';
 
 type JsonObject = Record<string, any>;
 
@@ -269,6 +273,31 @@ let codexVersion: CodexVersion | undefined;
 let cleanVersionWarningShown = false;
 let controller: CodexAppTurnController;
 
+/** Per-turn token accumulators keyed by codex appTurnId. Fed by
+ *  thread/tokenUsage/updated notifications; drained (and deleted) when the
+ *  matching turn's final marker is emitted. Bounded by turn lifetime — a turn
+ *  that never finalizes leaves at most one stale entry, cleared on next final. */
+const usageAccumulators = new Map<string, TurnTokenUsageAccumulator>();
+/** Only one turn is active at a time; a small cap bounds leakage from turns
+ *  that never emit a final marker. */
+const MAX_USAGE_ACCUMULATORS = 8;
+
+/** Get (or create, with bounded pruning) the usage accumulator for a turn. */
+function getOrCreateUsageAccumulator(turnId: string): TurnTokenUsageAccumulator {
+  let acc = usageAccumulators.get(turnId);
+  if (!acc) {
+    // Bounded pruning: a turn that never emits a final marker (crash/interrupt)
+    // would otherwise leak its accumulator. Evict the oldest insertion at the cap.
+    if (usageAccumulators.size >= MAX_USAGE_ACCUMULATORS) {
+      const oldest = usageAccumulators.keys().next().value;
+      if (oldest !== undefined) usageAccumulators.delete(oldest);
+    }
+    acc = new TurnTokenUsageAccumulator();
+    usageAccumulators.set(turnId, acc);
+  }
+  return acc;
+}
+
 function detectedCodexVersion(): CodexVersion | undefined {
   if (codexVersionChecked) return codexVersion;
   codexVersionChecked = true;
@@ -320,6 +349,32 @@ function handleServerRequest(msg: JsonObject): boolean {
 }
 
 function handleNotification(msg: JsonObject): void {
+  // Per-turn token usage rides on thread/tokenUsage/updated (NOT turn/completed).
+  // Feed the accumulator for the matching appTurnId; the controller ignores this
+  // method, so we handle it here and still delegate for everything else.
+  if (msg.method === 'thread/tokenUsage/updated') {
+    const params = (msg.params ?? {}) as JsonObject;
+    const turnId = typeof params.turnId === 'string' ? params.turnId : undefined;
+    if (turnId) {
+      const usage = (params.tokenUsage ?? {}) as JsonObject;
+      const parsed = parseTokenUsagePair(usage.total, usage.last);
+      const acc = getOrCreateUsageAccumulator(turnId);
+      if (parsed) {
+        acc.update(parsed.total, parsed.last);
+      } else {
+        // Malformed usage for a KNOWN turn: poison it (sticky). Silently skipping
+        // would let a later valid notification rebuild a fresh baseline and report
+        // only the last completion — a plausible-looking undercount. This also
+        // covers asymmetric cacheWrite presence (total has it, last omits it or
+        // vice-versa), where a 0-default would misattribute cache-create tokens.
+        acc.poison('malformed tokenUsage notification');
+      }
+    } else {
+      // No turnId to attribute usage to — can't fold it into any turn. Surface a
+      // protocol warning rather than dropping it entirely silently.
+      writeLine('[codex-app] tokenUsage notification without turnId (ignored)');
+    }
+  }
   controller?.handleNotification(msg);
 }
 
@@ -453,7 +508,17 @@ controller = new CodexAppTurnController({
   onDiagnostic: writeLine,
   onLifecycle: event => emitMarker('lifecycle', event),
   onFinal: marker => {
-    emitMarker('final', marker);
+    // Attach this turn's token usage (if the accumulator saw coherent totals)
+    // and drain its accumulator. Omitted when no usage was observed — never zeros.
+    const acc = marker.appTurnId ? usageAccumulators.get(marker.appTurnId) : undefined;
+    const usage = acc?.result() ?? undefined;
+    // Surface a protocol anomaly rather than silently omitting usage — a
+    // regression/negative-baseline should be visible in the runner log.
+    if (acc?.warning && !usage) {
+      writeLine(`[codex-app] token usage dropped for turn ${marker.appTurnId ?? '?'}: ${acc.warning}`);
+    }
+    if (marker.appTurnId) usageAccumulators.delete(marker.appTurnId);
+    emitMarker('final', usage ? { ...marker, usage } : marker);
     writeLine();
   },
   onPrompt: prompt,
