@@ -99,6 +99,7 @@ export function getDaemonSessionUsageSnapshot(
         ?? ds.session.workingDir
         ?? ds.session.adoptedFrom?.cwd
         ?? ds.adoptedFrom?.cwd,
+      larkAppId: ds.larkAppId,
       fresh: true,
     });
   } catch (error) {

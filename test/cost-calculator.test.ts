@@ -20,6 +20,10 @@ vi.mock('node:fs', async (importOriginal) => {
   return {
     ...original,
     existsSync: vi.fn(() => false),
+    lstatSync: vi.fn(() => ({
+      isFile: () => true,
+      mtimeMs: 0,
+    })),
     readFileSync: vi.fn(() => ''),
   };
 });
@@ -528,8 +532,14 @@ describe('getSessionTokenUsage', () => {
       turns: 0,
       model: '',
     });
-    expect(findCodexSessionIdByBotmuxSessionId).toHaveBeenCalledWith('botmux-sid');
-    expect(findCodexRolloutBySessionId).toHaveBeenCalledWith('codex-sid');
+    expect(findCodexSessionIdByBotmuxSessionId).toHaveBeenCalledWith(
+      'botmux-sid',
+      { codexHome: expect.any(String) },
+    );
+    expect(findCodexRolloutBySessionId).toHaveBeenCalledWith(
+      'codex-sid',
+      { codexHome: expect.any(String) },
+    );
   });
 
   it('keeps Codex latest context usage separate from cumulative Session tokens', () => {
@@ -588,6 +598,36 @@ describe('getSessionTokenUsage', () => {
         turns: 0,
         model: '',
       },
+    });
+  });
+
+  it('reports Codex context when token_count omits cumulative totals', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: {
+            input_tokens: 49_978,
+            cached_input_tokens: 49_536,
+            output_tokens: 274,
+            reasoning_output_tokens: 38,
+            total_tokens: 50_252,
+          },
+          model_context_window: 258_400,
+        },
+      },
+    }));
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      fresh: true,
+    })).toEqual({
+      context: { usedTokens: 50_252, windowTokens: 258_400, percentUsed: 19 },
+      tokens: null,
     });
   });
 
@@ -947,6 +987,27 @@ describe('getSessionTokenUsage', () => {
 
     expect(findCodexSessionIdByBotmuxSessionId).toHaveBeenCalledTimes(1);
     expect(findCodexRolloutBySessionId).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not scan Codex history when cliSessionId is already authoritative', () => {
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(
+      '/home/testuser/.codex/sessions/rollout-codex-explicit.jsonl',
+    );
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { total_token_usage: { input_tokens: 1, output_tokens: 1 } },
+      },
+    }));
+
+    getSessionTokenUsage({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-explicit',
+    });
+
+    expect(findCodexSessionIdByBotmuxSessionId).not.toHaveBeenCalled();
   });
 
   it('retries a missed codex path lookup only after the retry window', () => {

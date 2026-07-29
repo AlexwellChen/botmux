@@ -8,7 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
-import { buildMarkdownCard } from '../src/im/lark/md-card.js';
+import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -303,13 +303,65 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).not.toContain('botmux');
   });
 
+  it('preserves an ambiguous legacy default-brand-only line', () => {
+    const formatA = {
+      elements: [[
+        { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+      ]],
+    };
+    const formatB = {
+      body: { elements: [{
+        tag: 'markdown',
+        text_size: 'notation_small_v2',
+        content: "<font color='grey'>[botmux](https://github.com/deepcoldy/botmux)</font>",
+      }] },
+    };
+
+    expect(parseApiMessage(makeMsg('interactive', formatA)).content)
+      .toContain('botmux(https://github.com/deepcoldy/botmux)');
+    expect(parseApiMessage(makeMsg('interactive', formatB)).content)
+      .toContain('[botmux](https://github.com/deepcoldy/botmux)');
+  });
+
+  it('only applies marker-less legacy footer compatibility at the card tail', () => {
+    const formatA = {
+      elements: [
+        [
+          { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+          { tag: 'text', text: ' · 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+        [{ tag: 'text', text: '后续正文' }],
+      ],
+    };
+    const formatB = {
+      body: { elements: [
+        {
+          tag: 'markdown',
+          text_size: 'notation_small_v2',
+          content: "<font color='grey'>[botmux](https://github.com/deepcoldy/botmux) · 发送给：<at id=ou_owner></at></font>",
+        },
+        { tag: 'markdown', content: '后续正文' },
+      ] },
+    };
+
+    expect(parseApiMessage(makeMsg('interactive', formatA)).content).toContain('botmux');
+    expect(parseApiMessage(makeMsg('interactive', formatB)).content).toContain('[botmux]');
+  });
+
   it('drops a Format A usage-only footer when the bot brand is disabled', () => {
     const card = {
       elements: [
         [{ tag: 'text', text: '正文内容' }],
         [
           { tag: 'text', text: '上下文 159.9K/258.4K (62%)' },
-          { tag: 'text', text: ' · Token ↑3.7M ↓23.3K · 发送给：' },
+          { tag: 'text', text: ' · Token ↑3.7M ↓23.3K ' },
+          {
+            tag: 'a',
+            text: '·',
+            href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1',
+          },
+          { tag: 'text', text: ' 发送给：' },
           { tag: 'at', user_name: 'Owner' },
         ],
       ],
@@ -326,7 +378,13 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
       elements: [
         [{ tag: 'text', text: '正文内容' }],
         [
-          { tag: 'text', text: 'Token ↑3.7M ↓23.3K · 发送给：' },
+          { tag: 'text', text: 'Token ↑3.7M ↓23.3K ' },
+          {
+            tag: 'a',
+            text: '·',
+            href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1',
+          },
+          { tag: 'text', text: ' 发送给：' },
           { tag: 'at', user_name: 'Owner' },
         ],
       ],
@@ -342,7 +400,13 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
       elements: [
         [{ tag: 'text', text: '正文内容' }],
         [
-          { tag: 'text', text: '上下文 159.9K/258.4K (62%) · 发送给：' },
+          { tag: 'text', text: '上下文 159.9K/258.4K (62%) ' },
+          {
+            tag: 'a',
+            text: '·',
+            href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1',
+          },
+          { tag: 'text', text: ' 发送给：' },
           { tag: 'at', user_name: 'Owner' },
         ],
       ],
@@ -372,6 +436,129 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).toContain('正文内容');
     expect(result.content).not.toContain('Acme');
     expect(result.content).not.toContain('发送给');
+  });
+
+  it('accepts a semantically equivalent decoded marker URL from Lark', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: 'Acme ' },
+          {
+            tag: 'a',
+            text: '·',
+            href: 'https://github.com/deepcoldy/botmux#reply-card-footer-v1',
+          },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Acme');
+  });
+
+  it('preserves marker-prefix URLs and exact marker URLs with ordinary link text', () => {
+    const formatA = {
+      elements: [
+        [{
+          tag: 'a',
+          text: '·',
+          href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1-guide',
+        }],
+        [{
+          tag: 'a',
+          text: '协议文档',
+          href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1',
+        }],
+      ],
+    };
+    const formatB = {
+      body: { elements: [
+        {
+          tag: 'markdown',
+          content: "<font color='grey'>"
+            + '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1-guide)'
+            + '</font>',
+        },
+        {
+          tag: 'markdown',
+          content: '[协议文档](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+        },
+      ] },
+    };
+
+    const textA = parseApiMessage(makeMsg('interactive', formatA)).content;
+    expect(textA).toContain('reply-card-footer-v1-guide');
+    expect(textA).toContain('协议文档');
+    const textB = parseApiMessage(makeMsg('interactive', formatB)).content;
+    expect(textB).toContain('reply-card-footer-v1-guide');
+    expect(textB).toContain('协议文档');
+  });
+
+  it('drops an English custom-brand footer through its visible separator marker', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: 'body' }],
+        [
+          { tag: 'text', text: 'Acme ' },
+          {
+            tag: 'a',
+            text: '·',
+            href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1',
+          },
+          {
+            tag: 'text',
+            text: ' Context 50.3K/258.4K (19%) · Tokens ↑1M ↓2K · Sent to: ',
+          },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('body');
+    expect(result.content).not.toContain('Acme');
+    expect(result.content).not.toContain('Context 50.3K');
+    expect(result.content).not.toContain('Tokens ↑1M');
+    expect(result.content).not.toContain('Sent to');
+  });
+
+  it('keeps a marker-less English usage-and-recipient paragraph as user data', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: 'body' }],
+        [
+          {
+            tag: 'text',
+            text: 'Context 50.3K/258.4K (19%) · Tokens ↑1M ↓2K · Sent to: ',
+          },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('body');
+    expect(result.content).toContain('Context 50.3K/258.4K (19%)');
+    expect(result.content).toContain('Tokens ↑1M ↓2K');
+    expect(result.content).toContain('Sent to: @Owner');
+  });
+
+  it('keeps a marker-less custom-brand footer-shaped paragraph as user data', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: 'body' }],
+        [
+          {
+            tag: 'text',
+            text: 'Acme · Context 50.3K/258.4K (19%) · Tokens ↑1M ↓2K · Sent to: ',
+          },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('Acme · Context 50.3K/258.4K (19%)');
+    expect(result.content).toContain('Tokens ↑1M ↓2K');
+    expect(result.content).toContain('Sent to: @Owner');
   });
 
   it('keeps ordinary prose that mentions context and tokens', () => {
@@ -452,6 +639,14 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).not.toContain('发送给');
   });
 
+  it('round-trips a footer whose custom brand contains an unmatched bracket', () => {
+    const raw = buildMarkdownCard('正文内容', 'ou_owner', 'Acme [beta');
+    const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Acme [beta');
+    expect(result.content).not.toContain('发送给');
+  });
+
   it('keeps body text that merely mentions botmux without the repo link', () => {
     // The filter anchors on the canonical repo URL, so genuine prose about
     // botmux survives — only the footer chrome is removed.
@@ -463,27 +658,137 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     const result = parseApiMessage(makeMsg('interactive', card));
     expect(result.content).toContain('botmux 这个项目挺好用的');
   });
+
+  it('keeps a real canonical Botmux repository link in Format A body text', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '项目地址：' },
+        {
+          tag: 'a',
+          text: 'botmux',
+          href: 'https://github.com/deepcoldy/botmux',
+        },
+        { tag: 'text', text: '，请查看 README。' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain(
+      '项目地址：botmux(https://github.com/deepcoldy/botmux)，请查看 README。',
+    );
+  });
+
+  it('keeps a real canonical Botmux repository link in Format B body text', () => {
+    const card = {
+      body: { elements: [{
+        tag: 'markdown',
+        content: '项目地址：[botmux](https://github.com/deepcoldy/botmux)，请查看 README。',
+      }] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain(
+      '项目地址：[botmux](https://github.com/deepcoldy/botmux)，请查看 README。',
+    );
+  });
 });
 
 // ─── Structural footer strip (brand-agnostic, for per-bot custom brands) ──
 
 describe('Interactive card parsing: footer stripped structurally (custom brand)', () => {
-  it('drops a custom-brand grey notation_small_v2 footer element (no botmux URL to anchor on)', () => {
-    // A peer bot configured brandLabel='Acme' — the receiving bot can't know
-    // that label, so the URL anchor can't catch it. The text_size+grey
-    // structural signal does.
+  it('drops a footer carrying the complete Botmux structural signature', () => {
+    const footer = buildReplyCardFooter({
+      brand: 'Acme',
+      recipientOpenIds: ['ou_owner'],
+    })!;
     const card = {
       body: { elements: [
         { tag: 'markdown', content: '正文内容' },
         { tag: 'hr' },
-        { tag: 'markdown', text_size: 'notation_small_v2',
-          content: "<font color='grey'>[Acme](https://acme.test) · 发送给：<at id=ou_owner></at></font>" },
+        footer.element,
       ] },
     };
     const result = parseApiMessage(makeMsg('interactive', card));
     expect(result.content).toContain('正文内容');
     expect(result.content).not.toContain('Acme');
     expect(result.content).not.toContain('发送给');
+  });
+
+  it('keeps third-party body content that only collides with the public element id', () => {
+    const card = {
+      body: { elements: [{
+        tag: 'markdown',
+        element_id: 'botmux_reply_footer',
+        content: '这是第三方卡片正文',
+      }] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('这是第三方卡片正文');
+  });
+
+  it('drops a custom-brand grey footer carrying the stable separator marker', () => {
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        { tag: 'markdown', text_size: 'notation_small_v2',
+          content: "<font color='grey'>[Acme](https://acme.test) "
+            + '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1) '
+            + '发送给：<at id=ou_owner></at></font>' },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Acme');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('keeps a third-party grey notation element without a Botmux id or marker', () => {
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        {
+          tag: 'markdown',
+          text_size: 'notation_small_v2',
+          content: "<font color='grey'>报警来源：第三方监控系统</font>",
+        },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).toContain('报警来源：第三方监控系统');
+  });
+
+  it('drops the canonical footer nested beside a voice button', () => {
+    const footer = buildReplyCardFooter({
+      brand: 'Acme',
+      recipientOpenIds: ['ou_owner'],
+      locale: 'en',
+    })!;
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: 'body' },
+        { tag: 'hr' },
+        {
+          tag: 'column_set',
+          columns: [
+            { tag: 'column', elements: [footer.element] },
+            {
+              tag: 'column',
+              elements: [{
+                tag: 'button',
+                text: { tag: 'plain_text', content: 'Voice summary' },
+              }],
+            },
+          ],
+        },
+      ] },
+    };
+
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('body');
+    expect(result.content).toContain('[Voice summary]');
+    expect(result.content).not.toContain('Acme');
+    expect(result.content).not.toContain('Sent to');
   });
 
   it('keeps a small-text element that is NOT a grey footer (foreign card content survives)', () => {

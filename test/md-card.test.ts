@@ -11,6 +11,7 @@ import { homedir, tmpdir } from 'node:os';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  appendReplyCardFooterToV2Card,
   buildCardBodyElements,
   buildImageCardElements,
   buildMarkdownCard,
@@ -712,6 +713,18 @@ describe('buildMarkdownCard', () => {
     expect(footer).not.toContain('不可用');
   });
 
+  it('promotes rounded compact values at unit boundaries', () => {
+    const json = buildMarkdownCard('hello', undefined, '', 'en', undefined, 'filesystem', {
+      context: { usedTokens: 999_950, windowTokens: 999_950_000 },
+      tokens: { in: 999_950_000, out: 999_950 },
+    });
+    const footer = JSON.parse(json).body.elements.at(-1).content;
+
+    expect(footer).toContain('Context 1M/1B');
+    expect(footer).toContain('Tokens ↑1B ↓1M');
+    expect(footer).not.toMatch(/1000[KM]/);
+  });
+
   it('omits the usage footer when the Agent CLI reports neither metric', () => {
     const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
       context: null,
@@ -777,15 +790,118 @@ describe('buildReplyCardFooter', () => {
     });
 
     expect(footer?.content).toContain(
-      "Acme · 上下文 12.3K · Token ↑67.9K ↓123 · "
+      'Acme [·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1) '
+      + '上下文 12.3K · Token ↑67.9K ↓123 · '
       + '发送给：<at id=ou_owner></at> <at id=ou_reviewer></at>',
     );
-    expect(footer?.content).toContain('https://github.com/deepcoldy/bot%6Dux#reply-card-footer');
+    expect(footer?.content).not.toContain('\u200B');
     expect(footer?.element).toMatchObject({
       tag: 'markdown',
+      element_id: 'botmux_reply_footer',
       text_size: 'notation_small_v2',
       content: footer?.content,
     });
+  });
+
+  it('appends the canonical signed footer to caller-supplied v2 cards', () => {
+    const original = {
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'body' }] },
+    };
+    const card = appendReplyCardFooterToV2Card(original, {
+      brand: '',
+      recipientOpenIds: ['ou_owner', 'ou_owner'],
+      locale: 'en',
+    }) as any;
+
+    expect(card).not.toBe(original);
+    expect(original.body.elements).toHaveLength(1);
+    expect(card.body.elements.at(-1)).toMatchObject({
+      tag: 'markdown',
+      element_id: 'botmux_reply_footer',
+      content: expect.stringContaining('Sent to: <at id=ou_owner></at>'),
+    });
+    expect(card.body.elements.at(-1).content).toContain(
+      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+    );
+  });
+
+  it('rejects caller-supplied cards without schema-2 body elements', () => {
+    expect(appendReplyCardFooterToV2Card(
+      { elements: [] },
+      { brand: '', recipientOpenIds: ['ou_owner'] },
+    )).toBeNull();
+    expect(appendReplyCardFooterToV2Card(
+      { schema: '1.0', body: { elements: [] } },
+      { brand: '', recipientOpenIds: ['ou_owner'] },
+    )).toBeNull();
+  });
+
+  it('rejects a custom card that already occupies the canonical footer id', () => {
+    expect(appendReplyCardFooterToV2Card(
+      {
+        schema: '2.0',
+        body: {
+          elements: [{
+            tag: 'column_set',
+            columns: [{
+              tag: 'column',
+              elements: [{ tag: 'markdown', element_id: 'botmux_reply_footer', content: 'x' }],
+            }],
+          }],
+        },
+      },
+      { brand: '', recipientOpenIds: ['ou_owner'] },
+    )).toBeNull();
+  });
+
+  it('rejects footer-id collisions in localized header tag components', () => {
+    expect(appendReplyCardFooterToV2Card(
+      {
+        schema: '2.0',
+        header: {
+          i18n_text_tag_list: {
+            zh_cn: [{
+              tag: 'text_tag',
+              element_id: 'botmux_reply_footer',
+              text: { tag: 'plain_text', content: '状态' },
+            }],
+          },
+        },
+        body: { elements: [{ tag: 'markdown', content: 'body' }] },
+      },
+      { brand: '', recipientOpenIds: ['ou_owner'] },
+    )).toBeNull();
+  });
+
+  it('does not treat callback payload fields as card element-id collisions', () => {
+    const card = appendReplyCardFooterToV2Card(
+      {
+        schema: '2.0',
+        body: {
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '提交' },
+            behaviors: [{
+              type: 'callback',
+              value: { tag: 'deploy', element_id: 'botmux_reply_footer' },
+            }],
+          }],
+        },
+      },
+      { brand: '', recipientOpenIds: ['ou_owner'] },
+    ) as any;
+
+    expect(card).not.toBeNull();
+    expect(card.body.elements.at(-1).element_id).toBe('botmux_reply_footer');
+  });
+
+  it('signs a default-brand-only footer with the versioned marker', () => {
+    const footer = buildReplyCardFooter({});
+    expect(footer?.content).toContain(DEFAULT_BRAND_LABEL);
+    expect(footer?.content).toContain(
+      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+    );
   });
 });
 
@@ -810,6 +926,9 @@ describe('brandFooterSegment', () => {
   });
   it('custom string → verbatim (markdown allowed)', () => {
     expect(brandFooterSegment('[Acme](https://acme.test)')).toBe('[Acme](https://acme.test)');
+  });
+  it('normalizes custom brands to the footer single-line invariant', () => {
+    expect(brandFooterSegment(' Acme\n  Team\r\nBot ')).toBe('Acme Team Bot');
   });
 });
 

@@ -271,11 +271,12 @@ function foldClaudeLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, e
  *  the latest snapshot counts. The active model rides on turn_context /
  *  session_meta payloads (latest wins — sessions can switch models). */
 function foldCodexLine(agg: TokenUsageAggregate, entry: any): void {
+  const contextUsage = extractCodexContextUsage(entry);
+  if (contextUsage) agg.latestContextUsage = contextUsage;
+
   const codexUsage = extractCodexTokenCountUsage(entry);
   if (codexUsage) {
     agg.latestCodexUsage = codexUsage;
-    const contextUsage = extractCodexContextUsage(entry);
-    if (contextUsage) agg.latestContextUsage = contextUsage;
     return;
   }
   const m = entry?.payload?.model ?? entry?.payload?.collaboration_mode?.settings?.model;
@@ -303,6 +304,9 @@ function foldCocoLine(agg: TokenUsageAggregate, entry: any): void {
 /** Cursor / TraeX / Antigravity: transcripts whose exact dialect is not yet
  *  pinned down — keep the tolerant multi-shape extraction for them. */
 function foldGenericLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
+  const contextUsage = extractCodexContextUsage(entry);
+  if (contextUsage) agg.latestContextUsage = contextUsage;
+
   const codexUsage = extractCodexTokenCountUsage(entry);
   if (codexUsage) {
     agg.latestCodexUsage = codexUsage;

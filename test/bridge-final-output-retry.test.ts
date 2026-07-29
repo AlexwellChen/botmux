@@ -85,7 +85,11 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
   LoggerLevel: { info: 2 },
 }));
 
-import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import {
+  getDaemonReplyCardUsageSnapshot,
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
+} from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
@@ -1297,12 +1301,118 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       sessionId: 'sid-final-out',
       cliSessionId: 'claude-session-xyz',
       cwd: '/tmp',
+      larkAppId: 'app_test',
       fresh: true,
     });
     const cards = sessionReply.mock.calls.map(call => call[1] as string);
     expect(new Set(cards)).toHaveLength(1);
     expect(cards[0]).toContain('上下文 12.3K/100K (12%)');
     expect(cards[0]).toContain('Token ↑67.9K ↓123');
+  });
+
+  it('reads a sandboxed Claude transcript through the daemon reply-card boundary', async () => {
+    const actualCostCalculator =
+      await vi.importActual<typeof import('../src/core/cost-calculator.js')>(
+        '../src/core/cost-calculator.js',
+      );
+    vi.mocked(getSessionUsageSnapshot)
+      .mockImplementationOnce(actualCostCalculator.getSessionUsageSnapshot);
+
+    const sandboxRoot = mkdtempSync(join(tmpdir(), 'botmux-card-usage-sandbox-'));
+    const previousSessionDataDir = process.env.SESSION_DATA_DIR;
+    try {
+      process.env.SESSION_DATA_DIR = join(sandboxRoot, 'data');
+      const transcriptDir = join(
+        sandboxRoot,
+        'bots',
+        'app_test',
+        'claude',
+        'projects',
+        '-tmp',
+      );
+      mkdirSync(transcriptDir, { recursive: true });
+      writeFileSync(
+        join(transcriptDir, 'claude-session-xyz.jsonl'),
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            model: 'claude-sonnet-test',
+            usage: {
+              input_tokens: 100,
+              output_tokens: 20,
+              cache_read_input_tokens: 10,
+              cache_creation_input_tokens: 5,
+            },
+          },
+        }) + '\n',
+      );
+
+      expect(getDaemonReplyCardUsageSnapshot(makeDs())).toMatchObject({
+        context: { usedTokens: 115 },
+        tokens: { in: 115, out: 20 },
+      });
+    } finally {
+      if (previousSessionDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousSessionDataDir;
+      rmSync(sandboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reads a sandboxed Codex rollout through the daemon reply-card boundary', async () => {
+    const actualCostCalculator =
+      await vi.importActual<typeof import('../src/core/cost-calculator.js')>(
+        '../src/core/cost-calculator.js',
+      );
+    vi.mocked(getSessionUsageSnapshot)
+      .mockImplementationOnce(actualCostCalculator.getSessionUsageSnapshot);
+
+    const sandboxRoot = mkdtempSync(join(tmpdir(), 'botmux-card-usage-codex-'));
+    const previousSessionDataDir = process.env.SESSION_DATA_DIR;
+    const codexSid = '019dd80d-d922-7a11-8339-0208d8c5b4ef';
+    try {
+      process.env.SESSION_DATA_DIR = join(sandboxRoot, 'data');
+      const rolloutDir = join(
+        sandboxRoot,
+        'bots',
+        'app_test',
+        'codex',
+        'sessions',
+        '2026',
+        '07',
+        '29',
+      );
+      mkdirSync(rolloutDir, { recursive: true });
+      writeFileSync(
+        join(rolloutDir, `rollout-2026-07-29T12-00-00-${codexSid}.jsonl`),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'token_count',
+            info: {
+              total_token_usage: {
+                input_tokens: 1_000,
+                cached_input_tokens: 400,
+                output_tokens: 50,
+              },
+              last_token_usage: { total_tokens: 250 },
+              model_context_window: 2_000,
+            },
+          },
+        }) + '\n',
+      );
+      const ds = makeDs();
+      ds.session.cliId = 'codex';
+      ds.session.cliSessionId = codexSid;
+
+      expect(getDaemonReplyCardUsageSnapshot(ds)).toMatchObject({
+        context: { usedTokens: 250, windowTokens: 2_000, percentUsed: 13 },
+        tokens: { in: 1_000, out: 50 },
+      });
+    } finally {
+      if (previousSessionDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousSessionDataDir;
+      rmSync(sandboxRoot, { recursive: true, force: true });
+    }
   });
 
   it('does not read or render usage when this bot disables the card-footer switch', async () => {

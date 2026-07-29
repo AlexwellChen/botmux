@@ -4458,6 +4458,7 @@ async function readCardUsageSnapshotForSend(
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId ?? session.adoptedFrom?.sessionId,
       cwd: session.workingDir ?? session.adoptedFrom?.cwd,
+      larkAppId,
       fresh: true,
     });
   } catch {
@@ -6072,26 +6073,21 @@ function argValues(args: string[], ...flags: string[]): string[] {
 function withCustomCardMentionFooter(
   card: Record<string, unknown>,
   mentionOpenIds: readonly string[],
-  sentToLabel: string,
+  locale?: Locale,
 ): { ok: true; card: Record<string, unknown> } | { ok: false; error: string } {
   if (mentionOpenIds.length === 0) return { ok: true, card };
-  const cloned = JSON.parse(JSON.stringify(card)) as Record<string, unknown>;
-  const body = cloned.body as { elements?: unknown } | undefined;
-  if (!body || !Array.isArray(body.elements)) {
+  const deduped = [...new Set(mentionOpenIds.filter(Boolean))];
+  const cloned = appendReplyCardFooterToV2Card(card, {
+    brand: '',
+    recipientOpenIds: deduped,
+    locale,
+  });
+  if (!cloned) {
     return {
       ok: false,
-      error: '自定义卡片带 --mention/--mention-back 时必须是 schema 2.0 且包含 body.elements；或改用 --no-mention 并在卡片 JSON 内自行处理展示',
+      error: '自定义卡片带 --mention/--mention-back 时必须是 schema 2.0、包含 body.elements，且未占用 botmux_reply_footer 元素 ID；或改用 --no-mention 并在卡片 JSON 内自行处理展示',
     };
   }
-  const deduped = [...new Set(mentionOpenIds.filter(Boolean))];
-  body.elements.push(
-    { tag: 'hr' },
-    {
-      tag: 'markdown',
-      text_size: 'notation_small_v2',
-      content: `<font color='grey'>${sentToLabel}${deduped.map(id => `<at id=${id}></at>`).join(' ')}</font>`,
-    },
-  );
   return { ok: true, card: cloned };
 }
 
@@ -6099,6 +6095,7 @@ function withCustomCardMentionFooter(
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildImageCardElements` from there.
 import {
+  appendReplyCardFooterToV2Card,
   buildImageCardElements,
   buildReplyCardFooter,
   prepareCardMarkdown,
@@ -7538,7 +7535,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       const withFooter = withCustomCardMentionFooter(
         customCard,
         mentionFooter,
-        t('card.sent_to', undefined, localeForBot(appId)),
+        localeForBot(appId),
       );
       if (!withFooter.ok) { console.error(`botmux send: ${withFooter.error}`); process.exit(2); }
       customCard = withFooter.card;
@@ -7673,7 +7670,11 @@ async function cmdSend(rest: string[]): Promise<void> {
             columns: [
               {
                 tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-                elements: [{ tag: 'markdown', text_size: 'notation_small_v2', content: footerContent || ' ' }],
+                elements: [footer?.element ?? {
+                  tag: 'markdown',
+                  text_size: 'notation_small_v2',
+                  content: ' ',
+                }],
               },
               {
                 tag: 'column', width: 'auto', vertical_align: 'center',

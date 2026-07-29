@@ -26,6 +26,12 @@ import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
 import { t, type Locale } from '../../i18n/index.js';
+import {
+  REPLY_CARD_FOOTER_ELEMENT_ID,
+  REPLY_CARD_FOOTER_MARKER,
+} from './reply-card-footer-signature.js';
+
+export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
 const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
@@ -53,6 +59,7 @@ export interface ReplyCardFooter {
   /** Standalone footer element used by ordinary reply cards. */
   element: {
     tag: 'markdown';
+    element_id: typeof REPLY_CARD_FOOTER_ELEMENT_ID;
     text_size: 'notation_small_v2';
     content: string;
   };
@@ -253,24 +260,21 @@ export function normalizeLocalHomeLinks(
 /** Default footer brand when a bot has no custom `brandLabel` configured. */
 export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
 
-/** A visually empty link that survives Lark's simplified card representation.
- * It lets message-parser identify our footer even when brandLabel is disabled
- * or custom, without exposing implementation text in the rendered card. */
-export const REPLY_CARD_FOOTER_MARKER =
-  '[\u200B](https://github.com/deepcoldy/bot%6Dux#reply-card-footer)';
-
 /**
  * Resolve the brand segment to render in a card footer from a bot's configured
  * `brandLabel` (see {@link resolveBrandLabel}):
  *   • `undefined` (unset)  → the default botmux link
  *   • `''` / whitespace    → `null` (brand suppressed)
- *   • any other string     → returned verbatim (markdown allowed)
+ *   • any other string     → one trimmed line (markdown allowed)
  * Returning `null` lets callers drop the brand — and, when there's also no
  * recipient, the whole footer (HR included) — so an empty brand reads clean.
  */
 export function brandFooterSegment(brand: string | undefined): string | null {
   if (brand === undefined) return DEFAULT_BRAND_LABEL;
-  return brand.trim() ? brand : null;
+  const normalized = brand
+    .trim()
+    .replace(/[ \t]*(?:\r\n?|\n|\u2028|\u2029)+[ \t]*/g, ' ');
+  return normalized || null;
 }
 
 function compactTokenCount(value: number): string {
@@ -279,9 +283,16 @@ function compactTokenCount(value: number): string {
     { threshold: 1_000_000, suffix: 'M' },
     { threshold: 1_000, suffix: 'K' },
   ] as const;
-  const unit = units.find(candidate => value >= candidate.threshold);
-  if (!unit) return Math.round(value).toString();
-  return `${(value / unit.threshold).toFixed(1).replace(/\.0$/, '')}${unit.suffix}`;
+  let unitIndex = units.findIndex(candidate => value >= candidate.threshold);
+  if (unitIndex < 0) return Math.round(value).toString();
+  let unit = units[unitIndex];
+  let scaled = value / unit.threshold;
+  // Avoid boundary artifacts such as 1000K/1000M after one-decimal rounding.
+  if (unitIndex > 0 && Number(scaled.toFixed(1)) >= 1_000) {
+    unit = units[--unitIndex];
+    scaled = value / unit.threshold;
+  }
+  return `${scaled.toFixed(1).replace(/\.0$/, '')}${unit.suffix}`;
 }
 
 function isNonNegativeFinite(value: unknown): value is number {
@@ -342,16 +353,69 @@ export function buildReplyCardFooter(opts: {
   }
   if (parts.length === 0) return null;
 
-  const content =
-    `<font color='grey'>${parts.join(' · ')}${REPLY_CARD_FOOTER_MARKER}</font>`;
+  // The first ordinary separator doubles as a visible, versioned marker. Lark
+  // preserves non-empty links in its simplified Format A, so custom/disabled
+  // brands remain identifiable without changing the rendered multi-part text.
+  // A one-part footer also gets the marker. The canonical repository URL alone
+  // is legitimate body content, so it must never double as proof of ownership.
+  const signedContent = parts.length > 1
+    ? `${parts[0]} ${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`
+    : `${parts[0]} ${REPLY_CARD_FOOTER_MARKER}`;
+  const content = `<font color='grey'>${signedContent}</font>`;
   return {
     content,
     element: {
       tag: 'markdown',
+      element_id: REPLY_CARD_FOOTER_ELEMENT_ID,
       text_size: 'notation_small_v2',
       content,
     },
   };
+}
+
+/** Clone a caller-supplied schema-2 card and append the canonical reply
+ * footer. Returns null for cards without a v2 `body.elements` array or when a
+ * caller-owned element already occupies the globally unique footer id. */
+export function appendReplyCardFooterToV2Card(
+  card: Record<string, unknown>,
+  opts: Parameters<typeof buildReplyCardFooter>[0],
+): Record<string, unknown> | null {
+  const cloned = JSON.parse(JSON.stringify(card)) as Record<string, unknown>;
+  if (cloned.schema !== '2.0') return null;
+  const body = cloned.body as { elements?: unknown } | undefined;
+  if (!body || !Array.isArray(body.elements)) return null;
+  const header = cloned.header as {
+    text_tag_list?: unknown;
+    i18n_text_tag_list?: unknown;
+  } | undefined;
+  const i18nHeaderTagLists = header?.i18n_text_tag_list
+    && typeof header.i18n_text_tag_list === 'object'
+    ? Object.values(header.i18n_text_tag_list as Record<string, unknown>)
+    : [];
+  if (
+    containsReplyCardFooterId(body.elements)
+    || containsReplyCardFooterId(header?.text_tag_list)
+    || containsReplyCardFooterId(i18nHeaderTagLists)
+  ) {
+    return null;
+  }
+  const footer = buildReplyCardFooter(opts);
+  if (footer) body.elements.push({ tag: 'hr' }, footer.element);
+  return cloned;
+}
+
+function containsReplyCardFooterId(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsReplyCardFooterId);
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (record.element_id === REPLY_CARD_FOOTER_ELEMENT_ID) return true;
+  // Follow only documented component-child slots. Callback `value`, behavior
+  // payloads, and other arbitrary business JSON are deliberately outside the
+  // card component tree even when they contain tag/element_id-shaped fields.
+  return containsReplyCardFooterId(record.elements)
+    || containsReplyCardFooterId(record.columns)
+    || containsReplyCardFooterId(record.actions)
+    || containsReplyCardFooterId(record.extra);
 }
 
 /** Build a Feishu native `table` element from a `table_open … table_close` token slice. */
