@@ -28,9 +28,31 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(true);
   });
 
-  it('non-adopt: prose about staying silent is not guessed away', () => {
+  it('non-adopt: prose then a standalone sentinel LINE suppresses the whole turn', () => {
+    // The real-world shape: the model explains the silence, then appends the
+    // token on its own trailing line. Full-string exact match let this leak.
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `Codex acknowledged and is reviewing. Nothing for me to do — no reply needed.\n\n${BRIDGE_NO_REPLY_SENTINEL}` },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: token inline in a prose sentence is not guessed away', () => {
+    // Last non-empty line is a full sentence (token mid-line), not a bare
+    // sentinel — a normal answer that merely mentions the token.
     expect(shouldSuppressBridgeEmit(
       { ...turn(100), finalText: `I will stay silent instead of replying. ${BRIDGE_NO_REPLY_SENTINEL}` },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: sentinel followed by more prose still posts (not a terminator)', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `${BRIDGE_NO_REPLY_SENTINEL}\n\nActually, here is the answer you asked for.` },
       undefined,
       [],
       false,
