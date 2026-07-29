@@ -955,7 +955,7 @@ describe('/vc preparation command', () => {
 
 describe('PASSTHROUGH_COMMANDS set', () => {
   it('should contain expected slash commands forwarded to CLI', () => {
-    for (const cmd of ['/compact', '/model', '/clear', '/plugin', '/usage', '/context', '/cost', '/mcp', '/diff', '/btw']) {
+    for (const cmd of ['/compact', '/model', '/clear', '/plugin', '/usage', '/context', '/cost', '/mcp', '/diff', '/btw', '/effort']) {
       expect(PASSTHROUGH_COMMANDS.has(cmd), `Expected PASSTHROUGH_COMMANDS to contain ${cmd}`).toBe(true);
     }
   });
@@ -979,10 +979,15 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
   });
 
-  it('enables /effort only for the Claude Code adapter', () => {
-    expect(PASSTHROUGH_COMMANDS.has('/effort')).toBe(false);
-    expect(resolvePassthroughCommands('app-1').has('/effort')).toBe(true);
-    expect(resolvePassthroughCommands('app-2').has('/effort')).toBe(false);
+  it('exposes /effort globally to every CLI (best-effort passthrough)', () => {
+    // /effort 放在全局 PASSTHROUGH_COMMANDS,而非某个 adapter 的 defaultPassthroughCommands
+    // ——所有 CLI 都尽力透传(Claude 家族 / Codex 原生支持;其它 CLI 认不得顶多回
+    // unknown-command,不崩溃)。未来新 CLI 零改动自动继承。
+    expect(PASSTHROUGH_COMMANDS.has('/effort')).toBe(true);
+    expect(resolvePassthroughCommands('app-1').has('/effort')).toBe(true); // claude-code
+    expect(resolvePassthroughCommands('app-2').has('/effort')).toBe(true); // codex
+    // 无 bot 上下文时也回落到全局集合,仍含 /effort。
+    expect(resolvePassthroughCommands(undefined).has('/effort')).toBe(true);
   });
 
   it('does not expose Codex interactive /title through the Lark channel', () => {
