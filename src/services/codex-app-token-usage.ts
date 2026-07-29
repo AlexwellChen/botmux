@@ -44,21 +44,32 @@ function isFiniteNum(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v);
 }
 
-/** Validate a raw notification payload's breakdown into a typed one, or null. */
+/** Token counts are non-negative integers; a negative or fractional value is a
+ *  protocol violation, not a real count. */
+function isTokenCount(v: unknown): v is number {
+  return isFiniteNum(v) && Number.isInteger(v) && v >= 0;
+}
+
+/** Validate a raw notification payload's breakdown into a typed one, or null.
+ *  0.145 fields are REQUIRED except `cacheWriteInputTokens` (added later, so a
+ *  compat default of 0 is honest for it only). Any other missing/non-numeric
+ *  field returns null — defaulting them to 0 would misreport a protocol gap as a
+ *  real 0. */
 export function parseCodexTokenBreakdown(raw: unknown): CodexTokenBreakdown | null {
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
-  const keys: (keyof CodexTokenBreakdown)[] = [
-    'totalTokens', 'inputTokens', 'cachedInputTokens',
-    'cacheWriteInputTokens', 'outputTokens', 'reasoningOutputTokens',
+  const required: (keyof CodexTokenBreakdown)[] = [
+    'totalTokens', 'inputTokens', 'cachedInputTokens', 'outputTokens', 'reasoningOutputTokens',
   ];
   const out = {} as CodexTokenBreakdown;
-  for (const k of keys) {
-    // Missing fields default to 0 (older/partial payloads); present-but-nonnumeric is invalid.
-    if (r[k] === undefined) { out[k] = 0; continue; }
-    if (!isFiniteNum(r[k])) return null;
+  for (const k of required) {
+    if (!isTokenCount(r[k])) return null; // required non-negative integer; else protocol gap
     out[k] = r[k] as number;
   }
+  // cacheWriteInputTokens: back-compat optional; absent → 0, present must be a token count.
+  if (r.cacheWriteInputTokens === undefined) out.cacheWriteInputTokens = 0;
+  else if (!isTokenCount(r.cacheWriteInputTokens)) return null;
+  else out.cacheWriteInputTokens = r.cacheWriteInputTokens as number;
   return out;
 }
 
@@ -88,10 +99,18 @@ export class TurnTokenUsageAccumulator {
     if (this.baseline === null) {
       // baseline = total - last, per field. This lets a mid-session / resumed
       // turn measure only its own tokens without knowing prior session totals.
-      this.baseline = subtract(total, last);
+      // A negative field means total < last — impossible if `last` is a subset
+      // of the cumulative `total`; treat as a protocol anomaly and fail closed
+      // rather than derive a bogus baseline that inflates the turn.
+      const baseline = subtract(total, last);
+      if (!allNonNegative(baseline)) {
+        this.protocolWarning = 'tokenUsage baseline (total-last) went negative';
+        return;
+      }
+      this.baseline = baseline;
     }
-    // total must be monotonic non-decreasing vs the last seen; a regression is a
-    // protocol anomaly → fail closed (stop trusting usage for this turn).
+    // total must be monotonic non-decreasing vs the last seen ACROSS ALL FIELDS;
+    // a regression in any field is a protocol anomaly → fail closed.
     if (this.latestTotal && !isGreaterOrEqual(total, this.latestTotal)) {
       this.protocolWarning = 'tokenUsage.total regressed';
       return;
@@ -124,9 +143,14 @@ function subtract(a: CodexTokenBreakdown, b: CodexTokenBreakdown): CodexTokenBre
 }
 
 function isGreaterOrEqual(a: CodexTokenBreakdown, b: CodexTokenBreakdown): boolean {
+  // Every cumulative field must be monotonic — a regression in ANY (including
+  // cacheRead/cacheWrite/reasoning) is a protocol anomaly, not just total/in/out.
   return a.totalTokens >= b.totalTokens
     && a.inputTokens >= b.inputTokens
-    && a.outputTokens >= b.outputTokens;
+    && a.cachedInputTokens >= b.cachedInputTokens
+    && a.cacheWriteInputTokens >= b.cacheWriteInputTokens
+    && a.outputTokens >= b.outputTokens
+    && a.reasoningOutputTokens >= b.reasoningOutputTokens;
 }
 
 function allNonNegative(d: CodexTokenBreakdown): boolean {

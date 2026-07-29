@@ -38,11 +38,17 @@ describe('toFourBucket', () => {
 });
 
 describe('parseCodexTokenBreakdown', () => {
-  it('defaults missing fields to 0', () => {
-    expect(parseCodexTokenBreakdown({ totalTokens: 5, inputTokens: 5 })).toMatchObject({ totalTokens: 5, inputTokens: 5, outputTokens: 0 });
+  it('parses a complete breakdown', () => {
+    expect(parseCodexTokenBreakdown({ totalTokens: 5, inputTokens: 5, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 3, reasoningOutputTokens: 1 }))
+      .toMatchObject({ totalTokens: 5, inputTokens: 5, outputTokens: 3 });
   });
   it('rejects non-numeric present fields', () => {
     expect(parseCodexTokenBreakdown({ totalTokens: 'x' })).toBeNull();
+  });
+  it('rejects negative or fractional token counts (protocol boundary)', () => {
+    const full = { totalTokens: 5, inputTokens: 5, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 3, reasoningOutputTokens: 1 };
+    expect(parseCodexTokenBreakdown({ ...full, inputTokens: -1 })).toBeNull();
+    expect(parseCodexTokenBreakdown({ ...full, outputTokens: 1.5 })).toBeNull();
   });
   it('rejects non-object', () => {
     expect(parseCodexTokenBreakdown(null)).toBeNull();
@@ -97,5 +103,43 @@ describe('TurnTokenUsageAccumulator — total-delta', () => {
 
   it('no notifications → null (caller omits usage, never writes zeros)', () => {
     expect(new TurnTokenUsageAccumulator().result()).toBeNull();
+  });
+
+  it('fail-closed: negative baseline (total < last) → null + warning (not inflated turn)', () => {
+    // codex review repro: total.input=50 but last.input=100 → baseline would be
+    // -50 and the turn would wrongly read input=100. Must reject.
+    const acc = new TurnTokenUsageAccumulator();
+    acc.update(bd({ totalTokens: 50, inputTokens: 50, outputTokens: 20 }), bd({ totalTokens: 100, inputTokens: 100, outputTokens: 40 }));
+    expect(acc.result()).toBeNull();
+    expect(acc.warning).toBeTruthy();
+  });
+
+  it('fail-closed: a regression in a NON-total field (cacheRead) is caught', () => {
+    const acc = new TurnTokenUsageAccumulator();
+    acc.update(
+      bd({ totalTokens: 200, inputTokens: 150, cachedInputTokens: 50, outputTokens: 50 }),
+      bd({ totalTokens: 100, inputTokens: 80, cachedInputTokens: 20, outputTokens: 20 }),
+    );
+    // total/input/output all advance, but cachedInputTokens regresses 50→10
+    acc.update(
+      bd({ totalTokens: 260, inputTokens: 200, cachedInputTokens: 10, outputTokens: 60 }),
+      bd({ totalTokens: 60, inputTokens: 50, cachedInputTokens: 0, outputTokens: 10 }),
+    );
+    expect(acc.result()).toBeNull();
+    expect(acc.warning).toBeTruthy();
+  });
+});
+
+describe('parseCodexTokenBreakdown — required fields', () => {
+  const full = { totalTokens: 1, inputTokens: 1, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 1, reasoningOutputTokens: 0 };
+  it('rejects a missing REQUIRED field (not defaulted to 0)', () => {
+    for (const k of ['totalTokens', 'inputTokens', 'cachedInputTokens', 'outputTokens', 'reasoningOutputTokens']) {
+      const { [k]: _omit, ...partial } = full as Record<string, number>;
+      expect(parseCodexTokenBreakdown(partial)).toBeNull();
+    }
+  });
+  it('accepts a missing cacheWriteInputTokens (back-compat → 0)', () => {
+    const { cacheWriteInputTokens: _omit, ...compat } = full;
+    expect(parseCodexTokenBreakdown(compat)?.cacheWriteInputTokens).toBe(0);
   });
 });

@@ -278,6 +278,9 @@ let controller: CodexAppTurnController;
  *  matching turn's final marker is emitted. Bounded by turn lifetime — a turn
  *  that never finalizes leaves at most one stale entry, cleared on next final. */
 const usageAccumulators = new Map<string, TurnTokenUsageAccumulator>();
+/** Only one turn is active at a time; a small cap bounds leakage from turns
+ *  that never emit a final marker. */
+const MAX_USAGE_ACCUMULATORS = 8;
 
 function detectedCodexVersion(): CodexVersion | undefined {
   if (codexVersionChecked) return codexVersion;
@@ -341,7 +344,17 @@ function handleNotification(msg: JsonObject): void {
     const last = parseCodexTokenBreakdown(usage.last);
     if (turnId && total && last) {
       let acc = usageAccumulators.get(turnId);
-      if (!acc) { acc = new TurnTokenUsageAccumulator(); usageAccumulators.set(turnId, acc); }
+      if (!acc) {
+        // Bounded pruning: a turn that never emits a final marker (crash/interrupt)
+        // would otherwise leak its accumulator. Only one turn is active at a time,
+        // so a tiny cap suffices — evict the oldest insertion when exceeded.
+        if (usageAccumulators.size >= MAX_USAGE_ACCUMULATORS) {
+          const oldest = usageAccumulators.keys().next().value;
+          if (oldest !== undefined) usageAccumulators.delete(oldest);
+        }
+        acc = new TurnTokenUsageAccumulator();
+        usageAccumulators.set(turnId, acc);
+      }
       acc.update(total, last);
     }
   }
@@ -482,6 +495,11 @@ controller = new CodexAppTurnController({
     // and drain its accumulator. Omitted when no usage was observed — never zeros.
     const acc = marker.appTurnId ? usageAccumulators.get(marker.appTurnId) : undefined;
     const usage = acc?.result() ?? undefined;
+    // Surface a protocol anomaly rather than silently omitting usage — a
+    // regression/negative-baseline should be visible in the runner log.
+    if (acc?.warning && !usage) {
+      writeLine(`[codex-app] token usage dropped for turn ${marker.appTurnId ?? '?'}: ${acc.warning}`);
+    }
     if (marker.appTurnId) usageAccumulators.delete(marker.appTurnId);
     emitMarker('final', usage ? { ...marker, usage } : marker);
     writeLine();
