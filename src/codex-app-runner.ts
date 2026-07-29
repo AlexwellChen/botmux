@@ -20,6 +20,10 @@ import {
   decodeCodexAppRunnerInput,
   type CodexAppRunnerInput,
 } from './services/codex-app-runner-protocol.js';
+import {
+  TurnTokenUsageAccumulator,
+  parseCodexTokenBreakdown,
+} from './services/codex-app-token-usage.js';
 
 type JsonObject = Record<string, any>;
 
@@ -269,6 +273,12 @@ let codexVersion: CodexVersion | undefined;
 let cleanVersionWarningShown = false;
 let controller: CodexAppTurnController;
 
+/** Per-turn token accumulators keyed by codex appTurnId. Fed by
+ *  thread/tokenUsage/updated notifications; drained (and deleted) when the
+ *  matching turn's final marker is emitted. Bounded by turn lifetime — a turn
+ *  that never finalizes leaves at most one stale entry, cleared on next final. */
+const usageAccumulators = new Map<string, TurnTokenUsageAccumulator>();
+
 function detectedCodexVersion(): CodexVersion | undefined {
   if (codexVersionChecked) return codexVersion;
   codexVersionChecked = true;
@@ -320,6 +330,21 @@ function handleServerRequest(msg: JsonObject): boolean {
 }
 
 function handleNotification(msg: JsonObject): void {
+  // Per-turn token usage rides on thread/tokenUsage/updated (NOT turn/completed).
+  // Feed the accumulator for the matching appTurnId; the controller ignores this
+  // method, so we handle it here and still delegate for everything else.
+  if (msg.method === 'thread/tokenUsage/updated') {
+    const params = (msg.params ?? {}) as JsonObject;
+    const turnId = typeof params.turnId === 'string' ? params.turnId : undefined;
+    const usage = (params.tokenUsage ?? {}) as JsonObject;
+    const total = parseCodexTokenBreakdown(usage.total);
+    const last = parseCodexTokenBreakdown(usage.last);
+    if (turnId && total && last) {
+      let acc = usageAccumulators.get(turnId);
+      if (!acc) { acc = new TurnTokenUsageAccumulator(); usageAccumulators.set(turnId, acc); }
+      acc.update(total, last);
+    }
+  }
   controller?.handleNotification(msg);
 }
 
@@ -453,7 +478,12 @@ controller = new CodexAppTurnController({
   onDiagnostic: writeLine,
   onLifecycle: event => emitMarker('lifecycle', event),
   onFinal: marker => {
-    emitMarker('final', marker);
+    // Attach this turn's token usage (if the accumulator saw coherent totals)
+    // and drain its accumulator. Omitted when no usage was observed — never zeros.
+    const acc = marker.appTurnId ? usageAccumulators.get(marker.appTurnId) : undefined;
+    const usage = acc?.result() ?? undefined;
+    if (marker.appTurnId) usageAccumulators.delete(marker.appTurnId);
+    emitMarker('final', usage ? { ...marker, usage } : marker);
     writeLine();
   },
   onPrompt: prompt,

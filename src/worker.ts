@@ -4970,6 +4970,7 @@ function handleCodexAppMarker(body: string): void {
         lastUuid: identity.lastUuid,
         turnId: identity.turnId,
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        ...(marker.usage ? { usage: marker.usage } : {}),
       });
       emitTurnTerminal(identity.turnId, 'completed', undefined, dispatchAttempt);
       return;

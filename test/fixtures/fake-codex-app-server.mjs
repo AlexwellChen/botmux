@@ -101,6 +101,20 @@ function emitTurnCompletion(threadId, turnId, outputSchema) {
       text: answer,
     },
   });
+  // Opt-in: emit a token-usage notification (as the real app-server does) so the
+  // runner's per-turn accumulator has something to fold. cumulative `total`,
+  // last-completion `last`. input includes cache read+write per codex semantics.
+  if (process.env.FAKE_TOKEN_USAGE === '1') {
+    notify('thread/tokenUsage/updated', {
+      threadId,
+      turnId,
+      tokenUsage: {
+        total: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+        last: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+        modelContextWindow: 272000,
+      },
+    });
+  }
   notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } });
 }
 

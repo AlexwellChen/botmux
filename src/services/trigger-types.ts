@@ -117,6 +117,15 @@ export interface TriggerResponse {
   output?: {
     content: string;
   };
+  /** Per-turn token usage for a completed async turn (codex-app). Present on
+   *  `state:'completed'` when captured; omitted otherwise. Field names mirror the
+   *  caller's TaskTokenUsage. */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreateTokens: number;
+  };
   async?: {
     status: TriggerAsyncStatus;
     sessionId?: string;
