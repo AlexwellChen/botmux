@@ -21,16 +21,37 @@ function nonBlankHost(value: string | undefined): string | undefined {
   return value?.trim() || undefined;
 }
 
+/** A wildcard/any-address bind is not itself a reachable destination, so a link
+ *  advertising it must be resolved to a concrete IP. A specific bind host (e.g.
+ *  127.0.0.1, a LAN IP) IS reachable and should be advertised verbatim. Blank
+ *  hosts are normalized away by callers (nonBlankHost) before they reach here,
+ *  so an empty string is also treated as a wildcard for the raw-config path in
+ *  dashboard.ts's loopback gate. */
+export function isWildcardBindHost(host: string): boolean {
+  return host === '0.0.0.0' || host === '::' || host === '';
+}
+
 const configuredWebExternalHost = nonBlankHost(process.env.WEB_EXTERNAL_HOST);
 const configuredDashboardExternalHost =
   nonBlankHost(process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST) ?? configuredWebExternalHost;
+const configuredDashboardBindHost = nonBlankHost(process.env.BOTMUX_DASHBOARD_HOST);
 
 export function getWebExternalHost(): string {
   return configuredWebExternalHost ?? getLocalIp();
 }
 
 export function getDashboardExternalHost(): string {
-  return configuredDashboardExternalHost ?? getLocalIp();
+  // Priority: explicit external host → the actual listen host (when it's a
+  // concrete, reachable address) → autodetected LAN IP. Advertising the bind
+  // host keeps the printed/DM'd link consistent with where the dashboard is
+  // actually listening: a 127.0.0.1 bind must link to 127.0.0.1, not a LAN IP
+  // nothing is listening on. Only a wildcard bind (0.0.0.0/::) — which isn't a
+  // reachable destination — falls through to autodetect.
+  if (configuredDashboardExternalHost) return configuredDashboardExternalHost;
+  if (configuredDashboardBindHost && !isWildcardBindHost(configuredDashboardBindHost)) {
+    return configuredDashboardBindHost;
+  }
+  return getLocalIp();
 }
 
 /**

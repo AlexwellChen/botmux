@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 describe('web external host', () => {
   const originalWebExternalHost = process.env.WEB_EXTERNAL_HOST;
   const originalDashboardExternalHost = process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST;
+  const originalDashboardHost = process.env.BOTMUX_DASHBOARD_HOST;
 
   afterEach(() => {
     vi.resetModules();
@@ -12,6 +13,8 @@ describe('web external host', () => {
     else process.env.WEB_EXTERNAL_HOST = originalWebExternalHost;
     if (originalDashboardExternalHost === undefined) delete process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST;
     else process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST = originalDashboardExternalHost;
+    if (originalDashboardHost === undefined) delete process.env.BOTMUX_DASHBOARD_HOST;
+    else process.env.BOTMUX_DASHBOARD_HOST = originalDashboardHost;
   });
 
   it('re-resolves the LAN IP when WEB_EXTERNAL_HOST is not configured', async () => {
@@ -95,5 +98,80 @@ describe('web external host', () => {
 
     const { config } = await import('../src/config.js');
     expect(config.dashboard.externalHost).toBe('terminal.example.com');
+  });
+
+  it('advertises a concrete BOTMUX_DASHBOARD_HOST bind instead of the LAN IP', async () => {
+    // The reported bug: bind 127.0.0.1 but the printed link showed the LAN IP.
+    delete process.env.WEB_EXTERNAL_HOST;
+    delete process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST;
+    process.env.BOTMUX_DASHBOARD_HOST = '127.0.0.1';
+
+    vi.doMock('node:os', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('node:os')>()),
+      networkInterfaces: vi.fn(() => ({
+        en0: [{ family: 'IPv4', internal: false, address: '10.0.12.34' }],
+      })),
+    }));
+    vi.doMock('../src/setup/ensure-tmux.js', () => ({
+      probeTmuxFunctional: () => ({ ok: false }),
+    }));
+
+    const { config } = await import('../src/config.js');
+    expect(config.dashboard.externalHost).toBe('127.0.0.1');
+    // The web terminal host is independent — it still autodetects the LAN IP.
+    expect(config.web.externalHost).toBe('10.0.12.34');
+  });
+
+  it('autodetects the LAN IP for a wildcard dashboard bind', async () => {
+    delete process.env.WEB_EXTERNAL_HOST;
+    delete process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST;
+    process.env.BOTMUX_DASHBOARD_HOST = '0.0.0.0';
+
+    vi.doMock('node:os', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('node:os')>()),
+      networkInterfaces: vi.fn(() => ({
+        en0: [{ family: 'IPv4', internal: false, address: '10.0.12.34' }],
+      })),
+    }));
+    vi.doMock('../src/setup/ensure-tmux.js', () => ({
+      probeTmuxFunctional: () => ({ ok: false }),
+    }));
+
+    const { config } = await import('../src/config.js');
+    expect(config.dashboard.externalHost).toBe('10.0.12.34');
+  });
+
+  it('autodetects the LAN IP for an IPv6 wildcard or blank dashboard bind', async () => {
+    delete process.env.WEB_EXTERNAL_HOST;
+    delete process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST;
+
+    vi.doMock('node:os', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('node:os')>()),
+      networkInterfaces: vi.fn(() => ({
+        en0: [{ family: 'IPv4', internal: false, address: '10.0.12.34' }],
+      })),
+    }));
+    vi.doMock('../src/setup/ensure-tmux.js', () => ({
+      probeTmuxFunctional: () => ({ ok: false }),
+    }));
+
+    for (const bind of ['::', '', '   ']) {
+      vi.resetModules();
+      process.env.BOTMUX_DASHBOARD_HOST = bind;
+      const { config } = await import('../src/config.js');
+      expect(config.dashboard.externalHost).toBe('10.0.12.34');
+    }
+  });
+
+  it('lets an explicit external host win over the bind host', async () => {
+    delete process.env.WEB_EXTERNAL_HOST;
+    process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST = 'dash.example.com';
+    process.env.BOTMUX_DASHBOARD_HOST = '127.0.0.1';
+    vi.doMock('../src/setup/ensure-tmux.js', () => ({
+      probeTmuxFunctional: () => ({ ok: false }),
+    }));
+
+    const { config } = await import('../src/config.js');
+    expect(config.dashboard.externalHost).toBe('dash.example.com');
   });
 });
