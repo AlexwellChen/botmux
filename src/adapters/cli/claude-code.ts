@@ -1149,7 +1149,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // `botmux session-ready` 给出启动 selector 边界。worker 收到后清掉旧
     // readyPattern 证据，并等待新 prompt 再投首条消息。
     injectsReadyHook: true,
-    defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
+    defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal', '/effort'] : undefined,
     // Seed shares most of this adapter but has not been verified to expose the
     // same native session-rename command. Keep the capability exact to Claude.
     buildSessionRenameCommand: variant.id === 'claude-code'

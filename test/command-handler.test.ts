@@ -979,6 +979,12 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
   });
 
+  it('enables /effort only for the Claude Code adapter', () => {
+    expect(PASSTHROUGH_COMMANDS.has('/effort')).toBe(false);
+    expect(resolvePassthroughCommands('app-1').has('/effort')).toBe(true);
+    expect(resolvePassthroughCommands('app-2').has('/effort')).toBe(false);
+  });
+
   it('does not expose Codex interactive /title through the Lark channel', () => {
     expect(PASSTHROUGH_COMMANDS.has('/title')).toBe(false);
     expect(DAEMON_COMMANDS.has('/title')).toBe(false);
