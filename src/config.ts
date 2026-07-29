@@ -21,12 +21,8 @@ function nonBlankHost(value: string | undefined): string | undefined {
   return value?.trim() || undefined;
 }
 
-/** A wildcard/any-address bind is not itself a reachable destination, so a link
- *  advertising it must be resolved to a concrete IP. A specific bind host (e.g.
- *  127.0.0.1, a LAN IP) IS reachable and should be advertised verbatim. Blank
- *  hosts are normalized away by callers (nonBlankHost) before they reach here,
- *  so an empty string is also treated as a wildcard for the raw-config path in
- *  dashboard.ts's loopback gate. */
+/** A wildcard bind (0.0.0.0 / :: / '') isn't a reachable address, so a link must
+ *  resolve it to a concrete IP; a specific host is advertised verbatim. */
 export function isWildcardBindHost(host: string): boolean {
   return host === '0.0.0.0' || host === '::' || host === '';
 }
@@ -41,12 +37,8 @@ export function getWebExternalHost(): string {
 }
 
 export function getDashboardExternalHost(): string {
-  // Priority: explicit external host → the actual listen host (when it's a
-  // concrete, reachable address) → autodetected LAN IP. Advertising the bind
-  // host keeps the printed/DM'd link consistent with where the dashboard is
-  // actually listening: a 127.0.0.1 bind must link to 127.0.0.1, not a LAN IP
-  // nothing is listening on. Only a wildcard bind (0.0.0.0/::) — which isn't a
-  // reachable destination — falls through to autodetect.
+  // Explicit external host → the actual (non-wildcard) listen host → LAN IP.
+  // A 127.0.0.1 bind must link to 127.0.0.1, not a LAN IP nothing listens on.
   if (configuredDashboardExternalHost) return configuredDashboardExternalHost;
   if (configuredDashboardBindHost && !isWildcardBindHost(configuredDashboardBindHost)) {
     return configuredDashboardBindHost;
