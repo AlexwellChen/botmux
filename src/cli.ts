@@ -4089,7 +4089,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close',
+  route: 'slash' | 'cd' | 'close' | 'chat-rename',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -4118,6 +4118,56 @@ async function postSessionCliIpc(
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+async function cmdChat(argv: string[]): Promise<void> {
+  const sub = argv[0] ?? '';
+  if (sub !== 'rename') {
+    console.error('用法: botmux chat rename <新群名称> [--proactive]');
+    process.exitCode = 2;
+    return;
+  }
+  const proactive = argv.includes('--proactive');
+  const name = argv.slice(1).filter(arg => arg !== '--proactive').join(' ').trim();
+  if (!name) {
+    console.error('用法: botmux chat rename <新群名称> [--proactive]');
+    process.exitCode = 2;
+    return;
+  }
+  const ctx = findAncestorSessionContext();
+  const sid = ctx?.sessionId;
+  if (!sid) {
+    console.error(JSON.stringify({ ok: false, error: 'missing_session_context' }));
+    process.exitCode = 1;
+    return;
+  }
+  const sessions = loadSessions();
+  const session = [...sessions.values()].find(x => x.sessionId === sid || x.sessionId.startsWith(sid));
+  if (!session) {
+    console.error(JSON.stringify({ ok: false, error: 'missing_session_context' }));
+    process.exitCode = 1;
+    return;
+  }
+  const daemon = findDaemon(session.larkAppId);
+  if (!daemon) {
+    console.error(JSON.stringify({ ok: false, error: 'daemon_offline' }));
+    process.exitCode = 1;
+    return;
+  }
+  const response = await postSessionCliIpc(
+    daemon.ipcPort,
+    session.sessionId,
+    'chat-rename',
+    { name, proactive },
+  );
+  const body: any = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
+  const out = JSON.stringify(body, null, 2);
+  if (response.ok && body?.ok) {
+    console.log(out);
+    return;
+  }
+  console.error(out);
+  process.exitCode = 1;
 }
 
 /** botmux slash "<斜杠命令>"：请求 daemon 在本会话 idle 后把命令敲入自己的 CLI。
@@ -4853,6 +4903,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   schedule run <id>                    标记立即执行
 
 飞书消息（在 CLI 会话内自动推断 session）:
+  chat rename <新群名称>               修改当前会话所在群的名称
+       --proactive                    标记为 AI 主动改名（应用 10 分钟防抖）
   send [content]                       发消息到当前话题（支持 stdin / --content-file）
        --images <path>                 内联图片（可重复）
        --files <path>                  附件（可重复）
@@ -10087,6 +10139,7 @@ switch (command) {
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'chat':     await cmdChat(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;
