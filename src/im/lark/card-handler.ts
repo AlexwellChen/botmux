@@ -756,17 +756,19 @@ export async function runAutoWorktreeCommit(deps: {
 /**
  * Drive a host-overload降压 sweep across daemons.
  *
- * `suspend_idle` fans out to EVERY online daemon and sums the affected counts —
- * live workers only exist in their owning daemon's process, so each must sweep
- * its own. `clean_stopped` operates on the SHARED, machine-wide session store,
- * so ONE daemon does the whole job: it tries daemons in order until the first
- * one succeeds (not a fixed `daemons[0]`, so a single flaky descriptor doesn't
- * sink the action while healthy siblings sit idle). Fanning clean_stopped out
- * would make siblings race the same zombies and double-count them.
+ * Both modes fan out to EVERY online daemon and sum the affected counts. Each
+ * daemon owns one bot-scoped session store and its own live workers, so neither
+ * stopped sessions nor idle workers can be swept through a sibling daemon.
  *
- * Throws when there are no online daemons, or when every attempt failed — so
- * the caller rolls back the nonce instead of burning the button on an action
- * that never ran. A partial success (≥1 daemon ok) returns normally.
+ * Fail-closed on partial failure: if ANY discovered daemon doesn't ACK, throw —
+ * the caller then rolls back the nonce (releaseOverloadNonce) so the owner can
+ * retry, instead of burning the button on a card that reports「已清理 0」while
+ * the daemon that actually held the zombies never ran. Both sweeps are
+ * idempotent (an already-closed session leaves the stopped set; an already-
+ * suspended worker leaves the idle set), so a retry only re-hits whatever
+ * failed. Reporting a partial count as a completed action would resurrect the
+ * exact "显示 0、实际没清" symptom this fix exists to kill — just triggered by
+ * "the daemon holding the zombies failed" instead of "the first daemon had none".
  */
 async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promise<number> {
   const daemons = listOnlineDaemons();
@@ -789,32 +791,21 @@ async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promis
     }
   };
 
-  if (mode === 'clean_stopped') {
-    // Machine-wide (shared store): try daemons in order, stop at the first
-    // success. Only if EVERY daemon failed do we throw (→ nonce rollback).
-    for (const d of daemons) {
-      const n = await postSweep(d);
-      if (n !== null) return n;
-    }
-    throw new Error(`sweep clean_stopped reached no daemon (${daemons.length} failed)`);
-  }
-
-  // suspend_idle: fan out to all daemons and sum. Throw only if not one acked.
-  let affected = 0;
-  let ok = 0;
+  // Fan out to all daemons and sum. Fail the whole action if ANY didn't ACK, so
+  // the caller keeps the button retriable rather than reporting a partial sweep
+  // as complete.
   const results = await Promise.all(daemons.map(postSweep));
-  for (const n of results) {
-    if (n !== null) { affected += n; ok++; }
+  const failed = results.filter(n => n === null).length;
+  if (failed > 0) {
+    throw new Error(`sweep ${mode}: ${failed}/${daemons.length} daemon(s) did not ack — retriable`);
   }
-  if (ok === 0) throw new Error(`sweep suspend_idle reached no daemon (${daemons.length} failed)`);
-  return affected;
+  return results.reduce((sum: number, n) => sum + (n ?? 0), 0);
 }
 
 /**
- * Machine-wide counts for the overload alert preview. `stopped` (zombies) reads
- * the SHARED session store, so every daemon returns the same number → take the
- * max (any one authoritative). `idle` live workers are per-owning-daemon → sum.
- * Best-effort: an unreachable daemon just contributes 0.
+ * Machine-wide counts for the overload alert preview. Each daemon reports its
+ * bot-scoped stopped sessions and its own live workers, so both fields must be
+ * summed. Best-effort: an unreachable daemon just contributes 0.
  */
 export async function countHostOverload(): Promise<{ stopped: number; idle: number }> {
   const daemons = listOnlineDaemons();
@@ -825,7 +816,7 @@ export async function countHostOverload(): Promise<{ stopped: number; idle: numb
       const res = await fetchDaemonIpc(d.ipcPort, '/api/host-overload/counts', { method: 'GET' });
       const body: any = await res.json().catch(() => ({}));
       if (res.ok && body?.ok) {
-        if (typeof body.stopped === 'number') stopped = Math.max(stopped, body.stopped);
+        if (typeof body.stopped === 'number') stopped += body.stopped;
         if (typeof body.idle === 'number') idle += body.idle;
       }
     } catch { /* unreachable daemon contributes 0 */ }
