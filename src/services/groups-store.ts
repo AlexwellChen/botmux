@@ -76,7 +76,15 @@ export async function isInChat(larkAppId: string, chatId: string): Promise<boole
 
 export type RenameChatResult =
   | { ok: true; oldName: string; newName: string; changed: boolean }
-  | { ok: false; error: 'bot_not_in_chat' | 'permission_denied' | 'lark_api_error'; detail?: string };
+  | {
+      ok: false;
+      error: 'bot_not_in_chat' | 'permission_denied' | 'lark_api_error' | 'rate_limited';
+      detail?: string;
+      oldName?: string;
+      newName?: string;
+      larkCode?: number;
+      retryAfterSeconds?: number;
+    };
 
 /**
  * Rename one chat using exactly the supplied bot identity.
@@ -89,11 +97,17 @@ export async function renameChat(
   larkAppId: string,
   chatId: string,
   newName: string,
+  opts: {
+    beforeUpdate?: () =>
+      | { ok: true }
+      | { ok: false; error: 'rate_limited'; retryAfterSeconds: number };
+  } = {},
 ): Promise<RenameChatResult> {
   const client = getBotClient(larkAppId);
   if (!await isInChat(larkAppId, chatId)) {
     return { ok: false, error: 'bot_not_in_chat' };
   }
+  let oldName: string | undefined;
   try {
     const current: any = await larkGet(
       client,
@@ -107,8 +121,11 @@ export async function renameChat(
         detail: `${current.msg ?? 'unknown'} (code: ${current.code})`,
       };
     }
-    const oldName = typeof current.data?.name === 'string' ? current.data.name.trim() : '';
-    if (oldName === newName) return { ok: true, oldName, newName, changed: false };
+    const fetchedOldName = typeof current.data?.name === 'string' ? current.data.name.trim() : '';
+    oldName = fetchedOldName;
+    if (fetchedOldName === newName) return { ok: true, oldName: fetchedOldName, newName, changed: false };
+    const gate = opts.beforeUpdate?.();
+    if (gate && !gate.ok) return { ...gate, oldName: fetchedOldName, newName };
 
     const updated: any = await (client as any).im.v1.chat.update({
       path: { chat_id: chatId },
@@ -119,9 +136,12 @@ export async function renameChat(
         ok: false,
         error: classifyRenameChatError(updated.code),
         detail: `${updated.msg ?? 'unknown'} (code: ${updated.code})`,
+        oldName: fetchedOldName,
+        newName,
+        larkCode: Number.isFinite(Number(updated.code)) ? Number(updated.code) : undefined,
       };
     }
-    return { ok: true, oldName, newName, changed: true };
+    return { ok: true, oldName: fetchedOldName, newName, changed: true };
   } catch (e: any) {
     const detail = e?.message ?? String(e);
     return {
@@ -130,6 +150,9 @@ export async function renameChat(
         ? 'permission_denied'
         : 'lark_api_error',
       detail,
+      oldName,
+      newName,
+      larkCode: Number.isFinite(Number(e?.code)) ? Number(e.code) : undefined,
     };
   }
 }

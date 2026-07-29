@@ -43,7 +43,7 @@ vi.mock('../src/bot-registry.js', () => ({
       }
       // getChatOwner: GET /open-apis/im/v1/chats/<id>
       if (/\/open-apis\/im\/v1\/chats\/[^/]+$/.test(url)) {
-        return { code: 0, data: { owner_id: 'ou_owner' } };
+        return { code: 0, data: { owner_id: 'ou_owner', name: 'one' } };
       }
       throw new Error(`unexpected GET url in mock: ${url}`);
     }),
@@ -98,7 +98,7 @@ describe('groups-store wrappers', () => {
     const result = await renameChat('appA', 'c1', '支付排障｜待验证');
     expect(result).toEqual({
       ok: true,
-      oldName: '',
+      oldName: 'one',
       newName: '支付排障｜待验证',
       changed: true,
     });
@@ -113,6 +113,50 @@ describe('groups-store wrappers', () => {
     await expect(renameChat('appA', 'c1', '新群名')).resolves.toMatchObject({
       ok: false,
       error: 'permission_denied',
+    });
+  });
+
+  it('renameChat returns same-name success before consulting the proactive write gate', async () => {
+    const beforeUpdate = vi.fn(() => ({
+      ok: false as const,
+      error: 'rate_limited' as const,
+      retryAfterSeconds: 600,
+    }));
+    await expect(renameChat('appA', 'c1', 'one', { beforeUpdate })).resolves.toEqual({
+      ok: true,
+      oldName: 'one',
+      newName: 'one',
+      changed: false,
+    });
+    expect(beforeUpdate).not.toHaveBeenCalled();
+    expect(chatUpdateStub).not.toHaveBeenCalled();
+  });
+
+  it('renameChat rate-limits a different-name proactive retry before the write', async () => {
+    const beforeUpdate = vi.fn(() => ({
+      ok: false as const,
+      error: 'rate_limited' as const,
+      retryAfterSeconds: 599,
+    }));
+    await expect(renameChat('appA', 'c1', 'two', { beforeUpdate })).resolves.toEqual({
+      ok: false,
+      error: 'rate_limited',
+      retryAfterSeconds: 599,
+      oldName: 'one',
+      newName: 'two',
+    });
+    expect(beforeUpdate).toHaveBeenCalledOnce();
+    expect(chatUpdateStub).not.toHaveBeenCalled();
+  });
+
+  it('renameChat preserves old/new names and the Lark code on update failure', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 99991672, msg: 'scope missing' });
+    await expect(renameChat('appA', 'c1', 'two')).resolves.toMatchObject({
+      ok: false,
+      error: 'permission_denied',
+      oldName: 'one',
+      newName: 'two',
+      larkCode: 99991672,
     });
   });
 

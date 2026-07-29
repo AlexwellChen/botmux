@@ -130,7 +130,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -138,7 +138,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
-import { ChatRenameCooldown, normalizeLarkChatName } from './chat-rename.js';
+import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, type DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
@@ -787,6 +787,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
 });
 
 const proactiveChatRenameCooldown = new ChatRenameCooldown();
+const chatRenameSerialQueue = new ChatRenameSerialQueue();
 
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
 ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params) => {
@@ -801,35 +802,48 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   if (!normalized.ok) return jsonRes(res, 400, normalized);
 
   const proactive = body.proactive === true;
+  const trigger = proactive ? 'ai_proactive' : 'user_explicit';
   const cooldownKey = `${ds.larkAppId}:${ds.chatId}`;
-  const now = Date.now();
-  const cooldown = proactiveChatRenameCooldown.check(cooldownKey, now);
-  if (proactive && !cooldown.ok) {
-    return jsonRes(res, 429, {
-      ok: false,
-      error: 'rate_limited',
-      retryAfterSeconds: cooldown.retryAfterSeconds,
+  await chatRenameSerialQueue.run(cooldownKey, async () => {
+    const result = await groupsStore.renameChat(ds.larkAppId, ds.chatId, normalized.name, {
+      beforeUpdate: proactive
+        ? () => {
+            const cooldown = proactiveChatRenameCooldown.check(cooldownKey);
+            return cooldown.ok
+              ? cooldown
+              : { ...cooldown, error: 'rate_limited' as const };
+          }
+        : undefined,
     });
-  }
-
-  const result = await groupsStore.renameChat(ds.larkAppId, ds.chatId, normalized.name);
-  if (!result.ok) {
-    const status = result.error === 'bot_not_in_chat' ? 403
-      : result.error === 'permission_denied' ? 403
-        : 502;
-    logger.warn(`[chat-rename:audit] failed session=${ds.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} proactive=${proactive} error=${result.error} detail=${result.detail ?? '-'}`);
-    return jsonRes(res, status, result);
-  }
-  if (result.changed) {
-    if (proactive) proactiveChatRenameCooldown.record(cooldownKey, now);
-    for (const active of getActiveSessionsRegistry()?.values() ?? []) {
-      if (active.chatId !== ds.chatId) continue;
-      active.session.chatDisplayName = result.newName;
-      sessionStore.updateSession(active.session);
+    const botOpenId = getBotOpenId(ds.larkAppId) ?? '-';
+    if (!result.ok) {
+      const status = result.error === 'bot_not_in_chat' ? 403
+        : result.error === 'permission_denied' ? 403
+          : result.error === 'rate_limited' ? 429
+            : 502;
+      logger.warn(
+        `[chat-rename:audit] result=failed session=${ds.session.sessionId} chat=${ds.chatId} `
+        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
+        + `old=${JSON.stringify(result.oldName ?? null)} new=${JSON.stringify(result.newName ?? normalized.name)} `
+        + `error=${result.error} larkCode=${result.larkCode ?? '-'} detail=${result.detail ?? '-'}`,
+      );
+      return jsonRes(res, status, result);
     }
-    logger.info(`[chat-rename:audit] success session=${ds.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} proactive=${proactive} old=${JSON.stringify(result.oldName)} new=${JSON.stringify(result.newName)}`);
-  }
-  jsonRes(res, 200, { ...result, chatId: ds.chatId });
+    if (result.changed) {
+      if (proactive) proactiveChatRenameCooldown.record(cooldownKey);
+      for (const active of getActiveSessionsRegistry()?.values() ?? []) {
+        if (active.chatId !== ds.chatId) continue;
+        active.session.chatDisplayName = result.newName;
+        sessionStore.updateSession(active.session);
+      }
+      logger.info(
+        `[chat-rename:audit] result=success session=${ds.session.sessionId} chat=${ds.chatId} `
+        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
+        + `old=${JSON.stringify(result.oldName)} new=${JSON.stringify(result.newName)} larkCode=0`,
+      );
+    }
+    return jsonRes(res, 200, { ...result, chatId: ds.chatId });
+  });
 });
 
 /** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）
