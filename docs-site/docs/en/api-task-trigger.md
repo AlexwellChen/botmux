@@ -155,7 +155,7 @@ GET /api/sessions/:sessionId/trigger-result
 ```
 
 About `usage` (this turn's token usage, four mutually-exclusive buckets):
-- Present only for **codex / codex-app tasks** and only when the turn's usage was captured; **omitted entirely** for other CLIs or when not captured.
+- Present only for **codex-app tasks** and only when the turn's usage was captured; **omitted entirely** for other CLIs (including plain codex) or when not captured.
 - **omit ≠ 0**: no usage means no `usage` field, not four zeros — treat "field absent = unknown", don't read a missing field as a real 0.
 - Buckets: `inputTokens` (fresh input, cache read/write already subtracted), `outputTokens`, `cacheReadTokens`, `cacheCreateTokens`, all per-turn deltas (not session totals).
 - **Survives restart**: after a daemon restart, re-querying a completed session restores `usage` alongside `output` from disk.

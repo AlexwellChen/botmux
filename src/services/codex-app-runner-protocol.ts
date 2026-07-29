@@ -155,15 +155,17 @@ export function normalizeAppRunnerFinalMarker(payload: unknown): CodexAppFinalMa
   };
 }
 
-/** Accept the four-bucket usage only when all fields are finite numbers, else
- *  drop it (the daemon then omits usage rather than persisting partial data). */
+/** Accept the four-bucket usage only when every field is a non-negative integer
+ *  (a token count), else drop it (daemon omits usage rather than persisting a
+ *  negative/fractional/partial value that a compromised or buggy runner sent). */
 function normalizeFinalUsage(raw: unknown): CodexAppFinalMarker['usage'] | undefined {
   if (!isRecord(raw)) return undefined;
   const keys = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreateTokens'] as const;
   const out = {} as NonNullable<CodexAppFinalMarker['usage']>;
   for (const k of keys) {
-    if (typeof raw[k] !== 'number' || !Number.isFinite(raw[k])) return undefined;
-    out[k] = raw[k] as number;
+    const v = raw[k];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) return undefined;
+    out[k] = v;
   }
   return out;
 }

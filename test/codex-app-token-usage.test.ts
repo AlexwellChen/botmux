@@ -105,6 +105,17 @@ describe('TurnTokenUsageAccumulator — total-delta', () => {
     expect(new TurnTokenUsageAccumulator().result()).toBeNull();
   });
 
+  it('poison() is sticky: a later valid update cannot resurrect usage', () => {
+    // Models malformed-then-valid within one turn: the runner poisons on the
+    // malformed notification; a subsequent valid one must NOT rebuild a baseline
+    // and report only that completion (a plausible-looking undercount).
+    const acc = new TurnTokenUsageAccumulator();
+    acc.poison('malformed tokenUsage notification');
+    acc.update(bd({ totalTokens: 130, inputTokens: 100, outputTokens: 30 }), bd({ totalTokens: 130, inputTokens: 100, outputTokens: 30 }));
+    expect(acc.result()).toBeNull();
+    expect(acc.warning).toBeTruthy();
+  });
+
   it('fail-closed: negative baseline (total < last) → null + warning (not inflated turn)', () => {
     // codex review repro: total.input=50 but last.input=100 → baseline would be
     // -50 and the turn would wrongly read input=100. Must reject.

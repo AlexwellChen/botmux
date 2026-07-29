@@ -115,6 +115,21 @@ function emitTurnCompletion(threadId, turnId, outputSchema) {
       },
     });
   }
+  // Opt-in: a MALFORMED usage notification first, then a valid one, same turn.
+  // Exercises the runner's sticky-poison path — usage must end up OMITTED.
+  if (process.env.FAKE_TOKEN_USAGE_POISON === '1') {
+    notify('thread/tokenUsage/updated', {
+      threadId, turnId,
+      tokenUsage: { total: { totalTokens: 'bad' }, last: {} }, // malformed → poison
+    });
+    notify('thread/tokenUsage/updated', {
+      threadId, turnId,
+      tokenUsage: {
+        total: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+        last: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+      },
+    });
+  }
   notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } });
 }
 

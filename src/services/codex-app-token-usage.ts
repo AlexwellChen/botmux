@@ -118,6 +118,15 @@ export class TurnTokenUsageAccumulator {
     this.latestTotal = total;
   }
 
+  /** Mark this turn's usage as unusable (sticky). Called when a notification for
+   *  the turn arrives but its breakdown is malformed: skipping it silently would
+   *  let a LATER valid notification rebuild a fresh baseline and report only the
+   *  last completion — a plausible-looking undercount. Poisoning makes result()
+   *  omit + warn instead. */
+  poison(reason: string): void {
+    if (!this.protocolWarning) this.protocolWarning = reason;
+  }
+
   /** The turn's usage so far as four buckets, or null if no usage seen / a
    *  protocol anomaly was detected / the bucket split is incoherent. */
   result(): TurnTokenUsage | null {

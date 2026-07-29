@@ -282,6 +282,22 @@ const usageAccumulators = new Map<string, TurnTokenUsageAccumulator>();
  *  that never emit a final marker. */
 const MAX_USAGE_ACCUMULATORS = 8;
 
+/** Get (or create, with bounded pruning) the usage accumulator for a turn. */
+function getOrCreateUsageAccumulator(turnId: string): TurnTokenUsageAccumulator {
+  let acc = usageAccumulators.get(turnId);
+  if (!acc) {
+    // Bounded pruning: a turn that never emits a final marker (crash/interrupt)
+    // would otherwise leak its accumulator. Evict the oldest insertion at the cap.
+    if (usageAccumulators.size >= MAX_USAGE_ACCUMULATORS) {
+      const oldest = usageAccumulators.keys().next().value;
+      if (oldest !== undefined) usageAccumulators.delete(oldest);
+    }
+    acc = new TurnTokenUsageAccumulator();
+    usageAccumulators.set(turnId, acc);
+  }
+  return acc;
+}
+
 function detectedCodexVersion(): CodexVersion | undefined {
   if (codexVersionChecked) return codexVersion;
   codexVersionChecked = true;
@@ -339,23 +355,19 @@ function handleNotification(msg: JsonObject): void {
   if (msg.method === 'thread/tokenUsage/updated') {
     const params = (msg.params ?? {}) as JsonObject;
     const turnId = typeof params.turnId === 'string' ? params.turnId : undefined;
-    const usage = (params.tokenUsage ?? {}) as JsonObject;
-    const total = parseCodexTokenBreakdown(usage.total);
-    const last = parseCodexTokenBreakdown(usage.last);
-    if (turnId && total && last) {
-      let acc = usageAccumulators.get(turnId);
-      if (!acc) {
-        // Bounded pruning: a turn that never emits a final marker (crash/interrupt)
-        // would otherwise leak its accumulator. Only one turn is active at a time,
-        // so a tiny cap suffices — evict the oldest insertion when exceeded.
-        if (usageAccumulators.size >= MAX_USAGE_ACCUMULATORS) {
-          const oldest = usageAccumulators.keys().next().value;
-          if (oldest !== undefined) usageAccumulators.delete(oldest);
-        }
-        acc = new TurnTokenUsageAccumulator();
-        usageAccumulators.set(turnId, acc);
+    if (turnId) {
+      const usage = (params.tokenUsage ?? {}) as JsonObject;
+      const total = parseCodexTokenBreakdown(usage.total);
+      const last = parseCodexTokenBreakdown(usage.last);
+      const acc = getOrCreateUsageAccumulator(turnId);
+      if (total && last) {
+        acc.update(total, last);
+      } else {
+        // Malformed usage for a KNOWN turn: poison it (sticky). Silently skipping
+        // would let a later valid notification rebuild a fresh baseline and report
+        // only the last completion — a plausible-looking undercount.
+        acc.poison('malformed tokenUsage notification');
       }
-      acc.update(total, last);
     }
   }
   controller?.handleNotification(msg);

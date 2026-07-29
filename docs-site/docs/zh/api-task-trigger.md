@@ -155,7 +155,7 @@ GET /api/sessions/:sessionId/trigger-result
 ```
 
 关于 `usage`（本轮 token 用量，四桶互斥）：
-- **仅 codex / codex-app 任务**、且本轮成功采集到用量时出现；其它 CLI 或未采集到时**整段省略**。
+- **仅 codex-app 任务**、且本轮成功采集到用量时出现；其它 CLI（含纯 codex）或未采集到时**整段省略**。
 - **omit ≠ 0**：拿不到用量就没有 `usage` 字段，而不是四个 0——请按"字段缺失=未知"处理，不要把缺失当成真实 0 用量。
 - 四桶：`inputTokens`（纯新增输入，已扣除缓存读/写）、`outputTokens`、`cacheReadTokens`、`cacheCreateTokens`，均为本轮增量（非会话累计）。
 - **随重启持久化**：daemon 重启后再查该已完成会话，`usage` 与 `output` 一并从磁盘恢复。

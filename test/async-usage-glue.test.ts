@@ -8,7 +8,7 @@
  * Run: pnpm vitest run test/async-usage-glue.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -77,5 +77,24 @@ describe('final_output → durable usage persistence (memory + disk + restart)',
 
     expect(ds.asyncTriggerResults.get('trg_b').usage).toBeUndefined();
     expect(asyncTriggerStore.lookup('sess-glue-2', 'trg_b')?.result.usage).toBeUndefined();
+  });
+});
+
+describe('trigger-result wrapper wires usage from both mem and persisted (source lock)', () => {
+  // The trigger-result composition (buildAsyncTriggerLookupResponse) is module
+  // private and behind the daemon registry, so unit-testing it live needs a heavy
+  // harness. Lock the two spreads that carry usage into resolveAsyncTriggerState —
+  // deleting either (live memResult.usage OR persisted result.usage) fails here,
+  // guarding the exact hop codex flagged. resolveAsyncTriggerState's own mem+disk
+  // usage emission is covered in async-trigger-state.test.ts.
+  it('passes memResult.usage (live path) into the resolver', () => {
+    const src = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
+    const call = src.indexOf('resolveAsyncTriggerState({');
+    expect(call).toBeGreaterThan(0);
+    const body = src.slice(call, src.indexOf('});', call));
+    // live in-memory result must forward usage
+    expect(body).toMatch(/memResult\?\.usage|usage: memResult\.usage/);
+    // persisted result is passed whole (its `result.usage` reaches the resolver)
+    expect(body).toContain('persisted');
   });
 });
