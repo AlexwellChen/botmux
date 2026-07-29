@@ -1603,9 +1603,10 @@ export function buildRelayPickerCard(
    *  so the re-render handlers (select / page / search) know they must delete +
    *  resend an ephemeral card instead of returning a body for Lark to patch in
    *  place (ephemeral cards can't be PATCH-updated). Default 'public' preserves
-   *  the legacy visible-to-all picker. Meaningful for group targets (incl. topic
-   *  groups — ephemeral is sent per-user at group top-level); p2p never goes
-   *  ephemeral (see command-handler). */
+   *  the legacy visible-to-all picker. Only ever set 'private' for flat chat-
+   *  scope 普通群 targets: ephemeral has no thread anchor, so command-handler
+   *  gates it on `targetScope === 'chat'` (thread-scope 话题群/话题 stay public
+   *  in-thread — see the gate comment there). p2p never goes ephemeral. */
   visibility: 'private' | 'public' = 'public',
 ): string {
   const searchQuery = state?.searchQuery ?? '';

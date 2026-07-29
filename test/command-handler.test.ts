@@ -197,7 +197,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   ),
   buildSlashListCard: vi.fn((params: any) => JSON.stringify(params)),
   buildRelayPickerCard: vi.fn(
-    (entries: any[], targetChatId: string, rootMessageId: string, _invokerOpenId?: string, _locale?: any, _state?: any, targetScope?: string, targetChatType?: string) => JSON.stringify({
+    (entries: any[], targetChatId: string, rootMessageId: string, _invokerOpenId?: string, _locale?: any, _state?: any, targetScope?: string, targetChatType?: string, visibility?: string) => JSON.stringify({
       schema: '2.0',
       body: {
         elements: entries.length === 0 ? [
@@ -206,7 +206,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
           tag: 'interactive_container',
           behaviors: [{
             type: 'callback',
-            value: { action: 'relay_select', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId, target_scope: targetScope ?? 'chat', target_chat_type: targetChatType ?? 'group' },
+            value: { action: 'relay_select', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId, target_scope: targetScope ?? 'chat', target_chat_type: targetChatType ?? 'group', visibility: visibility ?? 'public' },
           }],
           elements: [{ tag: 'markdown', content: `**${e.title}**\n${e.chatMode ?? 'group'}\n${e.chatLabel}` }],
         })),
@@ -240,6 +240,10 @@ vi.mock('../src/im/lark/client.js', () => ({
   // Default returns null so picker entries fall back to raw chatId.
   getChatName: vi.fn(async () => null),
   getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
+  // privateCard /relay picker: chat-scope 普通群 sends the picker ephemeral
+  // (visible-to-invoker) via this. Default resolves to a fake ephemeral id;
+  // scenarios override with mockRejectedValueOnce to exercise the fallback.
+  sendEphemeralCard: vi.fn(async () => 'eph_picker_msg_id'),
 }));
 
 vi.mock('../src/services/group-creator.js', () => ({
@@ -3914,6 +3918,138 @@ describe('handleCommand', () => {
       expect(containerValue?.target_scope).toBe('thread');
       // 话题群 top-level → anchor = the /relay message id (makeLarkMessage → 'msg_001').
       expect(containerValue?.root_id).toBe('msg_001');
+    });
+
+    // ── privateCard picker gate (PR #654 + 首审/复审修复) ────────────────────
+    // The picker exposes session title + source-chat name. When privateCard is
+    // on, a FLAT 普通群 (chat-scope) sends it as an ephemeral card (visible to the
+    // invoker only). But ephemeral has no thread anchor, so thread-scope targets
+    // must NOT use it (see the gate comment in command-handler + the REGRESSION
+    // in ephemeral-or-reply.test.ts). 申晗 (2026-07-29): 话题内公开可接受.
+
+    // Helper: bot with privateCard on.
+    const withPrivateCard = () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        const bot = defaultGetBot(id);
+        (bot.config as any).privateCard = true;
+        return bot;
+      }) as any);
+    };
+
+    it('privateCard + flat 普通群 (chat-scope): sends the picker as an ephemeral card, NOT a visible reply', async () => {
+      withPrivateCard();
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'secret task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      // Ephemeral send to the invoker in the current chat — never a visible reply.
+      expect(vi.mocked(sendEphemeralCard)).toHaveBeenCalledTimes(1);
+      const [appId, chatId, openId, cardJson] = vi.mocked(sendEphemeralCard).mock.calls[0];
+      expect(appId).toBe(LARK_APP_ID);
+      expect(chatId).toBe(CHAT_ID);
+      expect(openId).toBe('ou_sender');
+      expect(vi.mocked(replyMessage)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+      // The ephemeral card carries visibility='private' baked into its buttons.
+      const card = JSON.parse(cardJson as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.visibility).toBe('private');
+    });
+
+    it('REGRESSION: privateCard + thread-scope (话题群) does NOT go ephemeral — stays a visible in-thread reply (public card)', async () => {
+      // Ephemeral has no thread anchor: a 话题群 rejects with 18053 and a 话题
+      // inside a 普通群 would leak the card to the group top level. So thread-
+      // scope pickers must skip ephemeral entirely (guarded, not fallback).
+      withPrivateCard();
+      const { sendEphemeralCard, getChatNameAndMode } = await import('../src/im/lark/client.js');
+      vi.mocked(getChatNameAndMode).mockResolvedValueOnce({ name: 'Topic Room', mode: 'topic' });
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'secret task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      // Ephemeral must NOT be attempted for a thread-scope target.
+      expect(vi.mocked(sendEphemeralCard)).not.toHaveBeenCalled();
+      // Card goes out as a visible in-thread reply, and is PUBLIC (not private).
+      const [, anchorMsgId, replyContent, msgType, inThread] = vi.mocked(replyMessage).mock.calls[0];
+      expect(anchorMsgId).toBe('msg_001');
+      expect(inThread).toBe(true);
+      expect(msgType).toBe('interactive');
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.target_scope).toBe('thread');
+      expect(containerValue?.visibility).toBe('public');
+    });
+
+    it('privateCard + chat-scope: falls back to a visible reply when the ephemeral send fails (e.g. 18053)', async () => {
+      withPrivateCard();
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+      vi.mocked(sendEphemeralCard).mockRejectedValueOnce(new Error('chat can not be thread (code: 18053)'));
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'secret task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      // Attempted ephemeral, then fell back to the visible reply with a PUBLIC card.
+      expect(vi.mocked(sendEphemeralCard)).toHaveBeenCalledTimes(1);
+      const [, , replyContent, msgType] = vi.mocked(replyMessage).mock.calls[0];
+      expect(msgType).toBe('interactive');
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.visibility).toBe('public');
+    });
+
+    it('privateCard OFF + flat 普通群: picker stays a visible reply (no ephemeral)', async () => {
+      // Default bot has no privateCard — the gate must not fire.
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'other task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      expect(vi.mocked(sendEphemeralCard)).not.toHaveBeenCalled();
+      const [, , replyContent] = vi.mocked(replyMessage).mock.calls[0];
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.visibility).toBe('public');
     });
 
     it('picker refuses upfront when this chat already has an active session for the bot', async () => {
