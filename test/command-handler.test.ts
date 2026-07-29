@@ -454,7 +454,7 @@ vi.mock('../src/services/card-mode-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
@@ -988,6 +988,21 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands('app-2').has('/effort')).toBe(true); // codex
     // 无 bot 上下文时也回落到全局集合,仍含 /effort。
     expect(resolvePassthroughCommands(undefined).has('/effort')).toBe(true);
+  });
+
+  it('keeps /effort OUT of the adapter default layer so it never gains cold-start', () => {
+    // 核心语义护栏:冷启动能力(空 topic 里发命令能否拉起新会话)只认 adapter 层的
+    // defaultPassthroughCommands(见 daemon.ts 的 isInitialSessionPassthrough →
+    // resolveAdapterDefaultPassthroughCommands),不认全局 PASSTHROUGH_COMMANDS。
+    // /effort 是「调档」而非「开一段工作」的命令,必须留在全局层、绝不进 adapter 层,
+    // 否则空话题单发 /effort 会凭空 spawn 一个没活干的会话。这条断言锁住该语义:
+    // 即使有人日后误把 /effort 加回某个 adapter 的 default,resolvePassthroughCommands
+    // 层的可见性测试仍会全绿(全局也有),唯有这里能抓住回归。
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/effort'); // claude-code
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).not.toContain('/effort'); // codex
+    // /goal 相反:它是「开启目标工作」的命令,刻意留在 adapter 层保留冷启动语义。
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).toContain('/goal');
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).toContain('/goal');
   });
 
   it('does not expose Codex interactive /title through the Lark channel', () => {
