@@ -368,6 +368,10 @@ function handleNotification(msg: JsonObject): void {
         // only the last completion — a plausible-looking undercount.
         acc.poison('malformed tokenUsage notification');
       }
+    } else {
+      // No turnId to attribute usage to — can't fold it into any turn. Surface a
+      // protocol warning rather than dropping it entirely silently.
+      writeLine('[codex-app] tokenUsage notification without turnId (ignored)');
     }
   }
   controller?.handleNotification(msg);
