@@ -4307,6 +4307,80 @@ describe('im.message.receive_v1 — regular group thread replies preference', ()
   });
 });
 
+describe('im.message.receive_v1 — p2p chat-mode topic reply anchoring', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    setupBotState({ p2pMode: 'chat', allowedUsers: [USER_OPEN_ID] });
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('p2p');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('a DM reply inside an existing topic stays chat-scope but anchors the visible reply back to the topic root (no leak to DM top level)', async () => {
+    // Regression: p2pMode default flipped to 'chat' makes the whole DM one flat
+    // chat-scope session. A message that is itself a reply INSIDE a native topic
+    // (root_id + thread_id) must keep the session flat (chat-scope, anchored on
+    // chatId) BUT thread its visible reply under that topic root via replyRootId
+    // — otherwise the reply leaks to the DM top level. The group-side
+    // replyRootId preservation is gated chatType==='group', so p2p needs its own.
+    const reply = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'follow up inside this DM topic' }),
+      rootId: 'dm-topic-root',
+      threadId: 'omt_dm_topic',
+      messageId: 'msg-dm-in-topic',
+      chatId: 'oc_dm_chat',
+      chatType: 'p2p',
+    });
+    // Bot owns the flat DM chat-scope session (keyed on chatId).
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'oc_dm_chat');
+
+    await capturedHandlers['im.message.receive_v1'](reply);
+    await flushEventWork();
+
+    // Session stays flat chat-scope on the DM chatId...
+    // ...and the visible reply is anchored back to the topic root (replyRootId).
+    const call = handlers.handleThreadReply.mock.calls.find(c => c[0] === reply)
+      ?? handlers.handleNewTopic.mock.calls.find(c => c[0] === reply);
+    expect(call).toBeTruthy();
+    expect(call![1]).toEqual(expect.objectContaining({
+      scope: 'chat',
+      anchor: 'oc_dm_chat',
+      replyRootId: 'dm-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('a top-level DM message (no thread) stays flat with no replyRootId', async () => {
+    // The fix must NOT invent a replyRootId for ordinary top-level DM messages —
+    // only real topic replies (root_id + thread_id) get the thread anchor.
+    const top = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'plain DM message' }),
+      messageId: 'msg-dm-top',
+      chatId: 'oc_dm_chat2',
+      chatType: 'p2p',
+    });
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](top);
+    await flushEventWork();
+
+    const call = handlers.handleNewTopic.mock.calls.find(c => c[0] === top)
+      ?? handlers.handleThreadReply.mock.calls.find(c => c[0] === top);
+    expect(call).toBeTruthy();
+    expect(call![1]).toEqual(expect.objectContaining({
+      scope: 'chat',
+      anchor: 'oc_dm_chat2',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(call![1].replyRootId).toBeUndefined();
+  });
+});
+
 describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | new-topic | shared)', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 

@@ -2465,6 +2465,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       };
       let routingSource = decision.source;
       let replyRootId: string | undefined;
+      // 私聊 chat 模式：会话是扁平连续的(整段 DM 一个 chat-scope 会话),但如果这条
+      // 消息本身是在某个已存在的话题里回复的(root_id+thread_id),可见回复必须落回
+      // 那个话题里,而不是漏到 DM 顶层。decideRouting 已把 scope 折成 chat(会话扁平
+      // 语义不变),这里只补 replyRootId 让 sendReply 用 reply_in_thread 锚回话题根。
+      // 群聊侧的同类保留由 maybeFold / alias 分支处理(它们 gate chatType==='group',
+      // 私聊走不到),故私聊必须在此单独补。仅 p2p:群顶层消息不该被强行塞进话题。
+      if (routing.scope === 'chat' && chatType === 'p2p' && message.root_id && message.thread_id) {
+        replyRootId = message.root_id;
+      }
       const explicitlyMentionedThisBot = isBotMentioned(larkAppId, message, senderOpenId);
       // Cheap in-memory gate FIRST: skip the getChatMode roundtrip and the
       // per-chat toggle disk read entirely for bots that never configured a
