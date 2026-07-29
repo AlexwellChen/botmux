@@ -89,7 +89,8 @@ import {
   freezeManagedZmxAttachTarget,
 } from './cli/zmx-managed-attach.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
-import { dispatchDeferredTopicSend, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
+import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
+import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
@@ -7480,7 +7481,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -7492,6 +7493,19 @@ async function cmdSend(rest: string[]): Promise<void> {
   // sender can still reply into a per-turn topic, so sender scope alone does
   // not describe which peer sessions are reachable.
   const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  const dataDir = resolveDataDir();
+  const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
+    ? readDeferredTopicBinding(dataDir, s.sessionId)
+    : undefined;
+  const deferredRoot = reusableDeferredTopicRoot({
+    session: s as SessionData & { larkAppId: string },
+    binding: deferredBinding,
+    explicitTopLevel: sendTopLevel,
+    reuseBoundRootWhenTopLevel: deferredMaterializedByThisCommand,
+  });
+  const reachabilityTarget = deferredRoot
+    ? { mode: 'thread' as const, rootMessageId: deferredRoot }
+    : sendTarget;
 
   // Load the sender-scoped bot identity map once. Besides prose @Name
   // injection below, it lets the sub-bot hint recognize peers that already
@@ -7499,7 +7513,6 @@ async function cmdSend(rest: string[]): Promise<void> {
   let botEntries: BotMentionEntry[] = [];
   let crossRef: Record<string, string> = {};
   try {
-    const dataDir = resolveDataDir();
     const botInfoPath = join(dataDir, 'bots-info.json');
     const parsedBotEntries = existsSync(botInfoPath)
       ? JSON.parse(readFileSync(botInfoPath, 'utf-8'))
@@ -7528,7 +7541,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   // `@OtherSubBot` can't slip past after this explicit guard already ran.
   let dispatchReg: Record<string, { orchChatId?: string; bots?: string[] }> = {};
   try {
-    const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+    const regPath = join(dataDir, 'orchestrate-dispatch.json');
     if (existsSync(regPath)) dispatchReg = JSON.parse(readFileSync(regPath, 'utf-8'));
   } catch { /* no/!corrupt registry → no guard */ }
   const dispatchActiveSeeds = new Set<string>();
@@ -7545,19 +7558,20 @@ async function cmdSend(rest: string[]): Promise<void> {
   // An active chat-scope session can outlive a /reply-mode switch. Verify the
   // target bot's current effective mode before assuming mentions still fold
   // back into that old session.
-  const foldableChatAppIds = foldableChatSessionAppIds({
+  const foldableChatAppIds = await foldableChatSessionAppIds({
     sessions: allSessions,
     targetChatId,
-    outboundMode: sendTarget.mode,
+    outboundMode: reachabilityTarget.mode,
     resolveMode: (larkAppId, chatId) => {
       getBot(larkAppId); // unknown target bot must fail closed
       return resolveRegularGroupMode(larkAppId, chatId);
     },
+    resolveChatMode: chatId => getChatModeStrict(appId, chatId),
   });
   const reachableOpenIds = activeConversationBotOpenIds({
     sessions: allSessions,
     targetChatId,
-    outboundRootMessageId: threadRootForReachability(sendTarget),
+    outboundRootMessageId: threadRootForReachability(reachabilityTarget),
     foldableChatAppIds,
     botEntries,
     crossRef,
@@ -7597,8 +7611,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     rootMessageId: s.rootMessageId,
     title: s.title,
   };
-  // Dispatch helper below uses the same precomputed target as the advisory
-  // guard, so the hint and actual Lark delivery cannot disagree about scope.
+  // Ordinary delivery uses the nominal target. Deferred delivery gets first
+  // refusal below; the advisory mirrors its existing binding in
+  // `reachabilityTarget` above so both paths agree about the effective root.
   const dispatch = async (
     content: string,
     msgType: string,

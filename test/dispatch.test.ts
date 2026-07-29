@@ -372,7 +372,7 @@ describe('send-target reachability helpers', () => {
     expect(threadRootForReachability({ mode: 'plain', chatId: 'oc_chat' })).toBeUndefined();
   });
 
-  it('accepts only currently foldable chat sessions in the target chat', () => {
+  it('accepts only currently foldable ordinary-group chat sessions in the target chat', async () => {
     const sessions = [
       { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_chat' },
       { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_new_topic' },
@@ -383,47 +383,100 @@ describe('send-target reachability helpers', () => {
       ['cli_new_topic', 'new-topic' as const],
       ['cli_elsewhere', 'shared' as const],
     ]);
-    expect(foldableChatSessionAppIds({
+    expect(await foldableChatSessionAppIds({
       sessions,
       targetChatId: 'oc_main',
       outboundMode: 'thread',
       resolveMode: appId => modes.get(appId),
+      resolveChatMode: async () => 'group',
     })).toEqual(new Set(['cli_chat']));
   });
 
-  it('keeps chat-topic chat sessions reachable only for top-level-like delivery', () => {
+  it('keeps chat-topic chat sessions reachable only for top-level-like delivery', async () => {
     const sessions = [
       { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_chat_topic' },
     ];
     const resolveMode = () => 'chat-topic' as const;
-    expect(foldableChatSessionAppIds({
+    expect(await foldableChatSessionAppIds({
       sessions,
       targetChatId: 'oc_main',
       outboundMode: 'plain',
       resolveMode,
+      resolveChatMode: async () => 'group',
     })).toEqual(new Set(['cli_chat_topic']));
-    expect(foldableChatSessionAppIds({
+    expect(await foldableChatSessionAppIds({
       sessions,
       targetChatId: 'oc_main',
       outboundMode: 'quote',
       resolveMode,
+      resolveChatMode: async () => 'group',
     })).toEqual(new Set(['cli_chat_topic']));
-    expect(foldableChatSessionAppIds({
+    expect(await foldableChatSessionAppIds({
       sessions,
       targetChatId: 'oc_main',
       outboundMode: 'thread',
       resolveMode,
+      resolveChatMode: async () => 'group',
     })).toEqual(new Set());
   });
 
-  it('fails closed when the target bot reply mode cannot be resolved', () => {
-    expect(foldableChatSessionAppIds({
+  it('excludes isolated deferred and VC chat sessions from the ordinary routing slot', async () => {
+    expect(await foldableChatSessionAppIds({
+      sessions: [
+        {
+          status: 'active',
+          scope: 'chat',
+          chatId: 'oc_main',
+          rootMessageId: 'om_deferred',
+          larkAppId: 'cli_deferred',
+          deferredScheduleRun: { routingAnchor: 'schedule-run:1' },
+        },
+        {
+          status: 'active',
+          scope: 'chat',
+          chatId: 'oc_main',
+          rootMessageId: 'om_vc',
+          larkAppId: 'cli_vc',
+          vcMeetingReceiver: { meetingId: 'meeting-1' },
+        },
+      ],
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode: () => 'chat',
+      resolveChatMode: async () => 'group',
+    })).toEqual(new Set());
+  });
+
+  it('fails closed after a regular group becomes a topic chat', async () => {
+    expect(await foldableChatSessionAppIds({
+      sessions: [
+        { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_stale' },
+      ],
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode: () => 'chat',
+      resolveChatMode: async () => 'topic',
+    })).toEqual(new Set());
+  });
+
+  it('fails closed when the target bot reply mode or chat topology cannot be resolved', async () => {
+    expect(await foldableChatSessionAppIds({
       sessions: [
         { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_unknown' },
       ],
       targetChatId: 'oc_main',
       outboundMode: 'plain',
       resolveMode: () => { throw new Error('unknown bot'); },
+      resolveChatMode: async () => 'group',
+    })).toEqual(new Set());
+    expect(await foldableChatSessionAppIds({
+      sessions: [
+        { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_unknown' },
+      ],
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode: () => 'chat',
+      resolveChatMode: async () => 'unknown',
     })).toEqual(new Set());
   });
 });

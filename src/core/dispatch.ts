@@ -236,33 +236,54 @@ type ReachabilitySession = {
   chatId: string;
   rootMessageId: string;
   larkAppId?: string;
+  deferredScheduleRun?: unknown;
+  vcMeetingReceiver?: unknown;
 };
 
 /**
  * Identify active chat sessions whose bot is still configured to fold a
  * mention back into that shared session. Mode lookup failures fail closed.
  */
-export function foldableChatSessionAppIds(input: {
+export async function foldableChatSessionAppIds(input: {
   sessions: Iterable<ReachabilitySession>;
   targetChatId: string;
   outboundMode: SessionReplyTarget['mode'];
   resolveMode: (larkAppId: string, chatId: string) => 'chat' | 'shared' | 'new-topic' | 'chat-topic' | undefined;
-}): Set<string> {
-  const appIds = new Set<string>();
+  resolveChatMode: (chatId: string) => Promise<'group' | 'topic' | 'p2p' | 'unknown' | undefined>;
+}): Promise<Set<string>> {
+  const candidates = new Set<string>();
   for (const session of input.sessions) {
     if (session.status !== 'active'
       || session.scope !== 'chat'
       || !session.larkAppId
-      || session.chatId !== input.targetChatId) continue;
+      || session.chatId !== input.targetChatId
+      // These chat-scoped sessions deliberately use isolated routing keys and
+      // can never be reached through the ordinary (chatId, appId) slot.
+      || session.deferredScheduleRun
+      || session.vcMeetingReceiver) continue;
+    candidates.add(session.larkAppId);
+  }
+
+  const appIds = new Set<string>();
+  if (candidates.size === 0) return appIds;
+  // Topology belongs to the chat, not to an individual bot. Resolve it once
+  // through the sending bot's authenticated client.
+  let chatMode: 'group' | 'topic' | 'p2p' | 'unknown' | undefined;
+  try {
+    chatMode = await input.resolveChatMode(input.targetChatId);
+  } catch { /* lookup failure → retain advisory */ }
+  if (chatMode !== 'group') return appIds;
+
+  for (const larkAppId of candidates) {
     try {
-      const mode = input.resolveMode(session.larkAppId, input.targetChatId);
+      const mode = input.resolveMode(larkAppId, input.targetChatId);
       // chat-topic reuses the chat session for top-level/quote delivery, but
       // deliberately keeps a real Lark topic isolated. new-topic never folds
       // a new mention back into a leftover chat session.
       if (mode === 'chat'
         || mode === 'shared'
         || (mode === 'chat-topic' && input.outboundMode !== 'thread')) {
-        appIds.add(session.larkAppId);
+        appIds.add(larkAppId);
       }
     } catch { /* unknown bot/mode → retain advisory */ }
   }
