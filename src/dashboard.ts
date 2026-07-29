@@ -528,6 +528,8 @@ interface ResolvedDashboardSettings {
     workerOnline: boolean;
     lastError: { at: string; message: string; retryAt: string } | null;
   };
+  /** Experimental anti-resend guidance in botmux routing hints. Default OFF. */
+  noVisibleOutputHint: boolean;
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -1046,6 +1048,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       workerOnline: isCodexNotifierWorkerStateFresh(codexNotifierState),
       lastError: codexNotifierState?.lastError ?? null,
     },
+    noVisibleOutputHint: dashboard.noVisibleOutputHint === true, // default OFF; opt-in anti-resend guidance
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,

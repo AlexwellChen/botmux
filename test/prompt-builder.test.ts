@@ -85,6 +85,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { buildNewTopicPrompt, buildFollowUpContent, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
+import { config } from '../src/config.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -320,10 +321,26 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
     // Complex send guidance is discoverable once in the opening catalog; keep
-    // every follow-up reminder intentionally tiny.
+    // Complex send guidance is discoverable once in the opening catalog; keep
+    // every follow-up reminder intentionally tiny. By default (experimental
+    // anti-resend toggle OFF) it is exactly #554's BOTMUX_NO_REPLY sentinel
+    // baseline — no anti-resend clause appended.
     expect(content).toContain('<botmux_reminder>需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY</botmux_reminder>');
+    expect(content).not.toContain('别因「无输出」提示重发');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
+  });
+
+  it('carries the anti-resend reminder variant when config.noVisibleOutputHint is ON', () => {
+    (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint = true;
+    try {
+      const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'codex' });
+      // ON variant must inherit #554's sentinel semantics AND add anti-resend.
+      expect(content).toContain('final 只输出 BOTMUX_NO_REPLY');
+      expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
+    } finally {
+      delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
+    }
   });
 
   it('uses final-output reminder for Hermes follow-ups', () => {
