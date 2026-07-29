@@ -15,7 +15,8 @@ import { config } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
-  loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
+  loadPersistedToken, loadOrCreatePersistedToken, persistToken,
+  loadDashboardSecret, loadOrCreateDashboardSecret,
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
@@ -232,8 +233,9 @@ function loadOrCreateSecret(): string {
 }
 
 // The active dashboard token is persisted to disk so a previously-issued
-// dashboard URL survives `botmux restart`; only `botmux dashboard` (the
-// /__cli/rotate endpoint) rotates it and thereby invalidates the old link.
+// dashboard URL survives `botmux restart`. A platform-bound dashboard creates
+// the first token on startup; only `botmux dashboard` (the /__cli/rotate
+// endpoint) replaces it and thereby invalidates the old link.
 // The start/restart hint reads it via the non-rotating /__cli/current endpoint
 // so it can show the live link without invalidating it.
 let activeToken: string | null = loadPersistedToken(TOKEN_PATH);
@@ -5192,6 +5194,10 @@ function startPlatformTunnelIfBound(): void {
   try {
     const binding = readPlatformBinding();
     if (!binding) return;
+    if (!activeToken) {
+      activeToken = loadOrCreatePersistedToken(TOKEN_PATH);
+      logger.info('[platform-tunnel] 已初始化 dashboard token');
+    }
     const version = readBotmuxVersion();
     platformTunnel = startPlatformTunnelClient({
       binding,
