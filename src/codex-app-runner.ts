@@ -22,7 +22,7 @@ import {
 } from './services/codex-app-runner-protocol.js';
 import {
   TurnTokenUsageAccumulator,
-  parseCodexTokenBreakdown,
+  parseTokenUsagePair,
 } from './services/codex-app-token-usage.js';
 
 type JsonObject = Record<string, any>;
@@ -357,15 +357,16 @@ function handleNotification(msg: JsonObject): void {
     const turnId = typeof params.turnId === 'string' ? params.turnId : undefined;
     if (turnId) {
       const usage = (params.tokenUsage ?? {}) as JsonObject;
-      const total = parseCodexTokenBreakdown(usage.total);
-      const last = parseCodexTokenBreakdown(usage.last);
+      const parsed = parseTokenUsagePair(usage.total, usage.last);
       const acc = getOrCreateUsageAccumulator(turnId);
-      if (total && last) {
-        acc.update(total, last);
+      if (parsed) {
+        acc.update(parsed.total, parsed.last);
       } else {
         // Malformed usage for a KNOWN turn: poison it (sticky). Silently skipping
         // would let a later valid notification rebuild a fresh baseline and report
-        // only the last completion — a plausible-looking undercount.
+        // only the last completion — a plausible-looking undercount. This also
+        // covers asymmetric cacheWrite presence (total has it, last omits it or
+        // vice-versa), where a 0-default would misattribute cache-create tokens.
         acc.poison('malformed tokenUsage notification');
       }
     } else {

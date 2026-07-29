@@ -54,7 +54,13 @@ function isTokenCount(v: unknown): v is number {
  *  0.145 fields are REQUIRED except `cacheWriteInputTokens` (added later, so a
  *  compat default of 0 is honest for it only). Any other missing/non-numeric
  *  field returns null — defaulting them to 0 would misreport a protocol gap as a
- *  real 0. */
+ *  real 0.
+ *
+ *  NOTE: when `total` and `last` are consumed together (the accumulator), prefer
+ *  `parseTokenUsagePair` — it additionally enforces that the back-compat
+ *  cacheWrite default is only honored when BOTH sides omit the field. A lone
+ *  breakdown parsed here cannot see its counterpart, so a `cacheWrite=0` default
+ *  here is provisional until the pair check confirms symmetry. */
 export function parseCodexTokenBreakdown(raw: unknown): CodexTokenBreakdown | null {
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
@@ -71,6 +77,35 @@ export function parseCodexTokenBreakdown(raw: unknown): CodexTokenBreakdown | nu
   else if (!isTokenCount(r.cacheWriteInputTokens)) return null;
   else out.cacheWriteInputTokens = r.cacheWriteInputTokens as number;
   return out;
+}
+
+/** True when a raw breakdown object carries `cacheWriteInputTokens` on the wire
+ *  (vs. omitting it — the pre-cacheWrite codex versions the compat default is
+ *  meant for). */
+function hasCacheWriteField(raw: unknown): boolean {
+  return !!raw && typeof raw === 'object'
+    && (raw as Record<string, unknown>).cacheWriteInputTokens !== undefined;
+}
+
+/** Parse the `{ total, last }` pair from one notification, enforcing the
+ *  cross-breakdown invariant the single parser can't see: the back-compat
+ *  `cacheWriteInputTokens → 0` default is honest ONLY when BOTH breakdowns omit
+ *  the field (a genuinely old codex). If exactly one side carries it, the two
+ *  disagree (version skew / corruption): silently defaulting the missing side to
+ *  0 would misattribute real cache-create tokens into fresh input AND poison the
+ *  baseline for later completions with a plausible-looking undercount. Return
+ *  null so the caller poisons the turn instead of emitting corrupt buckets. */
+export function parseTokenUsagePair(
+  rawTotal: unknown,
+  rawLast: unknown,
+): { total: CodexTokenBreakdown; last: CodexTokenBreakdown } | null {
+  const total = parseCodexTokenBreakdown(rawTotal);
+  const last = parseCodexTokenBreakdown(rawLast);
+  if (!total || !last) return null;
+  // Asymmetric cacheWrite presence ⇒ the 0-default on the missing side is a
+  // guess, not a fact. Refuse rather than fabricate a wrong split.
+  if (hasCacheWriteField(rawTotal) !== hasCacheWriteField(rawLast)) return null;
+  return { total, last };
 }
 
 /** Map a cumulative-delta codex breakdown to riff's four mutually-exclusive
@@ -128,12 +163,23 @@ export class TurnTokenUsageAccumulator {
   }
 
   /** The turn's usage so far as four buckets, or null if no usage seen / a
-   *  protocol anomaly was detected / the bucket split is incoherent. */
+   *  protocol anomaly was detected / the bucket split is incoherent. When usage
+   *  is dropped for an incoherent delta or bucket split (as opposed to simply
+   *  never having seen a notification), a warning is recorded so the caller can
+   *  surface the omission rather than dropping it silently. */
   result(): TurnTokenUsage | null {
     if (this.protocolWarning || !this.baseline || !this.latestTotal) return null;
     const delta = subtract(this.latestTotal, this.baseline);
-    if (!allNonNegative(delta)) return null;
-    return toFourBucket(delta);
+    if (!allNonNegative(delta)) {
+      this.protocolWarning = 'tokenUsage delta (latestTotal-baseline) went negative';
+      return null;
+    }
+    const buckets = toFourBucket(delta);
+    if (!buckets) {
+      this.protocolWarning = 'tokenUsage bucket split incoherent (cache buckets exceed input)';
+      return null;
+    }
+    return buckets;
   }
 
   /** Non-null when the accumulator gave up on usage for a protocol reason. */

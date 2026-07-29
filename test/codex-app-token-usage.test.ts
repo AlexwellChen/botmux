@@ -9,6 +9,7 @@ import { describe, it, expect } from 'vitest';
 import {
   TurnTokenUsageAccumulator,
   parseCodexTokenBreakdown,
+  parseTokenUsagePair,
   toFourBucket,
   type CodexTokenBreakdown,
 } from '../src/services/codex-app-token-usage.js';
@@ -152,5 +153,73 @@ describe('parseCodexTokenBreakdown — required fields', () => {
   it('accepts a missing cacheWriteInputTokens (back-compat → 0)', () => {
     const { cacheWriteInputTokens: _omit, ...compat } = full;
     expect(parseCodexTokenBreakdown(compat)?.cacheWriteInputTokens).toBe(0);
+  });
+});
+
+describe('parseTokenUsagePair — cacheWrite symmetry (codex P1)', () => {
+  const total = { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 10 };
+  const last = { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 10 };
+
+  it('parses a well-formed pair (both carry cacheWrite)', () => {
+    const p = parseTokenUsagePair(total, last);
+    expect(p?.total.cacheWriteInputTokens).toBe(40);
+    expect(p?.last.cacheWriteInputTokens).toBe(40);
+  });
+
+  it('accepts a pair where BOTH omit cacheWrite (genuine old codex → 0/0)', () => {
+    const { cacheWriteInputTokens: _t, ...totalOld } = total;
+    const { cacheWriteInputTokens: _l, ...lastOld } = last;
+    const p = parseTokenUsagePair(totalOld, lastOld);
+    expect(p?.total.cacheWriteInputTokens).toBe(0);
+    expect(p?.last.cacheWriteInputTokens).toBe(0);
+  });
+
+  it('REJECTS asymmetric cacheWrite: total has it, last omits it (would misattribute cache-create)', () => {
+    const { cacheWriteInputTokens: _l, ...lastNoCW } = last;
+    expect(parseTokenUsagePair(total, lastNoCW)).toBeNull();
+  });
+
+  it('REJECTS asymmetric cacheWrite the other way: last has it, total omits it', () => {
+    const { cacheWriteInputTokens: _t, ...totalNoCW } = total;
+    expect(parseTokenUsagePair(totalNoCW, last)).toBeNull();
+  });
+
+  it('returns null when either breakdown is itself malformed', () => {
+    expect(parseTokenUsagePair({ totalTokens: 'x' }, last)).toBeNull();
+    expect(parseTokenUsagePair(total, null)).toBeNull();
+  });
+});
+
+describe('TurnTokenUsageAccumulator — asymmetric-cacheWrite poison (codex P1 end-to-end)', () => {
+  it('asymmetric first packet → poison; a later VALID packet cannot resurrect (omit, not miscount)', () => {
+    // First notification for the turn: total carries cacheWrite=40, last omits it.
+    // parseTokenUsagePair refuses → runner poisons the turn. A subsequent coherent
+    // packet must NOT rebuild a baseline and report a plausible-looking wrong split.
+    const acc = new TurnTokenUsageAccumulator();
+    const total1 = { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 10 };
+    const last1NoCW = { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 10 };
+    const parsed1 = parseTokenUsagePair(total1, last1NoCW);
+    expect(parsed1).toBeNull();
+    acc.poison('malformed tokenUsage notification'); // what the runner does on null
+
+    // later valid packet (both sides symmetric)
+    const parsed2 = parseTokenUsagePair(
+      { totalTokens: 200, inputTokens: 150, cachedInputTokens: 40, cacheWriteInputTokens: 40, outputTokens: 60, reasoningOutputTokens: 10 },
+      { totalTokens: 70, inputTokens: 50, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 0 },
+    );
+    if (parsed2) acc.update(parsed2.total, parsed2.last);
+    expect(acc.result()).toBeNull();
+    expect(acc.warning).toBeTruthy();
+  });
+});
+
+describe('TurnTokenUsageAccumulator — warning on incoherent omit (codex non-blocking)', () => {
+  it('records a warning when the bucket split is incoherent (not silent)', () => {
+    // baseline=0, latestTotal has cache buckets exceeding input → toFourBucket null.
+    const acc = new TurnTokenUsageAccumulator();
+    const bad = bd({ totalTokens: 100, inputTokens: 50, cachedInputTokens: 40, cacheWriteInputTokens: 60, outputTokens: 20 });
+    acc.update(bad, bad); // baseline = 0 → delta = bad; toFourBucket returns null (40+60 > 50)
+    expect(acc.result()).toBeNull();
+    expect(acc.warning).toBe('tokenUsage bucket split incoherent (cache buckets exceed input)');
   });
 });
