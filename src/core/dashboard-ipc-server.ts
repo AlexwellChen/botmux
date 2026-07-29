@@ -69,6 +69,7 @@ import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
+import { isSuspendableBackendType } from './persistent-backend.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
@@ -649,11 +650,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
 
 /**
  * Count host-overload降压 candidates for THIS daemon's scope, so the alert card
- * can show "僵尸 N / 闲置 M" before the owner clicks. `stopped` counts zombies
- * from the SHARED session store (same answer on every daemon — the card handler
- * only takes it from one), `idle` counts THIS daemon's own idle live workers
- * (owning-daemon-authoritative — the handler sums across daemons). Mirrors the
- * exact classification the sweep uses so the preview matches what a click does.
+ * can show "僵尸 N / 闲置 M" before the owner clicks. Both counts are local to
+ * THIS daemon: its session store is bot-scoped, and live workers only exist in
+ * their owning process. The card handler sums every daemon's response. Mirrors
+ * the exact classification the sweep uses so the preview matches a click.
  */
 ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
   const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s)).length;
@@ -661,6 +661,7 @@ ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
   for (const ds of listActiveSessions()) {
     if (!ds.worker || ds.worker.killed) continue;
     if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;
+    if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
     if (ds.lastScreenStatus !== 'idle') continue;
     idle++;
   }
@@ -671,8 +672,8 @@ ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
  * Bulk host-overload降压 sweep, driven by the overload-alert card buttons.
  * `mode`:
  *   - `clean_stopped`: close stopped zombie sessions (dead CLI + no tmux) from
- *     the SHARED session store — machine-wide, so a single daemon's sweep is
- *     enough (the alert-owning daemon calls this once, no fan-out needed).
+ *     THIS daemon's bot-scoped session store. The card handler fans this mode
+ *     out to every online daemon.
  *   - `suspend_idle`: suspend THIS daemon's own idle (non-busy, suspendable,
  *     non-adopt) live workers. Live workers only exist in their owning daemon's
  *     process, so the card handler fans this mode out to every online daemon.
@@ -690,10 +691,8 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
     for (const s of stopped) {
       try {
         const r = await closeSession(s.sessionId);
-        // Only count sessions this call actually closed. A shared-store session
-        // already closed by another daemon's concurrent sweep returns
-        // alreadyClosed=true — counting it would inflate `affected` by the
-        // number of daemons that raced on the same zombie.
+        // Only count sessions this call actually closed. A concurrent action in
+        // this daemon may already have closed the same record.
         if (r.ok && !r.alreadyClosed) affected++;
       } catch (err) {
         logger.warn(`[overload-sweep] close failed for ${s.sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
@@ -710,6 +709,7 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
     for (const ds of listActiveSessions()) {
       if (!ds.worker || ds.worker.killed) continue;             // no live worker
       if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;  // never suspend adopt
+      if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
       if (ds.lastScreenStatus !== 'idle') continue;              // never cut an in-flight reply
       try {
         if (suspendWorker(ds, 'host_overload_suspend')) affected++;
