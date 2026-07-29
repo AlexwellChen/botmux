@@ -333,6 +333,12 @@ async function ensureThread(): Promise<string> {
         cwd: args.cwd,
         approvalPolicy: 'never',
         sandbox: 'danger-full-access',
+        // Intentionally NO model / model_reasoning_effort here: on resume the
+        // app-server restores the thread's persisted {model, provider, effort}
+        // triple, and sending any single override would short-circuit that
+        // restoration (drifting model/provider to the current default). Per-turn
+        // overrides are applied on the fresh thread/start below only. Mirrors the
+        // RPC engine's resume contract (see codex-rpc-engine.resumeThread).
         config: { shell_environment_policy: { inherit: 'all' } },
         developerInstructions: appDeveloperInstructions(args),
         excludeTurns: true,

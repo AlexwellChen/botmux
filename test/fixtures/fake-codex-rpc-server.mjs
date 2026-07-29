@@ -7,6 +7,9 @@
 //   FAKE_DIE_AFTER_MS=N  → exit(1) after N ms (crash → engine onDead)
 //   FAKE_THREAD_CONFIG_FILE=path → write the received thread/start params to path
 //                                  (lets a test assert model/effort forwarding)
+//   FAKE_RESUME_CONFIG_FILE=path → write the received thread/resume params to path
+//                                  (lets a test assert model/effort are SUPPRESSED
+//                                   on resume)
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { writeFileSync } from 'node:fs';
@@ -60,7 +63,12 @@ wss.on('connection', (ws) => {
         }
         return reply({ thread: { id: 'thread-fake-1' } });
       }
-      case 'thread/resume': return reply({ thread: { id: msg.params?.threadId ?? 'thread-fake-1' } });
+      case 'thread/resume': {
+        if (process.env.FAKE_RESUME_CONFIG_FILE) {
+          try { writeFileSync(process.env.FAKE_RESUME_CONFIG_FILE, JSON.stringify(msg.params ?? {})); } catch { /* test-only */ }
+        }
+        return reply({ thread: { id: msg.params?.threadId ?? 'thread-fake-1' } });
+      }
       case 'thread/read':
         threadReadAttempt += 1;
         return reply({ thread: {

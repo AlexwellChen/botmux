@@ -402,4 +402,36 @@ describe('codex-app-runner app-server protocol integration', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('SUPPRESSES model/effort on thread/resume even when --model/--reasoning-effort are passed (no resume drift)', async () => {
+    // PR #639 P2 regression lock, runner side: a resume (--thread-id present)
+    // routes to thread/resume, and even though the adapter still forwards
+    // --model/--reasoning-effort on argv, the resume request must carry NEITHER
+    // top-level model NOR config.model_reasoning_effort — else the app-server's
+    // model-resume-override short-circuit drops the persisted triple to the
+    // current default. Fresh thread/start (the test above) still stamps both.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-resume-suppress-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', [
+      '--thread-id', 'thread-existing-1', '--model', 'gpt-5.6-terra', '--reasoning-effort', 'xhigh',
+    ]);
+    try {
+      await waitForOutput(harness, output => output.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitForOutput(harness, output => FINAL_MARKER.test(output));
+      const requests = readRequests(logPath);
+      const resume = requests.find(r => r.method === 'thread/resume');
+      const start = requests.find(r => r.method === 'thread/start');
+      expect(resume).toBeTruthy();          // routed to resume, not start
+      expect(start).toBeFalsy();            // a warm resume must not fresh-start
+      expect(resume.params.model).toBeUndefined();                          // no top-level model
+      expect(resume.params.config?.model_reasoning_effort).toBeUndefined(); // no effort
+    } finally {
+      await stopChild(harness.child);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

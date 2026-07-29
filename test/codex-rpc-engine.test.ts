@@ -79,6 +79,60 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(params.config?.model_reasoning_effort).toBe('xhigh');
   }, 20_000);
 
+  it('SUPPRESSES model + reasoningEffort on thread/resume (start keeps both) — no resume drift', async () => {
+    // Regression lock for the PR #639 P2: a cold resume must send NEITHER
+    // config.model NOR config.model_reasoning_effort, or the app-server's
+    // model-resume-override short-circuit drops the persisted {model, provider,
+    // effort} triple to the current default. Fresh start still stamps both.
+    // Asserts start-keeps AND resume-drops in ONE engine lifecycle so the two
+    // paths can't silently converge. (a) effort-only face is covered by the
+    // model-less test below; this locks the full-override face.
+    const startFile = join(tmpdir(), `fake-start-cfg-${Math.round(performance.now())}.json`);
+    const resumeFile = join(tmpdir(), `fake-resume-cfg-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'resume-suppress',
+      model: 'gpt-5.6-terra',
+      reasoningEffort: 'xhigh',
+      env: { ...process.env, FAKE_THREAD_CONFIG_FILE: startFile, FAKE_RESUME_CONFIG_FILE: resumeFile },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.resumeThread('thread-fake-1');
+    engine.stop();
+    const startParams = JSON.parse(readFileSync(startFile, 'utf8'));
+    const resumeParams = JSON.parse(readFileSync(resumeFile, 'utf8'));
+    rmSync(startFile, { force: true });
+    rmSync(resumeFile, { force: true });
+    // start (positive): both present, xhigh verbatim
+    expect(startParams.config?.model).toBe('gpt-5.6-terra');
+    expect(startParams.config?.model_reasoning_effort).toBe('xhigh');
+    // resume (negative): NEITHER present — the whole point of the fix
+    expect(resumeParams.config?.model).toBeUndefined();
+    expect(resumeParams.config?.model_reasoning_effort).toBeUndefined();
+  }, 20_000);
+
+  it('SUPPRESSES a stable configured model on thread/resume (pre-existing shared-engine face)', async () => {
+    // Covers the pre-existing model-only drift the same fix closes: even a model
+    // that never changes (a TraeX/codex bot's configured model, no per-turn
+    // effort) must NOT be re-sent on resume, else provider drifts. engine has no
+    // cliId — this one assertion covers both codex and TraeX.
+    const resumeFile = join(tmpdir(), `fake-resume-model-only-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'resume-model-only',
+      model: 'gpt-5.6-terra', // configured model, no reasoningEffort
+      env: { ...process.env, FAKE_RESUME_CONFIG_FILE: resumeFile },
+    });
+    await engine.start();
+    await engine.resumeThread('thread-fake-1');
+    engine.stop();
+    const resumeParams = JSON.parse(readFileSync(resumeFile, 'utf8'));
+    rmSync(resumeFile, { force: true });
+    expect(resumeParams.config?.model).toBeUndefined();
+    expect(resumeParams.config?.model_reasoning_effort).toBeUndefined();
+    // sanity: resume still carries the non-model params it must (env policy)
+    expect(resumeParams.config?.shell_environment_policy).toBeTruthy();
+  }, 20_000);
+
   it('waits for resumed-thread metadata to advance before restoring its title', async () => {
     const engine = makeEngine({
       sessionId: 'resume-title',
