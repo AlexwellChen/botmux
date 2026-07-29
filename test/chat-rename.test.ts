@@ -25,6 +25,14 @@ describe('chat rename', () => {
     });
   });
 
+  it('rejects Unicode line/paragraph separators and BOM mid-name (FR-5)', () => {
+    // Original class trimmed these only at the edges; FR-5 requires rejecting
+    // line breaks and invisible format controls anywhere in the name.
+    expect(normalizeLarkChatName('a\u2028b')).toEqual({ ok: false, error: 'invalid_chat_name' });
+    expect(normalizeLarkChatName('a\u2029b')).toEqual({ ok: false, error: 'invalid_chat_name' });
+    expect(normalizeLarkChatName('a\ufeffb')).toEqual({ ok: false, error: 'invalid_chat_name' });
+  });
+
   it('applies a per-key proactive cooldown with retry metadata', () => {
     const cooldown = new ChatRenameCooldown(60_000);
     expect(cooldown.check('app:chat', 100_000)).toEqual({ ok: true });

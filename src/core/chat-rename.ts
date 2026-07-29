@@ -9,7 +9,7 @@ export function normalizeLarkChatName(input: unknown):
   if (
     !name
     || Array.from(name).length > CHAT_NAME_MAX_CODE_POINTS
-    || /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f]/u.test(name)
+    || /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u206f\ufeff]/u.test(name)
   ) {
     return { ok: false, error: 'invalid_chat_name' };
   }

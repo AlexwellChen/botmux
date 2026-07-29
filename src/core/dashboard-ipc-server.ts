@@ -831,10 +831,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
     }
     if (result.changed) {
       if (proactive) proactiveChatRenameCooldown.record(cooldownKey);
+      // FR-7: the Lark write already succeeded, so a local cache-refresh
+      // failure (ENOSPC/EACCES on the session store) must NOT reverse the
+      // outcome into an HTTP 500 — best-effort per session, warn and keep the
+      // rename a success. Catch per-session so one bad write can't skip the rest.
       for (const active of getActiveSessionsRegistry()?.values() ?? []) {
         if (active.chatId !== ds.chatId) continue;
         active.session.chatDisplayName = result.newName;
-        sessionStore.updateSession(active.session);
+        try {
+          sessionStore.updateSession(active.session);
+        } catch (e) {
+          logger.warn(`[chat-rename:audit] cache_refresh_failed session=${active.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} detail=${e instanceof Error ? e.message : String(e)}`);
+        }
       }
       logger.info(
         `[chat-rename:audit] result=success session=${ds.session.sessionId} chat=${ds.chatId} `
