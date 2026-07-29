@@ -760,9 +760,15 @@ export async function runAutoWorktreeCommit(deps: {
  * daemon owns one bot-scoped session store and its own live workers, so neither
  * stopped sessions nor idle workers can be swept through a sibling daemon.
  *
- * Throws when there are no online daemons, or when every attempt failed — so
- * the caller rolls back the nonce instead of burning the button on an action
- * that never ran. A partial success (≥1 daemon ok) returns normally.
+ * Fail-closed on partial failure: if ANY discovered daemon doesn't ACK, throw —
+ * the caller then rolls back the nonce (releaseOverloadNonce) so the owner can
+ * retry, instead of burning the button on a card that reports「已清理 0」while
+ * the daemon that actually held the zombies never ran. Both sweeps are
+ * idempotent (an already-closed session leaves the stopped set; an already-
+ * suspended worker leaves the idle set), so a retry only re-hits whatever
+ * failed. Reporting a partial count as a completed action would resurrect the
+ * exact "显示 0、实际没清" symptom this fix exists to kill — just triggered by
+ * "the daemon holding the zombies failed" instead of "the first daemon had none".
  */
 async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promise<number> {
   const daemons = listOnlineDaemons();
@@ -785,15 +791,15 @@ async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promis
     }
   };
 
-  // Fan out to all daemons and sum. Throw only if not one daemon acked.
-  let affected = 0;
-  let ok = 0;
+  // Fan out to all daemons and sum. Fail the whole action if ANY didn't ACK, so
+  // the caller keeps the button retriable rather than reporting a partial sweep
+  // as complete.
   const results = await Promise.all(daemons.map(postSweep));
-  for (const n of results) {
-    if (n !== null) { affected += n; ok++; }
+  const failed = results.filter(n => n === null).length;
+  if (failed > 0) {
+    throw new Error(`sweep ${mode}: ${failed}/${daemons.length} daemon(s) did not ack — retriable`);
   }
-  if (ok === 0) throw new Error(`sweep ${mode} reached no daemon (${daemons.length} failed)`);
-  return affected;
+  return results.reduce((sum: number, n) => sum + (n ?? 0), 0);
 }
 
 /**
