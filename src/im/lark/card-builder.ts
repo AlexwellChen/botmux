@@ -1597,6 +1597,17 @@ export function buildRelayPickerCard(
    *  Authoritative from the /relay command's session chatType. Default 'group'
    *  covers legacy cards rendered before this field existed. */
   targetChatType: 'group' | 'p2p' = 'group',
+  /** When 'private', the card is (or will be) delivered as an ephemeral card
+   *  visible only to the invoker — so the session title / source-chat name never
+   *  leak to other group members. Baked into every button value as `visibility`
+   *  so the re-render handlers (select / page / search) know they must delete +
+   *  resend an ephemeral card instead of returning a body for Lark to patch in
+   *  place (ephemeral cards can't be PATCH-updated). Default 'public' preserves
+   *  the legacy visible-to-all picker. Only ever set 'private' for flat chat-
+   *  scope 普通群 targets: ephemeral has no thread anchor, so command-handler
+   *  gates it on `targetScope === 'chat'` (thread-scope 话题群/话题 stay public
+   *  in-thread — see the gate comment there). p2p never goes ephemeral. */
+  visibility: 'private' | 'public' = 'public',
 ): string {
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
@@ -1621,6 +1632,7 @@ export function buildRelayPickerCard(
     target_scope: targetScope,
     target_chat_type: targetChatType,
     invoker_open_id: invokerOpenId,
+    visibility,
     search: searchQuery,
     page,
     selected: selectedSessionId ?? '',

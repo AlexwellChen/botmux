@@ -1171,6 +1171,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // session's chatType for DM targets. Default 'group' covers legacy cards.
     const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
     const targetChatType = (value.target_chat_type as 'group' | 'p2p') ?? 'group';
+    const cardVisibility = (value.visibility as 'private' | 'public') ?? 'public';
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!targetChatId || !targetRootId || !operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
@@ -1233,7 +1234,32 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       },
       targetScope,
       targetChatType,
+      cardVisibility,
     );
+    // ── Private (ephemeral) picker: delete-then-resend ────────────────────
+    // Ephemeral cards CANNOT be PATCH-updated (Feishu legacy interface), so we
+    // can't return a body for the dispatcher to patch in place. Instead delete
+    // the clicked card and resend a fresh ephemeral one carrying the new state
+    // — the same send→interact→delete→resend pattern Feishu documents for
+    // ephemeral flows. Resend FIRST, then delete the old one, so a resend
+    // failure doesn't leave the user with no card at all. The toast keeps the
+    // callback response non-empty (returning {} would make Lark show nothing).
+    if (cardVisibility === 'private') {
+      const { sendEphemeralCard, deleteEphemeralCard } = await import('./client.js');
+      try {
+        await sendEphemeralCard(larkAppId, targetChatId, invokerOpenId ?? operatorOpenId, cardJson);
+        if (cardMessageId) {
+          await deleteEphemeralCard(larkAppId, cardMessageId).catch(() => { /* stale card lingering is cosmetic */ });
+        }
+        // No card body returned — the replacement is already sent. An empty
+        // response is fine here (the new ephemeral card is the user-visible
+        // result); a toast would double up with the freshly-rendered card.
+        return;
+      } catch (err) {
+        logger.warn(`[card-action] relay private picker re-render failed (${err instanceof Error ? err.message : err}); leaving old card in place`);
+        return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'ephemeral_refresh_failed' }, loc) } };
+      }
+    }
     // Return an updated card body — event-dispatcher wraps this as
     // { card: { type: 'raw', data: <body> } } so Lark patches the picker
     // in place rather than appending a new message.
@@ -1360,6 +1386,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // field and default to 'group' (their pickers never offered DM targets).
     const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
     const targetChatType = (value.target_chat_type as 'group' | 'p2p') ?? 'group';
+    const cardVisibility = (value.visibility as 'private' | 'public') ?? 'public';
     const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootId;
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!sourceSessionId || !targetChatId || !targetRootId) {
@@ -1485,8 +1512,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: r.error }, loc) } };
     }
     // Best-effort: remove the picker card now that the selection resolved.
+    // Ephemeral (private) pickers need the ephemeral-delete endpoint —
+    // deleteMessage (im/v1/messages) doesn't apply to ephemeral message ids.
     if (cardMessageId && larkAppId) {
-      deleteMessage(larkAppId, cardMessageId).catch(() => { /* leave it */ });
+      if (cardVisibility === 'private') {
+        const { deleteEphemeralCard } = await import('./client.js');
+        deleteEphemeralCard(larkAppId, cardMessageId).catch(() => { /* leave it */ });
+      } else {
+        deleteMessage(larkAppId, cardMessageId).catch(() => { /* leave it */ });
+      }
     }
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
