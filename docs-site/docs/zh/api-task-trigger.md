@@ -56,6 +56,10 @@
 - **`envelope.trusted` 必须是 `false`**。这是防注入设计：`trusted:false` 声明「以下 envelope 内容是不可信外部数据」，daemon 才会把它包成 untrusted event、不执行里面夹带的指令。你要机器人真正执行的东西放在顶层 `instruction`（可信指令），不要放进 envelope。
 - **不传 `chatId`** 时，`options` 必须含 `waitForFinalOutput` 或 `asyncReturnSessionId` 之一，否则报 `target_required`。
 - **`options.timeoutMs` 范围 `[1000, 300000]`**（1 秒 ~ 5 分钟），越界报 400。不传默认 120000。
+- **`options.model`** / **`options.reasoningEffort`**（可选，**仅对 codex / codex-app 机器人生效**）：按本次触发覆盖模型与推理档位。
+  - `model`：codex 模型 id（≤200 字符）；`reasoningEffort`：`low` / `medium` / `high` / `xhigh`（原样透传给 codex，不做降级）。
+  - **仅新建会话生效**：只在这次触发**创建新会话**时冻结；折叠进已有 worker 的续轮不改写。
+  - **作用域收窄到 codex 家族**：目标机器人不是 codex/codex-app 时，这两个字段被忽略（不会改动 Claude/Gemini/CoCo 等的模型）。
 
 ### 同步模式（waitForFinalOutput）
 

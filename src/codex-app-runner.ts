@@ -31,6 +31,8 @@ interface Args {
   botName?: string;
   botOpenId?: string;
   locale?: string;
+  model?: string;
+  reasoningEffort?: string;
 }
 
 interface PendingRequest {
@@ -57,6 +59,8 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
+    else if (key === '--model' && val !== undefined) { out.model = val; i++; }
+    else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
   }
   if (!out.sessionId) throw new Error('--session-id is required');
   return out;
@@ -329,6 +333,12 @@ async function ensureThread(): Promise<string> {
         cwd: args.cwd,
         approvalPolicy: 'never',
         sandbox: 'danger-full-access',
+        // Intentionally NO model / model_reasoning_effort here: on resume the
+        // app-server restores the thread's persisted {model, provider, effort}
+        // triple, and sending any single override would short-circuit that
+        // restoration (drifting model/provider to the current default). Per-turn
+        // overrides are applied on the fresh thread/start below only. Mirrors the
+        // RPC engine's resume contract (see codex-rpc-engine.resumeThread).
         config: { shell_environment_policy: { inherit: 'all' } },
         developerInstructions: appDeveloperInstructions(args),
         excludeTurns: true,
@@ -352,7 +362,17 @@ async function ensureThread(): Promise<string> {
     cwd: args.cwd,
     approvalPolicy: 'never',
     sandbox: 'danger-full-access',
-    config: { shell_environment_policy: { inherit: 'all' } },
+    config: {
+      shell_environment_policy: { inherit: 'all' },
+      // Per-turn reasoning effort → codex config key (ThreadStartParams accepts an
+      // arbitrary config map). Codex 0.145 accepts low/medium/high/xhigh and echoes
+      // xhigh back verbatim, so pass it through unchanged (no downgrade).
+      ...(args.reasoningEffort ? { model_reasoning_effort: args.reasoningEffort } : {}),
+    },
+    // Per-turn model override → ThreadStartParams top-level model. Only set on a
+    // fresh thread/start, so a fold-in (existing thread) keeps its frozen model —
+    // matching the API's fresh-spawn-only override semantics.
+    ...(args.model && args.model.trim() ? { model: args.model.trim() } : {}),
     serviceName: 'botmux',
     developerInstructions: appDeveloperInstructions(args),
     ephemeral: false,
