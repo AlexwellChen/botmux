@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -7431,7 +7431,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   // is idempotent, so the downstream send path reuses these same clients.
   // envPinnedRiffBot is re-registered LAST so a remote env credential is never
   // clobbered by a stale bots.json entry for the same app.
-  const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
+  const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
+  const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
@@ -7503,7 +7504,13 @@ async function cmdSend(rest: string[]): Promise<void> {
     const parsedBotEntries = existsSync(botInfoPath)
       ? JSON.parse(readFileSync(botInfoPath, 'utf-8'))
       : [];
-    botEntries = Array.isArray(parsedBotEntries) ? parsedBotEntries : [];
+    botEntries = Array.isArray(parsedBotEntries)
+      ? parsedBotEntries.filter((entry): entry is BotMentionEntry =>
+          !!entry
+          && typeof entry === 'object'
+          && typeof entry.larkAppId === 'string'
+          && (entry.botName === null || typeof entry.botName === 'string'))
+      : [];
     const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
     const parsedCrossRef = existsSync(crossRefPath)
       ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
@@ -7535,10 +7542,23 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     }
   }
+  // An active chat-scope session can outlive a /reply-mode switch. Verify the
+  // target bot's current effective mode before assuming mentions still fold
+  // back into that old session.
+  const foldableChatAppIds = foldableChatSessionAppIds({
+    sessions: allSessions,
+    targetChatId,
+    outboundMode: sendTarget.mode,
+    resolveMode: (larkAppId, chatId) => {
+      getBot(larkAppId); // unknown target bot must fail closed
+      return resolveRegularGroupMode(larkAppId, chatId);
+    },
+  });
   const reachableOpenIds = activeConversationBotOpenIds({
     sessions: allSessions,
     targetChatId,
-    outboundRootMessageId: sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId,
+    outboundRootMessageId: threadRootForReachability(sendTarget),
+    foldableChatAppIds,
     botEntries,
     crossRef,
   });

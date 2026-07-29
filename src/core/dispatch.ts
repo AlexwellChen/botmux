@@ -14,6 +14,7 @@
  * (cli.ts) performs the actual sendMessage + replyMessage.
  */
 
+import type { SessionReplyTarget } from './reply-target.js';
 export { resolveSendTarget } from './reply-target.js';
 
 export interface DispatchBot {
@@ -224,21 +225,60 @@ export function findSubBotTopic(input: {
   return null;
 }
 
+/** A quote reply references a root but does not enter that root's thread. */
+export function threadRootForReachability(target: SessionReplyTarget): string | undefined {
+  return target.mode === 'thread' ? target.rootMessageId : undefined;
+}
+
+type ReachabilitySession = {
+  status: 'active' | 'closed';
+  scope?: 'thread' | 'chat';
+  chatId: string;
+  rootMessageId: string;
+  larkAppId?: string;
+};
+
+/**
+ * Identify active chat sessions whose bot is still configured to fold a
+ * mention back into that shared session. Mode lookup failures fail closed.
+ */
+export function foldableChatSessionAppIds(input: {
+  sessions: Iterable<ReachabilitySession>;
+  targetChatId: string;
+  outboundMode: SessionReplyTarget['mode'];
+  resolveMode: (larkAppId: string, chatId: string) => 'chat' | 'shared' | 'new-topic' | 'chat-topic' | undefined;
+}): Set<string> {
+  const appIds = new Set<string>();
+  for (const session of input.sessions) {
+    if (session.status !== 'active'
+      || session.scope !== 'chat'
+      || !session.larkAppId
+      || session.chatId !== input.targetChatId) continue;
+    try {
+      const mode = input.resolveMode(session.larkAppId, input.targetChatId);
+      // chat-topic reuses the chat session for top-level/quote delivery, but
+      // deliberately keeps a real Lark topic isolated. new-topic never folds
+      // a new mention back into a leftover chat session.
+      if (mode === 'chat'
+        || mode === 'shared'
+        || (mode === 'chat-topic' && input.outboundMode !== 'thread')) {
+        appIds.add(session.larkAppId);
+      }
+    } catch { /* unknown bot/mode → retain advisory */ }
+  }
+  return appIds;
+}
+
 /**
  * Resolve sender-scoped open_ids for bots that already have an active session
  * at the current conversation anchor. These peers are reachable here, so an
  * older dispatch record for the same bot must not be presented as the target.
  */
 export function activeConversationBotOpenIds(input: {
-  sessions: Iterable<{
-    status: 'active' | 'closed';
-    scope?: 'thread' | 'chat';
-    chatId: string;
-    rootMessageId: string;
-    larkAppId?: string;
-  }>;
+  sessions: Iterable<ReachabilitySession>;
   targetChatId: string;
   outboundRootMessageId?: string;
+  foldableChatAppIds?: Set<string>;
   botEntries: Array<{ larkAppId: string; botName: string | null }>;
   crossRef: Record<string, string>;
 }): Set<string> {
@@ -252,13 +292,20 @@ export function activeConversationBotOpenIds(input: {
     // A thread-scope peer is reachable only when this send actually lands in
     // the same thread root.
     const here = session.scope === 'chat'
-      || (!!input.outboundRootMessageId
-        && session.rootMessageId === input.outboundRootMessageId);
+      ? input.foldableChatAppIds?.has(session.larkAppId) === true
+      : !!input.outboundRootMessageId
+        && session.rootMessageId === input.outboundRootMessageId;
     if (here) activeAppIds.add(session.larkAppId);
   }
 
   const openIds = new Set<string>();
-  const entries = Array.isArray(input.botEntries) ? input.botEntries : [];
+  const entries = Array.isArray(input.botEntries)
+    ? input.botEntries.filter((entry): entry is { larkAppId: string; botName: string | null } =>
+        !!entry
+        && typeof entry === 'object'
+        && typeof entry.larkAppId === 'string'
+        && (entry.botName === null || typeof entry.botName === 'string'))
+    : [];
   const crossRef = input.crossRef && typeof input.crossRef === 'object'
     ? input.crossRef
     : {};
@@ -271,7 +318,7 @@ export function activeConversationBotOpenIds(input: {
       candidate.botName?.toLowerCase() === entry.botName!.toLowerCase());
     if (sameNameEntries.length !== 1) continue;
     const openId = crossRef[entry.botName];
-    if (openId) openIds.add(openId);
+    if (typeof openId === 'string' && openId) openIds.add(openId);
   }
   return openIds;
 }

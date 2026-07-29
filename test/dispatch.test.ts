@@ -27,9 +27,11 @@ import {
   findSubBotTopic,
   eligibleAutoMentionAliases,
   offTopicSubBotTopic,
+  foldableChatSessionAppIds,
   recordDispatchInputCommit,
   resolveReportTarget,
   resolveSendTarget,
+  threadRootForReachability,
 } from '../src/core/dispatch.js';
 
 describe('parseDispatchBotSpec', () => {
@@ -241,6 +243,20 @@ describe('activeConversationBotOpenIds', () => {
     expect(result).toEqual(new Set(['ou_reviewer']));
   });
 
+  it('does not trust a leftover chat session after the bot stops using a foldable mode', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      foldableChatAppIds: new Set(),
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set());
+  });
+
   it('does not treat a peer active only in another topic as reachable here', () => {
     const result = activeConversationBotOpenIds({
       sessions: [
@@ -262,6 +278,7 @@ describe('activeConversationBotOpenIds', () => {
       ],
       targetChatId: 'oc_main',
       outboundRootMessageId: 'om_current',
+      foldableChatAppIds: new Set(['cli_reviewer']),
       botEntries,
       crossRef,
     });
@@ -293,6 +310,20 @@ describe('activeConversationBotOpenIds', () => {
     expect(result).toEqual(new Set());
   });
 
+  it('does not treat a quoted root as entering a thread peer session', () => {
+    const quoteTarget = { mode: 'quote' as const, rootMessageId: 'om_current' };
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: threadRootForReachability(quoteTarget),
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set());
+  });
+
   it('fails closed when multiple bot apps share the same display name', () => {
     const result = activeConversationBotOpenIds({
       sessions: [
@@ -318,6 +349,81 @@ describe('activeConversationBotOpenIds', () => {
       outboundRootMessageId: 'om_current',
       botEntries: {} as any,
       crossRef,
+    })).toEqual(new Set());
+  });
+
+  it('ignores malformed elements inside a bot identity array', () => {
+    expect(activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      botEntries: [null, 1, {}, ...botEntries] as any,
+      crossRef,
+    })).toEqual(new Set(['ou_reviewer']));
+  });
+});
+
+describe('send-target reachability helpers', () => {
+  it('only exposes a root for a real thread send, not quote/plain delivery', () => {
+    expect(threadRootForReachability({ mode: 'thread', rootMessageId: 'om_thread' })).toBe('om_thread');
+    expect(threadRootForReachability({ mode: 'quote', rootMessageId: 'om_quote' })).toBeUndefined();
+    expect(threadRootForReachability({ mode: 'plain', chatId: 'oc_chat' })).toBeUndefined();
+  });
+
+  it('accepts only currently foldable chat sessions in the target chat', () => {
+    const sessions = [
+      { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_chat' },
+      { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_new_topic' },
+      { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_else', rootMessageId: 'oc_else', larkAppId: 'cli_elsewhere' },
+    ];
+    const modes = new Map([
+      ['cli_chat', 'chat' as const],
+      ['cli_new_topic', 'new-topic' as const],
+      ['cli_elsewhere', 'shared' as const],
+    ]);
+    expect(foldableChatSessionAppIds({
+      sessions,
+      targetChatId: 'oc_main',
+      outboundMode: 'thread',
+      resolveMode: appId => modes.get(appId),
+    })).toEqual(new Set(['cli_chat']));
+  });
+
+  it('keeps chat-topic chat sessions reachable only for top-level-like delivery', () => {
+    const sessions = [
+      { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_chat_topic' },
+    ];
+    const resolveMode = () => 'chat-topic' as const;
+    expect(foldableChatSessionAppIds({
+      sessions,
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode,
+    })).toEqual(new Set(['cli_chat_topic']));
+    expect(foldableChatSessionAppIds({
+      sessions,
+      targetChatId: 'oc_main',
+      outboundMode: 'quote',
+      resolveMode,
+    })).toEqual(new Set(['cli_chat_topic']));
+    expect(foldableChatSessionAppIds({
+      sessions,
+      targetChatId: 'oc_main',
+      outboundMode: 'thread',
+      resolveMode,
+    })).toEqual(new Set());
+  });
+
+  it('fails closed when the target bot reply mode cannot be resolved', () => {
+    expect(foldableChatSessionAppIds({
+      sessions: [
+        { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_unknown' },
+      ],
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode: () => { throw new Error('unknown bot'); },
     })).toEqual(new Set());
   });
 });
