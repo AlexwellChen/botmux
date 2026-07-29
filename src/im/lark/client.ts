@@ -791,6 +791,34 @@ export async function sendEphemeralCard(
   return messageId ?? '';
 }
 
+/**
+ * Delete a previously-sent ephemeral card (`ephemeral/v1/delete`). Ephemeral
+ * cards CANNOT be PATCH-updated (see {@link sendEphemeralCard}), so the picker's
+ * "in-place refresh" (page / search / select) is implemented as delete-then-
+ * resend; this is the delete half. Best-effort: returns false on any failure
+ * (already gone, network) rather than throwing — a stale ephemeral card lingering
+ * is a cosmetic issue, not a correctness one, and the caller has already sent the
+ * replacement by the time cleanup runs.
+ */
+export async function deleteEphemeralCard(larkAppId: string, messageId: string): Promise<boolean> {
+  const c = getBotClient(larkAppId);
+  try {
+    const res: any = await (c as any).request({
+      method: 'POST',
+      url: '/open-apis/ephemeral/v1/delete',
+      data: { message_id: messageId },
+    });
+    if (res && typeof res.code === 'number' && res.code !== 0) {
+      logger.debug(`Delete ephemeral card ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.debug(`Failed to delete ephemeral card ${messageId}: ${err}`);
+    return false;
+  }
+}
+
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
   const c = getBotClient(larkAppId);
   let res: any;
