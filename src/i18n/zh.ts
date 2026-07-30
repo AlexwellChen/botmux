@@ -501,7 +501,6 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露）',
   'help.dashboard': '/dashboard [模块] - 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等）',
   'help.insight': '/insight    - 查看当前会话的工具调用摘要与风险建议（operator 专用）',
-  'help.land': '/land       - 查看沙盒会话改动 diff，并由 owner 在卡片上确认落盘',
   'help.subscribe_doc': '/subscribe-lark-doc <文档链接|list|off> - 通过飞书 API 订阅文档（需要文档 User Token）',
   'help.watch_comment': '/watch-comment <文档链接|list|off> - 监听文档评论并把 AI 回复发回评论串',
   'help.vc': '/vc prepare <会议链接或会议号> - 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话',
@@ -1123,16 +1122,6 @@ export const messages: Record<string, string> = {
 
   // Auto-start (joined chat) member-read failure admin DM
   'daemon.auto_start_member_read_failed': '⚠️ botmux「被拉进新群自动开工」已开启，但读取群成员失败，无法判断群里是否有授权用户，自动开工被跳过。\n\n最可能原因：缺少读取群成员的权限（im:chat / 群信息读取），或没有订阅「机器人进群」事件 `im.chat.member.bot.added_v1`。\n\n请到飞书开放平台 → 应用 → 权限管理 / 事件订阅 里补齐，然后 `botmux restart`。\n\n错误详情：{detail}',
-
-  // Sandbox landing (/land) errors
-  'sandbox.no_clone': '该会话没有沙盒改动层（未开沙盒，或改动层已清理）',
-  'sandbox.clone_not_git': '沙盒改动层不可用，暂不支持落盘',
-  'sandbox.nothing_to_land': '没有改动可落盘',
-  'sandbox.target_not_git': '落盘目标目录不存在：{dir}',
-  'sandbox.apply_failed': '落盘失败：{detail}',
-  'sandbox.diff_failed': '读取沙盒改动失败：{detail}',
-  'sandbox.workingdir_not_found': '找不到会话 workingDir',
-  'sandbox.no_changes_left': '沙盒改动层已无改动',
 
   // ─── Dashboard 创建会话（createSession）─────────────────────────────────────
   'cmd.createSession.untitled': '新会话',
