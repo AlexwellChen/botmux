@@ -83,10 +83,10 @@ describe('web external host', () => {
   it('returns a concrete IPv6 bind raw (URL layer brackets it)', async () => {
     setEnv({ BOTMUX_DASHBOARD_HOST: '::1' });
     const config = await loadConfig(() => '10.0.12.34');
+    // config layer stays raw; bracketing for the URL is formatUrlHost's job and
+    // is covered hermetically in dashboard-url.test.ts (this suite doesn't mock
+    // the platform-binding / remote-access state buildDashboardUrl reads).
     expect(config.dashboard.externalHost).toBe('::1');
-    const { buildDashboardUrl } = await import('../src/core/dashboard-url.js');
-    expect(buildDashboardUrl({ host: config.dashboard.externalHost, port: 7891 }))
-      .toBe('http://[::1]:7891/');
   });
 
   it('autodetects the LAN IP for wildcard or blank dashboard binds', async () => {
