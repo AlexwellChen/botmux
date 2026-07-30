@@ -21,16 +21,29 @@ function nonBlankHost(value: string | undefined): string | undefined {
   return value?.trim() || undefined;
 }
 
+/** A wildcard bind (0.0.0.0 / :: / '') isn't a reachable address, so a link must
+ *  resolve it to a concrete IP; a specific host is advertised verbatim. */
+export function isWildcardBindHost(host: string): boolean {
+  return host === '0.0.0.0' || host === '::' || host === '';
+}
+
 const configuredWebExternalHost = nonBlankHost(process.env.WEB_EXTERNAL_HOST);
 const configuredDashboardExternalHost =
   nonBlankHost(process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST) ?? configuredWebExternalHost;
+const configuredDashboardBindHost = nonBlankHost(process.env.BOTMUX_DASHBOARD_HOST);
 
 export function getWebExternalHost(): string {
   return configuredWebExternalHost ?? getLocalIp();
 }
 
 export function getDashboardExternalHost(): string {
-  return configuredDashboardExternalHost ?? getLocalIp();
+  // Explicit external host → the actual (non-wildcard) listen host → LAN IP.
+  // A 127.0.0.1 bind must link to 127.0.0.1, not a LAN IP nothing listens on.
+  if (configuredDashboardExternalHost) return configuredDashboardExternalHost;
+  if (configuredDashboardBindHost && !isWildcardBindHost(configuredDashboardBindHost)) {
+    return configuredDashboardBindHost;
+  }
+  return getLocalIp();
 }
 
 /**
