@@ -1,6 +1,21 @@
 import { describe, it, expect } from 'vitest';
 import { buildGrantCard, buildGrantResultCard, buildGrantNotifyCard } from '../src/im/lark/card-builder.js';
 
+function deepFind(node: any, predicate: (value: any) => boolean): any[] {
+  const out: any[] = [];
+  if (predicate(node)) out.push(node);
+  if (Array.isArray(node)) {
+    for (const child of node) out.push(...deepFind(child, predicate));
+  } else if (node && typeof node === 'object') {
+    for (const child of Object.values(node)) out.push(...deepFind(child, predicate));
+  }
+  return out;
+}
+
+function callbackValue(node: any): any {
+  return node?.behaviors?.[0]?.value ?? node?.value;
+}
+
 describe('buildGrantCard', () => {
   it('embeds @owner, requester name, and nonce-bearing actions', () => {
     const json = buildGrantCard(
@@ -11,8 +26,9 @@ describe('buildGrantCard', () => {
     const flat = JSON.stringify(card);
     expect(flat).toContain('<at id=ou_owner></at>');
     expect(flat).toContain('张三');
-    const actions = card.elements.find((e: any) => e.tag === 'action').actions;
-    const byAction = Object.fromEntries(actions.map((a: any) => [a.value.action, a.value]));
+    expect(card.schema).toBe('2.0');
+    const actions = deepFind(card, value => value?.tag === 'button');
+    const byAction = Object.fromEntries(actions.map((a: any) => [callbackValue(a).action, callbackValue(a)]));
     expect(byAction.grant_chat).toMatchObject({ target_open_ids: ['ou_g'], chat_id: 'oc_1', nonce: 'n1' });
     expect(byAction.grant_deny).toMatchObject({ target_open_ids: ['ou_g'], chat_id: 'oc_1', nonce: 'n1' });
     // request mode (member self-application) offers chat-only — no global button,
@@ -24,9 +40,9 @@ describe('buildGrantCard', () => {
     const card = JSON.parse(buildGrantCard(
       { ownerOpenId: 'ou_o', targets: [{ openId: 'ou_g', name: 'Bob' }], chatId: 'oc_2', nonce: 'n2', mode: 'owner' }, 'en',
     ));
-    const actions = card.elements.find((e: any) => e.tag === 'action').actions;
+    const actions = deepFind(card, value => value?.tag === 'button');
     expect(actions).toHaveLength(3);
-    const byAction = Object.fromEntries(actions.map((a: any) => [a.value.action, a.value]));
+    const byAction = Object.fromEntries(actions.map((a: any) => [callbackValue(a).action, callbackValue(a)]));
     expect(byAction.grant_chat).toMatchObject({ target_open_ids: ['ou_g'], chat_id: 'oc_2', nonce: 'n2' });
     expect(byAction.grant_global).toMatchObject({ target_open_ids: ['ou_g'], chat_id: 'oc_2', nonce: 'n2' });
     expect(byAction.grant_deny).toMatchObject({ target_open_ids: ['ou_g'], chat_id: 'oc_2', nonce: 'n2' });
@@ -44,11 +60,30 @@ describe('buildGrantCard', () => {
     expect(flat).toContain('张三');
     expect(flat).toContain('李四');
     expect(flat).toContain('Codex');
-    const actions = card.elements.find((e: any) => e.tag === 'action').actions;
-    const byAction = Object.fromEntries(actions.map((a: any) => [a.value.action, a.value]));
+    const actions = deepFind(card, value => value?.tag === 'button');
+    const byAction = Object.fromEntries(actions.map((a: any) => [callbackValue(a).action, callbackValue(a)]));
     // one click → all three targets, shared nonce
     expect(byAction.grant_chat).toMatchObject({ target_open_ids: ['ou_a', 'ou_b', 'ou_bot'], chat_id: 'oc_3', nonce: 'n3' });
     expect(byAction.grant_global).toMatchObject({ target_open_ids: ['ou_a', 'ou_b', 'ou_bot'], chat_id: 'oc_3', nonce: 'n3' });
+  });
+
+  it('defaults to one hour and three messages, with quota inside more limits', () => {
+    const card = JSON.parse(buildGrantCard(
+      { ownerOpenId: 'ou_o', targets: [{ openId: 'ou_g', name: 'Bob' }], chatId: 'oc_2', nonce: 'n2', mode: 'owner' },
+      'zh',
+    ));
+    const expiry = deepFind(card, value => value?.tag === 'select_static' && value?.name === 'grant_duration')[0];
+    const quota = deepFind(card, value => value?.tag === 'input' && value?.name === 'grant_quota')[0];
+    expect(expiry.initial_option).toBe('3600000');
+    expect(quota.default_value).toBe('3');
+    expect(quota.options).toBeUndefined();
+    const panel = deepFind(card, value => value?.tag === 'collapsible_panel')[0];
+    expect(panel.expanded).toBe(false);
+    expect(deepFind(panel, value => value === quota)).toHaveLength(1);
+    const form = deepFind(card, value => value?.tag === 'form' && value?.name === 'grant_limits_form')[0];
+    expect(deepFind(form, value => value === expiry)).toHaveLength(1);
+    const actions = deepFind(form, value => value?.tag === 'button');
+    expect(actions.every(action => action.action_type === 'form_submit')).toBe(true);
   });
 
   it('buildGrantNotifyCard @-mentions every granted target (legacy string[] = humans)', () => {
@@ -80,6 +115,6 @@ describe('buildGrantCard', () => {
 
   it('buildGrantResultCard has no buttons', () => {
     const card = JSON.parse(buildGrantResultCard('chat', 'zh'));
-    expect(card.elements.some((e: any) => e.tag === 'action')).toBe(false);
+    expect(deepFind(card, value => value?.tag === 'button')).toHaveLength(0);
   });
 });

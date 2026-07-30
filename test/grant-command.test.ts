@@ -24,6 +24,26 @@ import { registerBot, getBot, loadBotConfigs } from '../src/bot-registry.js';
 import { addChatGrant } from '../src/services/grant-store.js';
 import * as pending from '../src/im/lark/grant-pending.js';
 
+function findCardCallbackValue(card: any, action: string): any {
+  const visit = (node: any): any => {
+    if (node?.behaviors?.[0]?.value?.action === action) return node.behaviors[0].value;
+    if (node?.value?.action === action) return node.value;
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const found = visit(child);
+        if (found) return found;
+      }
+    } else if (node && typeof node === 'object') {
+      for (const child of Object.values(node)) {
+        const found = visit(child);
+        if (found) return found;
+      }
+    }
+    return undefined;
+  };
+  return visit(card);
+}
+
 describe('parseGrantTarget', () => {
   it('extracts first non-bot human mention', () => {
     const msg = { mentions: [
@@ -203,7 +223,8 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
     const [, , content, msgType] = replyMock.mock.calls.at(-1)!;
     expect(msgType).toBe('interactive');
     expect(content).toContain('grant_chat');           // card carries grant actions
-    expect(pending.checkNonce('b1', 'oc_1', 'ou_z', JSON.parse(content).elements.find((e: any)=>e.tag==='action').actions[0].value.nonce)).toBe(true);
+    const grantChat = findCardCallbackValue(JSON.parse(content), 'grant_chat');
+    expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(true);
   });
 
   it('non-owner: replies owner_only, no card', async () => {
@@ -249,7 +270,7 @@ describe('tryHandleGrantCommand multi-target (@bot /grant @a @b)', () => {
     expect(msgType).toBe('interactive');
     expect(content).toContain('张三');
     expect(content).toContain('李四');
-    const grantChat = JSON.parse(content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    const grantChat = findCardCallbackValue(JSON.parse(content), 'grant_chat');
     expect(grantChat.target_open_ids).toEqual(['ou_a', 'ou_b']);
     // one shared nonce validates every target
     expect(pending.checkNonce('bm', 'oc_1', 'ou_a', grantChat.nonce)).toBe(true);

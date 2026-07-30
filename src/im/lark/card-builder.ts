@@ -9,6 +9,11 @@ import { t, type Locale } from '../../i18n/index.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
+import {
+  DEFAULT_GRANT_DURATION_MS,
+  DEFAULT_GRANT_QUOTA,
+  GRANT_DURATION_OPTIONS,
+} from '../../services/grant-policy.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -1224,10 +1229,12 @@ export interface GrantCardOpts {
   nonce: string;
   /** 'request' = 无权限者自助申请；'owner' = owner 主动 /grant。仅文案不同。 */
   mode: 'request' | 'owner';
+  /** 当前卡片暂存的限制；缺省使用产品默认值。 */
+  durationMs?: number;
+  quota?: number;
 }
 
-/** 授权卡片：正文 @owner，三枚按钮各带 action + 上下文 + nonce。
- *  多目标共用一张卡，按钮 value 带 target_open_ids 数组，owner 点一次范围套用到全部。 */
+/** 授权卡片：有效期是主设置，消息额度收进「更多限制」。 */
 export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const names = o.targets.map(t => `**${escapeMd(t.name)}**`).join('、');
   const single = o.targets[0];
@@ -1236,27 +1243,101 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     : o.targets.length > 1
       ? t('card.grant.body_owner_multi', { names, owner: o.ownerOpenId }, locale)
       : t('card.grant.body_owner', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale);
-  // target_names 与 target_open_ids 同序：授权成功后据此把目标登记进 observed 花名册
-  // （/grant @bot 成功后顺带「认识」对方，等价内部跑一次 /introduce）。
-  const v = { target_open_ids: o.targets.map(t => t.openId), target_names: o.targets.map(t => t.name), chat_id: o.chatId, nonce: o.nonce };
-  // 「全局授权对话」只在 owner 主动发卡时出现：owner 一眼明确要给全局；request 模式（成员
-  // 自助申请）只提供「本群」，避免成员把自己申请到全局。两个授权按钮都是 talk-only。
-  const grantButtons: any[] = [
-    { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: t('card.grant.btn_chat', undefined, locale) }, value: { action: 'grant_chat', ...v } },
+  const durationMs = o.durationMs ?? DEFAULT_GRANT_DURATION_MS;
+  const quota = o.quota ?? DEFAULT_GRANT_QUOTA;
+  // target_names 与 target_open_ids 同序：授权成功后据此把目标登记进 observed 花名册。
+  const v = {
+    target_open_ids: o.targets.map(t => t.openId),
+    target_names: o.targets.map(t => t.name),
+    chat_id: o.chatId,
+    nonce: o.nonce,
+    mode: o.mode,
+  };
+  const button = (action: string, text: string, type: string): Record<string, unknown> => ({
+    tag: 'button',
+    type,
+    text: { tag: 'plain_text', content: text },
+    name: action,
+    action_type: 'form_submit',
+    value: { action, ...v },
+  });
+  const grantButtons: Array<Record<string, unknown>> = [
+    button('grant_chat', t('card.grant.btn_chat', undefined, locale), 'primary_filled'),
   ];
   if (o.mode === 'owner') {
-    grantButtons.push({ tag: 'button', type: 'default', text: { tag: 'plain_text', content: t('card.grant.btn_global', undefined, locale) }, value: { action: 'grant_global', ...v } });
+    grantButtons.push(button('grant_global', t('card.grant.btn_global', undefined, locale), 'default'));
   }
-  grantButtons.push({ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: t('card.grant.btn_deny', undefined, locale) }, value: { action: 'grant_deny', ...v } });
+  grantButtons.push(button('grant_deny', t('card.grant.btn_deny', undefined, locale), 'danger'));
   const card = {
-    config: { wide_screen_mode: true },
-    header: { template: 'orange', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
-    elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: body } },
-      { tag: 'hr' },
-      { tag: 'action', actions: grantButtons },
-      { tag: 'note', elements: [{ tag: 'lark_md', content: t('card.grant.note', undefined, locale) }] },
-    ],
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'default' },
+    header: { template: 'blue', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
+    body: {
+      direction: 'vertical',
+      padding: '12px 12px 16px 12px',
+      vertical_spacing: 'small',
+      elements: [
+        { tag: 'markdown', content: body },
+        {
+          tag: 'form',
+          name: 'grant_limits_form',
+          elements: [
+            {
+              tag: 'select_static',
+              name: 'grant_duration',
+              width: 'fill',
+              label: { tag: 'plain_text', content: t('card.grant.duration_label', undefined, locale) },
+              initial_option: String(durationMs),
+              placeholder: { tag: 'plain_text', content: t('card.grant.duration_label', undefined, locale) },
+              options: [
+                ...GRANT_DURATION_OPTIONS.map(ms => ({
+                  text: { tag: 'plain_text', content: t(`card.grant.duration_${ms}` as any, undefined, locale) },
+                  value: String(ms),
+                })),
+                { text: { tag: 'plain_text', content: t('card.grant.duration_permanent', undefined, locale) }, value: 'permanent' },
+              ],
+            },
+            {
+              tag: 'collapsible_panel',
+              expanded: false,
+              header: {
+                title: {
+                  tag: 'markdown',
+                  content: t('card.grant.more_limits_summary', { n: quota ?? t('card.grant.quota_unlimited', undefined, locale) }, locale),
+                },
+                vertical_align: 'center',
+                icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' },
+                icon_position: 'follow_text',
+                icon_expanded_angle: -180,
+              },
+              padding: '8px 0px 4px 0px',
+              elements: [{
+                tag: 'input',
+                name: 'grant_quota',
+                width: 'fill',
+                default_value: quota === undefined ? '' : String(quota),
+                max_length: 4,
+                label: { tag: 'plain_text', content: t('card.grant.quota_label', undefined, locale) },
+                placeholder: { tag: 'plain_text', content: t('card.grant.quota_placeholder', undefined, locale) },
+              }],
+            },
+            {
+              tag: 'column_set',
+              flex_mode: 'none',
+              horizontal_spacing: 'small',
+              columns: grantButtons.map((action, index) => ({
+                tag: 'column',
+                width: index === 0 ? 'weighted' : 'auto',
+                ...(index === 0 ? { weight: 1 } : {}),
+                vertical_align: 'center',
+                elements: [action],
+              })),
+            },
+          ],
+        },
+        { tag: 'markdown', content: `<font color="grey">${t('card.grant.note', undefined, locale)}</font>` },
+      ],
+    },
   };
   return JSON.stringify(card);
 }
@@ -1275,6 +1356,7 @@ export function buildGrantNotifyCard(
   target: string | string[] | Array<{ openId: string; name?: string; isBot?: boolean }>,
   locale?: Locale,
   quota?: number,
+  expiresAt?: number,
 ): string {
   const entries = (Array.isArray(target) ? target : [target]).map(tt =>
     typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
@@ -1285,6 +1367,9 @@ export function buildGrantNotifyCard(
   ).join(' ');
   let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
   if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
+  if (expiresAt !== undefined) {
+    content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
+  }
   const card = {
     config: { wide_screen_mode: true },
     elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
@@ -1304,12 +1389,27 @@ export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, loc
 }
 
 /** 授权处置后的终态卡（无按钮，防重复点击）。 */
-export function buildGrantResultCard(kind: 'chat' | 'global' | 'deny', locale?: Locale): string {
+function formatGrantExpiry(expiresAt: number, locale?: Locale): string {
+  return new Date(expiresAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false });
+}
+
+export function buildGrantResultCard(
+  kind: 'chat' | 'global' | 'deny',
+  locale?: Locale,
+  quota?: number,
+  expiresAt?: number,
+): string {
   const key = kind === 'chat' ? 'card.grant.result_chat' : kind === 'global' ? 'card.grant.result_global' : 'card.grant.result_deny';
+  let content = t(key, undefined, locale);
+  if (kind !== 'deny') {
+    if (expiresAt !== undefined) content += `\n${t('card.grant.result_expiry', { time: formatGrantExpiry(expiresAt, locale) }, locale)}`;
+    if (quota !== undefined) content += `\n${t('card.grant.result_quota', { n: quota }, locale)}`;
+  }
   const card = {
-    config: { wide_screen_mode: true },
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'default' },
     header: { template: kind === 'deny' ? 'grey' : 'green', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
-    elements: [{ tag: 'div', text: { tag: 'lark_md', content: t(key, undefined, locale) } }],
+    body: { elements: [{ tag: 'markdown', content }] },
   };
   return JSON.stringify(card);
 }

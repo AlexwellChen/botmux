@@ -152,6 +152,35 @@ describe('grant-store', () => {
 });
 
 describe('grant-store message quota', () => {
+  it('persists expiry and re-granting as permanent clears only the expiry record', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { registry, store } = await freshModules();
+    const expiresAt = Date.now() + 60_000;
+    await store.addChatGrant('a1', 'oc_1', 'ou_g', 3, expiresAt);
+    expect(readConfig().grantExpiryState).toEqual({ 'chat:oc_1:ou_g': { expiresAt } });
+    expect(registry.getBot('a1').config.grantExpiryState).toEqual({ 'chat:oc_1:ou_g': { expiresAt } });
+    await store.addChatGrant('a1', 'oc_1', 'ou_g', 3);
+    expect(readConfig().grantExpiryState).toBeUndefined();
+    expect(registry.getBot('a1').config.grantExpiryState).toBeUndefined();
+  });
+
+  it('expired cleanup is conditional and cannot remove a freshly renewed grant', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { registry, store } = await freshModules();
+    const expiredAt = Date.now() - 1;
+    await store.addChatGrant('a1', 'oc_1', 'ou_g', 3, expiredAt);
+    const renewedAt = Date.now() + 60_000;
+    await store.addChatGrant('a1', 'oc_1', 'ou_g', 3, renewedAt);
+    expect(await store.removeExpiredGrant('a1', 'chat', 'oc_1', 'ou_g', expiredAt))
+      .toEqual({ ok: true, removed: false });
+    expect(registry.getBot('a1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
+    expect(await store.removeExpiredGrant('a1', 'chat', 'oc_1', 'ou_g', renewedAt, renewedAt))
+      .toEqual({ ok: true, removed: true });
+    expect(readConfig().chatGrants).toEqual({});
+    expect(readConfig().quotaState).toBeUndefined();
+    expect(readConfig().grantExpiryState).toBeUndefined();
+  });
+
   it('addChatGrant with quota writes a scope-aware quotaState record (disk + memory)', async () => {
     writeConfig({ allowedUsers: ['ou_owner'] });
     const { registry, store } = await freshModules();

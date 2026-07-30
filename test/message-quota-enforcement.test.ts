@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   consumeQuota: vi.fn(),
   removeChatGrant: vi.fn(),
   removeGlobalGrant: vi.fn(),
+  getGrantExpiresAt: vi.fn(),
+  removeExpiredGrant: vi.fn(),
   beginCharge: vi.fn(),
   commitCharge: vi.fn(),
   abortCharge: vi.fn(),
@@ -24,6 +26,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 vi.mock('../src/services/grant-store.js', () => ({
   chatQuotaKey: (chatId: string, openId: string) => `chat:${chatId}:${openId}`,
   globalQuotaKey: (openId: string) => `global:${openId}`,
+  getGrantExpiresAt: mocks.getGrantExpiresAt,
   addAllowedChatGroup: vi.fn(),
   addChatGrant: vi.fn(),
   addGlobalGrant: vi.fn(),
@@ -31,6 +34,7 @@ vi.mock('../src/services/grant-store.js', () => ({
   removeAllowedChatGroup: vi.fn(),
   removeChatGrant: mocks.removeChatGrant,
   removeGlobalGrant: mocks.removeGlobalGrant,
+  removeExpiredGrant: mocks.removeExpiredGrant,
   revokeGrant: vi.fn(),
 }));
 
@@ -83,6 +87,8 @@ describe('message quota enforcement', () => {
     mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true });
     mocks.removeChatGrant.mockResolvedValue({ ok: true, removed: true });
     mocks.removeGlobalGrant.mockResolvedValue({ ok: true, removed: true });
+    mocks.getGrantExpiresAt.mockReturnValue(undefined);
+    mocks.removeExpiredGrant.mockResolvedValue({ ok: true, removed: true });
     mocks.buildQuotaExhaustedCard.mockReturnValue('quota-card');
     mocks.replyMessage.mockResolvedValue('om_reply');
     mocks.sendMessage.mockResolvedValue('om_send');
@@ -149,6 +155,22 @@ describe('message quota enforcement', () => {
       .resolves.toBe(false);
     expect(mocks.beginCharge).not.toHaveBeenCalled();
     expect(mocks.consumeQuota).not.toHaveBeenCalled();
+  });
+
+  it('rejects an expired grant before quota charging and schedules conditional cleanup', async () => {
+    const expiredAt = Date.now() - 1;
+    mocks.getGrantExpiresAt.mockReturnValue(expiredAt);
+    await expect(enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_chat', 'om_expired', 'om_anchor'))
+      .resolves.toBe(false);
+    expect(mocks.beginCharge).not.toHaveBeenCalled();
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    expect(mocks.removeExpiredGrant).toHaveBeenCalledWith(
+      'quota_app',
+      'chat',
+      'oc_1',
+      'ou_chat',
+      expiredAt,
+    );
   });
 
   it('allows the exhausting chat-grant message but defers revoke/notify to the next message', async () => {

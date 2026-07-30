@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatBotMembers, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
@@ -44,7 +44,12 @@ import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
-import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
+import {
+  chatQuotaKey,
+  getGrantExpiresAt,
+  globalQuotaKey,
+  removeExpiredGrant,
+} from '../../services/grant-store.js';
 import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
@@ -63,6 +68,7 @@ import {
 } from '../../vc-agent/push-source.js';
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
 import type { VcMeetingImTurnOrigin } from '../../types.js';
+import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -1211,12 +1217,42 @@ export function grantCommandRestriction(
 
 /** per-chat per-user 授权命中判断（仅用于 canTalk —— 不给管理命令权）。 */
 function hasChatGrant(larkAppId: string, chatId: string | undefined, openId: string | undefined): boolean {
-  return !!chatId && !!openId && !!getBot(larkAppId).config.chatGrants?.[chatId]?.includes(openId);
+  if (!chatId || !openId || !getBot(larkAppId).config.chatGrants?.[chatId]?.includes(openId)) return false;
+  return grantNotExpired(larkAppId, 'chat', chatId, openId, chatQuotaKey(chatId, openId));
 }
 
 /** 全局对话授权命中判断（人/bot 通用，仅用于 canTalk / bot 路由闸 —— 不给管理命令权）。 */
 function hasGlobalGrant(larkAppId: string, openId: string | undefined): boolean {
-  return !!openId && !!getBot(larkAppId).config.globalGrants?.includes(openId);
+  if (!openId || !getBot(larkAppId).config.globalGrants?.includes(openId)) return false;
+  return grantNotExpired(larkAppId, 'global', undefined, openId, globalQuotaKey(openId));
+}
+
+const expiryCleanupInFlight = new Set<string>();
+
+/**
+ * 到期判断是同步安全边界：过期后本条消息立即拒绝；持久化清理由带 observedExpiresAt
+ * 条件的原子 RMW 异步完成，避免误删刚续期的授权。
+ */
+function grantNotExpired(
+  larkAppId: string,
+  scope: 'chat' | 'global',
+  chatId: string | undefined,
+  openId: string,
+  grantKey: string,
+): boolean {
+  const expiresAt = getGrantExpiresAt(larkAppId, grantKey);
+  if (expiresAt === undefined || Date.now() < expiresAt) return true;
+  const cleanupKey = `${larkAppId}:${grantKey}:${expiresAt}`;
+  if (!expiryCleanupInFlight.has(cleanupKey)) {
+    expiryCleanupInFlight.add(cleanupKey);
+    void removeExpiredGrant(larkAppId, scope, chatId, openId, expiresAt)
+      .then(result => {
+        if (!result.ok) logger.warn(`[grant:${larkAppId}] expiry cleanup failed key=${grantKey} reason=${result.reason}`);
+      })
+      .catch(err => logger.warn(`[grant:${larkAppId}] expiry cleanup failed key=${grantKey}: ${err}`))
+      .finally(() => expiryCleanupInFlight.delete(cleanupKey));
+  }
+  return false;
 }
 
 /**
@@ -1381,11 +1417,31 @@ async function maybeSendGrantRequestCard(
   const observedName = mentionName
     ? undefined
     : listObservedBots(config.session.dataDir, larkAppId, chatId).find(b => b.openId === requesterOpenId)?.name;
-  const name = mentionName ?? observedName ?? requesterOpenId;
+  const profileName = mentionName || observedName
+    ? undefined
+    : (await getUserProfile(larkAppId, requesterOpenId).catch(() => null))?.name;
+  const shortRequester = `${requesterOpenId.slice(0, 10)}…${requesterOpenId.slice(-4)}`;
+  const name = mentionName ?? observedName ?? profileName ?? shortRequester;
   // 把原始消息事件挂在 pending 上：授权成功后可重放，用户无需再 @ 一遍。
-  const nonce = openPending(larkAppId, chatId, requesterOpenId, getBot(larkAppId).config.messageQuota?.defaultLimit, messageData);
+  const quota = getBot(larkAppId).config.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
+  const nonce = openPending(
+    larkAppId,
+    chatId,
+    requesterOpenId,
+    quota,
+    messageData,
+    DEFAULT_GRANT_DURATION_MS,
+  );
   const card = buildGrantCard(
-    { ownerOpenId: owner, targets: [{ openId: requesterOpenId, name: String(name) }], chatId, nonce, mode: 'request' },
+    {
+      ownerOpenId: owner,
+      targets: [{ openId: requesterOpenId, name: String(name) }],
+      chatId,
+      nonce,
+      mode: 'request',
+      quota,
+      durationMs: DEFAULT_GRANT_DURATION_MS,
+    },
     localeForBot(larkAppId),
   );
   await replyMessage(larkAppId, message.message_id, card, 'interactive')
