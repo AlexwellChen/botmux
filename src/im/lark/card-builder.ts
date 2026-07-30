@@ -10,6 +10,7 @@ import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
 import {
+  clampGrantQuotaForCard,
   DEFAULT_GRANT_DURATION_MS,
   DEFAULT_GRANT_QUOTA,
   GRANT_DURATION_OPTIONS,
@@ -1244,7 +1245,9 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
       ? t('card.grant.body_owner_multi', { names, owner: o.ownerOpenId }, locale)
       : t('card.grant.body_owner', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale);
   const durationMs = o.durationMs ?? DEFAULT_GRANT_DURATION_MS;
-  const quota = o.quota ?? DEFAULT_GRANT_QUOTA;
+  // 夹取到卡片可提交区间：历史 messageQuota.defaultLimit（parser 无上限）若 >MAX，
+  // 直接透传会让初值超过 normalize 上限 → owner 一点授权就报「参数无效」发不出。
+  const quota = clampGrantQuotaForCard(o.quota ?? DEFAULT_GRANT_QUOTA);
   // target_names 与 target_open_ids 同序：授权成功后据此把目标登记进 observed 花名册。
   const v = {
     target_open_ids: o.targets.map(t => t.openId),

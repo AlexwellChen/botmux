@@ -2883,8 +2883,18 @@ export async function enforceMessageQuotaForCliInput(
 
   let quota;
   try {
-    const def = getBot(larkAppId).config.messageQuota?.defaultLimit;
-    quota = await consumeQuota(larkAppId, ev.quotaKey, def);
+    // oncall ∩ chatGrant 交集的额度决策**全部收口进 consumeQuota 的同一把锁**，杜绝跨 await
+    // 用陈旧 ev 决策：
+    //   • explicitGrantOverride（live 显式授权）→ 不兜 default（undefined）。
+    //   • expiredGrantCleanup（观察到过期 chatGrant）→ 透传给 consumeQuota，锁内以**当前 expiry**
+    //     为权威：当前 expiry<=now → 原子清「成员+quota+expiry」并回落 default；当前无/未来 expiry
+    //     → grant live（成员在→不兜 default 按现有/不限；成员已清→回落 default）。
+    //   • 其余 oncall（非成员）→ 兜 default。
+    // 传入的 def 是「拟回落值」；是否真用由 consumeQuota 锁内定夺（有 expiredGrant 时以 CAS 为准）。
+    const def = ev.reason === 'oncall' && !ev.explicitGrantOverride
+      ? getBot(larkAppId).config.messageQuota?.defaultLimit
+      : undefined;
+    quota = await consumeQuota(larkAppId, ev.quotaKey, def, ev.expiredGrantCleanup);
   } catch (err) {
     logger.warn(`[quota:${larkAppId}] consume failed; dropping message ${messageId.substring(0, 12)}: ${err}`);
     abortCharge(larkAppId, messageId);

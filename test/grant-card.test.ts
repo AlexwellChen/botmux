@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildGrantCard, buildGrantResultCard, buildGrantNotifyCard } from '../src/im/lark/card-builder.js';
+import { normalizeGrantQuotaOption } from '../src/services/grant-policy.js';
 
 function deepFind(node: any, predicate: (value: any) => boolean): any[] {
   const out: any[] = [];
@@ -96,6 +97,19 @@ describe('buildGrantCard', () => {
     const byAction = Object.fromEntries(actions.map((action: any) => [callbackValue(action).action, action]));
     expect(byAction.grant_chat).toMatchObject({ type: 'primary', text: { content: '授权本群对话' } });
     expect(byAction.grant_deny).toMatchObject({ type: 'danger', text: { content: '拒绝' } });
+  });
+
+  it('P2: clamps an over-max default quota so the card stays submittable', () => {
+    // 历史 messageQuota.defaultLimit（parser 无上限）可能 >1000；卡片初值必须夹到
+    // normalize 认得的区间，否则 owner 一点授权就报「参数无效」发不出去。
+    const card = JSON.parse(buildGrantCard(
+      { ownerOpenId: 'ou_o', targets: [{ openId: 'ou_g', name: 'Bob' }], chatId: 'oc_2', nonce: 'n2', mode: 'owner', quota: 1001 },
+      'zh',
+    ));
+    const quota = deepFind(card, value => value?.tag === 'input' && value?.name === 'grant_quota')[0];
+    expect(quota.default_value).toBe('1000');
+    // 且这个初值必须能通过服务端 normalize（不是 null=坏卡）
+    expect(normalizeGrantQuotaOption(quota.default_value)).toBe(1000);
   });
 
   it('buildGrantNotifyCard @-mentions every granted target (legacy string[] = humans)', () => {

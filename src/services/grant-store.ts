@@ -279,18 +279,73 @@ export async function removeExpiredGrant(
  *
  * defaultLimit>0 且 quotaKey 对应记录不存在时：懒初始化 {limit:defaultLimit, used:1}
  * （oncall 群默认额度场景，避免每条消息都要显式 /grant 才落记录）。
+ *
+ * `expiredGrant`（可选）：oncall ∩ chatGrant 交集用。传入时**锁内**以「本 key 的**当前** expiry」
+ *   为唯一权威判定（不看调用方 evaluate 时的观察值——那可能已陈旧）：
+ *   • 当前 expiry 存在且 <= now → grant 确已过期 → 同一把锁内原子清「成员+quota+expiry」，本条
+ *     按「grant 已消失」处理（回落 defaultLimit 懒初始化 / 无 default 则 tracked:false）。
+ *   • 当前无 expiry / expiry 在未来（永久/已续期）→ 仍是成员则 grant **live**：不兜 default，按现有
+ *     记录消费（无记录=显式不限→tracked:false）；已非成员（被 revoke/整条清）→ 普通 oncall→回落 default。
+ * 这样「过期清理 + 本次 oncall 额度决策」收口在同一原子 RMW，杜绝跨 await 用陈旧 ev 决策。
  */
 export async function consumeQuota(
-  larkAppId: string, quotaKey: string, defaultLimit?: number,
+  larkAppId: string,
+  quotaKey: string,
+  defaultLimit?: number,
+  expiredGrant?: { scope: 'chat' | 'global'; chatId?: string; openId: string; now?: number },
 ): Promise<{ tracked: boolean; allow: boolean; exhausted: boolean; used: number; limit: number }> {
   const bot = getBot(larkAppId); // throw → 调用方 fail-closed
   type Res = { tracked: boolean; allow: boolean; exhausted: boolean; used: number; limit: number };
-  const initLimit = typeof defaultLimit === 'number' && Number.isInteger(defaultLimit) && defaultLimit > 0 ? defaultLimit : 0;
+  const initLimitRaw = typeof defaultLimit === 'number' && Number.isInteger(defaultLimit) && defaultLimit > 0 ? defaultLimit : 0;
+  const now = expiredGrant?.now ?? Date.now();
+  // grantCleared: RMW 锁内是否真的清掉了整条 grant（CAS 命中）。内存同步据此，而非从 tracked 反推。
+  let grantCleared = false;
   const r = await rmwBotEntry<Res>(larkAppId, (entry) => {
+    // 交集原子清理（收口在同一把锁，基于**当锁快照**而非陈旧 evaluate 观察值决策）：
+    //   本 key 的**当前** expiry 存在且 <= now → grant 确已过期 → 原子清「成员+quota+expiry」，
+    //   本条按「无记录」走 oncall default。否则（无 expiry=永久 / expiry 在未来=已续期）→ grant
+    //   仍 live → 不兜 default，按现有记录消费（无记录=显式不限→保持不限）。以当前 expiry 为准，
+    //   天然覆盖各交错时序：
+    //     • 同一 expiry 仍过期 → 清；• 续期为未来/永久 → 不清、live；• 换成另一个但也已过期 → 照清
+    //       （不遗留陈旧已耗尽 rec 误拒本条，也无需等下一条自愈）；• 已被别处整条清（无 expiry
+    //       且非成员）→ 走「无 expiry」分支不清，按普通 oncall 回落 default。
+    let initLimit = initLimitRaw;
+    if (expiredGrant) {
+      const cur = getExpiryMap(entry)?.[quotaKey]?.expiresAt;
+      if (cur !== undefined && cur <= now) {
+        // 当前 expiry 确已过期 → 原子清整条 grant，回落 default
+        if (expiredGrant.scope === 'chat' && expiredGrant.chatId) {
+          const map = (entry.chatGrants && typeof entry.chatGrants === 'object') ? entry.chatGrants : {};
+          if (Array.isArray(map[expiredGrant.chatId]) && map[expiredGrant.chatId].includes(expiredGrant.openId)) {
+            map[expiredGrant.chatId] = map[expiredGrant.chatId].filter((id: string) => id !== expiredGrant.openId);
+            if (map[expiredGrant.chatId].length === 0) delete map[expiredGrant.chatId];
+            entry.chatGrants = map;
+          }
+        } else if (expiredGrant.scope === 'global') {
+          const grants: string[] = Array.isArray(entry.globalGrants) ? entry.globalGrants : [];
+          if (grants.includes(expiredGrant.openId)) {
+            const next = grants.filter(id => id !== expiredGrant.openId);
+            if (next.length > 0) entry.globalGrants = next; else delete entry.globalGrants;
+          }
+        }
+        setQuotaRecord(entry, quotaKey, null);
+        setExpiryRecord(entry, quotaKey, null);
+        grantCleared = true;
+      } else {
+        // 当前无 expiry（永久 / 已被整条清）或 expiry 在未来（已续期）→ grant 仍 live 或该用户已
+        // 非成员：靠**当前是否仍是成员**决定是否抑制 default。
+        //   • 仍是成员 → live grant（续期/改永久/永久不限）→ 不兜 default，按现有记录/不限消费；
+        //   • 已非成员（被 revoke / 已被别处整条清）→ 普通 oncall 访客 → 回落 default（保留 initLimit）。
+        const isMember = expiredGrant.scope === 'chat' && expiredGrant.chatId
+          ? !!(entry.chatGrants?.[expiredGrant.chatId]?.includes?.(expiredGrant.openId))
+          : Array.isArray(entry.globalGrants) && entry.globalGrants.includes(expiredGrant.openId);
+        if (isMember) initLimit = 0; // 仍是成员且未过期 → live → 抑制 default
+      }
+    }
     const qs = getQuotaMap(entry);
     const rec = qs?.[quotaKey];
     if (!rec) {
-      if (!initLimit) return { write: false, result: { tracked: false, allow: true, exhausted: false, used: 0, limit: 0 } };
+      if (!initLimit) return { write: grantCleared, result: { tracked: false, allow: true, exhausted: false, used: 0, limit: 0 } };
       // 懒初始化：defaultLimit 生效，首次命中即 used=1
       entry.quotaState = { ...(qs ?? {}), [quotaKey]: { limit: initLimit, used: 1 } };
       return { write: true, result: { tracked: true, allow: true, exhausted: 1 >= initLimit, used: 1, limit: initLimit } };
@@ -303,6 +358,19 @@ export async function consumeQuota(
     return { write: true, result: { tracked: true, allow: true, exhausted: used >= rec.limit, used, limit: rec.limit } };
   });
   if (!r.ok) throw new Error(`consumeQuota RMW failed: ${r.reason}`);
+  // 内存同步：① 若锁内清掉了整条 grant（CAS 命中）→ 先同步删内存的成员+quota+expiry；
+  //           ② 再按扣费结果同步 quota 记录（tracked 写快照 / 否则无记录）。两步独立，互不遮蔽。
+  if (grantCleared) {
+    setQuotaRecord(bot.config, quotaKey, null);
+    setExpiryRecord(bot.config, quotaKey, null);
+    if (expiredGrant!.scope === 'chat' && expiredGrant!.chatId && bot.config.chatGrants?.[expiredGrant!.chatId]) {
+      bot.config.chatGrants[expiredGrant!.chatId] = bot.config.chatGrants[expiredGrant!.chatId].filter(id => id !== expiredGrant!.openId);
+      if (bot.config.chatGrants[expiredGrant!.chatId].length === 0) delete bot.config.chatGrants[expiredGrant!.chatId];
+    } else if (expiredGrant!.scope === 'global') {
+      const next = (bot.config.globalGrants ?? []).filter(id => id !== expiredGrant!.openId);
+      if (next.length > 0) bot.config.globalGrants = next; else delete bot.config.globalGrants;
+    }
+  }
   if (r.result.tracked) setQuotaRecord(bot.config, quotaKey, { limit: r.result.limit, used: r.result.used });
   return r.result;
 }
