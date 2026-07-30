@@ -6,6 +6,7 @@ import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js'
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
+import { cardUsageFooterSegment, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -21,7 +22,7 @@ export const CONFIG_UNSET = '__unset__';
 
 /** 布尔字段按配置页的逻辑分组（与 dashboard 的 Bot Profiles 区块对应）。 */
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
-  { sec: 'card.config.sec.card', keys: ['showUsageInCardFooter', 'disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard'] },
+  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
   { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands'] },
 ];
@@ -665,9 +666,9 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
  *  by both {@link buildStreamingCard} and {@link buildPrivateSnapshotCard}. */
 function pushStreamBody(
   elements: any[],
-  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale },
+  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot },
 ): void {
-  const { status, usageLimit, displayMode, imageKey, cliName, locale } = opts;
+  const { status, usageLimit, displayMode, imageKey, cliName, locale, usage } = opts;
   if (status === 'limited' && usageLimit) {
     elements.push({
       tag: 'markdown',
@@ -684,6 +685,17 @@ function pushStreamBody(
       elements.push({ tag: 'markdown', content: t('card.status.waiting_screenshot', undefined, locale) });
     }
     elements.push({ tag: 'hr' });
+  }
+  // Native Context / Token usage line (grey, small) when this bot displays usage
+  // on the streaming card. Missing metrics are omitted independently by
+  // cardUsageFooterSegment; a fully-empty snapshot renders nothing.
+  const usageSeg = usage ? cardUsageFooterSegment(usage, locale) : null;
+  if (usageSeg) {
+    elements.push({
+      tag: 'markdown',
+      text_size: 'notation_small_v2',
+      content: `<font color='grey'>${usageSeg}</font>`,
+    });
   }
 }
 
@@ -715,6 +727,7 @@ export function buildStreamingCard(
   usageLimit?: CliUsageLimitState,
   writableTerminalUrl?: string,
   localCliReady = false,
+  usage?: CardUsageSnapshot,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
@@ -724,7 +737,7 @@ export function buildStreamingCard(
   const elements: any[] = [];
 
   // ── Output body (shared with the private snapshot card) ──────────────────
-  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale });
+  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage });
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];

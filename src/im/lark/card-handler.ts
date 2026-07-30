@@ -15,7 +15,6 @@ import {
   applyConfigField,
   coerceConfigValue,
   getConfigCardData,
-  resolveConfigBooleanValue,
 } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
@@ -1421,7 +1420,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     let r;
     if (value.action === 'config_toggle') {
       if (spec.kind !== 'boolean') return { toast: { type: 'error', content: t('cmd.config.invalid_bool', { field: spec.key, value: '' }, loc) } };
-      const cur = resolveConfigBooleanValue(spec, (cbot.config as any)[spec.configKey]);
+      const cur = (cbot.config as any)[spec.configKey] === true;
       r = await applyConfigField(larkAppId, spec, !cur);
     } else {
       const raw = (action as any)?.option ?? (action as any)?.input_value ?? '';

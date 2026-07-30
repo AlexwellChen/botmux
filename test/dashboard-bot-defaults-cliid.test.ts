@@ -204,9 +204,9 @@ describe('Codex App history switch', () => {
   });
 });
 
-describe('reply-card usage footer switch', () => {
-  it('is default-on and persists explicit off/on changes', async () => {
-    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+describe('reply-card usage display mode', () => {
+  it('defaults to streaming and persists explicit footer/off changes', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, string>) => ({
       ok: true,
       status: 200,
       body: { ok: true, ...patch },
@@ -214,27 +214,27 @@ describe('reply-card usage footer switch', () => {
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
-        bot: { larkAppId: 'cli_usage' },
+        bot: { larkAppId: 'cli_usage', usageSupported: true },
         putCardPref,
       }));
     });
 
-    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-show-usage-in-card-footer' });
-    expect(toggle().props.checked).toBe(true);
+    const menu = () => renderer.root.findByProps({ id: 'bd-menu-usageDisplay' });
+    expect(menu().props.value).toBe('streaming');
 
     await act(async () => {
-      toggle().props.onChange({ currentTarget: { checked: false } });
+      menu().props.onChange('footer');
       await Promise.resolve();
     });
-    expect(putCardPref).toHaveBeenLastCalledWith({ showUsageInCardFooter: false });
-    expect(toggle().props.checked).toBe(false);
+    expect(putCardPref).toHaveBeenLastCalledWith({ usageDisplay: 'footer' });
+    expect(menu().props.value).toBe('footer');
 
     await act(async () => {
-      toggle().props.onChange({ currentTarget: { checked: true } });
+      menu().props.onChange('off');
       await Promise.resolve();
     });
-    expect(putCardPref).toHaveBeenLastCalledWith({ showUsageInCardFooter: true });
-    expect(toggle().props.checked).toBe(true);
+    expect(putCardPref).toHaveBeenLastCalledWith({ usageDisplay: 'off' });
+    expect(menu().props.value).toBe('off');
   });
 
   it('rolls back when persistence fails', async () => {
@@ -246,18 +246,18 @@ describe('reply-card usage footer switch', () => {
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
-        bot: { larkAppId: 'cli_usage' },
+        bot: { larkAppId: 'cli_usage', usageSupported: true },
         putCardPref,
       }));
     });
 
-    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-show-usage-in-card-footer' });
+    const menu = () => renderer.root.findByProps({ id: 'bd-menu-usageDisplay' });
     await act(async () => {
-      toggle().props.onChange({ currentTarget: { checked: false } });
+      menu().props.onChange('off');
       await Promise.resolve();
     });
 
-    expect(toggle().props.checked).toBe(true);
+    expect(menu().props.value).toBe('streaming');
     expect(renderer.root.findByProps({ 'data-card-pref-status': '' }).children.join(''))
       .toContain('write_failed');
   });

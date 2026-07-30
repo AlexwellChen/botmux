@@ -44,7 +44,7 @@ import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath } from '../bot-registry.js';
+import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 
@@ -79,6 +79,7 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
 export function getDaemonSessionUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
+  opts?: { fresh?: boolean },
 ): CardUsageSnapshot {
   try {
     const resolvedCliId = effectiveCliId ?? (
@@ -99,8 +100,15 @@ export function getDaemonSessionUsageSnapshot(
         ?? ds.session.workingDir
         ?? ds.session.adoptedFrom?.cwd
         ?? ds.adoptedFrom?.cwd,
-      larkAppId: ds.larkAppId,
-      fresh: true,
+      // Enable the BOT_HOME transcript fallback for CLI-data-redirected /
+      // sandboxed bots (same as the ledger and dashboard-row readers). Without
+      // it a read-isolated bot's transcript is invisible and the card shows no
+      // usage even though it exists under BOT_HOME.
+      larkAppId: ds.larkAppId ?? ds.session.larkAppId,
+      // Reply cards read at the exact turn boundary (fresh); the live streaming
+      // card refreshes on every status tick and rides the reader's reparse
+      // throttle instead (fresh:false) to stay off the disk.
+      fresh: opts?.fresh ?? true,
     });
   } catch (error) {
     logger.warn(
@@ -111,22 +119,43 @@ export function getDaemonSessionUsageSnapshot(
   }
 }
 
-/** Card-specific usage acquisition. Keep the display preference out of the
- * native usage reader so accounting and dashboard consumers remain intact.
- * A concrete empty snapshot (rather than undefined) also freezes "hidden" over
- * final-output retries. */
+/** Reply-card (final output / adopt preamble / local-turn) usage. Only the
+ * `'footer'` display mode surfaces usage here; `'streaming'` and `'off'` yield a
+ * concrete empty snapshot. Keeping the display decision out of the native usage
+ * reader leaves accounting and dashboard consumers intact; the concrete empty
+ * snapshot (rather than undefined) also freezes "hidden" over final-output
+ * retries. */
 export function getDaemonReplyCardUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
 ): CardUsageSnapshot {
   try {
-    if (getBot(ds.larkAppId).config.showUsageInCardFooter === false) {
+    if (resolveUsageDisplay(ds.larkAppId) !== 'footer') {
       return { context: null, tokens: null };
     }
   } catch {
-    // Missing runtime config must preserve the backwards-compatible default ON.
+    // Missing runtime config → default 'streaming' → no footer usage.
+    return { context: null, tokens: null };
   }
   return getDaemonSessionUsageSnapshot(ds, effectiveCliId);
+}
+
+/** Streaming-card usage. Only the `'streaming'` display mode (the default)
+ * surfaces usage in the live card body; `'footer'` and `'off'` yield empty.
+ * Returns a concrete empty snapshot on any config failure so the streaming
+ * renderer stays best-effort. */
+export function getDaemonStreamingCardUsageSnapshot(
+  ds: DaemonSession,
+  effectiveCliId?: CliId,
+): CardUsageSnapshot {
+  try {
+    if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
+      return { context: null, tokens: null };
+    }
+  } catch {
+    // Missing runtime config → default 'streaming' → show usage (best-effort).
+  }
+  return getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: false });
 }
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -3397,6 +3426,7 @@ function setupWorkerHandlers(
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+            getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -3449,6 +3479,7 @@ function setupWorkerHandlers(
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+            getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
         }

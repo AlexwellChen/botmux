@@ -330,11 +330,11 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   });
 });
 
-describe('PUT /api/bot-card-prefs — reply-card usage footer', () => {
-  it('is default-on and persists explicit off/on changes immediately', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-usage-footer-'));
+describe('PUT /api/bot-card-prefs — reply-card usage display mode', () => {
+  it('defaults to streaming and persists explicit footer/off changes immediately', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-usage-display-'));
     const configPath = join(dir, 'bots.json');
-    const appId = 'test-usage-footer-app';
+    const appId = 'test-usage-display-app';
     const prevBotsConfig = process.env.BOTS_CONFIG;
     try {
       process.env.BOTS_CONFIG = configPath;
@@ -349,29 +349,40 @@ describe('PUT /api/bot-card-prefs — reply-card usage footer', () => {
       const base = `http://127.0.0.1:${handle.port}`;
 
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(initial.showUsageInCardFooter).toBe(true);
+      expect(initial.usageDisplay).toBe('streaming');
 
+      const footer = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ usageDisplay: 'footer' }),
+      });
+      expect(footer.status).toBe(200);
+      expect(await footer.json()).toMatchObject({ ok: true, usageDisplay: 'footer' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBe('footer');
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ usageDisplay: 'footer' });
+
+      // Back to the default 'streaming' → key dropped, GET reflects the default.
+      const streaming = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ usageDisplay: 'streaming' }),
+      });
+      expect(streaming.status).toBe(200);
+      expect(await streaming.json()).toMatchObject({ ok: true, usageDisplay: 'streaming' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBeUndefined();
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ usageDisplay: 'streaming' });
+
+      // 'off' persists verbatim.
       const off = await fetch(`${base}/api/bot-card-prefs`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ showUsageInCardFooter: false }),
+        body: JSON.stringify({ usageDisplay: 'off' }),
       });
       expect(off.status).toBe(200);
-      expect(await off.json()).toMatchObject({ ok: true, showUsageInCardFooter: false });
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].showUsageInCardFooter).toBe(false);
-      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
-        .toMatchObject({ showUsageInCardFooter: false });
-
-      const on = await fetch(`${base}/api/bot-card-prefs`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ showUsageInCardFooter: true }),
-      });
-      expect(on.status).toBe(200);
-      expect(await on.json()).toMatchObject({ ok: true, showUsageInCardFooter: true });
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].showUsageInCardFooter).toBeUndefined();
-      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
-        .toMatchObject({ showUsageInCardFooter: true });
+      expect(await off.json()).toMatchObject({ ok: true, usageDisplay: 'off' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBe('off');
     } finally {
       if (handle) await handle.close();
       handle = null;

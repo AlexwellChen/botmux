@@ -45,6 +45,9 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotClient: vi.fn(),
   getBotBrand: vi.fn(() => undefined),
   resolveBrandLabel: vi.fn(() => undefined),
+  // Reply-card footer usage only renders in 'footer' mode; tests override this
+  // per case. Default 'footer' keeps the positive usage-render tests below green.
+  resolveUsageDisplay: vi.fn(() => 'footer'),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -108,7 +111,7 @@ import {
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
-import { getBot } from '../src/bot-registry.js';
+import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
 
 // Build a fake worker child process whose IPC `message` event we can fire
 // manually, then wire it through setupWorkerHandlers via forkAdoptWorker.
@@ -218,6 +221,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       botOpenId: 'ou_bot',
       botName: 'TestBot',
     } as any);
+    // clearAllMocks wipes the factory return; re-arm footer mode so the
+    // positive usage-render tests see footer usage (individual tests override).
+    vi.mocked(resolveUsageDisplay).mockReturnValue('footer');
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     mkdirSync('/tmp/test-sessions', { recursive: true });
   });
@@ -1415,7 +1421,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     }
   });
 
-  it('does not read or render usage when this bot disables the card-footer switch', async () => {
+  it('does not read or render footer usage when this bot is not in footer mode', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -1423,17 +1429,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
-    vi.mocked(getBot).mockReturnValue({
-      config: {
-        larkAppId: 'app_test',
-        larkAppSecret: 'secret',
-        cliId: 'claude-code',
-        showUsageInCardFooter: false,
-      },
-      resolvedAllowedUsers: [],
-      botOpenId: 'ou_bot',
-      botName: 'TestBot',
-    } as any);
+    // Default streaming (or off) → the reply-card footer must not carry usage,
+    // and the gate must short-circuit before touching the transcript reader.
+    vi.mocked(resolveUsageDisplay).mockReturnValue('off');
 
     const ds = makeDs();
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;

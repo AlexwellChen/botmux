@@ -4448,7 +4448,10 @@ async function readCardUsageSnapshotForSend(
 
   // Old/offline daemon fallback. Sandboxed panes receive this per-bot value
   // explicitly from the worker because bots.json is intentionally unreadable.
-  if (!resolveShowUsageInCardFooter(larkAppId)) {
+  // This send path renders into the reply-card FOOTER, so only the 'footer'
+  // display mode surfaces usage here; 'streaming' shows it on the daemon's live
+  // card (absent on this offline fallback) and 'off' shows nothing.
+  if (resolveUsageDisplay(larkAppId) !== 'footer') {
     return { context: null, tokens: null };
   }
 
@@ -4458,7 +4461,9 @@ async function readCardUsageSnapshotForSend(
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId ?? session.adoptedFrom?.sessionId,
       cwd: session.workingDir ?? session.adoptedFrom?.cwd,
-      larkAppId,
+      // BOT_HOME transcript fallback for CLI-data-redirected / sandboxed bots
+      // (parity with the daemon reader and the ledger/dashboard consumers).
+      larkAppId: larkAppId ?? session.larkAppId,
       fresh: true,
     });
   } catch {
@@ -6104,7 +6109,7 @@ import {
 } from './im/lark/md-card.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { resolveBrandLabel, resolveShowUsageInCardFooter } from './bot-registry.js';
+import { resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
@@ -6386,8 +6391,12 @@ async function registerSelfFromCredFile(): Promise<void> {
     apiOnly: cred.apiOnly === true || undefined,
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
-    showUsageInCardFooter:
-      process.env.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER === 'false' ? false : undefined,
+    usageDisplay:
+      process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'off'
+        ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
+        : undefined,
   } as import('./bot-registry.js').BotConfig);
 }
 
@@ -6453,8 +6462,12 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     brand,
     cliId: 'riff',
     allowedUsers: [],
-    showUsageInCardFooter:
-      process.env.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER === 'false' ? false : undefined,
+    usageDisplay:
+      process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'off'
+        ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
+        : undefined,
   } as unknown as import('./bot-registry.js').BotConfig;
 
   const session: SessionData = {

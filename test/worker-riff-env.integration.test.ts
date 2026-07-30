@@ -96,7 +96,7 @@ describe('Riff worker session environment', () => {
         cliId: 'riff',
         backendType: 'riff',
         riff: { baseUrl: `http://127.0.0.1:${port}` },
-        showUsageInCardFooter: false,
+        usageDisplay: 'footer',
       }]));
 
       const logs: string[] = [];
@@ -146,7 +146,7 @@ describe('Riff worker session environment', () => {
           setTimeout(() => rejectPromise(new Error(`task-execute timeout\n${logs.join('')}`)), 15_000);
         }),
       ]);
-      expect(request.config?.env?.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER).toBe('false');
+      expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
     } finally {
       if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       for (const socket of sockets) socket.destroy();

@@ -95,7 +95,7 @@ import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
 import {
   loadBotConfigs,
   resolveBrandLabel,
-  resolveShowUsageInCardFooter,
+  resolveUsageDisplay,
   type BotConfig,
 } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
@@ -6707,8 +6707,7 @@ async function spawnCli(
       BOTMUX_SESSION_ID: cfg.sessionId,
       BOTMUX_CHAT_ID: cfg.chatId,
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
-      BOTMUX_SHOW_USAGE_IN_CARD_FOOTER:
-        resolveShowUsageInCardFooter(cfg.larkAppId) ? 'true' : 'false',
+      BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
     };
     // Core-only capability must survive into the sandboxed CLI: riffModeSession
     // rebuilds a synthetic BotConfig from env (no bots.json), and would otherwise
@@ -7404,8 +7403,7 @@ async function spawnCli(
     const bl = resolveBrandLabel(cfg.larkAppId);
     if (typeof bl === 'string') childEnv.BOTMUX_BRAND_LABEL = bl;
   }
-  childEnv.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER =
-    resolveShowUsageInCardFooter(cfg.larkAppId) ? 'true' : 'false';
+  childEnv.BOTMUX_USAGE_DISPLAY = resolveUsageDisplay(cfg.larkAppId);
   // NOTE: under read isolation `botmux send` gets this bot's secret from the worker-
   // written cred FILE in its BOT_HOME (send-cred.json, see sendCredFilePath) located
   // via the BOTMUX_LARK_APP_ID above — NOT from the env. The secret is deliberately kept OUT

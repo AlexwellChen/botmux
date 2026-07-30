@@ -86,11 +86,16 @@ describe('dashboard bot payload helpers', () => {
       .toMatchObject({ codexAppCleanInput: true });
   });
 
-  it('projects reply-card usage footer visibility as an explicit default-on boolean', () => {
+  it('projects the usage-display mode, defaulting to streaming and honoring legacy/off', () => {
     const daemon = { larkAppId: 'app_usage', botName: 'Usage', cliId: 'codex' };
-    expect(botDefaultsPayload(daemon, {})).toMatchObject({ showUsageInCardFooter: true });
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ usageDisplay: 'streaming' });
+    expect(botDefaultsPayload(daemon, { usageDisplay: 'footer' }))
+      .toMatchObject({ usageDisplay: 'footer' });
+    expect(botDefaultsPayload(daemon, { usageDisplay: 'off' }))
+      .toMatchObject({ usageDisplay: 'off' });
+    // Legacy boolean projects to 'off'.
     expect(botDefaultsPayload(daemon, { showUsageInCardFooter: false }))
-      .toMatchObject({ showUsageInCardFooter: false });
+      .toMatchObject({ usageDisplay: 'off' });
   });
 
   it('projects sandboxPaths three tiers, defaulting to null when absent or malformed', () => {

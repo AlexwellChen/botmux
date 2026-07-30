@@ -46,6 +46,10 @@ export type {
 } from './types.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
+/** Where a bot shows native Context / Token usage on its Session cards. */
+export type UsageDisplayMode = 'streaming' | 'footer' | 'off';
+/** Default when a bot sets nothing: usage rides the live streaming card. */
+export const DEFAULT_USAGE_DISPLAY: UsageDisplayMode = 'streaming';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
 export type ContentTriggerMatchType = 'keyword' | 'regex';
 export type ContentTriggerActionType = 'start-or-wake-session';
@@ -1198,15 +1202,16 @@ export interface BotConfig {
    */
   brandLabel?: string;
   /**
-   * Whether ordinary reply-card footers show native Context Usage and Token
-   * Usage. Missing/true preserves the default display; false hides both metrics
-   * without disabling Usage Ledger accounting or other footer chrome.
+   * Where to show native Context / Token usage for this bot's Session cards:
+   *   • `'streaming'` (default / unset) → in the live streaming card body
+   *   • `'footer'`                      → in the ordinary reply-card footer
+   *   • `'off'`                         → nowhere
+   * A missing individual metric is still omitted independently, and this only
+   * controls DISPLAY — Usage Ledger accounting and other consumers are
+   * unaffected. Backward compat: a legacy `showUsageInCardFooter: false` with no
+   * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
-  showUsageInCardFooter?: boolean;
-  /**
-   * botmux slash 可注入的 CLI 原生斜杠命令 allowlist（如 ["/compact","/model"]）。
-   * 缺省/空 = 通用注入关闭。/cd 永远被拒（见 core/slash-inject.ts）。
-   */
+  usageDisplay?: UsageDisplayMode;
   tuiSlashAllow?: string[];
   /**
    * When true, suppress the live streaming session card entirely. The web
@@ -1406,7 +1411,7 @@ export function __testOnly_resetBotRegistry(): void {
   loadedConfigPath = undefined;
   oncallChatCache = null;
   brandLabelCache = null;
-  showUsageInCardFooterCache = null;
+  usageDisplayCache = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
@@ -1728,7 +1733,23 @@ export function isChatOncallBoundForAnyBot(chatId: string): boolean {
 // Per-bot brand label, mtime-cached for the disk fallback. Keyed by larkAppId →
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
-let showUsageInCardFooterCache: { mtimeMs: number; map: Map<string, boolean> } | null = null;
+let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+
+/** Normalize a raw bots.json entry's usage-display intent to the enum, applying
+ *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
+ *  `showUsageInCardFooter: false` maps to `'off'`; everything else is the
+ *  default (`'streaming'`). Single source of truth for both the in-memory parse
+ *  and the disk-fallback resolver so they cannot drift. */
+export function normalizeUsageDisplay(entry: {
+  usageDisplay?: unknown;
+  showUsageInCardFooter?: unknown;
+}): UsageDisplayMode {
+  if (entry.usageDisplay === 'streaming' || entry.usageDisplay === 'footer' || entry.usageDisplay === 'off') {
+    return entry.usageDisplay;
+  }
+  if (entry.showUsageInCardFooter === false) return 'off';
+  return DEFAULT_USAGE_DISPLAY;
+}
 
 /** Resolve the bots.json path the same way loadBotConfigs does, without
  *  requiring the registry to have been loaded (works in one-shot CLI processes
@@ -1782,37 +1803,39 @@ export function resolveBrandLabel(larkAppId: string): string | undefined {
 }
 
 /**
- * Resolve the per-bot, default-on reply-card usage visibility. A freshly loaded
- * registry wins over the spawn-time env so long-lived panes observe `/botconfig`
- * hot updates; sandboxed/env-only processes carry the same field in their
- * synthetic registered bot and otherwise fall back to the injected env.
+ * Resolve the per-bot usage-display mode (default `'streaming'`). A freshly
+ * loaded registry wins over the spawn-time env so long-lived panes observe
+ * `/botconfig` hot updates; sandboxed/env-only processes carry the value in
+ * their synthetic registered bot and otherwise fall back to the injected env.
  */
-export function resolveShowUsageInCardFooter(larkAppId: string): boolean {
+export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
   const inMem = bots.get(larkAppId);
-  if (inMem) return inMem.config.showUsageInCardFooter !== false;
+  if (inMem) return normalizeUsageDisplay(inMem.config);
   if (process.env.BOTMUX_LARK_APP_ID === larkAppId
-    && 'BOTMUX_SHOW_USAGE_IN_CARD_FOOTER' in process.env) {
-    return process.env.BOTMUX_SHOW_USAGE_IN_CARD_FOOTER !== 'false';
+    && 'BOTMUX_USAGE_DISPLAY' in process.env) {
+    const env = process.env.BOTMUX_USAGE_DISPLAY;
+    if (env === 'streaming' || env === 'footer' || env === 'off') return env;
+    return DEFAULT_USAGE_DISPLAY;
   }
   const path = loadedConfigPath ?? botsConfigDiskPath();
-  if (!path) return true;
+  if (!path) return DEFAULT_USAGE_DISPLAY;
   try {
     const stat = statSync(path);
-    if (!showUsageInCardFooterCache || showUsageInCardFooterCache.mtimeMs !== stat.mtimeMs) {
+    if (!usageDisplayCache || usageDisplayCache.mtimeMs !== stat.mtimeMs) {
       const raw = JSON.parse(readFileSync(path, 'utf-8'));
-      const map = new Map<string, boolean>();
+      const map = new Map<string, UsageDisplayMode>();
       if (Array.isArray(raw)) {
         for (const entry of raw) {
           if (entry && typeof entry.larkAppId === 'string') {
-            map.set(entry.larkAppId, entry.showUsageInCardFooter !== false);
+            map.set(entry.larkAppId, normalizeUsageDisplay(entry));
           }
         }
       }
-      showUsageInCardFooterCache = { mtimeMs: stat.mtimeMs, map };
+      usageDisplayCache = { mtimeMs: stat.mtimeMs, map };
     }
-    return showUsageInCardFooterCache.map.get(larkAppId) ?? true;
+    return usageDisplayCache.map.get(larkAppId) ?? DEFAULT_USAGE_DISPLAY;
   } catch {
-    return true;
+    return DEFAULT_USAGE_DISPLAY;
   }
 }
 
@@ -2376,8 +2399,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
-      // Default ON: only explicit false is meaningful/persisted.
-      showUsageInCardFooter: entry.showUsageInCardFooter === false ? false : undefined,
+      // Persist only a non-default usage-display mode; 'streaming' (default) and
+      // an absent key both mean streaming. Legacy showUsageInCardFooter:false is
+      // still honored on read (see normalizeUsageDisplay) but never re-emitted.
+      usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
+        ? undefined
+        : normalizeUsageDisplay(entry),
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
       silentTurnReactions: entry.silentTurnReactions === true || undefined,
       receivedReactionEmoji: typeof entry.receivedReactionEmoji === 'string' && entry.receivedReactionEmoji.trim()

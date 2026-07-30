@@ -1,6 +1,6 @@
 /**
- * `/botconfig` 交互卡片：默认开启的布尔字段必须按“有效值”翻转，而不是按
- * bots.json 中是否显式存在 true 翻转。
+ * `/botconfig` 交互卡片：usageDisplay 是三态枚举,经 config_set 选项写入,
+ * coerce 校验枚举值并即时落盘 + 同步内存 config。
  */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -47,29 +47,42 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-describe('/botconfig default-on toggle', () => {
-  it('first click turns showUsageInCardFooter off and persists false', async () => {
+describe('/botconfig usageDisplay enum', () => {
+  it('config_set writes a non-default usageDisplay (footer) and syncs runtime config', async () => {
     const { registry, handler } = await fresh();
     const result = await handler.handleCardAction({
       operator: { open_id: 'ou_owner' },
       action: {
         value: {
-          action: 'config_toggle',
-          field: 'showUsageInCardFooter',
+          action: 'config_set',
+          field: 'usageDisplay',
           loc: 'en',
         },
+        option: 'footer',
       },
     }, deps, 'app_config');
 
     expect(result?.toast).toMatchObject({
       type: 'success',
-      content: '✓ showUsageInCardFooter = off',
+      content: '✓ usageDisplay = footer',
     });
-    expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].showUsageInCardFooter).toBe(false);
-    expect(registry.getBot('app_config').config.showUsageInCardFooter).toBe(false);
+    expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBe('footer');
+    expect(registry.getBot('app_config').config.usageDisplay).toBe('footer');
+  });
 
-    const rerendered = JSON.stringify(result?.card?.data ?? {});
-    expect(rerendered).toContain('Usage in card footer');
-    expect(rerendered).toContain('⚪');
+  it('config_set rejects an invalid usageDisplay value', async () => {
+    const { registry, handler } = await fresh();
+    const result = await handler.handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: 'config_set', field: 'usageDisplay', loc: 'en' },
+        option: 'nonsense',
+      },
+    }, deps, 'app_config');
+
+    expect(result?.toast?.type).toBe('error');
+    // Unchanged on disk / in memory.
+    expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBeUndefined();
+    expect(registry.getBot('app_config').config.usageDisplay).toBeUndefined();
   });
 });

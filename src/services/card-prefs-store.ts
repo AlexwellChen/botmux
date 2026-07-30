@@ -5,8 +5,10 @@
  * without a restart.
  *
  * Per-bot card and related session preferences:
- *   • showUsageInCardFooter      — show native Context / Token usage in ordinary
- *                                  reply-card footers (default true)
+ *   • usageDisplay              — where to show native Context / Token usage:
+ *                                  'streaming' (default) = live streaming card
+ *                                  body, 'footer' = ordinary reply-card footer,
+ *                                  'off' = nowhere
  *   • disableStreamingCard      — suppress the live streaming session card
  *   • silentTurnReactions       — in card-off sessions, also drop the ✋→✅
  *                                  lightweight status reactions on the trigger
@@ -21,12 +23,20 @@
  *                                  (see chat-reply-mode-store). Default 'chat'.
  */
 import { rmwBotEntry } from './config-store.js';
-import { getBot, type ChatReplyMode } from '../bot-registry.js';
+import {
+  getBot,
+  normalizeUsageDisplay,
+  DEFAULT_USAGE_DISPLAY,
+  type ChatReplyMode,
+  type UsageDisplayMode,
+} from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
 
 export interface BotCardPrefs {
-  /** Ordinary reply-card footers show native Context / Token usage. Default true. */
-  showUsageInCardFooter: boolean;
+  /** Where to show native Context / Token usage:
+   *  'streaming' (default) = live streaming card body, 'footer' = ordinary
+   *  reply-card footer, 'off' = nowhere. */
+  usageDisplay: UsageDisplayMode;
   disableStreamingCard: boolean;
   silentTurnReactions: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
@@ -57,13 +67,13 @@ export interface BotCardPrefs {
   docSubscribeDefaultMode: 'mention-only' | 'all';
 }
 
-/** Current card prefs for a bot (`showUsageInCardFooter` and
- * `botToBotSameDir` default true; other booleans default false). */
+/** Current card prefs for a bot (`usageDisplay` defaults to 'streaming';
+ * `botToBotSameDir` defaults true; other booleans default false). */
 export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
   try {
     const c = getBot(larkAppId).config;
     return {
-      showUsageInCardFooter: c.showUsageInCardFooter !== false,
+      usageDisplay: normalizeUsageDisplay(c),
       disableStreamingCard: c.disableStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
@@ -81,7 +91,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     };
   } catch {
     return {
-      showUsageInCardFooter: true,
+      usageDisplay: DEFAULT_USAGE_DISPLAY,
       disableStreamingCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
@@ -150,9 +160,16 @@ export async function updateBotCardPrefs(
     if (val === 'all') entry[key] = 'all';
     else delete entry[key];
   };
+  // 用量显示位置：只存非默认模式；'streaming'（默认）删键保持 bots.json 干净
+  // （absent === 'streaming'）。
+  const applyUsageDisplay = (entry: any, key: keyof BotCardPrefs, val: UsageDisplayMode | undefined) => {
+    if (val === undefined) return;
+    if (val === 'footer' || val === 'off') entry[key] = val;
+    else delete entry[key];
+  };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
-    applyDefaultTrue(entry, 'showUsageInCardFooter', patch.showUsageInCardFooter);
+    applyUsageDisplay(entry, 'usageDisplay', patch.usageDisplay);
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
@@ -169,7 +186,7 @@ export async function updateBotCardPrefs(
     return {
       write: true,
       result: {
-        showUsageInCardFooter: entry.showUsageInCardFooter !== false,
+        usageDisplay: normalizeUsageDisplay(entry),
         disableStreamingCard: entry.disableStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
@@ -193,9 +210,11 @@ export async function updateBotCardPrefs(
   if (!r.ok) return { ok: false, reason: r.reason };
 
   // Sync in-memory config so live card builders / routing react without a restart.
-  if (patch.showUsageInCardFooter !== undefined) {
-    // Default true: store false explicitly, clear (→ default on) when true.
-    bot.config.showUsageInCardFooter = patch.showUsageInCardFooter === false ? false : undefined;
+  if (patch.usageDisplay !== undefined) {
+    // Store only a non-default mode; 'streaming' (default) clears the key.
+    bot.config.usageDisplay = (patch.usageDisplay && patch.usageDisplay !== DEFAULT_USAGE_DISPLAY)
+      ? patch.usageDisplay
+      : undefined;
   }
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
@@ -242,7 +261,7 @@ export async function updateBotCardPrefs(
     bot.config.docSubscribeDefaultMode = patch.docSubscribeDefaultMode === 'all' ? 'all' : undefined;
   }
   logger.info(
-    `[card-prefs:${larkAppId}] showUsageInCardFooter=${r.result.showUsageInCardFooter} ` +
+    `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
     `disableStreamingCard=${r.result.disableStreamingCard} ` +
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +

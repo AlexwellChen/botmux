@@ -257,6 +257,21 @@ function codexRolloutInHome(
   return candidateMtime(path) === null ? null : path;
 }
 
+/** CLIs whose sessions expose a botmux-resolvable native transcript (the only
+ *  source of Context / Token usage). Kept byte-for-byte in sync with the
+ *  switch in {@link resolveSessionTranscriptPath}; a CLI absent here can never
+ *  surface usage, so UI should hide usage-display options for it rather than
+ *  offer a control that is always empty. */
+const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
+  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'antigravity',
+]);
+
+/** True when this CLI can produce native usage (has a resolvable transcript).
+ *  UI uses this to decide whether to offer usage-display configuration. */
+export function cliSupportsNativeUsage(cliId: string | undefined): boolean {
+  return !!cliId && USAGE_RESOLVABLE_CLI_IDS.has(cliId);
+}
+
 export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTranscriptPath | null {
   const sid = q.cliSessionId || q.sessionId;
   switch (q.cliId) {

@@ -86,10 +86,10 @@ describe('buildBotmuxEnvAssignments()', () => {
   it('forwards the reply-card usage visibility into persistent CLI panes', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
-      BOTMUX_SHOW_USAGE_IN_CARD_FOOTER: 'false',
+      BOTMUX_USAGE_DISPLAY: 'footer',
       PATH: '/usr/bin',
     });
-    expect(out).toContain('BOTMUX_SHOW_USAGE_IN_CARD_FOOTER=false');
+    expect(out).toContain('BOTMUX_USAGE_DISPLAY=footer');
     expect(out).not.toContain('PATH=/usr/bin');
   });
 

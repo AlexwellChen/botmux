@@ -64,17 +64,29 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[3].brandLabel).toBeUndefined();         // non-string ignored
   });
 
-  it('parses showUsageInCardFooter as a default-on strict boolean', () => {
+  it('parses usageDisplay as a three-state enum, defaulting to streaming and honoring legacy showUsageInCardFooter', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'usage-default', larkAppSecret: 's' },
-      { larkAppId: 'usage-on', larkAppSecret: 's', showUsageInCardFooter: true },
-      { larkAppId: 'usage-off', larkAppSecret: 's', showUsageInCardFooter: false },
-      { larkAppId: 'usage-invalid', larkAppSecret: 's', showUsageInCardFooter: 'false' },
+      { larkAppId: 'usage-streaming', larkAppSecret: 's', usageDisplay: 'streaming' },
+      { larkAppId: 'usage-footer', larkAppSecret: 's', usageDisplay: 'footer' },
+      { larkAppId: 'usage-off', larkAppSecret: 's', usageDisplay: 'off' },
+      { larkAppId: 'usage-invalid', larkAppSecret: 's', usageDisplay: 'nonsense' },
+      { larkAppId: 'usage-legacy-off', larkAppSecret: 's', showUsageInCardFooter: false },
+      { larkAppId: 'usage-legacy-on', larkAppSecret: 's', showUsageInCardFooter: true },
     ]));
-    expect(cfgs[0].showUsageInCardFooter).toBeUndefined();
-    expect(cfgs[1].showUsageInCardFooter).toBeUndefined();
-    expect(cfgs[2].showUsageInCardFooter).toBe(false);
-    expect(cfgs[3].showUsageInCardFooter).toBeUndefined();
+    // Default (unset) and explicit 'streaming' both persist as undefined (default).
+    expect(cfgs[0].usageDisplay).toBeUndefined();
+    expect(cfgs[1].usageDisplay).toBeUndefined();
+    // Non-default modes persist verbatim.
+    expect(cfgs[2].usageDisplay).toBe('footer');
+    expect(cfgs[3].usageDisplay).toBe('off');
+    // Invalid enum falls back to the default (undefined).
+    expect(cfgs[4].usageDisplay).toBeUndefined();
+    // Legacy boolean: false → 'off'; true → default streaming (undefined).
+    expect(cfgs[5].usageDisplay).toBe('off');
+    expect(cfgs[6].usageDisplay).toBeUndefined();
+    // Legacy field is never re-emitted.
+    expect((cfgs[5] as any).showUsageInCardFooter).toBeUndefined();
   });
 
   it('getOwnerOpenId returns first ou_ in resolvedAllowedUsers', () => {
