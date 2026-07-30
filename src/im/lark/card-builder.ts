@@ -1234,7 +1234,7 @@ export interface GrantCardOpts {
   quota?: number;
 }
 
-/** 授权卡片：有效期是主设置，消息额度收进「更多限制」。 */
+/** 授权卡片：有效期与消息额度并列展示，owner 一次提交两项限制。 */
 export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const names = o.targets.map(t => `**${escapeMd(t.name)}**`).join('、');
   const single = o.targets[0];
@@ -1258,11 +1258,11 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     type,
     text: { tag: 'plain_text', content: text },
     name: action,
-    action_type: 'form_submit',
+    form_action_type: 'submit',
     value: { action, ...v },
   });
   const grantButtons: Array<Record<string, unknown>> = [
-    button('grant_chat', t('card.grant.btn_chat', undefined, locale), 'primary_filled'),
+    button('grant_chat', t('card.grant.btn_chat', undefined, locale), 'primary'),
   ];
   if (o.mode === 'owner') {
     grantButtons.push(button('grant_global', t('card.grant.btn_global', undefined, locale), 'default'));
@@ -1271,71 +1271,95 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const card = {
     schema: '2.0',
     config: { update_multi: true, width_mode: 'default' },
-    header: { template: 'blue', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
+    header: {
+      template: 'orange',
+      title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) },
+    },
     body: {
       direction: 'vertical',
-      padding: '12px 12px 16px 12px',
-      vertical_spacing: 'small',
+      padding: '12px 12px 20px 12px',
+      vertical_spacing: 'medium',
       elements: [
         { tag: 'markdown', content: body },
         {
           tag: 'form',
           name: 'grant_limits_form',
+          vertical_spacing: 'large',
           elements: [
             {
-              tag: 'select_static',
-              name: 'grant_duration',
-              width: 'fill',
-              label: { tag: 'plain_text', content: t('card.grant.duration_label', undefined, locale) },
-              initial_option: String(durationMs),
-              placeholder: { tag: 'plain_text', content: t('card.grant.duration_label', undefined, locale) },
-              options: [
-                ...GRANT_DURATION_OPTIONS.map(ms => ({
-                  text: { tag: 'plain_text', content: t(`card.grant.duration_${ms}` as any, undefined, locale) },
-                  value: String(ms),
-                })),
-                { text: { tag: 'plain_text', content: t('card.grant.duration_permanent', undefined, locale) }, value: 'permanent' },
-              ],
-            },
-            {
-              tag: 'collapsible_panel',
-              expanded: false,
-              header: {
-                title: {
-                  tag: 'markdown',
-                  content: t('card.grant.more_limits_summary', { n: quota ?? t('card.grant.quota_unlimited', undefined, locale) }, locale),
+              tag: 'column_set',
+              flex_mode: 'bisect',
+              horizontal_spacing: 'medium',
+              columns: [
+                {
+                  tag: 'column',
+                  width: 'weighted',
+                  weight: 1,
+                  vertical_spacing: 'small',
+                  elements: [
+                    {
+                      tag: 'markdown',
+                      content: `**${t('card.grant.duration_label', undefined, locale)}**`,
+                    },
+                    {
+                      tag: 'select_static',
+                      name: 'grant_duration',
+                      width: 'fill',
+                      initial_option: String(durationMs),
+                      placeholder: { tag: 'plain_text', content: t('card.grant.duration_label', undefined, locale) },
+                      options: [
+                        ...GRANT_DURATION_OPTIONS.map(ms => ({
+                          text: { tag: 'plain_text', content: t(`card.grant.duration_${ms}` as any, undefined, locale) },
+                          value: String(ms),
+                        })),
+                        {
+                          text: { tag: 'plain_text', content: t('card.grant.duration_permanent', undefined, locale) },
+                          value: 'permanent',
+                        },
+                      ],
+                    },
+                  ],
                 },
-                vertical_align: 'center',
-                icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' },
-                icon_position: 'follow_text',
-                icon_expanded_angle: -180,
-              },
-              padding: '8px 0px 4px 0px',
-              elements: [{
-                tag: 'input',
-                name: 'grant_quota',
-                width: 'fill',
-                default_value: quota === undefined ? '' : String(quota),
-                max_length: 4,
-                label: { tag: 'plain_text', content: t('card.grant.quota_label', undefined, locale) },
-                placeholder: { tag: 'plain_text', content: t('card.grant.quota_placeholder', undefined, locale) },
-              }],
+                {
+                  tag: 'column',
+                  width: 'weighted',
+                  weight: 1,
+                  vertical_spacing: 'small',
+                  elements: [
+                    {
+                      tag: 'markdown',
+                      content: `**${t('card.grant.quota_label', undefined, locale)}**`,
+                    },
+                    {
+                      tag: 'input',
+                      name: 'grant_quota',
+                      width: 'fill',
+                      default_value: quota === undefined ? '' : String(quota),
+                      max_length: 4,
+                      placeholder: { tag: 'plain_text', content: t('card.grant.quota_placeholder', undefined, locale) },
+                    },
+                  ],
+                },
+              ],
             },
             {
               tag: 'column_set',
               flex_mode: 'none',
               horizontal_spacing: 'small',
-              columns: grantButtons.map((action, index) => ({
+              columns: grantButtons.map(action => ({
                 tag: 'column',
-                width: index === 0 ? 'weighted' : 'auto',
-                ...(index === 0 ? { weight: 1 } : {}),
+                width: 'auto',
                 vertical_align: 'center',
                 elements: [action],
               })),
             },
           ],
         },
-        { tag: 'markdown', content: `<font color="grey">${t('card.grant.note', undefined, locale)}</font>` },
+        {
+          tag: 'markdown',
+          text_size: 'notation',
+          content: `<font color="grey">${t('card.grant.note', undefined, locale)}</font>`,
+        },
       ],
     },
   };
@@ -2102,4 +2126,3 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
   };
   return JSON.stringify(card);
 }
-

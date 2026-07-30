@@ -67,7 +67,7 @@ describe('buildGrantCard', () => {
     expect(byAction.grant_global).toMatchObject({ target_open_ids: ['ou_a', 'ou_b', 'ou_bot'], chat_id: 'oc_3', nonce: 'n3' });
   });
 
-  it('defaults to one hour and three messages, with quota inside more limits', () => {
+  it('defaults to one hour and three messages in one two-column row', () => {
     const card = JSON.parse(buildGrantCard(
       { ownerOpenId: 'ou_o', targets: [{ openId: 'ou_g', name: 'Bob' }], chatId: 'oc_2', nonce: 'n2', mode: 'owner' },
       'zh',
@@ -77,13 +77,24 @@ describe('buildGrantCard', () => {
     expect(expiry.initial_option).toBe('3600000');
     expect(quota.default_value).toBe('3');
     expect(quota.options).toBeUndefined();
-    const panel = deepFind(card, value => value?.tag === 'collapsible_panel')[0];
-    expect(panel.expanded).toBe(false);
-    expect(deepFind(panel, value => value === quota)).toHaveLength(1);
+    expect(deepFind(card, value => value?.tag === 'collapsible_panel')).toHaveLength(0);
+    const limitsRow = deepFind(card, value =>
+      value?.tag === 'column_set'
+      && value?.flex_mode === 'bisect'
+      && deepFind(value, child => child === expiry).length === 1,
+    )[0];
+    expect(deepFind(limitsRow, value => value === quota)).toHaveLength(1);
     const form = deepFind(card, value => value?.tag === 'form' && value?.name === 'grant_limits_form')[0];
     expect(deepFind(form, value => value === expiry)).toHaveLength(1);
     const actions = deepFind(form, value => value?.tag === 'button');
-    expect(actions.every(action => action.action_type === 'form_submit')).toBe(true);
+    expect(actions.every(action => action.form_action_type === 'submit')).toBe(true);
+    expect(card.header).toMatchObject({
+      template: 'orange',
+      title: { content: '🔑 使用授权' },
+    });
+    const byAction = Object.fromEntries(actions.map((action: any) => [callbackValue(action).action, action]));
+    expect(byAction.grant_chat).toMatchObject({ type: 'primary', text: { content: '授权本群对话' } });
+    expect(byAction.grant_deny).toMatchObject({ type: 'danger', text: { content: '拒绝' } });
   });
 
   it('buildGrantNotifyCard @-mentions every granted target (legacy string[] = humans)', () => {
