@@ -82,7 +82,7 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, getDaemonStreamingCardUsageSnapshot } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
@@ -2022,6 +2022,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           undefined,
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: sessionCliId(ds) }),
+          getDaemonStreamingCardUsageSnapshot(ds, sessionCliId(ds)),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -2352,6 +2353,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               cardUsageLimit(ds),
               writableTerminalLinkFor(ds),
               isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+              getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -2395,6 +2397,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+          getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -2436,6 +2439,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+          getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -2502,6 +2506,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+          getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -2543,6 +2548,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+          getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

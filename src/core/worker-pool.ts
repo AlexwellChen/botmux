@@ -143,10 +143,13 @@ export function getDaemonReplyCardUsageSnapshot(
 /** Streaming-card usage. Only the `'streaming'` display mode (the default)
  * surfaces usage in the live card body; `'footer'` and `'off'` yield empty.
  * Returns a concrete empty snapshot on any config failure so the streaming
- * renderer stays best-effort. */
+ * renderer stays best-effort. `fresh` forces an exact read at meaningful
+ * boundaries (turn end / idle); intra-turn ticks leave it false to ride the
+ * reader's reparse throttle and stay off the disk. */
 export function getDaemonStreamingCardUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
+  opts?: { fresh?: boolean },
 ): CardUsageSnapshot {
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
@@ -155,7 +158,7 @@ export function getDaemonStreamingCardUsageSnapshot(
   } catch {
     // Missing runtime config → default 'streaming' → show usage (best-effort).
   }
-  return getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: false });
+  return getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: opts?.fresh ?? false });
 }
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -3479,7 +3482,11 @@ function setupWorkerHandlers(
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-            getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+            // Turn end (→ idle) reads the exact latest usage; intra-turn status
+            // ticks ride the throttle. See getDaemonStreamingCardUsageSnapshot.
+            getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, {
+              fresh: ds.lastScreenStatus === 'idle',
+            }),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
         }
