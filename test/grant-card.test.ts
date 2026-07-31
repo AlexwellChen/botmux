@@ -89,7 +89,12 @@ describe('buildGrantCard', () => {
     const form = deepFind(card, value => value?.tag === 'form' && value?.name === 'grant_limits_form')[0];
     expect(deepFind(form, value => value === expiry)).toHaveLength(1);
     const actions = deepFind(form, value => value?.tag === 'button');
-    expect(actions.every(action => action.form_action_type === 'submit')).toBe(true);
+    // v2(schema 2.0)卡片表单提交按钮**必须**用 action_type: 'form_submit'——曾误改成
+    // form_action_type: 'submit' 导致点击授权按钮无任何反应(callback 不触发)。显式断言
+    // 正确字段 + 拒绝错误字段,防再次静默回归。
+    expect(actions.length).toBeGreaterThan(0);
+    expect(actions.every(action => action.action_type === 'form_submit')).toBe(true);
+    expect(actions.every(action => action.form_action_type === undefined)).toBe(true);
     expect(card.header).toMatchObject({
       template: 'orange',
       title: { content: '🔑 使用授权' },

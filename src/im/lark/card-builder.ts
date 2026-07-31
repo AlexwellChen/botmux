@@ -1274,7 +1274,10 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     type,
     text: { tag: 'plain_text', content: text },
     name: action,
-    form_action_type: 'submit',
+    // v2（schema 2.0）卡片的表单提交按钮用 action_type: 'form_submit'（与本文件其它 2.0 表单
+    // 一致，也是本卡最初 live 验证过的写法）。曾一度改成 v2 的 form_action_type: 'submit'（见
+    // 授权卡 UI 并排布局那次），实测点击授权按钮无任何反应——callback 不触发。故钉回 form_submit。
+    action_type: 'form_submit',
     value: { action, ...v },
   });
   const grantButtons: Array<Record<string, unknown>> = [
