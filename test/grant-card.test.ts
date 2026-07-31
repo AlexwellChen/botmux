@@ -77,6 +77,7 @@ describe('buildGrantCard', () => {
     expect(expiry.initial_option).toBe('3600000');
     expect(quota.default_value).toBe('3');
     expect(quota.options).toBeUndefined();
+    expect(quota.max_length).toBeUndefined();
     expect(deepFind(card, value => value?.tag === 'collapsible_panel')).toHaveLength(0);
     const limitsRow = deepFind(card, value =>
       value?.tag === 'column_set'

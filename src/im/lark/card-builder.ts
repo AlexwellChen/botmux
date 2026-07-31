@@ -1335,7 +1335,6 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
                       name: 'grant_quota',
                       width: 'fill',
                       default_value: quota === undefined ? '' : String(quota),
-                      max_length: 4,
                       placeholder: { tag: 'plain_text', content: t('card.grant.quota_placeholder', undefined, locale) },
                     },
                   ],
