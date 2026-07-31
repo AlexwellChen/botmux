@@ -9,7 +9,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
 import {
   findConfigField,
   applyConfigField,
@@ -1074,12 +1074,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
     // 通知卡的 grantee 渲染参数：bot 只用纯文本名字（不 <at>，否则唤醒对方 bot 误拉空会话），真人 @ 点名。
     const notifyTargets = granted.map((id, i) => ({ openId: id, name: idToName.get(id) || undefined, isBot: !humanFlags[i] }));
-    // 授权成功后：
-    //   1. 先同步返回 callback 响应（in-place patch 成「已授权」终态卡），避免飞书等待
-    //      太久或 deleteMessage 与 callback 响应竞态导致客户端 300000 报错；
-    //   2. 通知卡 + 部分失败告知 + 撤回原卡 走后台 fire-and-forget（不阻塞 callback）。
-    const resultCardBody = JSON.parse(buildGrantResultCard(kind, loc, quota, expiresAt));
-    if (cardMessageId) {
+    // 授权成功后：**就地 patch 原卡**为终态（正文直接 @ 被授权人 + 额度/有效期），这一张卡既是
+    // 「已授权」结果态、又 ping 到被授权人——无需再单独发通知卡、也无需撤回原卡（申晗 2026-07-31
+    // 反馈：直接在原卡更新即可）。同步返回该 body 即完成 in-place patch，避免 deleteMessage 与
+    // callback 响应竞态导致客户端 300000。仅「部分失败」仍走后台补一条文字告知。
+    const resultCardBody = JSON.parse(buildGrantResultCard(kind, loc, quota, expiresAt, notifyTargets));
+    if (cardMessageId && failed.length > 0) {
       let replyInThread = true;
       try {
         const detail = await getMessageDetail(larkAppId, cardMessageId);
@@ -1087,34 +1087,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         if (!item) throw new Error('no message item in getMessageDetail response');
         replyInThread = Boolean(item.thread_id);
       } catch (err) {
-        logger.debug(`grant notify thread-mode probe failed, defaulting to thread reply: ${err}`);
+        logger.debug(`grant partial-failure thread-mode probe failed, defaulting to thread reply: ${err}`);
       }
-      // fire-and-forget: 通知卡 + 部分失败文字 + 撤回原卡
+      // fire-and-forget: 仅在有部分目标失败时补一条文字告知（不阻塞 callback）。
       Promise.resolve()
         .then(async () => {
+          const failNames = failed.map(f => idToName.get(f.openId) || f.openId).join('、');
           try {
-            await replyMessage(
-              larkAppId,
-              cardMessageId,
-              buildGrantNotifyCard(kind, notifyTargets, loc, quota, expiresAt),
-              'interactive',
-              replyInThread,
-            );
+            await replyMessage(larkAppId, cardMessageId, t('card.grant.partial_failed', { names: failNames }, loc), 'text', replyInThread);
           } catch (err) {
-            logger.warn(`grant notify failed (grant still applied): ${err}`);
-          }
-          if (failed.length > 0) {
-            const failNames = failed.map(f => idToName.get(f.openId) || f.openId).join('、');
-            try {
-              await replyMessage(larkAppId, cardMessageId, t('card.grant.partial_failed', { names: failNames }, loc), 'text', replyInThread);
-            } catch (err) {
-              logger.warn(`grant partial-failure notice failed: ${err}`);
-            }
-          }
-          try {
-            await deleteMessage(larkAppId, cardMessageId);
-          } catch (err) {
-            logger.debug(`grant card withdraw (post-callback) failed: ${err}`);
+            logger.warn(`grant partial-failure notice failed: ${err}`);
           }
         })
         .catch(err => logger.error(`grant post-callback background tasks failed: ${err}`));

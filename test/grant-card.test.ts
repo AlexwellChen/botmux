@@ -148,4 +148,24 @@ describe('buildGrantCard', () => {
     const card = JSON.parse(buildGrantResultCard('chat', 'zh'));
     expect(deepFind(card, value => value?.tag === 'button')).toHaveLength(0);
   });
+
+  it('buildGrantResultCard 带 targets 时正文 @ 被授权人 + 额度/有效期(就地 patch 即通知)', () => {
+    // 申晗 2026-07-31：授权成功直接就地更新原卡即可,原卡结果态里带 @被授权人,不再单独发通知卡。
+    const expiresAt = 1_800_000_000_000;
+    const flat = buildGrantResultCard('chat', 'zh', 5, expiresAt, [{ openId: 'ou_g', name: '张三', isBot: false }]);
+    expect(flat).toContain('<at id=ou_g></at>');   // @ 真人被授权人
+    expect(flat).toContain('5');                    // 额度
+    const card = JSON.parse(flat);
+    expect(deepFind(card, value => value?.tag === 'button')).toHaveLength(0);  // 终态卡无按钮
+    // 有名字的 bot 用纯文本(不 <at> 免唤醒),真人 <at>
+    const botFlat = buildGrantResultCard('chat', 'zh', undefined, undefined, [{ openId: 'ou_bot', name: 'Codex', isBot: true }]);
+    expect(botFlat).not.toContain('<at id=ou_bot');
+    expect(botFlat).toContain('Codex');
+  });
+
+  it('buildGrantResultCard deny 或无 targets → 回落简单状态态(无 @)', () => {
+    expect(buildGrantResultCard('deny', 'zh', undefined, undefined, [{ openId: 'ou_g', name: '张三' }]))
+      .not.toContain('<at id=ou_g');  // deny 不 @
+    expect(buildGrantResultCard('chat', 'zh')).not.toContain('<at');  // 无 targets 不 @
+  });
 });

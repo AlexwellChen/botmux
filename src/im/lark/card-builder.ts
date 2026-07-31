@@ -1412,11 +1412,7 @@ export function buildGrantNotifyCard(
 ): string {
   const entries = (Array.isArray(target) ? target : [target]).map(tt =>
     typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
-  const at = entries.map(e =>
-    e.isBot && e.name && e.name.length > 0
-      ? e.name                                              // bot 有名字：纯文本，不 <at>（不唤醒对方）
-      : `<at id=${e.openId}></at>`,                          // 真人 / bot 无名字：@ 点名（bot 无名字时靠飞书据 open_id 展示身份，代价=可能一次空会话）
-  ).join(' ');
+  const at = renderGrantAtMentions(entries);
   let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
   if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
   if (expiresAt !== undefined) {
@@ -1482,17 +1478,44 @@ function formatGrantExpiry(expiresAt: number, locale?: Locale): string {
   return new Date(expiresAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false });
 }
 
+/** 被授权目标的 @ 渲染：bot 有名字用纯文本(不 <at> 免唤醒对方)，真人/无名字 bot 用 <at> 点名。 */
+type GrantTargetEntry = { openId: string; name?: string; isBot?: boolean };
+function renderGrantAtMentions(target: string | string[] | GrantTargetEntry[]): string {
+  const entries = (Array.isArray(target) ? target : [target]).map(tt =>
+    typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
+  return entries.map(e =>
+    e.isBot && e.name && e.name.length > 0
+      ? e.name
+      : `<at id=${e.openId}></at>`,
+  ).join(' ');
+}
+
+/** 授权处置后的终态卡（无按钮，防重复点击）。授权成功(chat/global)时**就地 patch 原卡**即为
+ *  此卡：正文直接 @ 被授权人 + 额度/有效期,一张卡既是结果态又 ping 到 ta,无需再单独发通知卡或
+ *  撤回原卡（见申晗 2026-07-31 反馈）。deny 或无 targets 时回落到不带 @ 的简单状态文案。 */
 export function buildGrantResultCard(
   kind: 'chat' | 'global' | 'deny',
   locale?: Locale,
   quota?: number,
   expiresAt?: number,
+  targets?: string | string[] | GrantTargetEntry[],
 ): string {
-  const key = kind === 'chat' ? 'card.grant.result_chat' : kind === 'global' ? 'card.grant.result_global' : 'card.grant.result_deny';
-  let content = t(key, undefined, locale);
-  if (kind !== 'deny') {
-    if (expiresAt !== undefined) content += `\n${t('card.grant.result_expiry', { time: formatGrantExpiry(expiresAt, locale) }, locale)}`;
-    if (quota !== undefined) content += `\n${t('card.grant.result_quota', { n: quota }, locale)}`;
+  let content: string;
+  const at = targets !== undefined ? renderGrantAtMentions(targets) : '';
+  if (kind !== 'deny' && at) {
+    // 授权成功且有被授权人：复用 notify 文案（{at} 已获授权，发消息 @ 我即可 + 额度/有效期后缀），
+    // 让就地 patch 的原卡直接把授权成功通知 + @ping 合为一张。
+    content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+    if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
+    if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
+  } else {
+    // deny / 无 targets 回落：简单状态态（无 @）。
+    const key = kind === 'chat' ? 'card.grant.result_chat' : kind === 'global' ? 'card.grant.result_global' : 'card.grant.result_deny';
+    content = t(key, undefined, locale);
+    if (kind !== 'deny') {
+      if (expiresAt !== undefined) content += `\n${t('card.grant.result_expiry', { time: formatGrantExpiry(expiresAt, locale) }, locale)}`;
+      if (quota !== undefined) content += `\n${t('card.grant.result_quota', { n: quota }, locale)}`;
+    }
   }
   const card = {
     schema: '2.0',
