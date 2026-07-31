@@ -331,6 +331,8 @@ import {
   announcePendingRepoSession,
   publishAttentionPatch,
   publishLastInputFromBotPatch,
+  publishSessionMessagePreviewPatch,
+  publishClosedSessionPatch,
   clearAgentAttention,
 } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
@@ -14858,6 +14860,10 @@ async function replyInvalidWorkingDirs(
   ds.pendingRepo = false;
   activeSessions.delete(sessionKey(anchor, larkAppId));
   sessionStore.closeSession(ds.session.sessionId);
+  publishClosedSessionPatch(
+    ds.session.sessionId,
+    ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+  );
   const msg = tr('cmd.repo.working_dir_not_exist', {
     dirs: invalid.map(d => `\`${d}\``).join(', '),
   }, localeForBot(larkAppId));
@@ -16375,6 +16381,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // Route to file queue (keyed by anchor: rootMessageId for thread, chatId for chat)
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
+  if (ds) publishSessionMessagePreviewPatch(ds);
 
   if (!ds) {
     // No active session at this anchor — auto-create. This branch is mostly a
