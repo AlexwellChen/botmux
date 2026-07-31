@@ -319,7 +319,12 @@ export function cardUsageFooterSegment(usage: CardUsageSnapshot, locale?: Locale
   }
   if (usage.tokens
     && isNonNegativeFinite(usage.tokens.in)
-    && isNonNegativeFinite(usage.tokens.out)) {
+    && isNonNegativeFinite(usage.tokens.out)
+    // Suppress an all-zero token line: a brand-new session (or a synthetic /
+    // zero-usage transcript record read before the real turn lands) yields
+    // in=out=0, which would render a meaningless "↑0 ↓0". Omit it like any
+    // other missing metric until there is real usage to show.
+    && (usage.tokens.in > 0 || usage.tokens.out > 0)) {
     parts.push(
       `${t('card.usage.tokens', undefined, locale)} `
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,

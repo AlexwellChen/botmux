@@ -713,6 +713,32 @@ describe('buildMarkdownCard', () => {
     expect(footer).not.toContain('不可用');
   });
 
+  it('omits an all-zero token line (new session / synthetic zero-usage record)', () => {
+    // A brand-new topic's first read can catch a transcript record whose usage
+    // object has zero/absent token fields → in=out=0. Rendering "↑0 ↓0" is
+    // meaningless noise, so the token segment (and the whole footer, if nothing
+    // else is present) must be omitted.
+    const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
+      context: null,
+      tokens: { in: 0, out: 0 },
+    });
+    const card = JSON.parse(json);
+    const rendered = JSON.stringify(card);
+    expect(rendered).not.toContain('Token');
+    expect(rendered).not.toContain('↑0');
+    // Nothing else in the footer → no orphan HR either.
+    expect(card.body.elements.map((element: any) => element.tag)).not.toContain('hr');
+  });
+
+  it('still renders when only one direction is zero (real one-sided usage)', () => {
+    const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
+      context: null,
+      tokens: { in: 12_345, out: 0 },
+    });
+    const footer = JSON.parse(json).body.elements.at(-1).content;
+    expect(footer).toContain('Token ↑12.3K ↓0');
+  });
+
   it('promotes rounded compact values at unit boundaries', () => {
     const json = buildMarkdownCard('hello', undefined, '', 'en', undefined, 'filesystem', {
       context: { usedTokens: 999_950, windowTokens: 999_950_000 },
