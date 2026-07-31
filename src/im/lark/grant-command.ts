@@ -16,6 +16,7 @@ import { logger } from '../../utils/logger.js';
 import {
   parseTargetsAfterCommand, isCommandTargetOnly, stripAllMentions,
 } from './mention-targets.js';
+import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 
 export { stripAllMentions };
 
@@ -205,12 +206,27 @@ export async function tryHandleGrantCommand(
       .catch(err => logger.debug(`grant bad_quota reply failed: ${err}`));
     return true;
   }
-  const quota = pq.quota ?? getBot(larkAppId).config.messageQuota?.defaultLimit;
+  const quota = pq.quota ?? getBot(larkAppId).config.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
 
   // /grant → 弹一张卡（owner 主动态），列出全部目标；owner 点一次范围按钮即对全部生效。额度（若有）对每个目标各自挂在 pending 上。
-  const nonce = openPendingMulti(larkAppId, chatId, targets.map(tgt => tgt.openId), quota);
+  const nonce = openPendingMulti(
+    larkAppId,
+    chatId,
+    targets.map(tgt => tgt.openId),
+    quota,
+    undefined,
+    DEFAULT_GRANT_DURATION_MS,
+  );
   const card = buildGrantCard(
-    { ownerOpenId: owner!, targets, chatId, nonce, mode: 'owner' },
+    {
+      ownerOpenId: owner!,
+      targets,
+      chatId,
+      nonce,
+      mode: 'owner',
+      quota,
+      durationMs: DEFAULT_GRANT_DURATION_MS,
+    },
     loc,
   );
   await replyMessage(larkAppId, messageId, card, 'interactive')
