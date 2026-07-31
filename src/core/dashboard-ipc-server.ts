@@ -67,7 +67,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
@@ -127,6 +127,7 @@ export function setBotAvatarChanger(fn: ((image: Buffer) => Promise<BotAvatarOut
 import {
   composeRowFromActive,
   composeRowFromClosed,
+  composeRowFromPersistedActive,
   feishuChatLink,
   setBotName as setRowsBotName,
   getBotName,
@@ -138,7 +139,7 @@ import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
-import { updateSessionTitle } from './session-title.js';
+import { normalizeSessionTitleSource, updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
@@ -504,13 +505,26 @@ ipcRoute('GET', '/healthz', (_req, res) => {
 // worker-pool → dashboard-ipc-server → worker-pool).
 
 export type { SessionRow };
-export { composeRowFromActive, composeRowFromClosed };
+export { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive };
 
 // Re-export setBotName for backwards-compatible imports (daemon.ts).  Both
 // callers (this module's cachedBotName + dashboard-rows' cachedBotName) need
 // to be primed; here we forward to the rows module which is the canonical
 // holder.
 export function setBotName(name: string): void { setRowsBotName(name); }
+
+function composeDashboardSessionRows(): SessionRow[] {
+  const active = listActiveSessions().map(composeRowFromActive);
+  const activeIds = new Set(active.map(row => row.sessionId));
+  const persisted = sessionStore.listSessions();
+  const unregisteredActive = persisted
+    .filter(session => session.status === 'active' && !activeIds.has(session.sessionId))
+    .map(composeRowFromPersistedActive);
+  const closed = persisted
+    .filter(session => session.status === 'closed' && !activeIds.has(session.sessionId))
+    .map(composeRowFromClosed);
+  return [...active, ...unregisteredActive, ...closed];
+}
 
 // The daemon's own larkAppId, primed at startup. Required for the groups
 // endpoints below which proxy calls into groups-store on this bot's behalf.
@@ -589,20 +603,23 @@ ipcRoute('POST', '/api/asks/answer', async (req, res) => {
 });
 
 ipcRoute('GET', '/api/sessions', (_req, res) => {
-  // Active first (live state), closed appended (historical)
-  const active = listActiveSessions().map(composeRowFromActive);
-  const activeIds = new Set(active.map(r => r.sessionId));
-  const closed = sessionStore.listSessions()
-    .filter(s => s.status === 'closed' && !activeIds.has(s.sessionId))
-    .map(composeRowFromClosed);
-  jsonRes(res, 200, { sessions: [...active, ...closed] });
+  // Runtime active first, then persisted active rows that restore deliberately
+  // left detached, then closed history. Persisted-active must never be projected
+  // through composeRowFromClosed: teardown uncertainty is not a close.
+  jsonRes(res, 200, { sessions: composeDashboardSessionRows() });
 });
 
 ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (ds) return jsonRes(res, 200, { session: composeRowFromActive(ds) });
-  const closed = sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
-  if (closed) return jsonRes(res, 200, { session: composeRowFromClosed(closed) });
+  const persisted = sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
+  if (persisted) {
+    return jsonRes(res, 200, {
+      session: persisted.status === 'active'
+        ? composeRowFromPersistedActive(persisted)
+        : composeRowFromClosed(persisted),
+    });
+  }
   jsonRes(res, 404, { error: 'not_found' });
 });
 
@@ -662,6 +679,9 @@ function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
 ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (isSessionTransferring(ds)) {
+    return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+  }
   // Adopt/observed sessions: botmux never owned the CLI — restarting would kill
   // the user's real tmux/zellij pane. Hard-reject (the worker self-guards too).
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
@@ -672,6 +692,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
     // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
     // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
     try {
+      ds.workerReady = false;
       ds.worker.send({ type: 'restart', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
     } catch (err) {
       return jsonRes(res, 502, { ok: false, error: String(err) });
@@ -697,6 +718,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (isSessionTransferring(ds)) {
+    return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+  }
   // Adopt/observed sessions: botmux never owned the CLI — suspending would kill
   // the user's real tmux/zellij pane. Same guard as /restart.
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
@@ -738,9 +762,9 @@ ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
 /**
  * Bulk host-overload降压 sweep, driven by the overload-alert card buttons.
  * `mode`:
- *   - `clean_stopped`: close stopped zombie sessions (dead CLI + no tmux) from
- *     THIS daemon's bot-scoped session store. The card handler fans this mode
- *     out to every online daemon.
+ *   - `clean_stopped`: close stopped zombie sessions (dead CLI + no exact
+ *     persistent backing) from THIS daemon's bot-scoped session store. The
+ *     card handler fans this mode out to every online daemon.
  *   - `suspend_idle`: suspend THIS daemon's own idle (non-busy, suspendable,
  *     non-adopt) live workers. Live workers only exist in their owning daemon's
  *     process, so the card handler fans this mode out to every online daemon.
@@ -838,12 +862,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_inject_unsupported' });
   }
-  if (!ds.worker || ds.worker.killed) return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
+  if ((!ds.worker || ds.worker.killed) && !isSessionTransferring(ds)) {
+    return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
+  }
   const allow = getBotTuiSlashAllow(ds.larkAppId);
   const v = validateSlashInjection(body?.command ?? '', allow);
   if (!v.ok) return jsonRes(res, 403, { ok: false, error: v.error });
   try {
-    ds.worker.send({ type: 'inject_command', command: v.command } as DaemonToWorker);
+    if (!sendWorkerSessionInput(ds, { type: 'inject_command', command: v.command })) {
+      return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
+    }
   } catch {
     // slash 注入无状态（不像 /cd 那样已 repin 记录），send 失败不需要杀进程
     // 冷启动——直接把失败面报给调用方即可。
@@ -945,6 +973,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (isSessionTransferring(ds)) {
+    return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+  }
   // Adopt/observed 会话是收编的用户自有 pane——注入或冷重启都会打断用户自己的
   // 终端会话。与 /suspend、/restart、/slash 同款排除。
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
@@ -961,6 +992,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     // 与 worker 侧一致（下次 forkWorker 用它重建 init 消息）。
     if (ds.initConfig) ds.initConfig.workingDir = v.resolvedPath;
     try {
+      ds.workerReady = false;
       ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
     } catch {
       // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
@@ -1001,6 +1033,11 @@ function sessionTransportDisabled(s: { chatId?: string; larkAppId?: string }): b
   let apiOnly = false;
   if (appId) { try { apiOnly = getBot(appId).config.apiOnly === true; } catch { /* unknown bot → not apiOnly */ } }
   return !larkTransportEnabled({ chatId: s.chatId ?? '', apiOnly });
+}
+
+/** Mutating IPC routes may only touch this daemon's own bot-partitioned store. */
+function findOwnedSessionRecord(sessionId: string): Session | undefined {
+  return findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId);
 }
 
 /** Four-state async lookup with durable fallback (design A).
@@ -1072,7 +1109,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
   const column = normalizeKanbanColumn(body.column);
   const position = normalizeKanbanPosition(body.position);
   if (!column && position === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
-  const session = findSessionRecord(params.sessionId);
+  const session = findOwnedSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   // 待办池(queued)会话被拖到「进行中」= 激活：把暂存内容当首轮发给 CLI 开跑。
   // activateQueuedSession 内部会清 queued + 把列设成 in_progress + forkWorker。
@@ -1336,12 +1373,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/insight/turn/:turnIndex', (req, res, p
 ipcRoute('GET', '/api/insights/summary', async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
-  const active = listActiveSessions().map(composeRowFromActive);
-  const activeIds = new Set(active.map(r => r.sessionId));
-  const closed = sessionStore.listSessions()
-    .filter(s => s.status === 'closed' && !activeIds.has(s.sessionId))
-    .map(composeRowFromClosed);
-  const rows = [...active, ...closed];
+  const rows = composeDashboardSessionRows();
   const overview = await buildSafeInsightOverview(rows.map(row => {
     const session = findSessionRecord(row.sessionId);
     return {
@@ -1375,19 +1407,28 @@ ipcRoute('GET', '/api/owner-profile', async (_req, res) => {
 // Codex/Claude Code 再收到一条 best-effort 原生 /rename，同步其 resume picker。
 // 飞书话题标题不受影响。全视图（看板/状态板/表格/抽屉）读同一字段。
 ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => {
-  let body: { title?: unknown };
+  let body: { title?: unknown; source?: unknown } & Record<string, unknown>;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const active = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, active, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   const title = normalizeSessionTitle(body.title);
   if (!title) return jsonRes(res, 400, { ok: false, error: 'bad_title' });
-  const active = findActiveBySessionId(params.sessionId);
-  const session = active?.session ?? sessionStore.getSession(params.sessionId);
+  const session = active?.session ?? sessionStore.getOwnedSession(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  const updated = updateSessionTitle(session, title);
+  const source = normalizeSessionTitleSource(body.source, 'dashboard');
+  const updated = updateSessionTitle(session, title, source);
   if (!updated.ok) return jsonRes(res, 400, { ok: false, error: updated.error });
   const agentSync = active
     ? requestAgentSessionRename(active, updated.title)
     : { status: 'not_running' as const };
-  jsonRes(res, 200, { ...updated, agentSync: agentSync.status });
+  jsonRes(res, 200, {
+    ok: true,
+    title: updated.title,
+    titleUpdatedAt: updated.updatedAt,
+    titleSource: updated.source,
+    agentSync: agentSync.status,
+  });
 });
 
 // 会话锁定：保护被锁定会话不被 dashboard「清理空闲」批量关闭。锁定是会话元数据，
@@ -1396,7 +1437,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lock', async (req, res, params) => {
   let body: { locked?: unknown };
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   if (typeof body.locked !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'bad_locked' });
-  const session = findSessionRecord(params.sessionId);
+  const session = findOwnedSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   if (body.locked) session.locked = true;
   else delete session.locked;
@@ -1427,6 +1468,9 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
   if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (!sessionSupportsWebTerminal(ds)) {
+    return jsonRes(res, 409, { ok: false, error: 'terminal_unsupported' });
+  }
   // Riff backend: the sandbox URL is the writable link — no local worker needed.
   if (ds.riffAccessUrl) {
     jsonRes(res, 200, { ok: true, url: ds.riffAccessUrl });
@@ -1474,7 +1518,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, pa
   if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   const r = await deliverWriteLinkCardToOwners(ds);
   const status = r.ok ? 200
-    : r.error === 'terminal_unavailable' ? 409
+    : r.error === 'terminal_unavailable' || r.error === 'terminal_unsupported' ? 409
     : r.error === 'no_owner' ? 422
     : 502;
   jsonRes(res, status, r);
@@ -3324,7 +3368,7 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
   jsonRes(res, 200, { ok: true, readIsolation: r.readIsolation, suspendedSessions });
 });
 
-// Per-bot session backend override (pty | tmux | herdr | zellij), or clear it
+// Per-bot session backend override (pty | tmux | herdr | zellij | zmx), or clear it
 // ('' / 'auto' / null → follow the daemon default). next-session 生效：running
 // sessions keep their spawn-time backend (Session.backendType stamp), only new
 // spawns read the new value — so switching here can't strand live sessions.
@@ -3649,6 +3693,14 @@ ipcRoute('GET', '/api/events', (_req, res) => {
     for (const ds of listActiveSessions()) {
       activeIds.add(ds.session.sessionId);
       res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromActive(ds) })}\n\n`);
+    }
+    // Persisted active rows may be intentionally absent from the runtime Map
+    // after an inconclusive exact-backend teardown. Replay them as dormant
+    // upserts so SSE reconnects retain the same truthful state as GET
+    // /api/sessions and never synthesize a closed row.
+    for (const s of sessionStore.listSessions()) {
+      if (s.status !== 'active' || activeIds.has(s.sessionId)) continue;
+      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromPersistedActive(s) })}\n\n`);
     }
     // Also replay sessions CLOSED during this run as `session.spawned` carrying a
     // closed row. The active-only replay above can't cover a restore-time zombie:

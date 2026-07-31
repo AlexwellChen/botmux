@@ -39,6 +39,10 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
 export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
+  /** True after the current worker generation has completed init. Kept
+   * separate from workerPort because backends without a Web Terminal still
+   * emit screen/idle/screenshot updates and support native local attach. */
+  workerReady?: boolean;
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
   /** Independent read-only xterm capability. Optional for hydrated/legacy
@@ -241,6 +245,10 @@ export interface DaemonSession {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
+  /** A final ScreenAnalyzer TUI answer has been dispatched and is waiting for
+   * the worker's resolved/failed ACK. Claimed synchronously by card-handler so
+   * duplicate clicks cannot inject a second key sequence into the same CLI. */
+  tuiPromptProcessing?: boolean;
   /** turnId of the last stuck_warning posted — dedup so we don't spam the
    *  thread with repeated warnings for the same unresolved turn. */
   stuckWarningTurnId?: string;

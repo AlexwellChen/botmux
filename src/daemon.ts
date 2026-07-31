@@ -43,7 +43,7 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -96,7 +96,7 @@ import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
-import type { DaemonToWorker, LarkMessage } from './types.js';
+import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, larkTransportEnabled } from './core/types.js';
@@ -116,6 +116,7 @@ import {
   forkWorker,
   forkAdoptWorker,
   sendWorkerInput,
+  sendWorkerSessionInput,
   killWorker,
   reapOrphanWorkers,
   scheduleCardPatch,
@@ -124,11 +125,18 @@ import {
   CARD_POSTING_SENTINEL,
   parkStreamCard,
   closeSession as closeSessionHelper,
+  setActiveSessionIfActive,
+  rollbackRejectedSessionAndGetWinner,
   ensureCliEnv,
   sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
+  workerHasInitialized,
+  sessionSupportsWebTerminal,
+  readableTerminalUrlFor,
   findActiveBySessionId,
   getDaemonBootId,
+  getDaemonStreamingCardUsageSnapshot,
+  isSessionTransferring,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady } from './core/dashboard-ipc-server.js';
@@ -186,6 +194,7 @@ import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
+import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   getSessionPersistentBackendType,
@@ -319,9 +328,9 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
-import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
-import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
-import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
+import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
+import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
+import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
@@ -512,7 +521,7 @@ const VC_MEETING_DELIVERY_LEASE_SCAN_MS = 60_000;
 const VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS = 3_000;
 const VC_MEETING_RUNTIME_EXPIRY_TEARDOWN_MS = 8_000;
 const VC_MEETING_RUNTIME_EXPIRY_REPROBE_MS = 5_000;
-const VC_MEETING_PERSISTENT_BACKENDS = ['tmux', 'herdr', 'zellij'] as const;
+const VC_MEETING_PERSISTENT_BACKENDS = ['tmux', 'herdr', 'zellij', 'zmx'] as const;
 
 type VcMeetingDeliveryScope = {
   receiverSessionId: string;
@@ -602,7 +611,8 @@ function isVcMeetingBootRecoveryBlocked(request: VcMeetingDeliveryRequest): bool
 function vcMeetingPersistentBackendAvailable(backendType: PersistentBackendType): boolean {
   if (backendType === 'tmux') return TmuxBackend.isAvailable();
   if (backendType === 'herdr') return HerdrBackend.isAvailable();
-  return ZellijBackend.isAvailable();
+  if (backendType === 'zellij') return ZellijBackend.isAvailable();
+  return ZmxBackend.isAvailable();
 }
 
 let testOnlyVcMeetingBootBackingMissing:
@@ -625,7 +635,8 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
   const persistedBackend = liveBackend ?? persistedSession?.backendType;
   if (persistedBackend === 'pty') return true;
   const backendTypes: readonly PersistentBackendType[] =
-    persistedBackend === 'tmux' || persistedBackend === 'herdr' || persistedBackend === 'zellij'
+    persistedBackend === 'tmux' || persistedBackend === 'herdr'
+      || persistedBackend === 'zellij' || persistedBackend === 'zmx'
       ? [persistedBackend]
       : VC_MEETING_PERSISTENT_BACKENDS.filter(vcMeetingPersistentBackendAvailable);
   let allMissing = true;
@@ -637,7 +648,7 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
     );
     const name = target.sessionName;
     if (destroy) {
-      try { killPersistentBackendTarget(target); }
+      try { killPersistentBackendTarget(target, sessionId); }
       catch (err) {
         logger.warn(
           `[vc-delivery] boot recovery backing kill failed backend=${backendType} `
@@ -798,7 +809,14 @@ type VcMeetingRuntimeLeaseRecoveryDeps = {
   resolveMissingPersistentScope: (sessionId: string) => VcMeetingRuntimePersistentScope;
   resolvePersistentTarget?: (sessionId: string, ds?: DaemonSession) => PersistentBackendTarget | undefined;
   backendAvailable: (backendType: PersistentBackendType) => boolean;
-  killPersistent: (backendType: PersistentBackendType, sessionName: string, target?: PersistentBackendTarget) => void;
+  /** `sessionId` is mandatory: ZMX destruction is identity-verified and refuses
+   *  a name-only kill. `target` carries Herdr's agent-scoped addressing. */
+  killPersistent: (
+    backendType: PersistentBackendType,
+    sessionName: string,
+    sessionId: string,
+    target?: PersistentBackendTarget,
+  ) => void;
   probePersistent: (backendType: PersistentBackendType, sessionName: string, target?: PersistentBackendTarget) => 'exists' | 'missing' | 'unknown';
   warn: (message: string) => void;
   error: (message: string) => void;
@@ -870,7 +888,7 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       : persistentScope === 'unknown'
         // An unavailable client binary cannot own/reach a live mux session on
         // this host. Excluding it avoids permanent unknown fences on machines
-        // that only install one of the three supported backends.
+        // that only install one of the supported persistent backends.
         ? VC_MEETING_PERSISTENT_BACKENDS.filter(deps.backendAvailable)
         : [persistentScope];
     let allMissing = true;
@@ -882,7 +900,7 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
         persistedTarget,
       );
       const name = target.sessionName;
-      try { deps.killPersistent(backendType, name, target); }
+      try { deps.killPersistent(backendType, name, fence.receiverSessionId, target); }
       catch (err) {
         deps.warn(
           `[vc-delivery] runtime lease backing kill failed backend=${backendType} `
@@ -1150,7 +1168,8 @@ const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
   resolveMissingPersistentScope(sessionId) {
     const persisted = sessionStore.getSession(sessionId);
     const backendType = persisted?.backendType;
-    if (backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij') {
+    if (backendType === 'tmux' || backendType === 'herdr'
+      || backendType === 'zellij' || backendType === 'zmx') {
       return backendType;
     }
     return backendType === 'pty' ? 'none' : 'unknown';
@@ -1160,15 +1179,199 @@ const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
       ?? sessionStore.getSession(sessionId)?.persistentBackendTarget;
   },
   backendAvailable: vcMeetingPersistentBackendAvailable,
-  killPersistent: (backendType, sessionName, target) => target
-    ? killPersistentBackendTarget(target)
-    : killPersistentSession(backendType, sessionName),
+  killPersistent: (backendType, sessionName, sessionId, target) => target
+    ? killPersistentBackendTarget(target, sessionId)
+    : killPersistentSession(backendType, sessionName, sessionId),
   probePersistent: (backendType, sessionName, target) => target
     ? probePersistentBackendTarget(target)
     : probePersistentSession(backendType, sessionName),
   warn: message => logger.warn(message),
   error: message => logger.error(message),
 });
+
+/**
+ * Identity captured before a document-comment path crosses an async boundary.
+ * A DaemonSession object can outlive its routing ownership: close, relay, repo
+ * switch, or another creator may replace either the map occupant or its Session
+ * object while an awaited Lark lookup is in flight. Both identities and the
+ * original routing key therefore form one generation.
+ */
+interface RoutingGeneration {
+  key: string;
+  ds: DaemonSession;
+  session: Session;
+}
+
+function captureRoutingGeneration(ds: DaemonSession): RoutingGeneration {
+  return {
+    key: sessionKey(sessionAnchorId(ds), ds.larkAppId),
+    ds,
+    session: ds.session,
+  };
+}
+
+function isCurrentRoutingGeneration(generation: RoutingGeneration): boolean {
+  const { key, ds, session } = generation;
+  return session.status === 'active'
+    && ds.session === session
+    && sessionKey(sessionAnchorId(ds), ds.larkAppId) === key
+    && activeSessions.get(key) === ds;
+}
+
+function ensureCurrentRoutingGeneration(generation: RoutingGeneration, phase: string): void {
+  if (isCurrentRoutingGeneration(generation)) return;
+  throw new Error(`session routing generation changed during ${phase}`);
+}
+
+type DocSessionRollback = typeof rollbackRejectedSessionAndGetWinner;
+
+/** Register one freshly-created doc-native session without overwriting a
+ * concurrent winner. The rejected row is closed before the winner is returned,
+ * so its persisted record cannot survive as a ghost-active session. */
+async function registerDocSessionCandidate(
+  key: string,
+  candidate: DaemonSession,
+  rollback: DocSessionRollback = rollbackRejectedSessionAndGetWinner,
+): Promise<DaemonSession | null> {
+  if (setActiveSessionIfActive(activeSessions, key, candidate)) return candidate;
+  return await rollback(activeSessions, key, candidate) ?? null;
+}
+
+interface DocBindingPersistenceDeps {
+  dataDir?: string;
+  read?: typeof getDocSubscription;
+  write?: typeof putDocSubscription;
+}
+
+function sameDocBindingRoute(a: DocSubscription, b: DocSubscription): boolean {
+  return a.sessionAnchor === b.sessionAnchor
+    && a.sessionId === b.sessionId
+    && a.scope === b.scope
+    && a.chatId === b.chatId;
+}
+
+/**
+ * Move one subscription onto the authoritative route owned by `selected`.
+ *
+ * The store is re-read immediately before the synchronous write so cursor and
+ * metadata updates made from another event are retained. A newer explicit
+ * rebind is never overwritten: the only route change accepted since `sub` was
+ * read is the same selected route (the normal concurrent auto-create winner
+ * case). Mutating the caller's snapshot keeps the current comment turn on the
+ * same route as the persisted subscription.
+ */
+function persistDocBindingToSession(
+  sub: DocSubscription,
+  larkAppId: string,
+  selected: DaemonSession,
+  deps: DocBindingPersistenceDeps = {},
+): void {
+  const dataDir = deps.dataDir ?? config.session.dataDir;
+  const read = deps.read ?? getDocSubscription;
+  const write = deps.write ?? putDocSubscription;
+  const current = read(dataDir, larkAppId, sub.fileToken);
+  if (!current) {
+    throw new Error(`document subscription was removed during routing: ${sub.fileToken.slice(0, 12)}`);
+  }
+
+  const selectedRoute: Pick<DocSubscription, 'sessionAnchor' | 'sessionId' | 'scope' | 'chatId'> = {
+    sessionAnchor: sessionAnchorId(selected),
+    sessionId: selected.session.sessionId,
+    scope: selected.scope,
+    chatId: selected.chatId,
+  };
+  const currentTargetsSelected = current.sessionAnchor === selectedRoute.sessionAnchor
+    && current.sessionId === selectedRoute.sessionId
+    && current.scope === selectedRoute.scope
+    && current.chatId === selectedRoute.chatId;
+  if (!sameDocBindingRoute(current, sub) && !currentTargetsSelected) {
+    throw new Error(`document subscription was rebound during routing: ${sub.fileToken.slice(0, 12)}`);
+  }
+
+  const rebound: DocSubscription = { ...current, ...selectedRoute };
+  write(dataDir, larkAppId, rebound);
+  Object.assign(sub, rebound);
+}
+
+type PersistDocBinding = typeof persistDocBindingToSession;
+type RollbackDocCandidate = (sessionId: string) => Promise<unknown>;
+
+/** Persist the route selected by registration. A candidate that won the CAS
+ * is now daemon-owned, so a failed subscription write must close only that
+ * exact occupant. A rejected candidate must never close the concurrent
+ * winner whose route it received from registerDocSessionCandidate(). */
+async function persistSelectedDocBinding(
+  routingKey: string,
+  sub: DocSubscription,
+  larkAppId: string,
+  selected: DaemonSession,
+  candidate: DaemonSession,
+  persist: PersistDocBinding = persistDocBindingToSession,
+  rollback: RollbackDocCandidate = closeSessionHelper,
+): Promise<void> {
+  try {
+    persist(sub, larkAppId, selected);
+  } catch (err) {
+    if (selected === candidate && activeSessions.get(routingKey) === candidate) {
+      try {
+        await rollback(candidate.session.sessionId);
+      } catch (rollbackErr) {
+        logger.error(
+          `[doc-comment] failed to roll back auto-created session ` +
+          `${candidate.session.sessionId.slice(0, 8)} after binding error: ` +
+          `${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+        );
+      } finally {
+        // closeSessionHelper removes this synchronously in production. Keep a
+        // final identity guard for injected/test rollback failures so no newer
+        // route owner can be evicted.
+        if (activeSessions.get(routingKey) === candidate) activeSessions.delete(routingKey);
+        candidate.session.status = 'closed';
+        candidate.session.closedAt ??= new Date().toISOString();
+      }
+    }
+    throw err;
+  }
+}
+
+function ownsCurrentRoute(ds: DaemonSession, larkAppId: string): boolean {
+  return ds.larkAppId === larkAppId
+    && ds.session.status === 'active'
+    && activeSessions.get(sessionKey(sessionAnchorId(ds), larkAppId)) === ds;
+}
+
+/** Resolve a binding without ever handing a stale anchor's replacement the
+ * comment. If the subscribed session was relayed, find it by stable sessionId
+ * and lazily migrate the subscription to its new authoritative route. */
+function resolveBoundDocSession(
+  sub: DocSubscription,
+  larkAppId: string,
+  persist: PersistDocBinding = persistDocBindingToSession,
+): DaemonSession | undefined {
+  const direct = activeSessions.get(sessionKey(sub.sessionAnchor, larkAppId));
+  if (
+    direct
+    && ownsCurrentRoute(direct, larkAppId)
+    && (!sub.sessionId || direct.session.sessionId === sub.sessionId)
+  ) {
+    return direct;
+  }
+
+  if (!sub.sessionId) return undefined;
+  const relocated = [...new Set(activeSessions.values())].find(candidate =>
+    candidate.session.sessionId === sub.sessionId
+    && ownsCurrentRoute(candidate, larkAppId));
+  if (!relocated) return undefined;
+  persist(sub, larkAppId, relocated);
+  return relocated;
+}
+
+export const __testOnly_captureRoutingGeneration = captureRoutingGeneration;
+export const __testOnly_isCurrentRoutingGeneration = isCurrentRoutingGeneration;
+export const __testOnly_registerDocSessionCandidate = registerDocSessionCandidate;
+export const __testOnly_persistDocBindingToSession = persistDocBindingToSession;
+export const __testOnly_persistSelectedDocBinding = persistSelectedDocBinding;
+export const __testOnly_resolveBoundDocSession = resolveBoundDocSession;
 
 type VcMeetingDaemonSession = {
   larkAppId: string;
@@ -3738,8 +3941,8 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   ds.streamingCardForced = undefined;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
-  if (ds.streamCardId && ds.workerPort) {
-    const readUrl = buildTerminalUrl(ds);
+  if (ds.streamCardId && workerHasInitialized(ds)) {
+    const readUrl = readableTerminalUrlFor(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
     const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
     const prevMode = ds.displayMode ?? 'hidden';
@@ -3750,6 +3953,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
       !!ds.adoptedFrom, false, localeForBot(ds.larkAppId), previousUsageLimit,
       writableTerminalLinkFor(ds),
       isLocalCliOpenReady(ds, { cliId: dsBotCfg.cliId }),
+      getDaemonStreamingCardUsageSnapshot(ds, dsBotCfg.cliId, { fresh: true }),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -3787,6 +3991,8 @@ function isSessionlessCommandInvocation(cmd: string, content: string): boolean {
 }
 
 async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription): Promise<void> {
+  const generation = captureRoutingGeneration(ds);
+  ensureCurrentRoutingGeneration(generation, 'prewarm:start');
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = localeForBot(ds.larkAppId);
@@ -3800,6 +4006,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
   const title = `[Doc Watch] ${sub.fileToken.slice(0, 12)}`;
   const turnId = `doc-watch-${Date.now()}-${sub.fileToken.slice(0, 8)}`;
   const sender = sub.ownerOpenId ? await resolveSender(ds.larkAppId, sub.ownerOpenId, 'user') : undefined;
+  ensureCurrentRoutingGeneration(generation, 'prewarm:sender');
 
   beginNewTurn(ds, title);
   ds.lastMessageAt = Date.now();
@@ -4197,7 +4404,10 @@ async function adoptCodexNotifierEvent(
       workingDir: event.cwd,
       ownerOpenId,
     };
-    activeSessions.set(activeKey, ds);
+    if (!setActiveSessionIfActive(activeSessions, activeKey, ds)) {
+      await closeSessionHelper(session.sessionId);
+      throw new Error('通知所在会话路由被一条待处理的持久会话占用');
+    }
   }
 
   if (ds.session.cliSessionId !== event.threadId || !ds.worker || ds.worker.killed) {
@@ -4810,7 +5020,12 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         } else {
           navKeys = computeCocoPickerKeys(parsed.questions, result.answers).navKeys;
         }
-        cocoDs.worker.send({ type: 'coco_drive_picker', navKeys, needsReviewSubmit, comment } as DaemonToWorker);
+        sendWorkerSessionInput(cocoDs, {
+          type: 'coco_drive_picker',
+          navKeys,
+          needsReviewSubmit,
+          comment,
+        });
         logger.info(`[${cocoDs.session.sessionId.slice(0, 8)}] CoCo picker drive: ${navKeys.length} keys, review=${needsReviewSubmit}, comment=${comment ? 'yes' : 'no'}`);
       } catch (err) {
         logger.warn(`CoCo picker drive failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -14936,6 +15151,69 @@ function isInitialSessionPassthrough(larkAppId: string, cmd: string): boolean {
   return resolveAdapterDefaultPassthroughCommands(larkAppId).includes(cmd);
 }
 
+/** Preserve the established mid-session passthrough semantics when a cold-start
+ * scratch loses its registration race to a concurrently-created real session. */
+function deliverPassthroughToExistingSession(
+  ds: DaemonSession,
+  cmd: string,
+  commandContent: string,
+  anchor: string,
+  larkAppId: string,
+  turn: {
+    messageId: string;
+    replyRootId?: string;
+    senderOpenId?: string;
+    senderIsBot: boolean;
+    substitute: boolean;
+  },
+): void {
+  if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
+    // Passthrough commands bypass the normal message-forwarding block, so bind
+    // the accepted Lark turn before the worker rotates its marker at the PTY
+    // write boundary. This helper also covers a cold-start registration race.
+    ds.session.quoteTargetId = turn.messageId;
+    ds.session.quoteTargetSenderOpenId = turn.senderOpenId;
+    ds.session.quoteTargetSenderIsBot = turn.senderIsBot;
+    const substituteReplyMode = turn.substitute
+      ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
+      : 'thread';
+    beginReplyTargetTurn(ds, turn.replyRootId, turn.messageId, new Date().toISOString(), {
+      quoteOnly: substituteReplyMode === 'quote',
+      substitute: turn.substitute,
+    });
+    if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
+      ds.session.lastCallerOpenId = turn.senderOpenId;
+    }
+    sessionStore.updateSession(ds.session);
+    // Compatibility note (empty-start opening): a raw passthrough is a
+    // LITERAL CLI command — its contract is that the CLI sees exactly the
+    // bytes the user typed, never a botmux XML envelope. So it deliberately
+    // does NOT consume `Session.initialUserTurnPending`: wrapping `/model`
+    // in `<user_message>` would break the literal contract, and silently
+    // clearing the marker would lose the opening for the next real turn.
+    // `/model` on an empty-started session therefore stays literal and the
+    // FOLLOWING business message still opens as a new topic.
+    beginNewTurn(ds, commandContent);
+    sendWorkerSessionInput(ds, {
+      type: 'raw_input',
+      content: commandContent,
+      turnId: turn.messageId,
+    });
+    markSessionActivity(ds);
+    logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
+    return;
+  }
+  void sessionReply(
+    anchor,
+    tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)),
+    'text',
+    larkAppId,
+  );
+}
+
+export const __testOnly_deliverPassthroughToExistingSession =
+  deliverPassthroughToExistingSession;
+
 async function startInitialPassthroughSession(args: {
   larkAppId: string;
   chatId: string;
@@ -14945,8 +15223,10 @@ async function startInitialPassthroughSession(args: {
   messageId: string;
   replyRootId?: string;
   parsed: LarkMessage;
+  cmd: string;
   commandContent: string;
   senderOpenId?: string;
+  substitute: boolean;
   /** Bot-locked union_id (quota gate's teamBot leg — bot senders only). */
   senderUnionId?: string;
   /** Raw sender union_id (quota gate's teamMember leg — may be a human). */
@@ -14961,7 +15241,7 @@ async function startInitialPassthroughSession(args: {
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, commandContent, senderOpenId, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId,
+    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType)) {
     return;
@@ -15031,7 +15311,31 @@ async function startInitialPassthroughSession(args: {
   }
   beginReplyTargetTurn(ds, replyRootId, messageId);
   sessionStore.updateSession(ds.session);
-  activeSessions.set(sessionKey(anchor, larkAppId), ds);
+  const creationKey = sessionKey(anchor, larkAppId);
+  if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
+    const winner = await rollbackRejectedSessionAndGetWinner(activeSessions, creationKey, ds);
+    if (winner) {
+      logger.info(
+        `[${session.sessionId.substring(0, 8)}] Initial passthrough registration lost to ` +
+        `${winner.session.sessionId.substring(0, 8)}; handing ${cmd} to routing winner`,
+      );
+      deliverPassthroughToExistingSession(winner, cmd, commandContent, anchor, larkAppId, {
+        messageId,
+        replyRootId,
+        senderOpenId,
+        senderIsBot: parsed.senderType === 'app' || parsed.senderType === 'bot',
+        substitute,
+      });
+    } else {
+      void sessionReply(
+        anchor,
+        tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+    }
+    return;
+  }
 
   if (pinnedWorkingDir && autoWt) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
@@ -15295,8 +15599,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           messageId,
           replyRootId,
           parsed,
+          cmd,
           commandContent,
           senderOpenId,
+          substitute: !!substituteTrigger,
           senderUnionId: teamTrustUnionId,
           memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
           // New-topic senders are humans here (mirrors the normal new-topic
@@ -15381,7 +15687,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
       }
       sessionStore.updateSession(session);
-      activeSessions.set(sessionKey(anchor, larkAppId), {
+      const commandDs: DaemonSession = {
         session,
         worker: null,
         workerPort: null,
@@ -15396,7 +15702,16 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         hasHistory: false,
         ownerOpenId: senderOpenId,
         ...cmdPending,
-      });
+      };
+      const commandKey = sessionKey(anchor, larkAppId);
+      if (!setActiveSessionIfActive(activeSessions, commandKey, commandDs)) {
+        const winner = await rollbackRejectedSessionAndGetWinner(activeSessions, commandKey, commandDs);
+        if (!winner) return;
+        logger.info(
+          `[${session.sessionId.substring(0, 8)}] Daemon-command registration lost to ` +
+          `${winner.session.sessionId.substring(0, 8)}; handing ${cmd} to routing winner`,
+        );
+      }
       // Pass mention-stripped content so /command argument parsing works.
       await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
       return;
@@ -15548,7 +15863,30 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     : 'thread';
   beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
   sessionStore.updateSession(ds.session);
-  activeSessions.set(sessionKey(anchor, larkAppId), ds);
+  const creationKey = sessionKey(anchor, larkAppId);
+  if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
+    const winner = await rollbackRejectedSessionAndGetWinner(activeSessions, creationKey, ds);
+    if (winner) {
+      logger.info(
+        `[${session.sessionId.substring(0, 8)}] New-topic registration lost to ` +
+        `${winner.session.sessionId.substring(0, 8)}; handing message to routing winner`,
+      );
+      await handleThreadReply(
+        data,
+        { ...ctx, scope, anchor },
+        {
+          parsed,
+          resources,
+          attachments,
+          quotaChecked: true,
+          queueAlreadyAppended: true,
+          senderResolved: true,
+          sender: newTopicSender,
+        },
+      );
+    }
+    return;
+  }
 
   // Auto-worktree: session is registered PENDING; build the worktree off the
   // critical path, then commitRepoSelection pins it + forks (folding in any
@@ -15610,6 +15948,85 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 // for the same chat (reconnect replay / double-delivery) can't both spawn —
 // claimed synchronously before the first await, released in `finally` (FR-13).
 const autoStartJoinInFlight = new Set<string>();
+// A join candidate becomes visible in activeSessions before its seed/reply
+// target and synchronous bootstrap are ready. Inbound turns for that exact
+// routing key must wait; otherwise they can re-fork the worker-null session and
+// then be replaced by the join handler's own fork. Deferred pendingRepo /
+// auto-worktree paths release after publishing their stable buffered state.
+const AUTO_START_JOIN_READY_MAX_WAIT_MS = 5_000;
+let testOnlyAutoStartJoinReadyMaxWaitMs: number | undefined;
+
+interface AutoStartJoinReadyBarrier {
+  ready: Promise<void>;
+  cancelled: boolean;
+  settle: () => void;
+  cancel: () => void;
+}
+
+const autoStartJoinReadyBySessionKey = new Map<string, AutoStartJoinReadyBarrier>();
+
+function beginAutoStartJoinReadyBarrier(
+  routingKey: string,
+  onCancel: () => void,
+): AutoStartJoinReadyBarrier {
+  let resolveReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    resolveReady = resolve;
+  });
+  let settled = false;
+  let barrier!: AutoStartJoinReadyBarrier;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    resolveReady();
+    if (autoStartJoinReadyBySessionKey.get(routingKey) === barrier) {
+      autoStartJoinReadyBySessionKey.delete(routingKey);
+    }
+  };
+  const cancel = () => {
+    if (settled) return;
+    barrier.cancelled = true;
+    try {
+      onCancel();
+    } catch (err) {
+      logger.warn(`[auto-start:入群] bootstrap timeout cleanup failed for ${routingKey}: ${err}`);
+    } finally {
+      settle();
+    }
+  };
+  barrier = { ready, cancelled: false, settle, cancel };
+  autoStartJoinReadyBySessionKey.set(routingKey, barrier);
+  return barrier;
+}
+
+async function waitForAutoStartJoinReady(larkAppId: string, anchor: string): Promise<void> {
+  const routingKey = sessionKey(anchor, larkAppId);
+  while (true) {
+    const barrier = autoStartJoinReadyBySessionKey.get(routingKey);
+    if (!barrier) return;
+    const maxWaitMs = testOnlyAutoStartJoinReadyMaxWaitMs ?? AUTO_START_JOIN_READY_MAX_WAIT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      barrier.ready.then(() => 'ready' as const),
+      new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), maxWaitMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (outcome === 'timeout' && autoStartJoinReadyBySessionKey.get(routingKey) === barrier) {
+      logger.warn(
+        `[auto-start:入群] bootstrap exceeded ${maxWaitMs}ms for ${anchor.substring(0, 12)}; ` +
+        `yielding registration to the waiting turn`,
+      );
+      barrier.cancel();
+    }
+  }
+}
+
+export function __testOnly_setAutoStartJoinReadyMaxWaitMs(value?: number): void {
+  testOnlyAutoStartJoinReadyMaxWaitMs = value;
+}
+
 // 主动开工 — 场景①: `${appId}:${chatId}` → the activeSessions key of the
 // auto-started join session. Needed because in a 话题群 the session is keyed at
 // the seed message id (not chatId), so a plain `activeSessions.has(chatId)`
@@ -15678,6 +16095,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
   }
   if (priorAnchorKey) groupJoinAnchorByChat.delete(chatLiveKey); // stale entry, will re-register below
   autoStartJoinInFlight.add(lockKey);
+  let joinReady: AutoStartJoinReadyBarrier | undefined;
   try {
     // D7 gate: an allowedUser must be a member of the chat. Alarm/oncall
     // platforms (e.g. Nexus) create the chat, add bots first and the human
@@ -15733,14 +16151,8 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚点已有会话，跳过`);
       return;
     }
-    const sharedReplyRootId = mode === 'group' && resolveRegularGroupMode(larkAppId, chatId) === 'shared'
-      ? await sendMessage(
-          larkAppId,
-          chatId,
-          tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId)),
-          'text',
-        )
-      : undefined;
+    const needsSharedReply = mode === 'group'
+      && resolveRegularGroupMode(larkAppId, chatId) === 'shared';
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -15776,13 +16188,112 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
-      pendingTurnId: sharedReplyRootId,
+      pendingTurnId: undefined,
     };
-    if (sharedReplyRootId) {
+    if (!setActiveSessionIfActive(activeSessions, dsKey, ds)) {
+      await closeSessionHelper(session.sessionId);
+      return;
+    }
+    const joinBootstrapExternallyTakenOver = (): boolean => (
+      activeSessions.get(dsKey) !== ds
+      || ds.session.status !== 'active'
+      || !!(ds.worker && !ds.worker.killed)
+    );
+    const joinBootstrapWasTakenOver = (): boolean => {
+      const takenOver = (
+        joinReady?.cancelled === true
+        || joinBootstrapExternallyTakenOver()
+      );
+      if (takenOver && ds.worker && !ds.worker.killed) {
+        logger.warn(
+          `[auto-start:入群] ${chatId.substring(0, 12)} bootstrap 期间会话已由其它入口启动，让位且不再 refork`,
+        );
+      }
+      return takenOver;
+    };
+    // Publish the barrier only after this candidate wins registration. There is
+    // no await between the CAS and this write, so a turn can never observe the
+    // worker-null session without also observing the barrier. Publishing earlier
+    // would unnecessarily stall real messages during membership retry and
+    // mode/working-dir discovery, where their own session may safely win.
+    joinReady = beginAutoStartJoinReadyBarrier(dsKey, () => {
+      // Scheduler/dashboard/trigger paths do not wait on the inbound-message
+      // barrier and may legitimately start this exact ds while join bootstrap
+      // is awaiting Lark/network I/O. Once that happens, timeout cancellation
+      // must yield to the new worker instead of closing its active turn.
+      if (joinBootstrapExternallyTakenOver()) {
+        logger.warn(
+          `[auto-start:入群] ${chatId.substring(0, 12)} bootstrap timeout 时会话已被接管，跳过候选回收`,
+        );
+        return;
+      }
+      // A user turn waited longer than the serializer's normal safety cap.
+      // Relinquish this half-bootstrapped registration instead of letting the
+      // turn fall back to the old "refork now, then get killed by late join"
+      // behavior. closeSessionHelper completes map/status/store mutation before
+      // its first await; the late best-effort cleanup must not hold the turn.
+      const closing = closeSessionHelper(session.sessionId);
+      if (activeSessions.get(dsKey) === ds) activeSessions.delete(dsKey);
+      void closing.catch((err) => {
+        logger.warn(`[auto-start:入群] timeout close failed for ${session.sessionId.substring(0, 8)}: ${err}`);
+      });
+    });
+    const rollbackRegisteredJoinSession = async (): Promise<void> => {
+      // closeSession transitions the row before its first await, but this
+      // handler owns a caller-supplied registry too. Drop only our identity so
+      // slow best-effort cleanup cannot block a retry or erase a replacement.
+      const closing = closeSessionHelper(session.sessionId);
+      if (activeSessions.get(dsKey) === ds) activeSessions.delete(dsKey);
+      await closing;
+    };
+
+    // Shared-mode seed/reply authority is externally visible. Publish it only
+    // after this candidate owns the routing key; a CAS loser must leave no
+    // orphaned "joined" topic and must not silently consume the first prompt.
+    let sharedReplyRootId: string | undefined;
+    const withdrawSharedReplySeed = (): void => {
+      if (!sharedReplyRootId) return;
+      const messageId = sharedReplyRootId;
+      sharedReplyRootId = undefined;
+      void deleteMessage(larkAppId, messageId);
+    };
+    const armSharedReplyTarget = (): void => {
+      if (!sharedReplyRootId) return;
+      ds.pendingTurnId = sharedReplyRootId;
       beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString());
       sessionStore.updateSession(ds.session);
+    };
+    if (needsSharedReply) {
+      try {
+        sharedReplyRootId = await sendMessage(
+          larkAppId,
+          chatId,
+          tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId)),
+          'text',
+        );
+      } catch (err: any) {
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} shared seed 发送失败：${err?.message ?? err}`);
+        await rollbackRegisteredJoinSession();
+        return;
+      }
+      if (joinReady.cancelled) {
+        // The send may have reached Lark even though its response exceeded the
+        // local wait cap. Best-effort withdraw the now-ownerless shared seed.
+        withdrawSharedReplySeed();
+        return;
+      }
+      if (activeSessions.get(dsKey) !== ds || ds.session.status !== 'active') {
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} shared seed 返回时会话已被替换，停止首轮`);
+        withdrawSharedReplySeed();
+        await rollbackRegisteredJoinSession();
+        return;
+      }
+      if (ds.worker && !ds.worker.killed) {
+        withdrawSharedReplySeed();
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} shared seed 返回时会话已由其它入口启动，让位`);
+        return;
+      }
     }
-    activeSessions.set(dsKey, ds);
     // Register the anchor so a later duplicate bot.added for this chat is deduped
     // even in 话题群 (where dsKey is the seed id, not chatId).
     groupJoinAnchorByChat.set(chatLiveKey, dsKey);
@@ -15797,17 +16308,33 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
-      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
+      armSharedReplyTarget();
       startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title, prompt: promptBody, operatorOpenId });
       return;
     }
 
     // Pinned working dir → spawn immediately.
     if (pinnedWorkingDir) {
-      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
       ensureSessionWhiteboard(ds);
       const prompt = await buildPrompt();
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
       await noteTurnReceived(ds, anchor, promptBody);
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
+      armSharedReplyTarget();
       rememberLastCliInput(ds, promptBody, prompt);
       forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
       ds.pendingTurnId = undefined;
@@ -15816,26 +16343,52 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
     }
 
     // No default dir → degrade to repo-selection card (D6 / FR-4).
-    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
+      withdrawSharedReplySeed();
+      return;
+    }
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
     const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
     if (projects.length > 0) {
       lastRepoScan.set(chatId, projects);
       const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-      ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      // The repo card itself belongs under the shared join seed. Arm the target
+      // immediately before its single network await; pendingRepo already makes
+      // this a stable buffered state for normal inbound/scheduler paths.
+      armSharedReplyTarget();
+      const repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      if (joinBootstrapWasTakenOver()) {
+        void deleteMessage(larkAppId, repoCardMessageId);
+        // If another entry actually started this same ds, its output still owns
+        // the shared seed we just armed. Preserve that root; closed/replaced
+        // candidates may withdraw it.
+        if (!ds.worker || ds.worker.killed) withdrawSharedReplySeed();
+        return;
+      }
+      ds.repoCardMessageId = repoCardMessageId;
       announcePendingRepoSession(ds);
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录，弹 repo 选择卡（${projects.length} 个项目）`);
     } else {
       ds.pendingRepo = false;
       ensureSessionWhiteboard(ds);
       const prompt = await buildPrompt();
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
       await noteTurnReceived(ds, anchor, promptBody);
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
+      armSharedReplyTarget();
       rememberLastCliInput(ds, promptBody, prompt);
       forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
       ds.pendingTurnId = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
     }
   } finally {
+    joinReady?.settle();
     autoStartJoinInFlight.delete(lockKey);
   }
 }
@@ -15874,18 +16427,41 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
   return 'Bot';
 }
 
-async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
+/**
+ * Work already completed by handleNewTopic (or an earlier auto-create pass)
+ * before its registration CAS lost to a concurrent session creator. Reusing
+ * it avoids a second quota/download/queue side effect when the same persisted-
+ * dedupe event is handed to the routing winner.
+ */
+interface PreparedThreadReply {
+  parsed: LarkMessage;
+  resources: MessageResource[];
+  attachments: LarkAttachment[];
+  quotaChecked: true;
+  queueAlreadyAppended: true;
+  senderResolved: true;
+  sender: ResolvedSender | undefined;
+}
+
+async function handleThreadReply(
+  data: any,
+  ctx: RoutingContext,
+  prepared?: PreparedThreadReply,
+): Promise<void> {
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
-  await resolveNonsupportMessage(data, larkAppId);
-  const { parsed, resources } = parseEventMessage(data);
+  await waitForAutoStartJoinReady(larkAppId, anchor);
+  if (!prepared) await resolveNonsupportMessage(data, larkAppId);
+  const parsedResult = prepared ?? parseEventMessage(data);
+  const parsed = parsedResult.parsed;
+  const resources = parsedResult.resources;
 
   // Expand merge_forward: fetch sub-messages and collect their resources
-  if (parsed.msgType === 'merge_forward') {
+  if (!prepared && parsed.msgType === 'merge_forward') {
     const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed);
     resources.push(...extraResources);
   }
 
-  learnFromMentions(larkAppId, parsed.mentions);
+  if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
 
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
   // [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI 知道这是另一个 bot 发的——
@@ -15922,27 +16498,29 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     + parsed.content;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
-  const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
-  emitHookEvent('thread.reply', {
-    larkAppId,
-    chatId: ctxChatId,
-    chatType: ctxChatType,
-    scope,
-    anchor,
-    messageId: parsed.messageId,
-    rootId: parsed.rootId,
-    parentId: parsed.parentId,
-    senderOpenId: senderOpenIdForPrefix,
-    senderType: parsed.senderType,
-    msgType: parsed.msgType,
-    sessionId: existingHookSession?.session.sessionId,
-    content: parsed.content,
-  });
-  if (isForeignBot) {
-    logger.info(
-      `[${larkAppId}] foreign-bot @mention prefix attached: sender=${senderOpenIdForPrefix?.substring(0, 12)} ` +
-      `senderType=${parsed.senderType} via=${isBotSenderType ? 'sender_type' : 'cross-ref'}`,
-    );
+  if (!prepared) {
+    const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
+    emitHookEvent('thread.reply', {
+      larkAppId,
+      chatId: ctxChatId,
+      chatType: ctxChatType,
+      scope,
+      anchor,
+      messageId: parsed.messageId,
+      rootId: parsed.rootId,
+      parentId: parsed.parentId,
+      senderOpenId: senderOpenIdForPrefix,
+      senderType: parsed.senderType,
+      msgType: parsed.msgType,
+      sessionId: existingHookSession?.session.sessionId,
+      content: parsed.content,
+    });
+    if (isForeignBot) {
+      logger.info(
+        `[${larkAppId}] foreign-bot @mention prefix attached: sender=${senderOpenIdForPrefix?.substring(0, 12)} ` +
+        `senderType=${parsed.senderType} via=${isBotSenderType ? 'sender_type' : 'cross-ref'}`,
+      );
+    }
   }
 
   // resolveSender is deferred until we know the message actually needs prompt
@@ -15950,8 +16528,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // anchor" all return early; routing them through resolveSender first would
   // tack the 800ms budget onto paths that never see the sender tag. Use the
   // helper below at every actual injection point.
-  let threadSenderCached: import('./im/lark/identity-cache.js').ResolvedSender | undefined;
-  let threadSenderResolved = false;
+  let threadSenderCached: ResolvedSender | undefined = prepared?.sender;
+  let threadSenderResolved = prepared?.senderResolved ?? false;
   const getThreadSender = async (): Promise<typeof threadSenderCached> => {
     if (threadSenderResolved) return threadSenderCached;
     threadSenderResolved = true;
@@ -16105,8 +16683,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           messageId: parsed.messageId,
           replyRootId,
           parsed,
+          cmd,
           commandContent,
           senderOpenId: threadSenderOpenId,
+          substitute: !!substituteTrigger,
           senderUnionId: threadTeamTrustUnionId,
           memberUnionId: threadSenderUnionId, // 原始 union（人腿），不锁 bot
           // Bot-started cold starts get no human owner (mirrors the auto-create
@@ -16125,47 +16705,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // 拉起）。TODO（后续产品决策）：是否把 CLI passthrough 也纳入 canOperate，
       // 收紧到与 daemon 命令同档；这会同时改变真人 oncall 成员的现有行为，应单独评估。
       const ds = existingDs;
-      if (ds?.worker && !ds.worker.killed) {
-        // Passthrough commands bypass the normal message-forwarding block
-        // below, so bind this accepted Lark turn here before the worker rotates
-        // its marker at the actual PTY write boundary.
-        ds.session.quoteTargetId = parsed.messageId;
-        ds.session.quoteTargetSenderOpenId = threadSenderOpenId;
-        ds.session.quoteTargetSenderIsBot = isForeignBot;
-        const substituteReplyMode = substituteTrigger
-          ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
-          : 'thread';
-        beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), {
-          quoteOnly: substituteReplyMode === 'quote',
+      if (ds) {
+        deliverPassthroughToExistingSession(ds, cmd, commandContent, anchor, larkAppId, {
+          messageId: parsed.messageId,
+          replyRootId,
+          senderOpenId: threadSenderOpenId,
+          senderIsBot: isForeignBot,
           substitute: !!substituteTrigger,
         });
-        if (threadSenderOpenId && ds.session.lastCallerOpenId !== threadSenderOpenId) {
-          ds.session.lastCallerOpenId = threadSenderOpenId;
-        }
-        sessionStore.updateSession(ds.session);
-        // Mark a new turn so the CLI's response to /model, /clear, /compact, etc.
-        // shows up as a fresh streaming card instead of silently PATCH-ing the
-        // previous turn's card.
-        //
-        // Compatibility note (empty-start opening): a raw passthrough is a
-        // LITERAL CLI command — its contract is that the CLI sees exactly the
-        // bytes the user typed, never a botmux XML envelope. So it deliberately
-        // does NOT consume `Session.initialUserTurnPending`: wrapping `/model`
-        // in `<user_message>` would break the literal contract, and silently
-        // clearing the marker would lose the opening for the next real turn.
-        // `/model` on an empty-started session therefore stays literal and the
-        // FOLLOWING business message still opens as a new topic.
-        beginNewTurn(ds, commandContent);
-        ds.worker.send({
-          type: 'raw_input',
-          content: commandContent,
-          turnId: parsed.messageId,
-        } as DaemonToWorker);
-        markSessionActivity(ds);
-        logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
-      } else {
-        sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       }
+      else void sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
@@ -16221,7 +16770,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
         }
         sessionStore.updateSession(session);
-        activeSessions.set(sessionKey(anchor, larkAppId), {
+        const threadCommandDs: DaemonSession = {
           session,
           worker: null,
           workerPort: null,
@@ -16236,7 +16785,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           hasHistory: false,
           ownerOpenId: threadSenderOpenId,
           ...cmdPending,
-        });
+        };
+        const commandKey = sessionKey(anchor, larkAppId);
+        if (!setActiveSessionIfActive(activeSessions, commandKey, threadCommandDs)) {
+          const winner = await rollbackRejectedSessionAndGetWinner(activeSessions, commandKey, threadCommandDs);
+          if (!winner) return;
+          logger.info(
+            `[${session.sessionId.substring(0, 8)}] Thread daemon-command registration lost to ` +
+            `${winner.session.sessionId.substring(0, 8)}; handing ${cmd} to routing winner`,
+          );
+        }
       }
       // Pass mention-stripped content so /command argument parsing works.
       // chatId lets session-less handlers (e.g. /group) reach the chat roster.
@@ -16301,7 +16859,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   const quotaSenderOpenId = threadSenderOpenId;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, threadTeamTrustUnionId, threadSenderUnionId, ctxChatType)) {
+  if (!prepared?.quotaChecked && !await enforceMessageQuotaForCliInput(
+    larkAppId,
+    ctxChatId ?? data?.message?.chat_id,
+    quotaSenderOpenId,
+    parsed.messageId,
+    anchor,
+    threadTeamTrustUnionId,
+    threadSenderUnionId,
+    ctxChatType,
+  )) {
     return;
   }
 
@@ -16315,12 +16882,18 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
-  const { attachments, needLogin } = await downloadResources(effectiveAppId, parsed.messageId, resources);
-  if (attachments.length > 0) {
-    parsed.attachments = attachments;
-  }
-  if (needLogin) {
-    sessionReply(anchor, tr('daemon.download_failed_need_login', undefined, localeForBot(effectiveAppId)), 'text', effectiveAppId);
+  let attachments: LarkAttachment[];
+  if (prepared) {
+    attachments = prepared.attachments;
+  } else {
+    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources);
+    attachments = downloaded.attachments;
+    if (attachments.length > 0) {
+      parsed.attachments = attachments;
+    }
+    if (downloaded.needLogin) {
+      sessionReply(anchor, tr('daemon.download_failed_need_login', undefined, localeForBot(effectiveAppId)), 'text', effectiveAppId);
+    }
   }
 
   // Update last message time + last caller (used by `botmux send` to address
@@ -16452,7 +17025,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
   // Route to file queue (keyed by anchor: rootMessageId for thread, chatId for chat)
   messageQueue.ensureQueue(anchor);
-  messageQueue.appendMessage(anchor, parsed);
+  if (!prepared?.queueAlreadyAppended) messageQueue.appendMessage(anchor, parsed);
   if (ds) publishSessionMessagePreviewPatch(ds);
 
   if (!ds) {
@@ -16572,7 +17145,26 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       : 'thread';
     beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
     sessionStore.updateSession(newDs.session);
-    activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+    const creationKey = sessionKey(anchor, larkAppId);
+    if (!setActiveSessionIfActive(activeSessions, creationKey, newDs)) {
+      const winner = await rollbackRejectedSessionAndGetWinner(activeSessions, creationKey, newDs);
+      if (winner) {
+        logger.info(
+          `[${session.sessionId.substring(0, 8)}] Reply auto-create registration lost to ` +
+          `${winner.session.sessionId.substring(0, 8)}; handing message to routing winner`,
+        );
+        await handleThreadReply(data, ctx, {
+          parsed,
+          resources,
+          attachments,
+          quotaChecked: true,
+          queueAlreadyAppended: true,
+          senderResolved: true,
+          sender: autoCreateSender,
+        });
+      }
+      return;
+    }
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
@@ -16890,11 +17482,21 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
  *   2) bot 的 defaultWorkingDir / workingDir 配置
  *   3) fallback 到 ~
  *
- * 创建后立即 fork worker 并把评论内容作为首轮输入。
- * 返回创建好的 DaemonSession（已加入 activeSessions），失败返回 null。
+ * 本函数只同步建立 session skeleton 并竞争 routing ownership；不解析评论
+ * 作者、不写 per-turn target、也不 fork。胜出的 authoritative
+ * handleDocComment delivery owner 统一完成这些动作。
+ * 返回胜出的 DaemonSession（已加入 activeSessions），失败返回 null。
  */
 async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx: DocCommentContext): Promise<DaemonSession | null> {
   const botCfg = getBot(larkAppId).config;
+  const virtualChatId = `doc:${sub.fileToken}`;
+  const virtualAnchor = virtualChatId;
+  const routingKey = sessionKey(virtualAnchor, larkAppId);
+  const existing = activeSessions.get(routingKey);
+  if (existing?.session.status === 'active' && ownsCurrentRoute(existing, larkAppId)) {
+    persistDocBindingToSession(sub, larkAppId, existing);
+    return existing;
+  }
 
   // 解析 workingDir：订阅时指定的 > bot 配置 defaultWorkingDir > bot 配置 workingDir > ~
   const workingDir = sub.workingDir
@@ -16902,11 +17504,8 @@ async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx
     ?? botCfg.workingDir
     ?? '~';
 
-  const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
   const title = `[Doc] ${sub.fileToken.slice(0, 8)}: ${ctx.text.slice(0, 40)}`;
 
-  const virtualChatId = `doc:${sub.fileToken}`;
-  const virtualAnchor = sub.sessionAnchor;
   const now = Date.now();
 
   const session = sessionStore.createSession(virtualChatId, virtualAnchor, title, 'group');
@@ -16936,36 +17535,66 @@ async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx
     currentTurnTitle: ctx.text.substring(0, 50),
   };
 
-  // 记录本轮回评论落点
-  const turnId = ctx.replyId || ctx.commentId;
-  (ds.docCommentTurns ??= new Map()).set(turnId, {
-    fileToken: sub.fileToken,
-    fileType: sub.fileType,
-    commentId: ctx.commentId,
-    replyToOpenId: ctx.authorOpenId,
-    replyToName: sender?.name,
-    replyId: ctx.replyId,
-    reactionId: undefined, // 由调用方在加 reaction 后回填
-  });
+  const selected = await registerDocSessionCandidate(routingKey, ds);
+  if (!selected) {
+    logger.warn(`[doc-comment] auto-create registration lost without an active winner file=${sub.fileToken.slice(0, 12)}`);
+    return null;
+  }
+  await persistSelectedDocBinding(routingKey, sub, larkAppId, selected, ds);
+  if (selected !== ds) {
+    logger.info(
+      `[doc-comment] auto-create ${session.sessionId.slice(0, 8)} lost to ` +
+      `${selected.session.sessionId.slice(0, 8)}; handing comment to routing winner`,
+    );
+    return selected;
+  }
 
-  const docTarget = {
-    fileToken: sub.fileToken,
-    fileType: sub.fileType,
-    commentId: ctx.commentId,
-    replyToName: sender?.name,
-    replyToOpenId: ctx.authorOpenId,
-    turnId,
-    replyId: ctx.replyId,
-  };
-  (ds.session.docCommentTargets ??= {})[turnId] = docTarget;
-  try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
-
-  activeSessions.set(sessionKey(virtualAnchor, larkAppId), ds);
-
-  // 不在这里 forkWorker —— handleDocComment 会统一处理（它会检查 worker 状态、
-  // 加 reaction、设 docCommentTurns、然后 fork 或 send）。这里只建好 session 骨架。
+  // 不在这里 forkWorker —— handleDocComment 会统一处理 reaction、per-turn
+  // 回复落点及 fork/send。这里只建好 session skeleton。
   logger.info(`[doc-comment] auto-created session for file=${sub.fileToken.slice(0, 12)} (wd=${workingDir}, cli=${botCfg.cliId})`);
-  return ds;
+  return selected;
+}
+
+/**
+ * One authoritative delivery result per document-comment turn. Event delivery
+ * and the --all poller can observe the same reply concurrently; followers must
+ * await the owner's real result rather than treating an in-flight claim as a
+ * success and advancing the poll cursor past a later failure.
+ */
+const handledDocCommentTurns = new BoundedMap<string, Promise<boolean>>(5_000);
+
+async function runClaimedDocCommentTurn(
+  claimKey: string,
+  work: () => Promise<void>,
+  onOwnerFailure?: (error: unknown) => Promise<void>,
+): Promise<boolean> {
+  const existing = handledDocCommentTurns.get(claimKey);
+  if (existing) return await existing;
+
+  let resolveClaim!: (ok: boolean) => void;
+  const claim = new Promise<boolean>((resolve) => { resolveClaim = resolve; });
+  handledDocCommentTurns.set(claimKey, claim);
+
+  try {
+    await work();
+    resolveClaim(true);
+    return true;
+  } catch (err) {
+    try {
+      await onOwnerFailure?.(err);
+    } finally {
+      if (handledDocCommentTurns.get(claimKey) === claim) {
+        handledDocCommentTurns.delete(claimKey);
+      }
+      resolveClaim(false);
+    }
+    throw err;
+  }
+}
+
+export const __testOnly_runClaimedDocCommentTurn = runClaimedDocCommentTurn;
+export function __testOnly_resetDocCommentClaims(): void {
+  handledDocCommentTurns.clear();
 }
 
 /**
@@ -16983,141 +17612,210 @@ async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
   const { larkAppId, sub, commentId, text } = ctx;
   const turnId = ctx.replyId || commentId;
   const claimKey = `${larkAppId}:${sub.fileToken}:${turnId}`;
-  if (handledDocCommentTurns.has(claimKey)) {
-    logger.info(`[doc-comment] duplicate turn skipped file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}`);
-    return true; // 已处理过，算成功（让 poller 推进游标）
-  }
-  const loc = localeForBot(larkAppId);
-
-  let ds: DaemonSession | undefined | null = activeSessions.get(sessionKey(sub.sessionAnchor, larkAppId));
-  if (!ds) {
-    // 无活跃 session → 自动为该文档创建一个（用虚拟 anchor = doc:{fileToken}）
-    logger.info(`[doc-comment] no active session for anchor=${sub.sessionAnchor.slice(0, 12)}; auto-creating for file=${sub.fileToken.slice(0, 12)}`);
-    ds = await autoCreateDocSession(sub, larkAppId, ctx);
-    if (!ds) {
-      // auto-create 失败：不设 claim（允许后续重试），返回 false 让 poller 不推进游标
-      logger.warn(`[doc-comment] auto-create session failed for file=${sub.fileToken.slice(0, 12)}; will retry comment ${commentId.slice(0, 12)}`);
-      return false;
-    }
-  }
-  // ds 确认有效后才设 claim——auto-create 失败时不占坑，允许重试。
-  handledDocCommentTurns.set(claimKey, Date.now());
-
-  try {
-  // 给用户的回复加 "Typing" reaction，让评论者知道 bot 正在处理。
   const userReplyId = ctx.replyId;
   let reactionId: string | undefined;
-  if (userReplyId) {
-    reactionId = await addCommentReaction(larkAppId,
-      { fileToken: sub.fileToken, fileType: sub.fileType },
-      commentId, userReplyId, 'Typing');
-  }
+  let deliveryDs: DaemonSession | undefined;
+  let deliverySession: Session | undefined;
 
-  const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
-  const authorName = sender?.name || ctx.authorOpenId?.slice(0, 8) || '?';
-  const dsBotCfg = getBot(ds.larkAppId).config;
-  const promptInput = {
-    fileToken: sub.fileToken,
-    fileType: sub.fileType,
-    question: text,
-    author: authorName,
-    selectedText: ctx.selectedText,
-    priorReplies: ctx.priorReplies?.map(reply => ({
-      author: reply.authorOpenId?.slice(0, 12),
-      text: reply.text,
-    })),
-    projectDir: ds.workingDir ?? sub.workingDir,
-    brand: normalizeBrand(dsBotCfg.brand),
-    locale: loc,
+  const targetMatchesThisTurn = (target: {
+    fileToken: string;
+    fileType: string;
+    commentId: string;
+    replyId?: string;
+  } | undefined): boolean => !!target
+    && target.fileToken === sub.fileToken
+    && target.fileType === sub.fileType
+    && target.commentId === commentId
+    && target.replyId === userReplyId;
+
+  const cleanupFailedDelivery = async (): Promise<void> => {
+    if (deliveryDs) {
+      const runtimeTarget = deliveryDs.docCommentTurns?.get(turnId);
+      if (targetMatchesThisTurn(runtimeTarget)) {
+        deliveryDs.docCommentTurns?.delete(turnId);
+      }
+    }
+
+    let removedPersistedTarget = false;
+    if (deliverySession) {
+      const persistedTarget = deliverySession.docCommentTargets?.[turnId];
+      if (targetMatchesThisTurn(persistedTarget)) {
+        delete deliverySession.docCommentTargets?.[turnId];
+        removedPersistedTarget = true;
+      }
+    }
+    if (removedPersistedTarget && deliverySession) {
+      try {
+        // Persist only the exact object still owned by this bot store. A stale
+        // continuation must not reinsert a displaced/cross-file Session row.
+        if (sessionStore.getOwnedSession(deliverySession.sessionId) === deliverySession) {
+          sessionStore.updateSession(deliverySession);
+        }
+      } catch (persistErr) {
+        logger.debug(
+          `[doc-comment] failed to persist aborted target cleanup ` +
+          `file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}: ` +
+          `${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
+        );
+      }
+    }
+
+    if (reactionId && userReplyId) {
+      try {
+        await removeCommentReaction(
+          larkAppId,
+          { fileToken: sub.fileToken, fileType: sub.fileType },
+          commentId,
+          userReplyId,
+          reactionId,
+        );
+      } catch (reactionErr) {
+        logger.debug(
+          `[doc-comment] failed to remove Typing after aborted delivery ` +
+          `file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}: ` +
+          `${reactionErr instanceof Error ? reactionErr.message : String(reactionErr)}`,
+        );
+      }
+    }
   };
 
-  // 记录本轮回评论的落点。两条路都要覆盖：
-  //   • ds.docCommentTurns（内存，按 turnId）→ deliverFinalOutput「兜底」分流用
-  //   • session.docCommentTargets（磁盘，per-turn map）→ `botmux send`「主回复」分流用
-  //     （botmux send 跑在独立子进程，只能从磁盘读会话态；per-turn 避免并发评论串线）
-  (ds.docCommentTurns ??= new Map()).set(turnId, {
-    fileToken: sub.fileToken,
-    fileType: sub.fileType,
-    commentId,
-    replyToOpenId: ctx.authorOpenId,
-    replyToName: sender?.name,
-    replyId: userReplyId,
-    reactionId,
-  });
-  const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, replyId: userReplyId, reactionId };
-
-  const selfBot = getBot(ds.larkAppId);
-
-  if (ds.worker && !ds.worker.killed) {
-    const isBridge = !!ds.adoptedFrom;
-    if (!isBridge) ensureSessionWhiteboard(ds);
-    const { promptContent, cliInput } = buildDocCommentTurnInput({
-      ds,
-      promptInput,
-      botCliId: dsBotCfg.cliId,
-      botCliPathOverride: dsBotCfg.cliPathOverride,
-      botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
-      sender,
-      mode: 'live',
-    });
-    beginNewTurn(ds, text);
-    (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
-    sessionStore.updateSession(ds.session); // 先落盘，botmux send 子进程才读得到落点
-    await noteTurnReceived(ds, commentId, text, sender, turnId);
-    rememberLastCliInput(ds, promptContent, cliInput);
-    sendWorkerInput(ds, cliInput, turnId);
-    logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
-  } else {
-    // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
-    logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
-    if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
-    ds.usageLimit = undefined;
-    ds.currentTurnTitle = text.substring(0, 50);
-    parkStreamCard(ds);
-    ds.streamCardId = undefined;
-    ds.streamCardNonce = undefined;
-    ds.streamCardPending = true;
-    ds.currentImageKey = undefined;
-    persistStreamCardState(ds);
-    // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
-    // the live-worker branch above (if (!isBridge) ensure…).
-    if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
-    const { promptContent, cliInput: wrappedInput } = buildDocCommentTurnInput({
-      ds,
-      promptInput,
-      botCliId: dsBotCfg.cliId,
-      botCliPathOverride: dsBotCfg.cliPathOverride,
-      botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
-      sender,
-      mode: 'refork',
-    });
-    (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
-    await noteTurnReceived(ds, commentId, text, sender, turnId);
-    rememberLastCliInput(ds, promptContent, wrappedInput);
-    sessionStore.updateSession(ds.session);
-    // Same adopt re-fork routing as handleThreadReply: an adopt session whose
-    // bridge worker exited must come back through forkAdoptWorker (observe +
-    // bridge), never forkWorker. buildDocCommentTurnInput(mode:'refork')
-    // delegates to buildReforkCliInput, which already bridge-formats the content
-    // when ds.adoptedFrom is set, so the doc-comment turn reaches the observed
-    // pane without a <user_message> wrapper.
-    if (ds.adoptedFrom) {
-      forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId });
-    } else {
-      forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+  try {
+    const duplicate = handledDocCommentTurns.has(claimKey);
+    if (duplicate) {
+      logger.info(`[doc-comment] duplicate turn awaiting owner file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}`);
     }
-  }
-  return true;
+    return await runClaimedDocCommentTurn(claimKey, async () => {
+      const loc = localeForBot(larkAppId);
+      let ds: DaemonSession | undefined | null = resolveBoundDocSession(sub, larkAppId);
+      if (!ds) {
+        // 无活跃 session → 自动为该文档创建一个（用虚拟 anchor = doc:{fileToken}）
+        logger.info(`[doc-comment] no active session for anchor=${sub.sessionAnchor.slice(0, 12)}; auto-creating for file=${sub.fileToken.slice(0, 12)}`);
+        ds = await autoCreateDocSession(sub, larkAppId, ctx);
+        if (!ds) {
+          throw new Error(`auto-create session failed for ${sub.fileToken.slice(0, 12)}`);
+        }
+      }
+      deliveryDs = ds;
+      const generation = captureRoutingGeneration(ds);
+      deliverySession = generation.session;
+      ensureCurrentRoutingGeneration(generation, 'comment:start');
+
+      // 给用户的回复加 "Typing" reaction，让评论者知道 bot 正在处理。
+      if (userReplyId) {
+        reactionId = await addCommentReaction(larkAppId,
+          { fileToken: sub.fileToken, fileType: sub.fileType },
+          commentId, userReplyId, 'Typing');
+      }
+      ensureCurrentRoutingGeneration(generation, 'comment:reaction');
+
+      const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
+      ensureCurrentRoutingGeneration(generation, 'comment:sender');
+      const authorName = sender?.name || ctx.authorOpenId?.slice(0, 8) || '?';
+      const dsBotCfg = getBot(ds.larkAppId).config;
+      const promptInput = {
+        fileToken: sub.fileToken,
+        fileType: sub.fileType,
+        question: text,
+        author: authorName,
+        selectedText: ctx.selectedText,
+        priorReplies: ctx.priorReplies?.map(reply => ({
+          author: reply.authorOpenId?.slice(0, 12),
+          text: reply.text,
+        })),
+        projectDir: ds.workingDir ?? sub.workingDir,
+        brand: normalizeBrand(dsBotCfg.brand),
+        locale: loc,
+      };
+
+      // 记录本轮回评论的落点。两条路都要覆盖：
+      //   • ds.docCommentTurns（内存，按 turnId）→ deliverFinalOutput「兜底」分流用
+      //   • session.docCommentTargets（磁盘，per-turn map）→ `botmux send`「主回复」分流用
+      //     （botmux send 跑在独立子进程，只能从磁盘读会话态；per-turn 避免并发评论串线）
+      (ds.docCommentTurns ??= new Map()).set(turnId, {
+        fileToken: sub.fileToken,
+        fileType: sub.fileType,
+        commentId,
+        replyToOpenId: ctx.authorOpenId,
+        replyToName: sender?.name,
+        replyId: userReplyId,
+        reactionId,
+      });
+      const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, replyId: userReplyId, reactionId };
+
+      const selfBot = getBot(ds.larkAppId);
+
+      if (ds.worker && !ds.worker.killed) {
+        const targetWorker = ds.worker;
+        const isBridge = !!ds.adoptedFrom;
+        if (!isBridge) ensureSessionWhiteboard(ds);
+        const { promptContent, cliInput } = buildDocCommentTurnInput({
+          ds,
+          promptInput,
+          botCliId: dsBotCfg.cliId,
+          botCliPathOverride: dsBotCfg.cliPathOverride,
+          botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
+          sender,
+          mode: 'live',
+        });
+        beginNewTurn(ds, text);
+        (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
+        // rememberLastCliInput persists both the exact comment target and the
+        // structured sidecar before any worker-visible delivery can occur.
+        rememberLastCliInput(ds, promptContent, cliInput);
+        await noteTurnReceived(ds, commentId, text, sender, turnId);
+        ensureCurrentRoutingGeneration(generation, 'comment:live-note');
+        if (ds.worker !== targetWorker || targetWorker.killed) {
+          throw new Error('worker generation changed during comment:live-note');
+        }
+        if (!sendWorkerInput(ds, cliInput, turnId)) {
+          throw new Error('worker became unavailable during comment:live-send');
+        }
+        logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
+        return;
+      }
+
+      // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
+      logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
+      if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
+      ds.usageLimit = undefined;
+      ds.currentTurnTitle = text.substring(0, 50);
+      parkStreamCard(ds);
+      ds.streamCardId = undefined;
+      ds.streamCardNonce = undefined;
+      ds.streamCardPending = true;
+      ds.currentImageKey = undefined;
+      persistStreamCardState(ds);
+      // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
+      // the live-worker branch above (if (!isBridge) ensure…).
+      if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
+      const { promptContent, cliInput: wrappedInput } = buildDocCommentTurnInput({
+        ds,
+        promptInput,
+        botCliId: dsBotCfg.cliId,
+        botCliPathOverride: dsBotCfg.cliPathOverride,
+        botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
+        sender,
+        mode: 'refork',
+      });
+      (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
+      rememberLastCliInput(ds, promptContent, wrappedInput);
+      await noteTurnReceived(ds, commentId, text, sender, turnId);
+      ensureCurrentRoutingGeneration(generation, 'comment:refork-note');
+      if (ds.worker && !ds.worker.killed) {
+        throw new Error('worker became active during comment:refork-note');
+      }
+      sessionStore.updateSession(ds.session);
+      if (ds.adoptedFrom) {
+        forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId });
+      } else {
+        forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+      }
+    }, cleanupFailedDelivery);
   } catch (err) {
-    // 投递失败：清理 claim 允许重试，返回 false 让 poller 不推进游标。
-    handledDocCommentTurns.delete(claimKey);
     logger.warn(`[doc-comment] delivery failed, claim released for retry file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)} err=${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
 }
-
-/** 同一条评论可能同时被长连接通知和 --all 轮询看到；daemon 内统一去重。 */
-const handledDocCommentTurns = new BoundedMap<string, number>(5_000);
 
 let docCommentPollRunning = false;
 
@@ -17222,7 +17920,7 @@ async function restoreDocSubscriptions(_sessions: Map<string, DaemonSession>): P
       //   • 有 sessionId 且其会话 status==='closed' → 真的关了 → 退订 + 删表
       //   • 会话不存在（被清理）→ 同上
       //   • 会话 active / 缺 sessionId（老订阅，无从判定）→ 保留 + 重订阅（保守，不误删）
-      const stored = sub.sessionId ? sessionStore.getSession(sub.sessionId) : undefined;
+      const stored = sub.sessionId ? sessionStore.getOwnedSession(sub.sessionId) : undefined;
       const definitelyClosed = sub.sessionId && (!stored || stored.status === 'closed');
       if (definitelyClosed) {
         if (sub.managedBy !== 'watch-comment') await unsubscribeDocFile(appId, file);
@@ -17850,7 +18548,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       host: terminalProxyHost,
       resolvePort: (sessionId) => {
         for (const ds of activeSessions.values()) {
-          if (ds.session.sessionId === sessionId && ds.workerPort) return ds.workerPort;
+          if (ds.session.sessionId === sessionId && sessionSupportsWebTerminal(ds) && ds.workerPort) {
+            return ds.workerPort;
+          }
         }
         return undefined;
       },
@@ -18465,7 +19165,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // detach-preserve a "herdr" session whose real pane is tmux (freeze-once).
         // undefined (frozen pty, or unresolvable legacy) → non-persistent → killWorker.
         if (shutdownBackendDisposition(ds) === 'detach') {
-          // Persistent backends (tmux / herdr / zellij): just kill the worker process —
+          // Persistent backends (tmux / herdr / zellij / zmx): just kill the worker process —
           // the multiplexer session survives for re-attach. The worker's SIGTERM
           // handler calls backend.kill(), which only DETACHES. Going through
           // killWorker() instead would send {type:'close'} → destroySession() →

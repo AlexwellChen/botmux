@@ -9,7 +9,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
 import {
   findConfigField,
   applyConfigField,
@@ -82,11 +82,12 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, getDaemonStreamingCardUsageSnapshot } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
+import { sendWorkerIpc } from '../../core/worker-ipc.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isRepoCardConsumed, isActiveRepoCard, claimCurrentRepoCard } from '../../core/types.js';
@@ -594,6 +595,22 @@ export async function commitRepoSelection(
     return;
   } else {
     // Mid-session repo switch — close old session, start fresh.
+    // ZMX close is identity/generation verified and may refuse. Prove teardown
+    // before claiming the card or mutating any old-session state; on refusal
+    // the current session and card remain fully retryable.
+    try {
+      teardownAuthoritativePersistentBackingBeforeClose(ds);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.warn(`[${tag(ds)}] Repo switch refused because backing teardown was not proven: ${reason}`);
+      try {
+        await sessionReply(rootId, t('cmd.repo.switch_close_failed', { error: reason }, locTarget));
+      } catch (replyErr) {
+        logger.warn(`[${tag(ds)}] Repo-switch teardown failure reply failed: ${replyErr instanceof Error ? replyErr.message : replyErr}`);
+      }
+      return;
+    }
+
     // Claim the current card BEFORE killWorker / any await. A concurrent click
     // on the same Feishu card must not pass a second kill+fork while the first
     // switch is still awaiting confirm replies. Correctness does not depend on
@@ -616,6 +633,7 @@ export async function commitRepoSelection(
     // the displaced session's stored workingDir (and the closed card), so
     // `claude --resume` later would reopen the old context in the new repo's
     // cwd. The new repo is pinned onto the fresh session below instead.
+    const oldSession = ds.session;
     const closedCard = buildClosedSessionCard(ds, locTarget);
 
     killWorker(ds);
@@ -640,7 +658,13 @@ export async function commitRepoSelection(
       () => sessionReply(rootId, closedCard, 'interactive'),
     );
 
-    const oldSession = ds.session;
+    // The close card delivery yields to inbound routing and dashboard IPC. If
+    // the user closed/replaced this generation during that await, do not mint a
+    // fresh active row from the stale continuation.
+    if (!sessionStillActive() || ds.session !== oldSession) {
+      logger.warn(`[${tag(ds)}] Repo switch cancelled after old-session close; routing generation changed during card delivery`);
+      return;
+    }
     // `rootId` is the routing anchor. For chat-scope sessions it is the
     // `oc_...` chat id, not the traceable `om_...` message root stored on
     // Session. Preserve the old identity and explicitly persist scope so card
@@ -1495,23 +1519,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // collectRelayPickerEntries already filters scratches at render time,
     // but a stale picker (rendered before a scratch was created) could
     // still produce a confirm click; this is the depth defense.
-    {
-      const { isRelayableRealSession } = await import('../../core/worker-pool.js');
-      if (!isRelayableRealSession(sourceDs)) {
-        return { toast: { type: 'error', content: t('card.relay.toast_not_started_yet', undefined, loc) } };
-      }
+    const { isDisposableCommandScratch, isRelayableRealSession } = await import('../../core/worker-pool.js');
+    if (!isRelayableRealSession(sourceDs)) {
+      return { toast: { type: 'error', content: t('card.relay.toast_not_started_yet', undefined, loc) } };
     }
     // Pre-flight target-chat conflict check — done BEFORE sendMessage M1 so
     // a refusal doesn't leave a misleading "已接力" announcement in the
     // target chat (王皓 caught this in testing). Mirror the same predicate
-    // transferSession uses, plus the `!!worker` filter that excludes daemon
-    // command scratch sessions (e.g. the /relay command's own session,
-    // which shares the bot's larkAppId + chatId but has no worker).
+    // transferSession uses. Only a narrowly classified daemon-command scratch
+    // may be ignored; worker-less queued/adopt/deferred/real sessions still own
+    // the anchor and must block before a misleading M1 is sent.
     const targetConflict = [...activeSessions.values()].find(c =>
       c !== sourceDs
       && c.larkAppId === larkAppId
       && sessionAnchorId(c) === targetAnchor
-      && !!c.worker
+      && !isDisposableCommandScratch(c)
     );
     if (targetConflict) {
       const conflictTitle = targetConflict.session.title || targetConflict.session.sessionId.substring(0, 8);
@@ -1878,6 +1900,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
         return;
       }
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, locDs),
+          },
+        };
+      }
       const effectiveCliId = sessionCliId(ds);
       const cliName = getCliDisplayName(effectiveCliId);
       logger.info(`[${tag(ds)}] Correlated restart via card button`);
@@ -1906,13 +1936,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // Build the closed card BEFORE killWorker/closeSession — it reads the
       // live session's identity off `ds`.
       const card = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
-      killWorker(ds);
-      sessionStore.closeSession(ds.session.sessionId);
-      publishClosedSessionPatch(
-        ds.session.sessionId,
-        ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
-      );
-      activeSessions.delete(sKey);
+      try {
+        await closeSession(ds.session.sessionId);
+      } catch (err) {
+        logger.error(`[${tag(ds)}] Refused close because backing teardown was not verified: ${err}`);
+        return {
+          toast: {
+            type: 'warning',
+            content: `会话关闭失败：${err instanceof Error ? err.message : String(err)}`,
+          },
+        };
+      }
+      // closeSession removes the captured ds before awaiting best-effort remote
+      // cleanup. A new session may claim the same route during that await; only
+      // delete here if this handler still owns the exact object it closed.
+      if (activeSessions.get(sKey) === ds) activeSessions.delete(sKey);
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
       // closed card ephemeral to the same owner audience instead. No group
@@ -1958,6 +1996,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await sessionReply(rootId, t('card.action.resume_adopt_unsupported', undefined, locDsResume));
         } else if (result.error === 'deferred_unmaterialized') {
           await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, locDsResume));
+        } else if (result.error === 'resume_cancelled') {
+          await sessionReply(rootId, t('card.action.resume_cancelled', undefined, locDsResume));
         }
       }
     }
@@ -2003,8 +2043,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       persistStreamCardState(ds);
 
       let cardJson: string | undefined;
-      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
-        const readUrl = buildTerminalUrl(ds);
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
+        const readUrl = readableTerminalUrlFor(ds);
         cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
@@ -2044,6 +2084,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'tui_keys' && ds) {
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
+      }
       // Fail-closed: only act on a currently-active card (either the
       // ScreenAnalyzer TUI prompt card or our stuck-warning card). A stale
       // click from a resolved/replaced card must NOT send any IPC to the
@@ -2061,6 +2109,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const optionType = value?.option_type ?? 'select';
       const selectedIndex = Number(value?.selected_index ?? 0);
       const selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
+      if (isActiveTuiCard && ds.tuiPromptProcessing) {
+        logger.info(`[${tag(ds)}] Duplicate TUI prompt card click — dropped (processing already in flight)`);
+        return;
+      }
 
       if (optionType === 'toggle') {
         // Only a ScreenAnalyzer TUI card may own toggle state. A stuck-warning
@@ -2104,6 +2156,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (ds.worker) {
         let allKeys: string[] = [];
         let isFinalStuck = false;
+        let dispatchedKeys = false;
         if (isActiveTuiCard && ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
           // Send each toggled option's keys in sequence
           for (const ti of ds.tuiToggledIndices.sort((a, b) => a - b)) {
@@ -2153,6 +2206,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
 
         if (allKeys.length > 0) {
+          const effectiveFinal = isFinal || isFinalStuck;
           // Atomic processing claim: if a previous click is already in flight
           // (waiting for tui_keys_delivered / stuck_warning_expired ACK), drop
           // this duplicate. Without this, two rapid clicks could both pass the
@@ -2163,6 +2217,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               return;
             }
             ds.stuckWarningProcessing = true;
+          }
+          if (isActiveTuiCard && effectiveFinal) {
+            ds.tuiPromptProcessing = true;
           }
           // Only the stuck-warning card's Enter action re-arms the detector
           // (Enter advances from the hook list to a per-hook review). Match by
@@ -2179,12 +2236,37 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           const stuckNonce = isActiveStuckCard ? ds.stuckWarningNonce : undefined;
           const stuckCliLifetime = isActiveStuckCard ? ds.stuckWarningCliLifetime : undefined;
           const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
-          const effectiveFinal = isFinal || isFinalStuck;
-          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal: effectiveFinal, rearmStuckDetector: isStuckWarningEnter, stuckNonce, stuckCliLifetime, stuckPageType: stuckPage } as DaemonToWorker);
+          const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
+            ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
+            : selectedText;
+          try {
+            await sendWorkerIpc(ds.worker, {
+              type: 'tui_keys',
+              keys: allKeys,
+              isFinal: effectiveFinal,
+              rearmStuckDetector: isStuckWarningEnter,
+              stuckNonce,
+              stuckCliLifetime,
+              stuckPageType: stuckPage,
+              cardMessageId: isActiveTuiCard ? cardMessageId : undefined,
+              selectedText: resolveText || selectedText,
+            } as DaemonToWorker);
+            dispatchedKeys = true;
+          } catch (err) {
+            if (isActiveStuckCard) ds.stuckWarningProcessing = false;
+            if (isActiveTuiCard && effectiveFinal) ds.tuiPromptProcessing = false;
+            logger.warn(`[${tag(ds)}] TUI key IPC delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+            return {
+              toast: {
+                type: 'warning',
+                content: t('card.action.tui_ipc_failed', undefined, localeForBot(ds.larkAppId)),
+              },
+            };
+          }
           logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${effectiveFinal} rearmStuck=${isStuckWarningEnter} stuckNonce=${stuckNonce ?? 'none'} — "${selectedText}"`);
         }
 
-        if (isFinal || isFinalStuck) {
+        if ((isFinal || isFinalStuck) && dispatchedKeys) {
           const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
             ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
             : selectedText;
@@ -2193,8 +2275,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // For a stuck-warning card, do NOT clear authority or render success
           // here. The worker may still reject the keys (stale screen). We show a
           // "processing" state to block duplicate clicks, and wait for the
-          // worker's tui_keys_delivered (success) or stuck_warning_expired
-          // ("page changed, not sent") ACK before resolving the card.
+          // worker's tui_keys_delivered (success), stuck_warning_expired
+          // ("page changed, not sent"), or tui_prompt_submit_failed ACK before
+          // resolving the card.
           if (isActiveStuckCard) {
             if (cardMessageId) {
               const processingCard = buildTuiPromptProcessingCard('处理中…', locDs);
@@ -2205,24 +2288,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             publishAttentionPatch(ds);
             try { return JSON.parse(buildTuiPromptProcessingCard('处理中…', locDs)); } catch { /* fall through */ }
           }
-          // Normal TUI prompt card (ScreenAnalyzer): resolve immediately.
-          if (cardMessageId) {
-            setTimeout(() => {
-              const resolvedCard = buildTuiPromptResolvedCard(finalText, locDs);
-              updateMessage(ds.larkAppId, cardMessageId, resolvedCard).catch(err =>
-                logger.debug(`[${tag(ds)}] Failed to update TUI prompt card: ${err}`),
-              );
-            }, allKeys.length * 100 + 500);
-          }
-          // Clear state only for the card that was actually clicked — a stuck
-          // card click must NOT wipe the ScreenAnalyzer TUI prompt state (or
-          // vice versa) if both coexist / race.
-          if (cardMessageId === ds.tuiPromptCardId) {
-            ds.tuiPromptCardId = undefined;
-            ds.tuiPromptOptions = undefined;
-            ds.tuiPromptMultiSelect = undefined;
-            ds.tuiToggledIndices = undefined;
-          }
+          // Normal TUI prompt cards also remain in processing until the worker
+          // confirms backend delivery via tui_prompt_resolved. A worker/backend
+          // rejection produces tui_prompt_submit_failed instead.
           publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }
         }
@@ -2230,28 +2298,62 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'tui_text_input' && ds) {
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
+      }
       const inputTextRaw = action?.form_value?.tui_custom_input;
       const inputText = typeof inputTextRaw === 'string' ? inputTextRaw : '';
       let inputKeys: string[] = [];
       try { inputKeys = JSON.parse(value?.input_keys ?? '[]'); } catch { /* bad json */ }
       const locDs = localeForBot(ds.larkAppId);
-      if (ds.worker && inputText && inputKeys.length > 0) {
-        // Atomic IPC — worker handles keys + text in one flow to avoid race
-        ds.worker.send({ type: 'tui_text_input', keys: inputKeys, text: inputText } as DaemonToWorker);
-        logger.info(`[${tag(ds)}] TUI text input: "${inputText}" (keys: ${JSON.stringify(inputKeys)})`);
-        if (cardMessageId) {
-          const resolvedCard = buildTuiPromptResolvedCard(inputText, locDs);
-          updateMessage(ds.larkAppId, cardMessageId, resolvedCard).catch(err =>
-            logger.debug(`[${tag(ds)}] Failed to update TUI prompt card: ${err}`),
-          );
-        }
-        ds.tuiPromptCardId = undefined;
-        ds.tuiPromptOptions = undefined;
-        publishAttentionPatch(ds);
+      const isActiveTuiCard = !!ds.tuiPromptCardId && cardMessageId === ds.tuiPromptCardId;
+      if (!isActiveTuiCard) {
+        logger.info(`[${tag(ds)}] tui_text_input from stale card ${cardMessageId} — ignored`);
+        return;
       }
+      if (ds.tuiPromptProcessing) {
+        logger.info(`[${tag(ds)}] Duplicate TUI text input — dropped (processing already in flight)`);
+        return;
+      }
+      if (!ds.worker || !inputText || inputKeys.length === 0) {
+        logger.info(
+          `[${tag(ds)}] TUI text input not dispatched ` +
+          `(worker=${!!ds.worker}, text=${!!inputText}, keys=${inputKeys.length})`,
+        );
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.tui_ipc_failed', undefined, locDs),
+          },
+        };
+      }
+      // Atomic IPC — worker handles keys + text in one flow to avoid race
+      ds.tuiPromptProcessing = true;
       try {
-        return JSON.parse(buildTuiPromptResolvedCard(inputText || t('card.action.tui_custom_input', undefined, locDs), locDs));
-      } catch { /* fall through */ }
+        await sendWorkerIpc(ds.worker, {
+          type: 'tui_text_input',
+          keys: inputKeys,
+          text: inputText,
+          cardMessageId,
+        } as DaemonToWorker);
+      } catch (err) {
+        ds.tuiPromptProcessing = false;
+        logger.warn(`[${tag(ds)}] TUI text IPC delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.tui_ipc_failed', undefined, locDs),
+          },
+        };
+      }
+      logger.info(`[${tag(ds)}] TUI text input: "${inputText}" (keys: ${JSON.stringify(inputKeys)})`);
+      publishAttentionPatch(ds);
+      try { return JSON.parse(buildTuiPromptProcessingCard(inputText, locDs)); } catch { /* fall through */ }
     }
 
     // Compatibility path for cards emitted before open_local_cli was introduced.
@@ -2270,10 +2372,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {
-      const botCfg = getBot(ds.larkAppId).config;
       const effectiveCliId = sessionCliId(ds);
       const locDs = localeForBot(ds.larkAppId);
-      if (ds.riffAccessUrl || (ds.workerPort && ds.workerToken)) {
+      if (!sessionSupportsWebTerminal(ds)) {
+        // Old cards can retain a get_write_link callback and stale port/token
+        // fields after the session is restored onto ZMX. This is a permanent
+        // backend capability boundary, not a transient startup delay.
+        const unsupportedCard = JSON.stringify({
+          config: { wide_screen_mode: true },
+          elements: [{ tag: 'markdown', content: t('card.action.terminal_unsupported', undefined, locDs) }],
+        });
+        await deliverEphemeralOrReply(ds, operatorOpenId, unsupportedCard, 'interactive', () => sessionReply(rootId, unsupportedCard, 'interactive'));
+        return;
+      }
+      if (sessionSupportsWebTerminal(ds) && (ds.riffAccessUrl || (ds.workerPort && ds.workerToken))) {
         const writeUrl = buildTerminalUrl(ds, { write: true });
         const cardJson = buildSessionCard(
           ds.session.sessionId,
@@ -2330,11 +2442,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           const next = nextMode(cur);
           ds.displayMode = next;
           persistStreamCardState(ds);
-          if (ds.worker) {
-            ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
+          if (ds.worker || isSessionTransferring(ds)) {
+            sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
           }
-          if (cardMessageId && ds.workerPort) {
-            const readUrl = buildTerminalUrl(ds);
+          if (cardMessageId && workerHasInitialized(ds)) {
+            const readUrl = readableTerminalUrlFor(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const cardJson = buildStreamingCard(
               ds.session.sessionId,
@@ -2374,11 +2486,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const next = nextMode(cur);
         ds.displayMode = next;
         persistStreamCardState(ds);
-        if (ds.worker) {
-          ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
+        if (ds.worker || isSessionTransferring(ds)) {
+          sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
         }
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = ds.workerPort ? buildTerminalUrl(ds) : '';
+        const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -2416,11 +2528,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const next = nextMode(cur);
       ds.displayMode = next;
       persistStreamCardState(ds);
-      if (ds.worker) {
-        ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
+      if (ds.worker || isSessionTransferring(ds)) {
+        sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
       }
-      if (ds.streamCardId && ds.workerPort) {
-        const readUrl = buildTerminalUrl(ds);
+      if (ds.streamCardId && workerHasInitialized(ds)) {
+        const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -2477,17 +2589,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     // Manual screenshot refresh — force immediate capture bypassing 10s interval + hash dedup.
     if (actionType === 'refresh_screenshot' && ds) {
-      if (ds.worker) {
-        ds.worker.send({ type: 'refresh_screen' } as DaemonToWorker);
+      if (ds.worker || isSessionTransferring(ds)) {
+        sendWorkerSessionInput(ds, { type: 'refresh_screen' });
         logger.info(`[${tag(ds)}] Manual screenshot refresh`);
       }
       // Return the current card JSON so Feishu doesn't revert the displayed
       // image to the originally-POSTed initial frame while waiting for the
       // fresh screenshot PATCH (~1s).
-      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
         const botCfg = getBot(ds.larkAppId).config;
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = buildTerminalUrl(ds);
+        const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -2520,16 +2632,24 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     // Quick-action keys (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½ page) — forward to worker.
     if (actionType === 'term_action' && ds) {
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
+      }
       const key = value?.key as TermActionKey | undefined;
       if (!key) return;
       if (ds.worker) {
-        ds.worker.send({ type: 'term_action', key } as DaemonToWorker);
+        sendWorkerSessionInput(ds, { type: 'term_action', key });
         logger.info(`[${tag(ds)}] term_action: ${key}`);
       }
-      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
         const botCfg = getBot(ds.larkAppId).config;
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = buildTerminalUrl(ds);
+        const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -2707,6 +2827,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
     const ds = activeSessions.get(sKey);
     if (!ds) return;
+    const sourceSession = ds.session;
+    if (isSessionTransferring(ds)) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
 
     if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
       logger.info(`codex_app_thread_select blocked for non-operator user: ${operatorOpenId} (chat=${ds.chatId})`);
@@ -2732,6 +2856,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       await sessionReply(rootId, t('cmd.codex_app_adopt.list_failed', { error: err?.message ?? String(err) }, localeForBot(ds.larkAppId)));
       return;
     }
+    if (
+      ds.session !== sourceSession
+      || ds.session.status !== 'active'
+      || activeSessions.get(sKey) !== ds
+      || isSessionTransferring(ds)
+    ) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
     const target = threads.find(t => t.threadId === selected.threadId);
     if (!target) {
       await sessionReply(rootId, t('cmd.codex_app_adopt.thread_not_found', { threadId: selected.threadId }, localeForBot(ds.larkAppId)));
@@ -2752,6 +2884,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
     const ds = activeSessions.get(sKey);
     if (!ds) return;
+    const sourceSession = ds.session;
+    if (isSessionTransferring(ds)) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
 
     // /adopt 是管理动作：下拉入口同样要求 canOperate（命令路径已在 daemon 层 gate）。
     if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
@@ -2819,6 +2955,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       await new Promise(r => setTimeout(r, 150));
       target = await resolveAdoptTarget();
     }
+    if (
+      ds.session !== sourceSession
+      || ds.session.status !== 'active'
+      || activeSessions.get(sKey) !== ds
+      || isSessionTransferring(ds)
+    ) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
     if (!target) {
       await sessionReply(rootId, t('cmd.adopt.target_exited', undefined, localeForBot(ds.larkAppId)));
       if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
@@ -2841,6 +2985,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
     const ds = activeSessions.get(sKey);
     if (!ds) return;
+    const sourceSession = ds.session;
+    if (isSessionTransferring(ds)) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
 
     if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
       logger.info(`adopt_resume_select blocked for non-operator user: ${operatorOpenId} (chat=${ds.chatId})`);
@@ -2856,6 +3004,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const botCfg = getBot(ds.larkAppId).config;
     const { discoverResumableSessionsForBot, startResumeImportSession } = await import('../../core/command-handler.js');
     const resumable = await discoverResumableSessionsForBot(botCfg.cliId, botCfg.cliPathOverride, activeSessions);
+    if (
+      ds.session !== sourceSession
+      || ds.session.status !== 'active'
+      || activeSessions.get(sKey) !== ds
+      || isSessionTransferring(ds)
+    ) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
     const target = resumable.find(r => r.cliSessionId === selected.cliSessionId);
     if (!target) {
       await sessionReply(rootId, t('cmd.adopt.resume_not_found', { id: selected.cliSessionId }, localeForBot(ds.larkAppId)));

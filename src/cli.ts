@@ -13,7 +13,7 @@
  *   botmux status         — show daemon status
  *   botmux upgrade|update — upgrade to latest version
  *   botmux device enroll|status|logout — manage the host desktop device credential
- *   botmux list           — interactive session picker (TUI), attach to tmux
+ *   botmux list           — interactive session picker (TUI), attach to managed tmux/ZMX sessions
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
@@ -76,12 +76,17 @@ import {
 import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
+import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
+import {
+  attachFrozenManagedZmxSession,
+  freezeManagedZmxAttachTarget,
+} from './cli/zmx-managed-attach.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDeferredTopicSend, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
@@ -167,6 +172,14 @@ import {
   stopExactPm2Process,
   type BotmuxPm2Inspection,
 } from './core/bot-live-control.js';
+import {
+  isSuspendableBackendType,
+  killPersistentBackendTarget,
+  probePersistentBackendTarget,
+  probePersistentSessions,
+  resolvePersistentBackendTarget,
+  type PersistentBackendType,
+} from './core/persistent-backend.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -1409,9 +1422,9 @@ async function promptEditBotConfig(
   }
 
   printInputHelp('会话后端 backendType', [
-    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr 支持托管持久会话；zellij 为实验后端（需 zellij >= 0.44）。',
+    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr 支持托管持久会话；zmx >= 0.7.0 提供纯文本持久会话 + 本机 attach（无 Web TUI）；zellij 为实验后端（需 zellij >= 0.44）。',
     '选择 traex + herdr 时，可在 Dashboard Settings 中开启 TraeX herdr plugin opt-in 并填写可信插件 spec；默认不会自动安装第三方插件。',
-    '留空保留当前值；输入 - 回到自动检测；接受 pty / tmux / herdr / zellij。',
+    '留空保留当前值；输入 - 回到全局默认（未设置 BACKEND_TYPE 时为 tmux）；接受 pty / tmux / herdr / zellij / zmx。',
   ]);
   input.backendType = await ask(rl, `会话后端 backendType [${formatOptionalValue(bot.backendType)}]: `);
 
@@ -3187,6 +3200,10 @@ interface SessionData {
   cliId?: string;
   /** CLI-native resume id when it differs from botmux's Session id. */
   cliSessionId?: string;
+  backendType?: BackendType;
+  /** Exact persistent host/agent selected by the worker. In particular, Herdr
+   * may own one agent inside a shared host session rather than the host itself. */
+  persistentBackendTarget?: PersistentBackendTarget;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
   /** Deliberately suspended by the resident-session cap. No process/backing
@@ -3422,6 +3439,7 @@ function formatSessionRow(
   multiBot: boolean,
   botLabels: Map<string, string>,
   cols: { id: number; bot?: number; title: number; dir: number; pid: number; uptime: number; status: number; target: number },
+  probeSnapshot: BackingProbeSnapshot,
 ): { text: string; alive: boolean } {
   const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
   const parts = [id];
@@ -3436,13 +3454,13 @@ function formatSessionRow(
   const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
   const alive = isSessionAliveForList(s);
   const status = padEndDisplay(sessionStatusLabel(s), cols.status);
-  const target = padEndDisplay(truncate(sessionTargetLabel(s), cols.target), cols.target);
+  const target = padEndDisplay(truncate(sessionTargetLabel(s, probeSnapshot), cols.target), cols.target);
   parts.push(title, dir, pid, uptime, status, target);
   return { text: parts.join(' │ '), alive };
 }
 
 /** Print plain session table (non-interactive). */
-function printSessionTable(active: SessionData[]): void {
+function printSessionTable(active: SessionData[], probeSnapshot: BackingProbeSnapshot): void {
   const botConfigs = loadBotConfigsForDisplay();
   const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.larkAppId).filter(Boolean)).size > 1;
   const botLabels = new Map<string, string>();
@@ -3471,22 +3489,12 @@ function printSessionTable(active: SessionData[]): void {
   console.log(separator);
 
   for (const s of active) {
-    const { text } = formatSessionRow(s, multiBot, botLabels, cols);
+    const { text } = formatSessionRow(s, multiBot, botLabels, cols, probeSnapshot);
     console.log(text);
   }
 
   console.log(separator);
   console.log(`共 ${active.length} 个活跃会话`);
-}
-
-/** Check if a tmux session exists. */
-function tmuxSessionExists(name: string): boolean {
-  try {
-    execSync(`tmux has-session -t ${name} 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() });
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function applyTmuxWindowSizeLargest(sessionName: string): void {
@@ -3517,7 +3525,7 @@ type SessionDeleteCloseResult =
  *  persistent row, lifecycle hooks, subscriptions, and backend teardown stay
  *  coherent. This legacy local path is safe only when there is no daemon
  *  process whose in-memory state could be stranded. */
-function closeSessionOffline(s: SessionData): void {
+function closeSessionOffline(s: SessionData): SessionDeleteCloseResult {
   const originalPid = adoptedCliPid(s);
   // Adopted sessions own only the botmux worker/viewer, never the user's CLI.
   if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
@@ -3527,18 +3535,43 @@ function closeSessionOffline(s: SessionData): void {
   // Adopted panes belong to the user. Ordinary bmx-* sessions are botmux-owned
   // and still need direct cleanup when no daemon exists to run killWorker().
   if (!isAdoptedSession(s)) {
-    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-    try {
-      execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
-        stdio: 'ignore',
-        env: tmuxEnv(),
-      });
-    } catch { /* no tmux session */ }
+    if (isSuspendableBackendType(s.backendType)) {
+      const target = resolvePersistentBackendTarget(
+        s.backendType,
+        s.sessionId,
+        s.persistentBackendTarget,
+      );
+      try {
+        killPersistentBackendTarget(target, s.sessionId);
+      } catch (err) {
+        // ZMX destruction is identity-verified against the complete botmux
+        // session UUID and waits for confirmed disappearance. Swallowing an
+        // inconclusive/mismatched kill would hide the sole control row while
+        // its CLI remains alive. Older mux backends retain their historical
+        // best-effort offline-close compatibility.
+        if (target.backendType === 'zmx') {
+          return {
+            ok: false,
+            error: `ZMX 离线删除未完成：${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+      }
+    } else {
+      // Legacy rows without backendType were historically tmux-backed.
+      const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
+      try {
+        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
+          stdio: 'ignore',
+          env: tmuxEnv(),
+        });
+      } catch { /* no tmux session */ }
+    }
   }
 
   s.status = 'closed';
   s.closedAt = new Date().toISOString();
   saveSession(s);
+  return { ok: true, via: 'offline' };
 }
 
 /** Close through the owning daemon whenever it is online. The IPC request is
@@ -3564,8 +3597,7 @@ async function closeSessionForDelete(
   // port); it only keeps larkAppId-less legacy records on the offline fallback,
   // whose saveSession() persists to the legacy file correctly.
   if (!s.larkAppId) {
-    closeSessionOffline(s);
-    return { ok: true, via: 'offline' };
+    return closeSessionOffline(s);
   }
 
   const daemon = online.find(d => d.larkAppId === s.larkAppId);
@@ -3588,8 +3620,7 @@ async function closeSessionForDelete(
     }
   }
 
-  closeSessionOffline(s);
-  return { ok: true, via: 'offline' };
+  return closeSessionOffline(s);
 }
 
 function adoptTargetLabel(s: SessionData): string {
@@ -3628,14 +3659,137 @@ function sessionStatusLabel(s: SessionData): string {
   return s.pid && isProcessAlive(s.pid) ? 'online' : s.pid ? 'stopped' : 'idle';
 }
 
-function sessionTargetLabel(s: SessionData, tmuxName?: string, hasTmux?: boolean): string {
-  if (isAdoptedSession(s)) return adoptTargetLabel(s);
-  if (hasTmux === undefined) {
-    const name = tmuxName ?? `bmx-${s.sessionId.substring(0, 8)}`;
-    hasTmux = tmuxSessionExists(name);
-    tmuxName = name;
+type BackingProbeSnapshot = ReadonlyMap<string, SessionProbe>;
+
+function backingProbeKey(target: PersistentBackendTarget): string {
+  const agentName = target.backendType === 'herdr' ? target.agentName ?? '' : '';
+  return `${target.backendType}\0${target.sessionName}\0${agentName}`;
+}
+
+function sessionPersistentTarget(s: SessionData): PersistentBackendTarget | undefined {
+  if (isSuspendableBackendType(s.backendType)) {
+    return resolvePersistentBackendTarget(
+      s.backendType,
+      s.sessionId,
+      s.persistentBackendTarget,
+    );
   }
-  return hasTmux ? `tmux: ${tmuxName}` : '-';
+  if (s.backendType === undefined) {
+    // Legacy rows predate backend stamping. Only tmux was externally
+    // attachable, and its deterministic target remains the compatibility path.
+    return {
+      backendType: 'tmux',
+      sessionName: `bmx-${s.sessionId.substring(0, 8)}`,
+    };
+  }
+  return undefined;
+}
+
+function persistentTargetDisplay(target: PersistentBackendTarget): string {
+  return target.backendType === 'herdr' && target.agentName
+    ? `${target.sessionName}/${target.agentName}`
+    : target.sessionName;
+}
+
+function buildBackingProbeSnapshot(sessions: readonly SessionData[]): BackingProbeSnapshot {
+  const namesByBackend = new Map<PersistentBackendType, Set<string>>();
+  const directTargets = new Map<string, PersistentBackendTarget>();
+  const add = (target: PersistentBackendTarget) => {
+    if (target.backendType === 'herdr' && target.agentName) {
+      directTargets.set(backingProbeKey(target), target);
+      return;
+    }
+    const backendType = target.backendType;
+    const name = target.sessionName;
+    const names = namesByBackend.get(backendType) ?? new Set<string>();
+    names.add(name);
+    namesByBackend.set(backendType, names);
+  };
+
+  for (const session of sessions) {
+    if (isAdoptedSession(session) || session.backendType === 'pty') continue;
+    const target = sessionPersistentTarget(session);
+    if (target) add(target);
+  }
+
+  const snapshot = new Map<string, SessionProbe>();
+  // Agent-scoped Herdr targets cannot be collapsed into a host-session probe:
+  // the shared host may be healthy after this exact Botmux agent exited.
+  for (const [key, target] of directTargets) {
+    snapshot.set(key, probePersistentBackendTarget(target));
+  }
+  for (const [backendType, names] of namesByBackend) {
+    for (const [name, probe] of probePersistentSessions(backendType, names)) {
+      snapshot.set(backingProbeKey({ backendType, sessionName: name } as PersistentBackendTarget), probe);
+    }
+  }
+  return snapshot;
+}
+
+function backingProbe(
+  snapshot: BackingProbeSnapshot | undefined,
+  target: PersistentBackendTarget,
+): SessionProbe {
+  return snapshot?.get(backingProbeKey(target))
+    ?? probePersistentBackendTarget(target);
+}
+
+function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
+  backendType?: BackendType;
+  target?: PersistentBackendTarget;
+  probe: 'exists' | 'missing' | 'unknown';
+  label: string;
+  attachBackend?: 'tmux' | 'zmx';
+} {
+  if (isSuspendableBackendType(s.backendType)) {
+    const target = sessionPersistentTarget(s)!;
+    const probe = backingProbe(snapshot, target);
+    const suffix = probe === 'exists' ? '' : ` (${probe})`;
+    return {
+      backendType: s.backendType,
+      target,
+      probe,
+      label: `${s.backendType}: ${persistentTargetDisplay(target)}${suffix}`,
+      attachBackend: s.backendType === 'tmux' || s.backendType === 'zmx'
+        ? s.backendType
+        : undefined,
+    };
+  }
+  if (s.backendType === 'pty') {
+    return { backendType: 'pty', probe: 'missing', label: 'pty' };
+  }
+  // Legacy rows predate backend stamping. Only tmux was externally attachable.
+  const target = sessionPersistentTarget(s)!;
+  const probe = backingProbe(snapshot, target);
+  return {
+    backendType: 'tmux',
+    target,
+    probe,
+    label: probe === 'exists' ? `tmux: ${target.sessionName}` : '-',
+    attachBackend: 'tmux',
+  };
+}
+
+function sessionTargetLabel(s: SessionData, snapshot?: BackingProbeSnapshot): string {
+  if (isAdoptedSession(s)) return adoptTargetLabel(s);
+  return sessionBackingInfo(s, snapshot).label;
+}
+
+function hasRecoverableBackingSession(s: SessionData, snapshot?: BackingProbeSnapshot): boolean {
+  if (isSuspendableBackendType(s.backendType)) {
+    // Unknown means the backend probe itself was inconclusive; keep the session
+    // rather than closing a potentially recoverable conversation from `list`.
+    // ZMX has one daemon per session. A clean "missing" result cannot
+    // distinguish a host reboot from an individual CLI exit, so keep the
+    // transcript-backed row for lazy resume instead of auto-pruning it.
+    if (s.backendType === 'zmx') return true;
+    const target = sessionPersistentTarget(s)!;
+    const probe = backingProbe(snapshot, target);
+    return probe === 'exists' || probe === 'unknown';
+  }
+  // Legacy sessions created before backendType stamping only had tmux recovery.
+  const target = sessionPersistentTarget(s);
+  return !!target && backingProbe(snapshot, target) === 'exists';
 }
 
 /** Shorten path for display: replace $HOME with ~. */
@@ -3645,7 +3799,7 @@ function shortenPath(p: string): string {
 }
 
 /** Interactive TUI session picker — returns a promise that resolves when done. */
-function interactiveSessionPicker(active: SessionData[]): Promise<void> {
+function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingProbeSnapshot): Promise<void> {
   const botConfigs = loadBotConfigsForDisplay();
   const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.larkAppId).filter(Boolean)).size > 1;
   const botLabels = new Map<string, string>();
@@ -3682,17 +3836,19 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
     session: SessionData;
     text: string;
     alive: boolean;
-    tmuxName: string;
-    hasTmux: boolean;
+    backendTarget?: PersistentBackendTarget;
+    backingProbe: 'exists' | 'missing' | 'unknown';
+    attachBackend?: 'tmux' | 'zmx';
     isAdopt: boolean;
     targetLabel: string;
     canAttach: boolean;
   }> {
     return active.map(s => {
-      const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
       const isAdopt = isAdoptedSession(s);
-      const hasTmux = !isAdopt && tmuxSessionExists(tmuxName);
-      const targetLabel = sessionTargetLabel(s, tmuxName, hasTmux);
+      const backing = isAdopt
+        ? { probe: 'missing' as const, label: adoptTargetLabel(s) }
+        : sessionBackingInfo(s, probeSnapshot);
+      const targetLabel = backing.label;
       // Build row text with shortened dir
       const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
       const parts = [id];
@@ -3710,7 +3866,20 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       const target = padEndDisplay(truncate(targetLabel, cols.target), cols.target);
       parts.push(title, dir, pid, uptime, status, target);
 
-      return { session: s, text: parts.join(' │ '), alive, tmuxName, hasTmux, isAdopt, targetLabel, canAttach: hasTmux && !isAdopt };
+      return {
+        session: s,
+        text: parts.join(' │ '),
+        alive,
+        backendTarget: 'target' in backing ? backing.target : undefined,
+        backingProbe: backing.probe,
+        attachBackend: 'attachBackend' in backing ? backing.attachBackend : undefined,
+        isAdopt,
+        targetLabel,
+        canAttach: !isAdopt
+          && backing.probe === 'exists'
+          && !!('attachBackend' in backing && backing.attachBackend)
+          && !!('target' in backing && backing.target),
+      };
     });
   }
 
@@ -3771,9 +3940,9 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
     const selected = rows[cursor];
     const targetHint = selected.isAdopt
       ? `\x1b[33m${selected.targetLabel}\x1b[0m  \x1b[2mEnter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。\x1b[0m`
-      : selected.hasTmux
-        ? `\x1b[32mtmux: ${selected.tmuxName}\x1b[0m`
-        : `\x1b[2mtmux: 无会话\x1b[0m`;
+      : selected.canAttach
+        ? `\x1b[32m${selected.attachBackend}: ${selected.backendTarget?.sessionName}\x1b[0m`
+        : `\x1b[2m${selected.targetLabel}（不可连接）\x1b[0m`;
     process.stdout.write(`\n  ${targetHint}\n`);
 
     // Flash message or confirmation prompt
@@ -3881,7 +4050,7 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
         return;
       }
 
-      // Enter — attach to tmux
+      // Enter — attach to a managed persistent backend.
       if (key === '\r' || key === '\n') {
         const selected = rows[cursor];
         if (selected.isAdopt) {
@@ -3890,16 +4059,50 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
           return;
         }
         if (!selected.canAttach) {
-          flashMsg = '\x1b[33m该会话没有 tmux，无法连接\x1b[0m';
+          flashMsg = '\x1b[33m该会话没有可连接的持久后端\x1b[0m';
           render();
           return;
         }
-        applyTmuxWindowSizeLargest(selected.tmuxName);
-        cleanup();
-        spawnSync('tmux', ['attach-session', '-t', selected.tmuxName], {
-          stdio: 'inherit',
-          env: tmuxEnv(),
-        });
+        if (selected.attachBackend === 'zmx') {
+          const target = selected.backendTarget;
+          if (!target || target.backendType !== 'zmx') {
+            flashMsg = '\x1b[31mZMX attach target is missing or inconsistent\x1b[0m';
+            render();
+            return;
+          }
+          // First prove both complete Botmux labels while the picker is still
+          // active, then freeze the PTY root generation across terminal
+          // cleanup and re-prove it immediately before attach.
+          const frozen = freezeManagedZmxAttachTarget(
+            target.sessionName,
+            selected.session.sessionId,
+          );
+          if (!frozen.ok) {
+            flashMsg = `\x1b[31m${frozen.message}\x1b[0m`;
+            render();
+            return;
+          }
+          cleanup();
+          const attached = attachFrozenManagedZmxSession(
+            target.sessionName,
+            selected.session.sessionId,
+            frozen.pid,
+          );
+          if (!attached.ok) console.error(attached.message);
+        } else {
+          const target = selected.backendTarget;
+          if (!target || target.backendType !== 'tmux') {
+            flashMsg = '\x1b[31mtmux attach target is missing or inconsistent\x1b[0m';
+            render();
+            return;
+          }
+          cleanup();
+          applyTmuxWindowSizeLargest(target.sessionName);
+          spawnSync('tmux', ['attach-session', '-t', `=${target.sessionName}`], {
+            stdio: 'inherit',
+            env: tmuxEnv(),
+          });
+        }
         resolve();
         return;
       }
@@ -3907,11 +4110,42 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
   });
 }
 
+/**
+ * Internal host-only bridge used by Dashboard "Open CLI" commands. The
+ * generated terminal shell executes this exact checkout's cli.js, keeping all
+ * ZMX ownership checks in TypeScript instead of approximating them with
+ * name-only shell pipelines.
+ */
+function cmdManagedZmxAttach(args: string[]): void {
+  const [name, sessionId, ...extra] = args;
+  if (!name?.trim() || !sessionId?.trim() || extra.length > 0) {
+    console.error('internal usage: __zmx-attach-managed <session-name> <complete-session-id>');
+    process.exitCode = 2;
+    return;
+  }
+  const frozen = freezeManagedZmxAttachTarget(name, sessionId);
+  if (!frozen.ok) {
+    console.error(frozen.message);
+    process.exitCode = 1;
+    return;
+  }
+  const attached = attachFrozenManagedZmxSession(name, sessionId, frozen.pid);
+  if (!attached.ok) {
+    console.error(attached.message);
+    process.exitCode = 1;
+  }
+}
+
 async function cmdList(): Promise<void> {
   const sessions = loadSessions();
   const active = [...sessions.values()].filter(s => s.status === 'active');
+  // One immutable control-plane snapshot per invocation. In particular, ZMX's
+  // full-list probe walks every per-session daemon, so running it once per row
+  // would make a large session list quadratic and amplify socket timeouts.
+  const probeSnapshot = buildBackingProbeSnapshot(active);
 
-  // Auto-prune unrecoverable sessions: process dead and no tmux session.
+  // Auto-prune unrecoverable sessions: process dead and no recoverable backing
+  // session (tmux/herdr/zellij/zmx).
   // Split into two buckets so a never-activated daemon-command scratch (e.g. an
   // unconfirmed /adopt that only posted a picker card, /help, an abandoned
   // /relay picker) isn't reported as a crashed CLI. Such a scratch never forked
@@ -3937,24 +4171,37 @@ async function cmdList(): Promise<void> {
     }
 
     const hasPid = !!(s.pid && isProcessAlive(s.pid));
-    const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-    const disposition = sessionListDisposition(s, { hasPid, hasBackingSession: hasTmux });
+    const hasBackingSession = hasRecoverableBackingSession(s, probeSnapshot);
+    const disposition = sessionListDisposition(s, { hasPid, hasBackingSession });
     if (disposition === 'prune_real') pruned.push(s);
     else if (disposition === 'prune_scratch') prunedScratch.push(s);
     else live.push(s);
   }
-  const closeNow = (arr: SessionData[]) => {
+  const closeNow = async (arr: SessionData[], kind: 'scratch' | 'real'): Promise<number> => {
+    let closed = 0;
     for (const s of arr) {
-      s.status = 'closed';
-      s.closedAt = new Date().toISOString();
-      saveSession(s);
+      const result = await closeSessionForDelete(s);
+      if (result.ok) {
+        closed++;
+      } else {
+        // Keep it visible: mutating only the store while a possible owner
+        // daemon still has the row in memory lets the next message resurrect
+        // exactly the session auto-prune claimed to close.
+        live.push(s);
+        console.warn(
+          `⚠️ 未自动清理 ${kind === 'scratch' ? '占位' : '会话'} ${s.sessionId.substring(0, 8)}：${result.error}`,
+        );
+      }
     }
+    return closed;
   };
   // Scratches: close silently — they were placeholders, not dead sessions.
-  closeNow(prunedScratch);
+  await closeNow(prunedScratch, 'scratch');
   if (pruned.length > 0) {
-    closeNow(pruned);
-    console.log(`已自动清理 ${pruned.length} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+    const closed = await closeNow(pruned, 'real');
+    if (closed > 0) {
+      console.log(`已自动清理 ${closed} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+    }
   }
 
   // Sort by creation time, newest first
@@ -3967,12 +4214,12 @@ async function cmdList(): Promise<void> {
 
   // Non-TTY (piped output) or explicit --plain flag: plain table
   if (!process.stdout.isTTY || process.argv.includes('--plain')) {
-    printSessionTable(live);
+    printSessionTable(live, probeSnapshot);
     return;
   }
 
   // Interactive TUI
-  await interactiveSessionPicker(live);
+  await interactiveSessionPicker(live, probeSnapshot);
 }
 
 async function cmdDelete(): Promise<void> {
@@ -3984,6 +4231,7 @@ async function cmdDelete(): Promise<void> {
 
   const sessions = loadSessions();
   const active = [...sessions.values()].filter(s => s.status === 'active');
+  const probeSnapshot = buildBackingProbeSnapshot(active);
 
   if (active.length === 0) {
     console.log('没有活跃会话。');
@@ -4007,8 +4255,7 @@ async function cmdDelete(): Promise<void> {
         return pid ? !isProcessAlive(pid) : !(s.pid && isProcessAlive(s.pid));
       }
       const hasPid = !!(s.pid && isProcessAlive(s.pid));
-      const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-      return !hasPid && !hasTmux;
+      return !hasPid && !hasRecoverableBackingSession(s, probeSnapshot);
     });
     if (toDelete.length === 0) {
       console.log('没有 stopped 状态的会话。');
@@ -4316,24 +4563,19 @@ async function cmdRoleSwitch(argv: string[]): Promise<void> {
  * so SESSION_DATA_DIR / breadcrumb-overridden deployments find the right
  * descriptor directory.
  */
-function listOnlineDaemons(): Array<{
+interface DaemonDescriptorLite {
   ipcPort: number;
   larkAppId: string;
+  pid?: number;
   bootInstanceId?: string;
   workflowIpcProtocol?: string;
   lastHeartbeat?: number;
-}> {
+}
+
+function listDaemonDescriptors(): DaemonDescriptorLite[] {
   const regDir = join(resolveDataDir(), 'dashboard-daemons');
   if (!existsSync(regDir)) return [];
-  const STALE_MS = 90_000;
-  const now = Date.now();
-  const all: Array<{
-    ipcPort: number;
-    larkAppId: string;
-    bootInstanceId?: string;
-    workflowIpcProtocol?: string;
-    lastHeartbeat?: number;
-  }> = [];
+  const all: DaemonDescriptorLite[] = [];
   let names: string[] = [];
   try { names = readdirSync(regDir); } catch { return []; }
   for (const f of names) {
@@ -4341,29 +4583,30 @@ function listOnlineDaemons(): Array<{
     try {
       const d = JSON.parse(readFileSync(join(regDir, f), 'utf-8'));
       if (typeof d?.ipcPort !== 'number' || typeof d?.larkAppId !== 'string') continue;
-      if (now - (d.lastHeartbeat ?? 0) > STALE_MS) continue;
       all.push({
         ipcPort: d.ipcPort,
         larkAppId: d.larkAppId,
+        ...(typeof d.pid === 'number' ? { pid: d.pid } : {}),
         ...(typeof d.bootInstanceId === 'string' && d.bootInstanceId
           ? { bootInstanceId: d.bootInstanceId }
           : {}),
         ...(typeof d.workflowIpcProtocol === 'string' && d.workflowIpcProtocol
           ? { workflowIpcProtocol: d.workflowIpcProtocol }
           : {}),
-        lastHeartbeat: d.lastHeartbeat,
+        ...(typeof d.lastHeartbeat === 'number' ? { lastHeartbeat: d.lastHeartbeat } : {}),
       });
     } catch { /* skip malformed */ }
   }
   return all;
 }
 
-function findDaemon(larkAppId?: string): {
-  ipcPort: number;
-  larkAppId: string;
-  bootInstanceId?: string;
-  workflowIpcProtocol?: string;
-} | null {
+function listOnlineDaemons(): DaemonDescriptorLite[] {
+  const STALE_MS = 90_000;
+  const now = Date.now();
+  return listDaemonDescriptors().filter(d => now - (d.lastHeartbeat ?? 0) <= STALE_MS);
+}
+
+function findDaemon(larkAppId?: string): DaemonDescriptorLite | null {
   const all = listOnlineDaemons();
   if (larkAppId) return all.find(d => d.larkAppId === larkAppId) ?? null;
   return all[0] ?? null;
@@ -4900,6 +5143,8 @@ async function cmdResume(): Promise<void> {
     console.error('❌ adopt 接管会话不支持 resume。');
   } else if (errCode === 'deferred_unmaterialized') {
     console.error('❌ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，不能 resume。');
+  } else if (errCode === 'resume_cancelled') {
+    console.error('❌ 恢复过程中会话被关闭，本次 resume 已取消。');
   } else {
     console.error(`❌ 恢复失败: ${errCode}`);
   }
@@ -5000,6 +5245,8 @@ async function cmdTermLink(rest: string[]): Promise<void> {
     console.error('❌ daemon 中该会话非活跃，无法获取可操作终端。');
   } else if (errCode === 'terminal_unavailable') {
     console.error('❌ 该会话终端尚未就绪（worker 未起或缺 token）。等会话起来再试。');
+  } else if (errCode === 'terminal_unsupported') {
+    console.error('❌ 该会话后端不提供 Web 终端；ZMX 会话请在本机运行 botmux list 或 zmx attach。');
   } else if (errCode === 'no_owner') {
     console.error('❌ 该 bot 未配置 owner（allowedUsers 为空 / 全开放模式），没有可私密投递的对象。');
   } else if (errCode === 'delivery_failed') {
@@ -10343,6 +10590,7 @@ switch (command) {
   }
   case 'list':
   case 'ls':      await cmdList(); break;
+  case '__zmx-attach-managed': cmdManagedZmxAttach(process.argv.slice(3)); break;
   case 'delete':
   case 'del':
   case 'rm':      await cmdDelete(); break;

@@ -134,6 +134,8 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 | `sandboxReadonlyPaths` | Extra existing paths mounted read-only inside the sandbox, useful for shared source snapshots, reference repos, or generated docs the bot should inspect but not modify |
 | `sandboxNetwork` | Network policy for sandboxed sessions. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` and blocks normal network egress |
 
+> ZMX cannot enforce the file sandbox or effective read isolation, so configurations that enable those boundaries fail closed; see [ZMX backend boundaries](/en/zmx#unsupported-combinations).
+
 ## Cards and terminal
 
 | Field | Description |
