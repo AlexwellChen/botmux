@@ -1129,7 +1129,7 @@ export interface BotConfig {
    * canTalk（oncall 群成员 / allowedChatGroups / chatGrant / globalGrant / p2pOpen 私聊
    * 等对话放行腿）。与 passthrough 无关——命令仍由 daemon 自己处理，只是准入门槛不同。
    * 解析时归一化（转小写、自动补 `/`、去重），且**只接受 DAEMON_COMMANDS 内的命令**，
-   * 其余条目丢弃并 warn。带 handler 内部第二道 owner 闸的命令（/card /term /insight /land）
+   * 其余条目丢弃并 warn。带 handler 内部第二道 owner 闸的命令（/card /term /insight）
    * 即使列入也仍会被内部闸拒绝（fail-closed，不视为本字段的适用对象）。
    * ⚠️ 与 `restrictGrantCommands` 的组合：那个开关在路由里先于本名单生效——开着时
    * chatGrant/globalGrant 被授权人发任何 slash 命令都被更早的限制闸挡下，本名单

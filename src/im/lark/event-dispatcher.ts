@@ -1408,7 +1408,7 @@ export function canOperate(
  * 对话放行腿命中即可）。名单外或未配置 → 与 canOperate 完全等价（现状不变）。
  *
  * 只作用于 daemon.ts 两条路由的 DAEMON_COMMANDS 统一闸；在统一闸之前特判的命令
- * （/vc-auth /term）与 handler 内部自带 owner 闸的命令（/card /insight /land）
+ * （/vc-auth /term）与 handler 内部自带 owner 闸的命令（/card /insight）
  * 不受影响——内部闸仍是最终权威（fail-closed）。
  *
  * chatType 省略时 p2pOpen 腿不生效（fail-closed），与 canTalk 语义一致——

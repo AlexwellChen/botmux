@@ -523,7 +523,6 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group)',
   'help.dashboard': '/dashboard [module] - Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.)',
   'help.insight': '/insight    - Show tool-call summary and risk suggestions for this session (operators only)',
-  'help.land': '/land       - Preview sandbox-session diffs and let the owner confirm applying them to disk',
   'help.subscribe_doc': '/subscribe-lark-doc <doc link|list|off> - Subscribe through the Feishu API (requires a doc-scoped User Token)',
   'help.watch_comment': '/watch-comment <doc link|list|off> - Watch doc comments and post AI replies back into their threads',
   'help.vc': '/vc prepare <meeting link or number> - Use the current regular group as a preparation chat and reuse the same Agent session during the meeting',
@@ -1146,16 +1145,6 @@ export const messages: Record<string, string> = {
 
   // Auto-start (joined chat) member-read failure admin DM
   'daemon.auto_start_member_read_failed': '⚠️ botmux “auto-start when added to a new chat” is on, but reading the chat members failed, so it can’t tell whether any authorized user is present — auto-start was skipped.\n\nMost likely cause: missing permission to read chat members (im:chat / chat info), or the “bot added to chat” event `im.chat.member.bot.added_v1` isn’t subscribed.\n\nGo to the Lark Open Platform → your app → Permissions / Event subscriptions to add them, then `botmux restart`.\n\nDetails: {detail}',
-
-  // Sandbox landing (/land) errors
-  'sandbox.no_clone': 'This session has no sandbox change layer (sandbox off, or the layer was cleaned up).',
-  'sandbox.clone_not_git': 'The sandbox change layer is unavailable; landing isn’t supported.',
-  'sandbox.nothing_to_land': 'No changes to land.',
-  'sandbox.target_not_git': 'Landing target directory does not exist: {dir}',
-  'sandbox.apply_failed': 'Landing failed: {detail}',
-  'sandbox.diff_failed': 'Reading sandbox changes failed: {detail}',
-  'sandbox.workingdir_not_found': 'Session workingDir not found',
-  'sandbox.no_changes_left': 'The sandbox change layer has no changes left',
 
   // ─── Dashboard create session ──────────────────────────────────────────────
   'cmd.createSession.untitled': 'New session',

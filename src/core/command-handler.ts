@@ -3358,7 +3358,6 @@ export async function handleCommand(
           t('help.term', undefined, loc),
           t('help.dashboard', undefined, loc),
           t('help.insight', undefined, loc),
-          t('help.land', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
           t('help.watch_comment', undefined, loc),
           t('help.vc', undefined, loc),
