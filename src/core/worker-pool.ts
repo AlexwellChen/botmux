@@ -38,7 +38,7 @@ import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
+import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 
@@ -79,10 +79,10 @@ import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.j
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import type { CliTurnPayload, CodexAppTurnInput, DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, isDocNativeSession, type DaemonSession } from './types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, isDocNativeSession, larkTransportEnabled, type DaemonSession } from './types.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { prependBotmuxBin } from './botmux-wrapper.js';
+import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -1112,6 +1112,11 @@ export async function deliverEphemeralOrReply(
  * any previously queued value — only the latest state matters).
  */
 export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: string): void {
+  // Defense-in-depth transport gate: a no-transport session (apiOnly bot or HTTP
+  // virtual chat) has no real Feishu card to PATCH. Callers already suppress via
+  // managedAuxUiSuppressed, but guarding the flush entry too means a stray direct
+  // call can never dial updateMessage on a synthetic id.
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
   // Bot opted out of the streaming card — never patch one into existence.
   // Turn-exact when the caller has turn context (screen updates): a substitute
   // turn arriving mid-PATCH must not suppress a normal turn's card (or vice
@@ -2371,9 +2376,12 @@ export function forkWorker(
   const familyAdapter = createCliAdapterSync(agentCfg.cliId, agentCfg.cliPathOverride);
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
 
-  // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
-  // The wrapper script there is written by the daemon at startup.
-  const botmuxBinDir = join(homedir(), '.botmux', 'bin');
+  // Prepend the botmux wrapper bin dir to PATH so CLIs can call `botmux send` etc.
+  // Single source of truth (resolveBotmuxWrapperBinDir): core-only → dedicated
+  // `<SESSION_DATA_DIR>/bin` (not the shared ~/.botmux/bin), matching where the
+  // daemon WROTE the wrapper — else the worker PATH would miss it or a same-HOME
+  // fleet wrapper would shadow it (codex P1).
+  const botmuxBinDir = resolveBotmuxWrapperBinDir(process.env);
   const pathWithBotmux = prependBotmuxBin(botmuxBinDir, process.env.PATH);
 
   const forkEnv = workerForkEnv(process.env);
@@ -2389,7 +2397,11 @@ export function forkWorker(
       SESSION_DATA_DIR: config.session.dataDir,
       BOTMUX_SESSION_ID: ds.session.sessionId,
       LARK_APP_ID: botCfg.larkAppId,
-      LARK_APP_SECRET: botCfg.larkAppSecret,
+      // Withhold the real secret from the worker's own CLI env for a no-transport
+      // session (apiOnly bot or HTTP virtual chat). SEPARATE leak from the
+      // init-message larkAppSecret — the spawned CLI env carries it directly from
+      // botCfg. Empty it here too so no secret reaches the worker/sandbox.
+      LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     },
   } as WindowsForkOptions);
   const startupState: WorkerStartupState = {
@@ -2492,7 +2504,16 @@ export function forkWorker(
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).
-    readIsolation: botCfg.readIsolation === true,
+    // HARD credential boundary for a no-transport session (apiOnly bot OR HTTP
+    // virtual chat): force read isolation so the CLI physically cannot read the
+    // full bots.json / sibling BOT_HOME / send-cred / lark-cli store — a model
+    // that deletes/forges the ancestry marker or bypasses the CLI still cannot
+    // build ANY (sibling) Lark client. The pid-marker gate is only friendly
+    // early-reject; THIS is the fail-closed boundary. Reuses the existing unified
+    // fs-policy (mac+Linux fail-closed); a backend that can't isolate locally
+    // refuses to spawn rather than leak creds.
+    readIsolation: botCfg.readIsolation === true
+      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }),
     readDenyExtraPaths: botCfg.readDenyExtraPaths ?? [],
     // Identifies THIS daemon lifetime. Stamped onto isolated panes so the worker
     // can tell a suspend→resume reattach (same boot id, still isolated) from a
@@ -2521,7 +2542,20 @@ export function forkWorker(
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
-    larkAppSecret: botCfg.larkAppSecret,
+    // Freeze on the session transport capability: a no-transport session
+    // (apiOnly bot OR HTTP virtual chat) must not even RECEIVE the real secret —
+    // withholding it removes the capability rather than gating a tamperable flag
+    // the sandboxed agent could flip. The worker then physically cannot dial
+    // Feishu (uploader/cred-write are also skipped downstream on the same test).
+    larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
+    apiOnly: botCfg.apiOnly,
+    // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
+    // no-transport worker's fs-policy denies it from a HOST-owned fact, not a
+    // guess off BOTS_CONFIG env (which the agent could see/forge). When it lives
+    // outside every botmux authority root, buildFsPolicy fails the spawn closed
+    // rather than silently masking an arbitrary parent dir (codex P1). Omitted
+    // from forkAdoptWorker below — its observe branch returns before fs-policy.
+    loadedBotsConfigPath: getLoadedConfigPath(),
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
@@ -2699,6 +2733,14 @@ function setupWorkerHandlers(
   /** Auxiliary worker UI is never an authorized output channel for a dedicated
    * VC receiver. Dashboard/audit state is still updated before these guards. */
   const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
+    // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
+    // Feishu chat to render a card/reaction into. Suppress ALL auxiliary UI at
+    // the single source every aux-UI handler funnels through — this is the
+    // authoritative fix, NOT a fake "success" message id from sessionReply (a
+    // synthetic id would get stored as streamCardId and later scheduleCardPatch
+    // → updateMessage would still dial Feishu). Dashboard/web-terminal state is
+    // still updated before these guards, so the terminal view is unaffected.
+    if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
     if (isSilentScheduledTurn(ds, turnId)) return true;
     if (ds.session.vcMeetingReceiver) return true;
     return ordinaryManagedSuppression(turnId, dispatchAttempt);
@@ -4636,11 +4678,19 @@ function reserveWorkerGeneration(ds: DaemonSession): number {
  * a fresh CLI, which the sandbox wraps normally.
  */
 export function adoptSandboxBlocked(
-  botCfg: { sandbox?: boolean; readIsolation?: boolean },
-  session?: { sandbox?: boolean },
+  botCfg: { sandbox?: boolean; readIsolation?: boolean; apiOnly?: boolean },
+  session?: { sandbox?: boolean; chatId?: string },
 ): boolean {
   return botCfg.sandbox === true
     || botCfg.readIsolation === true
+    // A core-only (apiOnly) bot — or a session on a synthetic HTTP virtual chat —
+    // must NOT adopt-observe a pre-existing external CLI: that CLI runs fully
+    // unisolated (the adopt observe branch returns before any fs-policy build),
+    // so it could read this host's bots.json / sibling creds on behalf of a
+    // no-transport turn. Convert to cold-start instead (same as sandbox adopt).
+    || botCfg.apiOnly === true
+    || (typeof session?.chatId === 'string'
+        && (session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')))
     || session?.sandbox === true
     || sandboxEnabled();
 }
@@ -4712,7 +4762,9 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       CLAUDECODE: undefined,
       BOTMUX: '1',
       LARK_APP_ID: botCfg.larkAppId,
-      LARK_APP_SECRET: botCfg.larkAppSecret,
+      // Withhold the real secret from the adopt worker's CLI env for a
+      // no-transport session — same rationale as forkWorker above.
+      LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     },
   } as WindowsForkOptions);
   const startupState: WorkerStartupState = { ready: false, failureNotified: false };
@@ -4838,7 +4890,13 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
-    larkAppSecret: botCfg.larkAppSecret,
+    // Freeze on the session transport capability: a no-transport session
+    // (apiOnly bot OR HTTP virtual chat) must not even RECEIVE the real secret —
+    // withholding it removes the capability rather than gating a tamperable flag
+    // the sandboxed agent could flip. The worker then physically cannot dial
+    // Feishu (uploader/cred-write are also skipped downstream on the same test).
+    larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
+    apiOnly: botCfg.apiOnly,
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,

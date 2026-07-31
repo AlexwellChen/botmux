@@ -141,7 +141,7 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
-import { sessionAnchorId, type DaemonSession } from './types.js';
+import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 import {
@@ -381,8 +381,32 @@ function tokenRouteAuthorized(req: IncomingMessage, bind?: string): boolean {
 }
 
 function routeHasPublicAccess(method: string, pathname: string): boolean {
-  // Liveness contains no data and performs no mutation.
-  return method === 'GET' && pathname === '/__health';
+  // Liveness contains no data and performs no mutation. /healthz is the
+  // core-only public alias of /__health (riff's sandbox launcher polls it).
+  return method === 'GET' && (pathname === '/__health' || pathname === '/healthz');
+}
+
+/**
+ * Core-only ONLY: the exact riff-facing routes that bypass the trusted-host HMAC
+ * when the daemon runs headless in riff's sandbox. Everything else STILL requires
+ * the HMAC (codex P1: authRequired:false opened all 96 IPC routes — a co-resident
+ * model turn could read/perturb sessions, scheduler, mutations). This is a tight
+ * allowlist of drive-my-own-turn + poll-my-own-output surfaces:
+ *   POST /api/trigger                              (start a turn)
+ *   GET  /api/sessions/:id/trigger-result          (poll final)
+ *   GET  /api/sessions/:id/insight                 (poll conversation/progress)
+ * `/api/asks/answer` is deliberately EXCLUDED — it is askId-keyed with no
+ * session/turn binding, so exposing it would let any co-resident turn hijack
+ * another pending ask (codex). riff's async main-link needs no awaiting_input;
+ * a future clarify path must be a sessionId+interaction-bound endpoint.
+ */
+function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
+  if (method === 'POST' && pathname === '/api/trigger') return true;
+  if (method === 'GET') {
+    return /^\/api\/sessions\/[^/]+\/trigger-result$/.test(pathname)
+      || /^\/api\/sessions\/[^/]+\/insight$/.test(pathname);
+  }
+  return false;
 }
 
 function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
@@ -444,6 +468,32 @@ function trustedHostAuthorized(
 }
 
 ipcRoute('GET', '/__health', (_req, res) => {
+  jsonRes(res, 200, { ok: true });
+});
+// Core-only readiness barrier (codex P1-3): the daemon binds its HTTP port BEFORE
+// restoreActiveSessions / v3 cold-attach / scheduler finish, so a launcher that
+// triggers the instant the port answers would race durable restore (transient
+// not_found / re-fire). /healthz returns 503 until the daemon marks itself ready
+// (setCoreOnlyReady, called AFTER restore in daemon.ts). Non-core-only daemons
+// never set this gate, so /healthz stays an unconditional 200 there.
+let coreOnlyReadinessGate = false; // true only in core-only, until ready
+let coreOnlyReady = false;
+export function armCoreOnlyReadinessGate(): void { coreOnlyReadinessGate = true; }
+export function setCoreOnlyReady(): void { coreOnlyReady = true; }
+/** @internal test-only: reset the core-only readiness gate between cases. */
+export function __testOnly_resetCoreOnlyReadiness(): void { coreOnlyReadinessGate = false; coreOnlyReady = false; }
+/** True when the readiness gate is armed (core-only) but restore hasn't finished.
+ *  The server-level gate returns 503 for the public control routes in this state,
+ *  and /healthz reports 'starting' — a barrier so riff can't trigger into a racing
+ *  durable restore even if it skips the healthz probe (codex P1). */
+function coreOnlyNotReady(): boolean { return coreOnlyReadinessGate && !coreOnlyReady; }
+// Public alias for core-only: riff's sandbox launcher polls GET /healthz to know
+// the service is FULLY up (bound AND restore-complete). 200 {ok:true} once ready;
+// 503 {ok:false,status:'starting'} while the readiness gate is armed but not ready.
+ipcRoute('GET', '/healthz', (_req, res) => {
+  if (coreOnlyNotReady()) {
+    return jsonRes(res, 503, { ok: false, status: 'starting' });
+  }
   jsonRes(res, 200, { ok: true });
 });
 
@@ -576,6 +626,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
  *  Best-effort and fire-and-forget; never blocks the HTTP response. */
 function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
   if (!ds.larkAppId) return;
+  // No-transport session (apiOnly bot or HTTP virtual chat) has no Feishu chat
+  // to post a restart notice into — skip (the raw sendMessage/replyMessage below
+  // bypass sessionReply's gate). Best-effort path; a silent skip is correct.
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
   const loc = localeForBot(ds.larkAppId);
   const cliName = getCliDisplayName(ds.session.cliId ?? 'claude-code');
   const text = fresh
@@ -798,6 +852,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   if (ds.chatType !== 'group') return jsonRes(res, 400, { ok: false, error: 'not_group_chat' });
   const normalized = normalizeLarkChatName(body.name);
   if (!normalized.ok) return jsonRes(res, 400, normalized);
@@ -921,6 +976,20 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
  *  store 持有同一对象，改字段后 updateSession 即落盘。 */
 function findSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
+}
+
+/** True when a session-bound IPC route must NOT touch Feishu: the owning bot is
+ *  core-only (apiOnly) OR the session is an HTTP virtual chat. Central guard for
+ *  every session-write route (chat-rename / write-link-card / resume-notice /
+ *  locate / restart-notice …) — the daemon owns the authoritative bot config,
+ *  so gating here catches the normal-bot-in-virtual-session case that
+ *  getBotClient (which only throws for apiOnly) cannot. Accepts a live
+ *  DaemonSession or a stored Session record. Never throws. */
+function sessionTransportDisabled(s: { chatId?: string; larkAppId?: string }): boolean {
+  const appId = s.larkAppId;
+  let apiOnly = false;
+  if (appId) { try { apiOnly = getBot(appId).config.apiOnly === true; } catch { /* unknown bot → not apiOnly */ } }
+  return !larkTransportEnabled({ chatId: s.chatId ?? '', apiOnly });
 }
 
 /** Four-state async lookup with durable fallback (design A).
@@ -1090,6 +1159,12 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   const appId = session.larkAppId || cachedLarkAppId;
   if (!appId) return jsonRes(res, 422, { ok: false, error: 'no_lark_app' });
+  // No-transport session (apiOnly bot or HTTP virtual chat) has no Feishu chat
+  // history — listChatMessages/listThreadMessages would dial Feishu with a
+  // synthetic chatId. Return empty history instead of making the network call.
+  if (!larkTransportEnabled({ chatId: session.chatId, apiOnly: getBot(appId).config.apiOnly })) {
+    return jsonRes(res, 200, { ok: true, messages: [], hint: 'no_feishu_transport' });
+  }
   const url = new URL(req.url ?? '/', 'http://localhost');
   const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '80', 10) || 80, 1), 200);
   try {
@@ -1385,6 +1460,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, pa
   if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   const r = await deliverWriteLinkCardToOwners(ds);
   const status = r.ok ? 200
     : r.error === 'terminal_unavailable' ? 409
@@ -1442,7 +1518,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const cliId = ds.session.cliId;
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const notice = JSON.stringify({ text: `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。` });
-  if (ds.larkAppId) {
+  if (ds.larkAppId && !sessionTransportDisabled(ds)) {
     if (ds.scope === 'chat' && ds.chatId) {
       getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
         .then((mode) => mode === 'topic' && ds.session.rootMessageId
@@ -1631,6 +1707,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
   }
   if (!ctx.ownerOpenId) {
     return jsonRes(res, 422, { ok: false, error: 'no_owner' });
+  }
+  // No-transport session (apiOnly bot or HTTP virtual chat) has no Feishu thread
+  // to @-locate the owner in — the replyMessage below would dial Feishu.
+  if (sessionTransportDisabled({ chatId: ds?.chatId ?? closed?.chatId, larkAppId: ctx.larkAppId })) {
+    return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   }
   try {
     const messageId = await replyMessage(
@@ -3589,13 +3670,32 @@ export function startIpcServer(opts: {
    * deliberate secret repair cannot strand a daemon on a stale cached key.
    * Tests that omit this option retain the lightweight in-process server. */
   authRequired?: boolean;
+  /** Upward-probe span on EADDRINUSE. Default DEFAULT_PROBE_SPAN (fleet daemons
+   * step to the next free port so a port race can't crash boot). Core-only
+   * (single in-sandbox service) sets 0 to BIND-OR-FAIL on the exact requested
+   * port — riff's task-runner is told a fixed port and must not have the service
+   * silently drift to another one. */
+  maxProbe?: number;
+  /** Core-only: additionally treat the tight riff-facing route allowlist
+   * (routeIsCoreOnlyPublic) as public (no HMAC). Every OTHER route still requires
+   * the trusted-host HMAC — this does NOT disable auth wholesale (codex P1). */
+  coreOnlyPublicRoutes?: boolean;
 }): Promise<IpcServerHandle> {
   let boundPort = opts.port;
   const server: Server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       const method = req.method ?? 'GET';
-      const publicRoute = routeHasPublicAccess(method, url.pathname);
+      const coreOnlyPublic = opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname);
+      const publicRoute = routeHasPublicAccess(method, url.pathname) || coreOnlyPublic;
+      // Readiness barrier (codex P1): the core-only public control routes
+      // (trigger / trigger-result / insight) must NOT enter their handlers until
+      // restore completes — a trigger during 'starting' races durable restore.
+      // Gate them at the server level so it doesn't depend on the caller probing
+      // /healthz first. /healthz itself reports 503 via its own handler.
+      if (coreOnlyPublic && coreOnlyNotReady()) {
+        return jsonRes(res, 503, { ok: false, status: 'starting', error: 'core-only service is still restoring; retry after /healthz returns 200' });
+      }
       const capabilityRoute = routeHasNarrowUntrustedAuth(method, url.pathname);
       if (opts.authRequired && !publicRoute) {
         const secret = ipcAuthSecret();
@@ -3632,6 +3732,7 @@ export function startIpcServer(opts: {
     server,
     port: opts.port,
     host: opts.host,
+    maxProbe: opts.maxProbe,
     log: (m) => logger.warn(`[dashboard-ipc] ${m}`),
   }).then((port) => {
     boundPort = port;

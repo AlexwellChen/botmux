@@ -16,6 +16,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter } from 'node:path';
+import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { homedir, tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
@@ -32,7 +33,7 @@ import {
   isolationPaneMarkerContent,
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
-import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths } from './adapters/cli/fs-policy.js';
+import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
@@ -399,7 +400,7 @@ function codexNativeTitleEnv(cfg: Extract<DaemonToWorker, { type: 'init' }>): No
     ...redactChildEnv(process.env),
     ...sanitizePerBotEnv(cfg.env),
   };
-  env.PATH = `${join(homedir(), '.botmux', 'bin')}${delimiter}${env.PATH ?? ''}`;
+  env.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), env.PATH);
   return env;
 }
 
@@ -562,7 +563,7 @@ async function captureCodexResumeTitleBaseline(threadId: string, engine?: CodexR
       ...redactChildEnv(process.env),
       ...sanitizePerBotEnv(cfg.env),
     };
-    env.PATH = `${join(homedir(), '.botmux', 'bin')}${delimiter}${env.PATH ?? ''}`;
+    env.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), env.PATH);
     const abortController = new AbortController();
     nativeSessionTitleSyncAbortControllers.add(abortController);
     try {
@@ -678,7 +679,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
   try {
     const cliBin = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride).resolvedBin;
     const engineEnv: NodeJS.ProcessEnv = { ...redactChildEnv(process.env) };
-    engineEnv.PATH = `${join(homedir(), '.botmux', 'bin')}:${engineEnv.PATH ?? ''}`;
+    engineEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), engineEnv.PATH);
     engineEnv.BOTMUX_SESSION_ID = cfg.sessionId;
     // In Codex/TraeX RPC mode the app-server, not the remote viewer TUI, runs
     // model shell tools. Give that process the same non-secret route binding as
@@ -4390,6 +4391,7 @@ let lastShotHash = '';
 let larkAppIdForUpload = '';
 let larkAppSecretForUpload = '';
 let larkBrandForUpload: 'feishu' | 'lark' = 'feishu';
+let apiOnlyForUpload = false;
 
 function startScreenshotLoop(): void {
   stopScreenshotLoop();
@@ -4445,6 +4447,7 @@ async function captureAndUpload(): Promise<void> {
   // stray scheduleOneShotAfterAction firing after user toggled back to hidden.
   if (displayMode !== 'screenshot') { logScreenshotSkip(`displayMode=${displayMode}`); return; }
   if (awaitingFirstPrompt)          { logScreenshotSkip('awaitingFirstPrompt'); return; }
+  if (apiOnlyForUpload)             { logScreenshotSkip('no Feishu transport (apiOnly bot or HTTP virtual session)'); return; }
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
 
   let png: Buffer;
@@ -6700,6 +6703,11 @@ async function spawnCli(
       BOTMUX_CHAT_ID: cfg.chatId,
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
     };
+    // Core-only capability must survive into the sandboxed CLI: riffModeSession
+    // rebuilds a synthetic BotConfig from env (no bots.json), and would otherwise
+    // drop apiOnly → getBotClient would not throw → `botmux send` could reach
+    // Feishu. Thread the flag so the reconstructed config keeps the boundary.
+    if (cfg.apiOnly) sessionEnv.BOTMUX_API_ONLY = '1';
     // Session scope for `botmux send` inside the sandbox. Thread sessions
     // anchor on a real om_ message (reply_in_thread); chat-scope sessions use
     // the chat id as anchor (sessionAnchorId), which is NOT a message id —
@@ -6734,6 +6742,19 @@ async function spawnCli(
     // Per-bot env (bots.json `env`) takes precedence over session context;
     // explicit riff config.env takes precedence over both.
     const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...cfg.backendConfig.env };
+    // Re-freeze the no-transport capability keys AFTER the merge: a stale or
+    // attacker-shaped backendConfig.env / per-bot env merges LAST and would
+    // otherwise override the frozen values, restoring send capability for a
+    // core-only bot or an HTTP virtual session. The host-owned session context
+    // is authoritative here — these keys cannot be overridden from config.
+    const noTransport = cfg.apiOnly === true
+      || cfg.chatId?.startsWith('http_async_') === true
+      || cfg.chatId?.startsWith('http_wait_') === true;
+    if (noTransport) {
+      delete mergedEnv.BOTMUX_LARK_APP_SECRET;
+      mergedEnv.BOTMUX_API_ONLY = '1';
+      mergedEnv.BOTMUX_CHAT_ID = cfg.chatId; // host-owned; never from config
+    }
     riffBackendConfig = Object.assign({}, cfg.backendConfig, { env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId });
     // 复用本地仓库+分支：多仓只认会话上的显式 stamp（仓库选择卡多选流按用户
     // 顺序写入 cfg.riffRepoDirs，首仓=primary）；否则仅对 workingDir 本身做单仓
@@ -7233,7 +7254,7 @@ async function spawnCli(
       mkdirSync(dirname(credPath), { recursive: true });
       writeFileSync(
         credPath,
-        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand }),
+        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly }),
         { mode: 0o600 },
       );
     } catch (e) {
@@ -7355,7 +7376,7 @@ async function spawnCli(
   // build can't read bots.json (Seatbelt-denied) → `botmux send` fails "Bot not registered".
   // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
   // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
-  childEnv.PATH = `${join(homedir(), '.botmux', 'bin')}:${childEnv.PATH ?? ''}`;
+  childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), childEnv.PATH);
   // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find the
   // daemon socket, route the card back to this thread, and resolve the
   // approver allowlist against session.owner. Missing env → exit 2.
@@ -7662,7 +7683,7 @@ async function spawnCli(
       }
     }
 
-    const policy = buildFsPolicy({
+    const fsPolicyCtx = {
       platform: process.platform as 'darwin' | 'linux',
       homeDir: sandboxHome,
       botmuxHome: canonical(dirname(dataDir)),
@@ -7671,6 +7692,26 @@ async function spawnCli(
       currentAppId: cfg.larkAppId,
       sessionId: cfg.sessionId,
       botHome: canonical(ownBotHome!),
+      // No-Lark-transport credential profile: apiOnly bot OR HTTP virtual chat.
+      // buildFsPolicy suppresses every Feishu-cred grant + hard-denies bots.json/
+      // lark-cli stores so a workingDir=~ grant can't re-expose them.
+      larkTransportEnabled: !(cfg.apiOnly === true
+        || cfg.chatId?.startsWith('http_async_') === true
+        || cfg.chatId?.startsWith('http_wait_') === true),
+      // ALWAYS freeze BOTH botmux authority roots for a no-transport turn: the
+      // configured one (`botmuxHome` above = dirname(dataDir)) AND the canonical
+      // default `~/.botmux`. A custom SESSION_DATA_DIR moves the data dir, but the
+      // default root still holds the live `.dashboard-secret` HMAC + bots.json —
+      // denying only one leaves the sibling-daemon escalation open (codex P1).
+      // Deduped inside buildFsPolicy when the two are equal (default layout).
+      defaultBotmuxHome: canonical(defaultBotmuxHome),
+      // The ACTUAL loaded bots-config path, frozen by the daemon
+      // (getLoadedConfigPath), NOT guessed from BOTS_CONFIG env here. Inside a
+      // frozen root → the parent mask already covers it; OUTSIDE every root →
+      // buildFsPolicy THROWS (fail-closed) rather than silently masking an
+      // arbitrary parent dir (`/tmp`, `/etc`, a project root) and bricking the
+      // core CLI (codex P1). Canonicalized so it shares the roots' namespace.
+      loadedBotsConfigPath: cfg.loadedBotsConfigPath ? canonical(cfg.loadedBotsConfigPath) : undefined,
       redirectedCliData: willRedirectCliData,
       cliDataPaths: willRedirectCliData ? undefined : keepExisting([
         cliAdapter.claudeDataDir,
@@ -7728,7 +7769,29 @@ async function spawnCli(
       writeRegexes: process.platform === 'darwin' && !willRedirectCliData && claudeDataDir
         ? [`^${sandboxHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.claude\\.json\\.tmp\\.[^/]+$`]
         : [],
-    });
+    };
+    const policy = (() => {
+      try {
+        return buildFsPolicy(fsPolicyCtx);
+      } catch (err) {
+        // A no-transport layout that cannot be safely confined (external
+        // bots-config, or workingDir that IS a Feishu-authority root) fails the
+        // spawn CLOSED with a diagnostic — never a silent parent-dir mask that
+        // would hide /tmp, /etc, or a project root and brick the core CLI (codex P1).
+        if (err instanceof FsPolicyConfigError) {
+          const msg = `[file-sandbox] refusing to start no-transport session ${cfg.sessionId}: ${err.message}`;
+          log(msg);
+          throw new Error(msg);
+        }
+        throw err;
+      }
+    })();
+    // A no-transport turn drops caller allow paths (extraWrite / readonlyRoots /
+    // user RW+RO) that fell inside a Feishu-authority root. Log the suppression so
+    // it's diagnosable rather than a silent hole (codex).
+    if (policy.suppressedAuthorityPaths?.length) {
+      log(`[file-sandbox] no-transport suppressed ${policy.suppressedAuthorityPaths.length} allow path(s) inside a Feishu-authority root: ${policy.suppressedAuthorityPaths.join(', ')}`);
+    }
     // Existence-filter only the ALLOW rules (baseline entries are candidates,
     // not guarantees): a non-existent allow path has nothing to expose, and
     // bwrap cannot bind a non-existent SOURCE. DENY rules are kept regardless —
@@ -10179,6 +10242,16 @@ process.on('message', async (raw: unknown) => {
       // Capture credentials for direct image upload from worker
       larkAppIdForUpload = msg.larkAppId;
       larkAppSecretForUpload = msg.larkAppSecret;
+      // Core-only (apiOnly) bots have no Feishu transport — the worker uploads
+      // screenshots via its OWN client (utils/lark-upload), bypassing the daemon's
+      // bot-level assertLarkTransport gate, so the capability must ride the init
+      // message into this process and hard-disable upload here. Also disable for
+      // a NORMAL bot whose turn runs in an HTTP virtual session (chatId is
+      // http_async_*/http_wait_*): it has real creds so apiOnly is false, but the
+      // synthetic chat has no card to attach a screenshot to.
+      apiOnlyForUpload = msg.apiOnly === true
+        || msg.chatId?.startsWith('http_async_') === true
+        || msg.chatId?.startsWith('http_wait_') === true;
       // brand 决定截图上传打哪个域（feishu / larksuite）。缺省 feishu。
       larkBrandForUpload = msg.brand === 'lark' ? 'lark' : 'feishu';
       // Resolve render dimensions BEFORE startScreenUpdates() — the

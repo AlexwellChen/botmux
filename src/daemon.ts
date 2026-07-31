@@ -21,7 +21,7 @@ import { buildDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
-import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
+import { botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from './core/botmux-wrapper.js';
 import {
   evaluateOverload,
   formatOverloadAlert,
@@ -59,6 +59,7 @@ import {
   resolveVcMeetingConsumerProfiles,
   setResolvedAllowedUsersRepublishHook,
   setAllowedUsersResolveRetryHook,
+  vcMeetingAgentConfigActive,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -98,7 +99,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId } from './core/types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, larkTransportEnabled } from './core/types.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -130,7 +131,7 @@ import {
   getDaemonBootId,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
   cancelSessionReadyAck,
@@ -2702,6 +2703,24 @@ async function sessionReply(
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
+  // Central Lark-transport gate (fail-closed): a core-only (apiOnly) bot or an
+  // HTTP virtual session (http_async_* / http_wait_*) has no real Feishu chat.
+  // Auxiliary worker UI is already suppressed at its source (worker-pool
+  // managedAuxUiSuppressed) and HTTP final_output is intercepted upstream in
+  // deliverFinalOutput, so this path is normally unreachable for such sessions;
+  // this is a defense-in-depth backstop. Return '' (NOT the synthetic anchor) —
+  // an empty message id reads as "nothing posted" to every caller that stores
+  // the result as a card id, so the falsy-guarded scheduleCardPatch/updateMessage
+  // never fire on a synthetic id. Returning `anchor` would be a latent bug: it
+  // would be stored as streamCardId and a later PATCH would dial Feishu.
+  const transportAllowed = larkTransportEnabled({
+    chatId: ds?.chatId ?? anchor,
+    apiOnly: getBot(appId).config.apiOnly,
+  });
+  if (!transportAllowed) {
+    logger.debug(`[lark-transport] suppressed reply for no-transport session (app=${appId} anchor=${anchor.substring(0, 16)})`);
+    return '';
+  }
   const hookContext = ds ? {
     sessionId: ds.session.sessionId,
     scope: ds.scope,
@@ -2975,8 +2994,13 @@ function getPidFile(): string {
 }
 
 /** Path to the wrapper bin directory — injected into worker PATH so CLIs
- *  can call `botmux send` / `botmux schedule` without a global npm install. */
-const BOTMUX_BIN_DIR = join(homedir(), '.botmux', 'bin');
+ *  can call `botmux send` / `botmux schedule` without a global npm install.
+ *  Single source of truth: resolveBotmuxWrapperBinDir (core-only → dedicated
+ *  `<SESSION_DATA_DIR>/bin`, never the shared `~/.botmux/bin`, so a same-HOME
+ *  fleet's wrapper/PATH is not clobbered and left unrestored on exit — codex P1).
+ *  Every consumer (worker-pool fork PATH, worker.ts child-env, tmux pane scripts)
+ *  MUST resolve the SAME dir. */
+const BOTMUX_BIN_DIR = resolveBotmuxWrapperBinDir(process.env);
 
 function writePidFile(): void {
   const dir = config.session.dataDir;
@@ -2984,12 +3008,18 @@ function writePidFile(): void {
     mkdirSync(dir, { recursive: true });
   }
   atomicWriteFileSync(getPidFile(), String(process.pid));
-  // Write breadcrumb so CLI tools (botmux list/delete) can find the active data dir
-  const breadcrumb = join(homedir(), '.botmux', '.data-dir');
-  try {
-    mkdirSync(join(homedir(), '.botmux'), { recursive: true });
-    atomicWriteFileSync(breadcrumb, config.session.dataDir);
-  } catch { /* best effort */ }
+  // Write breadcrumb so CLI tools (botmux list/delete) can find the active data dir.
+  // SKIP in core-only (codex P1): the global `~/.botmux/.data-dir` is a shared-HOME
+  // signpost for bare-shell CLIs; a core-only service must not rewrite it to point
+  // a same-HOME host operator at the core-only store. Core-only's own workers get
+  // the data dir via the frozen SESSION_DATA_DIR env, not this breadcrumb.
+  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+    const breadcrumb = join(homedir(), '.botmux', '.data-dir');
+    try {
+      mkdirSync(join(homedir(), '.botmux'), { recursive: true });
+      atomicWriteFileSync(breadcrumb, config.session.dataDir);
+    } catch { /* best effort */ }
+  }
 
   // Write a thin wrapper script so `botmux` is always in PATH for CLI sessions,
   // regardless of whether the package was installed globally.  The wrapper
@@ -4724,6 +4754,18 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       detail: 'meeting receiver asks are not an idempotent managed action',
     });
   }
+  // No-transport session (apiOnly bot or HTTP virtual chat): `botmux ask` posts
+  // an interactive Lark card and blocks the turn on a human click — impossible
+  // without a real Feishu chat. Fail fast with `unsupported` instead of letting
+  // it fall into the Lark dispatcher and hang the agent on a card that can never
+  // render. (Structured HTTP awaiting_input is a separate, future capability.)
+  if (askSession && !larkTransportEnabled({ chatId: askSession.chatId, apiOnly: getBot(askSession.larkAppId).config.apiOnly })) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'unsupported',
+      detail: 'botmux ask requires a Feishu chat; this session has no Lark transport (apiOnly / HTTP virtual session)',
+    });
+  }
 
   // 谁能答复 = 谁能在该 chat 跟 bot 说话（canTalk）。鉴权在 broker 点击时按注入的
   // canTalkChecker 判定（见下方 setAskCanTalkChecker），daemon 这里不再预解析 approver。
@@ -5526,8 +5568,15 @@ ipcRoute('POST', '/api/vc-meetings/consumer-catch-up', async (req, res) => {
 });
 
 function effectiveVcMeetingAgentConfig(larkAppId: string): VcMeetingAgentConfig | undefined {
-  const cfg = getBot(larkAppId)?.config.vcMeetingAgent;
-  return cfg?.enabled === true ? cfg : undefined;
+  // Delegate to the pure predicate (bot-registry) so the apiOnly fail-close and the
+  // enabled check live in ONE tested place. apiOnly (core-only) bots have no Feishu
+  // connection — a VC listener drives `lark-cli vc +meeting-events --as bot`, which
+  // breaks the zero-Feishu-network contract. This accessor gates every VC entry
+  // (config read / event fetch / sync) INCLUDING the boot-time
+  // `restoreVcMeetingRuntimeSessionsForBot`, whose call site sits OUTSIDE the
+  // `!cfg.apiOnly` boot block — so a migrated bots.json (normal VC bot flipped to
+  // apiOnly, stale runtime record on disk) can no longer re-spawn lark-cli at boot.
+  return vcMeetingAgentConfigActive(getBot(larkAppId)?.config);
 }
 
 function configuredVcMeetingListenerChatId(cfg: VcMeetingAgentConfig): string | undefined {
@@ -17376,7 +17425,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // sandboxReadonlyPaths / readDenyExtraPaths → sandbox + sandboxPaths) BEFORE
   // loading, so the parsed configs below already carry the new model. Writes
   // new fields, keeps old ones (downgrade = zero-op), backs up once. Idempotent.
-  await migrateSandboxConfigAtStartup();
+  // SKIP in core-only (codex P1-2): this reads + backs-up + rewrites the on-disk
+  // fleet bots.json. A headless core-only service must never touch an ambient
+  // host fleet config — its identity is a synthesized in-memory apiOnly bot.
+  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+    await migrateSandboxConfigAtStartup();
+  }
 
   // Load the assigned bot (one daemon per bot)
   let botConfigs = loadBotConfigs();
@@ -17540,7 +17594,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Publish self-descriptor for the dashboard registry. The dashboard sibling
   // process discovers running daemons by scanning <resolvedDataDir>/dashboard-daemons/
   // and watching for mtime updates (heartbeat) / file removal (shutdown).
-  const ipcPort = config.dashboard.ipcBasePort + idx;
+  //
+  // Core-only (in-sandbox, single service): riff's task-runner is handed ONE
+  // fixed port and dials 127.0.0.1:<port> directly, so the port must be exactly
+  // BOTMUX_API_PORT and must NOT drift via the fleet's upward EADDRINUSE probe —
+  // a silent drift would leave the client dialing a dead port. Fleet daemons
+  // keep the ipcBasePort+idx scheme + probe (a port race must not crash boot).
+  const coreOnlyApiPort = process.env.BOTMUX_CORE_ONLY === '1'
+    ? Number(process.env.BOTMUX_API_PORT) || 0
+    : 0;
+  const ipcPort = coreOnlyApiPort || config.dashboard.ipcBasePort + idx;
   // Worker/CLI descendants use this only to reach the current daemon's
   // agent-facing, live-origin-gated endpoints. Internal control endpoints use
   // a separate daemon-to-daemon credential and never trust this port marker.
@@ -17584,6 +17647,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   };
   setDisplayNameRefresher(refreshBotNameState);
+  // apiOnly (core-only) bots have no Feishu app to rename / re-avatar. These
+  // handlers drive the open-platform console (browser web-session, NOT
+  // getBotClient — so the bot-level gate can't catch them); skip registering
+  // them entirely so the dashboard profile actions are inert for a core-only bot.
+  if (!cfg.apiOnly) {
   // 机器人真·改名（dashboard 档案头 ✎）：开放平台自动化改飞书应用名并发布新版本
   // （群内显示名跟随已发布版本，见 services/open-platform-rename.ts）。成功后同步
   // 内存 botName / bots-info 名册 / descriptor，并清掉冗余的 displayName 别名——
@@ -17621,6 +17689,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
     return r;
   });
+  } // end !cfg.apiOnly (open-platform rename/avatar handlers)
   // One cap implementation shared by event-driven checks (process start / idle
   // edge) and the 60s safety-net timer below. Each daemon owns exactly one
   // bot's activeSessions map, so the configured limit is per bot.
@@ -17731,10 +17800,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   loadOrCreateDashboardSecret(
     join(homedir(), '.botmux', '.dashboard-secret'),
   );
+  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  // Core-only keeps the trusted-host HMAC ON (codex P1: authRequired:false opened
+  // ALL 96 IPC routes — a co-resident model turn could read/perturb sessions,
+  // scheduler, mutations). Instead we allowlist ONLY the tight riff-facing routes
+  // (routeIsCoreOnlyPublic: /api/trigger + /api/sessions/:id/{trigger-result,insight}
+  // + the always-public /healthz) as no-HMAC; every other route still requires it.
+  // Arm the readiness gate BEFORE the bind (codex P1): between listen() and a
+  // later arm there'd be a window where the port answers unarmed and a trigger
+  // could slip past the 503 barrier. Armed-first means the very first accepted
+  // connection already sees the not-ready gate.
+  if (coreOnly) armCoreOnlyReadinessGate();
   const ipcHandle = await startIpcServer({
     port: ipcPort,
     host: '127.0.0.1',
     authRequired: true,
+    coreOnlyPublicRoutes: coreOnly,
+    // Fleet: probe upward so a port race can't crash boot. Core-only: BIND-OR-FAIL
+    // on the exact BOTMUX_API_PORT — riff was handed that port and the service must
+    // never silently drift to another (client would dial a dead port).
+    ...(coreOnly ? { maxProbe: 0 } : {}),
   });
   // startIpcServer probes upward on EADDRINUSE (e.g. a second botmux instance on
   // this host already holds ipcBasePort+idx), so the bound port may differ from
@@ -17743,16 +17828,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   desc.ipcPort = ipcHandle.port;
   process.env.BOTMUX_DAEMON_IPC_PORT = String(ipcHandle.port);
   logger.info(`[dashboard-ipc] listening on 127.0.0.1:${ipcHandle.port} (bot ${idx})`);
+  // NOTE: the core-only ready line + readiness release (setCoreOnlyReady) are
+  // emitted LATER, AFTER restoreActiveSessions completes — until then BOTH
+  // /healthz AND the public control routes (trigger/result/insight) return 503,
+  // so riff never triggers into a racing durable restore (codex P1).
 
   // Single reverse-proxy port that fronts every session's web terminal under
   // /s/{sessionId}, so dev-machine users forward one port (proxyBasePort+idx)
   // instead of one per topic. Bound on the public host so `ssh -L` can reach it.
   const proxyPort = config.web.proxyBasePort + idx;
+  // Core-only (codex P1-4): the web terminal proxy + worker web ports default to
+  // config.web.host (0.0.0.0). In riff's sandbox the whole surface must stay
+  // loopback — an in-sandbox headless service has no reason to expose terminals
+  // on all interfaces. Force 127.0.0.1 so nothing but the local task-runner can
+  // reach it (the IPC server is already 127.0.0.1-bound above).
+  const terminalProxyHost = coreOnly ? '127.0.0.1' : config.web.host;
   let terminalProxy: TerminalProxyHandle | null = null;
   try {
     terminalProxy = await startTerminalProxy({
       port: proxyPort,
-      host: config.web.host,
+      host: terminalProxyHost,
       resolvePort: (sessionId) => {
         for (const ds of activeSessions.values()) {
           if (ds.session.sessionId === sessionId && ds.workerPort) return ds.workerPort;
@@ -17772,7 +17867,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // falls back to the worker's own port so links stay reachable if the port
     // was taken (e.g. EADDRINUSE).
     setTerminalProxyPort(terminalProxy.port);
-    logger.info(`[terminal-proxy] listening on ${config.web.host}:${terminalProxy.port} (bot ${idx}) — session terminals at /s/{sessionId}`);
+    logger.info(`[terminal-proxy] listening on ${terminalProxyHost}:${terminalProxy.port} (bot ${idx}) — session terminals at /s/{sessionId}`);
   } catch (err) {
     logger.error(`[terminal-proxy] failed to bind port ${proxyPort} — falling back to direct worker ports for terminal links: ${(err as Error).message}`);
   }
@@ -17824,8 +17919,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Refresh CLI version per bot's cliId
     refreshCliVersion(cfg.cliId, cfg.cliPathOverride);
 
-    // Resolve allowed users per bot
-    if ((bot.config.allowedUsers?.length ?? 0) > 0 || bot.resolvedAllowedUsers.length > 0) {
+    // Resolve allowed users per bot. Skipped for apiOnly (core-only) bots:
+    // their HTTP control-API triggers authenticate via the dashboard token, not
+    // allowedUsers, and resolving email/union_id entries would call the Feishu
+    // contact API — a network round-trip a no-Feishu bot must never make.
+    if (!cfg.apiOnly && ((bot.config.allowedUsers?.length ?? 0) > 0 || bot.resolvedAllowedUsers.length > 0)) {
       // 含邮箱或 union_id(on_) 都要重解析成本 app 的 open_id —— 否则 canTalk/canOperate
       // 拿 sender 的 ou_ 对不上 on_，owner 会被自己的 bot 锁死（PR#72）。
       // literal ou_ 也走 best-effort 校验，用于诊断把其他 app 视角 open_id
@@ -17901,6 +17999,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     checkAllowedChatGroupsConfig(bot);
 
+    // apiOnly (core-only) bots never connect to Feishu: skip the open_id probe,
+    // the required-scope check, and the WSClient event subscription. They are
+    // driven purely over the HTTP control API (trigger → spawn → trigger-result),
+    // whose async path early-returns in deliverFinalOutput before any Feishu send.
+    // Seed a synthetic identity so downstream reads (worker botOpenId, dashboard
+    // roster) get a stable non-undefined value instead of the never-probed one.
+    if (cfg.apiOnly) {
+      bot.botOpenId ||= `bot_${cfg.larkAppId}`;
+      bot.botName ||= cfg.displayName ?? cfg.larkAppId;
+      logger.info(`[api-only] ${cfg.larkAppId} 以 core-only 模式启动：跳过飞书 open_id 探测 / scope 校验 / WSClient 订阅，仅 HTTP 控制 API 驱动`);
+    } else {
     // Probe bot open_id and persist to bots-info.json. When the friendly
     // botName comes back from /bot/v3/info, refresh the dashboard descriptor
     // so the registry shows "Claude" / "Codex" instead of the raw app id.
@@ -17930,13 +18039,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // a single failure here is not actionable. Surface as debug only.
       logger.debug(`[${cfg.larkAppId}] Bot open_id probe failed (will retry): ${err.message}`);
     });
+    } // end !cfg.apiOnly (open_id probe)
 
     // Required-scope check: 启动后 best-effort 校验
     // im:message.group_at_msg.include_bot:readonly。缺失会 logger.error +
     // 私信 allowedUsers[0]。校验异步，跑失败不影响 daemon。
-    checkRequiredScopes(cfg.larkAppId).catch(err => {
-      logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
-    });
+    // apiOnly 无飞书连接 → 无 scope 概念，跳过。
+    if (!cfg.apiOnly) {
+      checkRequiredScopes(cfg.larkAppId).catch(err => {
+        logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
+      });
+    }
 
     // 主动开工 — 场景①: the bot.added event can't be self-verified via API, and
     // if it isn't subscribed the handler simply never fires (no runtime signal).
@@ -17976,7 +18089,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     };
     // 存起来供授权成功后重放消息用（replayGrantedMessage → replayMessageEvent）。
     botHandlers.set(cfg.larkAppId, botEventHandlers);
-    startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, botEventHandlers, normalizeBrand(cfg.brand));
+    // apiOnly bots never subscribe to Feishu events → no WSClient. This is the
+    // core decoupling: the daemon serves the HTTP control API only.
+    if (!cfg.apiOnly) {
+      startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, botEventHandlers, normalizeBrand(cfg.brand));
+    }
 
     // A distillation command is durably prepared before its model run/card
     // delivery. Resume active prepared/proposed allocations after a daemon
@@ -18092,17 +18209,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   try { sweepGlobalBotmuxSkills(); }
   catch (err) { logger.warn(`[skills] post-restore global sweep failed: ${err instanceof Error ? err.message : String(err)}`); }
 
-  // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
-  // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
-  await restoreDocSubscriptions(activeSessions);
+  // 文档订阅恢复 + 评论轮询：都是主动调飞书文档 API 的路径。apiOnly（core-only）
+  // bot 从不连飞书，且其合成身份不会有真实文档订阅——整块跳过，否则非 pristine
+  // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
+  let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
+  if (!cfg.apiOnly) {
+    // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
+    // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
+    await restoreDocSubscriptions(activeSessions);
 
-  // `drive.notice.comment_add_v1` 只可靠推送 @Bot 通知；--all 通过应用身份轮询
-  // 评论列表补齐普通评论。先立即建/续基线，之后每 5 秒增量检查。
-  const docCommentPollTimer = setInterval(() => {
+    // `drive.notice.comment_add_v1` 只可靠推送 @Bot 通知；--all 通过应用身份轮询
+    // 评论列表补齐普通评论。先立即建/续基线，之后每 5 秒增量检查。
+    docCommentPollTimer = setInterval(() => {
+      void pollWatchedDocComments(cfg.larkAppId);
+    }, 5_000);
+    docCommentPollTimer.unref?.();
     void pollWatchedDocComments(cfg.larkAppId);
-  }, 5_000);
-  docCommentPollTimer.unref?.();
-  void pollWatchedDocComments(cfg.larkAppId);
+  }
 
   // Sweep orphan sandbox trees left by a previous run's crash/kill: any
   // <dataDir>/sandboxes/<sid> whose session is no longer active gets its
@@ -18171,8 +18294,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   maintenanceHeartbeat.unref?.();
 
   // Auto-update / auto-restart and the restart-report DM run only on the
-  // primary daemon (bot-0) — a restart is host-wide.
-  if (idx === 0) {
+  // primary daemon (bot-0) — a restart is host-wide. NEVER in core-only (codex
+  // P1): a headless in-sandbox service synthesizes its single bot at idx=0, but
+  // it must NOT own host-wide fleet maintenance — auto-update could rewrite the
+  // global botmux install and a detached `botmux restart` would tear down the
+  // real fleet. Core-only manages only its own single process.
+  if (idx === 0 && !coreOnly) {
     startMaintenance();
     startCliRuntimeUpdateMonitor({
       dataDir: config.session.dataDir,
@@ -18398,4 +18525,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');
+  if (coreOnly) {
+    // Readiness barrier release (codex P1-3): restoreActiveSessions + v3 attach +
+    // scheduler + signal handlers are all wired now, so the HTTP surface is safe
+    // to drive. Flip /healthz → 200 THEN print the machine-parseable ready line.
+    // riff's launcher waits for either signal before pointing its client here, so
+    // a trigger can't race a durable restore (transient not_found / re-fire).
+    // Exact ready-line text is a locked contract (regex ^\[core-only\] listening on ).
+    setCoreOnlyReady();
+    // eslint-disable-next-line no-console
+    console.log(`[core-only] listening on 127.0.0.1:${ipcHandle.port} (bot ${cfg.larkAppId}, cli ${cfg.cliId})`);
+  }
 }

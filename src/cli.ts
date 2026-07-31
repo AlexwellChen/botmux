@@ -404,6 +404,79 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
   }
 }
 
+/**
+ * `botmux serve --api-only` — run a single-process, headless core-only service
+ * in the FOREGROUND (stdio inherited so a launcher can watch the ready line and
+ * the process lifetime IS the service). No pm2, no dashboard, no bots.json, no
+ * Feishu credentials. See src/index-core-only.ts for the full contract.
+ */
+async function cmdServe(args: string[]): Promise<void> {
+  const apiOnly = args.includes('--api-only');
+  if (!apiOnly) {
+    console.error('Usage: botmux serve --api-only [--port <PORT>] [--bot <local_slug>] [--cli <cliId>] [--state-dir <DIR>]');
+    console.error('  Only core-only (--api-only) serving is supported. It runs a headless HTTP');
+    console.error('  control-API service with no Feishu credentials (for riff sandbox / embedding).');
+    process.exit(2);
+  }
+  const getOpt = (flag: string): string | undefined => {
+    const i = args.indexOf(flag);
+    return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+  };
+  const port = getOpt('--port') ?? process.env.BOTMUX_API_PORT;
+  if (!port || !/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+    console.error(`botmux serve --api-only: --port (or BOTMUX_API_PORT) must be a valid port; got: ${port ?? '(unset)'}`);
+    process.exit(2);
+  }
+  const bot = getOpt('--bot') ?? process.env.BOTMUX_API_ONLY_BOT;
+  const cli = getOpt('--cli') ?? process.env.BOTMUX_CORE_CLI;
+  const workingDir = getOpt('--working-dir') ?? process.env.BOTMUX_CORE_WORKING_DIR;
+  const stateDir = getOpt('--state-dir') ?? process.env.BOTMUX_CORE_STATE_DIR;
+
+  const coreScript = join(PKG_ROOT, 'dist', 'index-core-only.js');
+  const child = spawn(process.execPath, [coreScript], {
+    stdio: 'inherit',
+    env: (() => {
+      const e: NodeJS.ProcessEnv = {
+        ...process.env,
+        BOTMUX_CORE_ONLY: '1',
+        BOTMUX_API_PORT: port,
+        // Freeze worker HTTP to loopback here too (defense-in-depth with the
+        // entrypoint) so a stray parent/dotenv 0.0.0.0 never reaches the child.
+        BOTMUX_WORKER_HTTP_HOST: '127.0.0.1',
+        ...(bot ? { BOTMUX_API_ONLY_BOT: bot } : {}),
+        ...(cli ? { BOTMUX_CORE_CLI: cli } : {}),
+        ...(workingDir ? { BOTMUX_CORE_WORKING_DIR: workingDir } : {}),
+        ...(stateDir ? { BOTMUX_CORE_STATE_DIR: stateDir } : {}),
+      };
+      // Never hand an ambient BOTS_CONFIG / legacy worker-host alias / ambient
+      // SESSION_DATA_DIR to the core-only child — the entrypoint freezes/strips
+      // these too, but keep the spawn env clean from the start (codex P1: agent
+      // could read $BOTS_CONFIG; ambient SESSION_DATA_DIR would point at a host
+      // fleet's store). The entrypoint re-derives a dedicated core-only state root.
+      delete e.BOTS_CONFIG;
+      delete e.BOTMUX_WORKER_HOST;
+      delete e.SESSION_DATA_DIR;
+      return e;
+    })(),
+  });
+  // Foreground lifetime tracks the child: forward termination signals and exit
+  // with the child's code so a launcher/supervisor sees an honest status.
+  const forward = (sig: NodeJS.Signals) => { try { child.kill(sig); } catch { /* */ } };
+  process.on('SIGTERM', () => forward('SIGTERM'));
+  process.on('SIGINT', () => forward('SIGINT'));
+  await new Promise<void>((resolve) => {
+    child.on('exit', (code, signal) => {
+      if (signal) { process.exitCode = 1; } else { process.exitCode = code ?? 0; }
+      resolve();
+    });
+    child.on('error', (err) => {
+      console.error(`[core-only] failed to spawn service: ${err.message}`);
+      process.exitCode = 1;
+      resolve();
+    });
+  });
+}
+
 function ecosystemConfig(activationAppId?: string): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
   const bots = loadBotsJson();
@@ -5631,6 +5704,8 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
 }
 
 async function cmdHistory(rest: string[]): Promise<void> {
+  // No-transport turn has no Feishu chat history to read — central hard gate.
+  assertTurnTransportOrExit('history');
   // Read isolation: register this bot from its cred file so the Lark client is
   // available without reading the denied bots.json (same as cmdSend).
   await registerSelfFromCredFile();
@@ -5643,6 +5718,9 @@ async function cmdHistory(rest: string[]): Promise<void> {
   const scopeArg = argValue(rest, '--scope') ?? 'session';
   const sessionIdArg = argValue(rest, '--session-id');
   const { sid, larkAppId: appId, session: s } = await resolveSessionAppId(sessionIdArg);
+  // Target-aware gate: a --session-id pointing at a virtual/apiOnly session must
+  // be refused even from a normal turn (env gate above can't see the argument).
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: appId }, 'history');
 
   const validScopes = new Set(['session', 'thread', 'chat', 'ambient']);
   if (!validScopes.has(scopeArg)) {
@@ -5771,6 +5849,8 @@ async function cmdHistory(rest: string[]): Promise<void> {
 
 
 async function cmdQuoted(rest: string[]): Promise<void> {
+  // No-transport turn cannot fetch a quoted Feishu message — central hard gate.
+  assertTurnTransportOrExit('quoted');
   const sessionIdArg = argValue(rest, '--session-id');
   // Positional message_id is required. The id comes verbatim from the
   // `[用户引用了消息 用 botmux quoted om_xxx 查看]` prompt prefix the daemon
@@ -5789,7 +5869,9 @@ async function cmdQuoted(rest: string[]): Promise<void> {
   // bots.json — same as cmdHistory / cmdSend. Missing this was why a sandboxed
   // isolated bot's `botmux quoted` failed "Bot not registered".
   await registerSelfFromCredFile();
-  const { larkAppId: appId } = await resolveSessionAppId(sessionIdArg);
+  const { larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
+  // Target-aware gate (see cmdHistory).
+  assertSessionTransportOrExit({ chatId: quotedSession.chatId, larkAppId: appId }, 'quoted');
 
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
@@ -6075,6 +6157,101 @@ async function relaySend(
   process.exit(1);
 }
 
+/** True if the running bot (by daemon-injected larkAppId) is core-only
+ *  (apiOnly). Read-only + never throws: used by `botmux send` to refuse early
+ *  with a clear message. Reads bots.json best-effort; an apiOnly bot runs
+ *  non-isolated (no Feishu secret to protect), so bots.json is readable here. */
+function currentBotIsApiOnly(larkAppId: string): boolean {
+  try {
+    return loadBotsJson().some((b: any) => b?.larkAppId === larkAppId && b?.apiOnly === true);
+  } catch {
+    return false;
+  }
+}
+
+/** Central CLI session-transport capability check. A turn has NO Feishu
+ *  transport when either the running bot is core-only (apiOnly) OR the turn runs
+ *  in an HTTP virtual session (BOTMUX_CHAT_ID starts with http_async_ or
+ *  http_wait_). This is the single source of truth every Feishu-touching CLI
+ *  command consults — send/dispatch (writes) AND history/quoted/bots (reads) —
+ *  so a normal bot in a virtual session can't reach Feishu by reloading
+ *  bots.json for a real client (the daemon side is already gated by
+ *  larkTransportEnabled; this closes the non-sandbox local-CLI path). Kept
+ *  read-only and total (never throws). */
+function currentTurnHasNoTransport(): boolean {
+  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  if (chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')) return true;
+  const appId = process.env.BOTMUX_LARK_APP_ID;
+  return !!appId && currentBotIsApiOnly(appId);
+}
+
+/** Tamper-resistant managed-origin transport check for the root-dispatch gate.
+ *  Resolves the origin session via the pid-marker ANCESTRY (process.ppid walk),
+ *  NOT the mutable BOTMUX_SESSION_ID env, then loads that session's record and
+ *  judges transport from its chatId + its bot's apiOnly config. So `env -u
+ *  BOTMUX_SESSION_ID -u BOTMUX_CHAT_ID -u BOTMUX_LARK_APP_ID` cannot shed the
+ *  managed no-transport identity. Returns false (not gated) when no managed
+ *  origin resolves — a bare host-operator shell keeps full access. Total; on any
+ *  resolution error falls back to the env-based check (never throws). */
+function managedOriginHasNoTransport(): boolean {
+  try {
+    const ctx = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+    if (!ctx?.sessionId) {
+      // No managed origin at all (bare operator). Still honor an explicit env
+      // signal if present (daemon-spawned turn whose marker was pruned), but a
+      // truly bare shell has neither → not gated.
+      return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+    }
+    const s = loadSessions().get(ctx.sessionId);
+    if (!s) {
+      // Marker resolved a session id but no record on disk (riff sandbox etc.) —
+      // fall back to the env view for that same managed turn.
+      return currentTurnHasNoTransport();
+    }
+    const chatId = s.chatId ?? '';
+    if (chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')) return true;
+    return !!s.larkAppId && currentBotIsApiOnly(s.larkAppId);
+  } catch {
+    return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+  }
+}
+
+/** Refuse a Feishu-touching CLI command for a no-transport turn with a clear,
+ *  actionable message (not a deep client error), then exit. `op` names the
+ *  command for the message. Returns true if it refused+exited is imminent — but
+ *  it calls process.exit(2), so callers just `if (assertTurnTransportOrExit(...)) return;`
+ *  for type-flow clarity; execution never continues past the exit. */
+function assertTurnTransportOrExit(op: string): void {
+  if (!currentTurnHasNoTransport()) return;
+  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  const why = chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')
+    ? 'this turn runs in an HTTP control-API session (no Feishu chat)'
+    : 'this is a core-only (apiOnly) bot with no Feishu connection';
+  console.error(
+    `botmux ${op} is unavailable: ${why}.\n` +
+    `Feishu read/write is not possible here — the turn communicates only over the HTTP\n` +
+    `control API (input via trigger, output via trigger-result). Produce your normal answer.`,
+  );
+  process.exit(2);
+}
+
+/** Target-aware variant: gate on the RESOLVED session (its chatId + owning bot's
+ *  apiOnly), not just the calling process env. The env gate can't see a
+ *  `--session-id <other>` argument that targets a different (virtual) session, so
+ *  commands that accept --session-id must call this AFTER resolving the target to
+ *  close the cross-session bypass. Read-only + total (never throws besides exit). */
+function assertSessionTransportOrExit(session: { chatId?: string; larkAppId?: string }, op: string): void {
+  const chatId = session.chatId ?? '';
+  const virtual = chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+  const apiOnly = !!session.larkAppId && currentBotIsApiOnly(session.larkAppId);
+  if (!virtual && !apiOnly) return;
+  console.error(
+    `botmux ${op} is unavailable for the target session: ${virtual ? 'it is an HTTP control-API session (no Feishu chat)' : 'its bot is core-only (apiOnly)'}.\n` +
+    `Feishu read/write is not possible for that session.`,
+  );
+  process.exit(2);
+}
+
 /** Under read isolation the CLI is denied bots.json, so `loadBotConfigs()` reads
  *  nothing. The worker instead wrote THIS bot's own secret to a per-bot cred file
  *  (its own is readable; siblings' are denied). Register just this bot from that
@@ -6086,7 +6263,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
   const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string };
+  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean };
   try {
     // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
     // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
@@ -6094,11 +6271,16 @@ async function registerSelfFromCredFile(): Promise<void> {
   } catch {
     return; // no cred file → not isolated (or first layer supplies creds elsewhere)
   }
-  if (!cred.larkAppSecret) return;
+  // apiOnly bots legitimately have an empty secret — don't bail on that, but DO
+  // carry the apiOnly flag through so the reconstructed config keeps the
+  // transport boundary (getBotClient throws for apiOnly). A non-apiOnly bot with
+  // no secret is still a no-op (nothing to register).
+  if (!cred.larkAppSecret && cred.apiOnly !== true) return;
   const { registerBot } = await import('./bot-registry.js');
   registerBot({
     larkAppId: appId,
-    larkAppSecret: cred.larkAppSecret,
+    larkAppSecret: cred.larkAppSecret ?? '',
+    apiOnly: cred.apiOnly === true || undefined,
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
   } as import('./bot-registry.js').BotConfig);
@@ -6162,6 +6344,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   const botConfig = {
     larkAppId: appId,
     larkAppSecret: appSecret,
+    apiOnly: process.env.BOTMUX_API_ONLY === '1' || undefined,
     brand,
     cliId: 'riff',
     allowedUsers: [],
@@ -6214,6 +6397,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     );
     process.exit(2);
   }
+  // No-transport turn (apiOnly bot OR HTTP virtual session): refuse via the
+  // central session-capability gate — same hard door every Feishu-touching CLI
+  // command consults.
+  assertTurnTransportOrExit('send');
   // Managed output attribution must come from the live process-tree marker,
   // whose turn/attempt is refreshed by the worker. BOTMUX_TURN_ID is a
   // spawn-time fallback and can be stale in a detached child after a later
@@ -6492,6 +6679,11 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  // Target-aware gate on the RESOLVED source session: `send --session-id <virtual>`
+  // (or an apiOnly bot's session) must be refused even if the ambient env looks
+  // transport-capable, and regardless of any `--chat-id` override — a no-transport
+  // turn may not originate ANY Feishu write. Closes the env-only gap for send.
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'send');
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
@@ -7549,6 +7741,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --session-id <id>     指定来源会话（默认自动推断）`);
     return;
   }
+  // dispatch opens a real Feishu topic + pulls bots into a chat (a write). A
+  // no-transport turn has no Feishu chat to dispatch into — central hard gate.
+  assertTurnTransportOrExit('dispatch');
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
@@ -7610,6 +7805,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  // Target-aware gate on the RESOLVED source session: dispatch from a virtual /
+  // apiOnly source turn is refused even with a real --chat-id override (a
+  // no-transport turn may not originate a Feishu topic/write). Closes the
+  // `dispatch --session-id <virtual> --chat-id oc_real` env-only gap.
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'dispatch');
 
   const targetChatId = overrideChatId ?? s.chatId;
   if (!targetChatId) { console.error(`session ${sid} 缺少 chatId，且未提供 --chat-id`); process.exit(1); }
@@ -8162,6 +8362,9 @@ botmux create-group — 用一组机器人新建飞书群
 `);
     return;
   }
+  // create-group builds a real Feishu group (cross-bot). A no-transport turn
+  // (apiOnly bot or HTTP virtual session) may not originate one — central gate.
+  assertTurnTransportOrExit('create-group');
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
@@ -8849,6 +9052,10 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
     console.error('用法: botmux bots list [--session-id ID]');
     process.exit(1);
   }
+  // `bots list` reads the Feishu chat roster (listChatBotMembers). A no-transport
+  // turn has no chat roster — central hard gate (also stops the routing prompt
+  // from advertising a Feishu-dependent helper in this context).
+  assertTurnTransportOrExit('bots list');
 
   const sessionIdArg = argValue(rest, '--session-id');
   // 与 history/quoted 同一前奏：先从本 bot 自己的 send-cred 文件注册，让 Lark client
@@ -8860,6 +9067,8 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   // 按"只 @ mentionable 的"判定群里没人可 @，多 bot 协作直接不发生且不报错。
   await registerSelfFromCredFile();
   const { sid, larkAppId: resolvedAppId, session: s } = await resolveSessionAppId(sessionIdArg);
+  // Target-aware gate (see cmdHistory).
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: resolvedAppId }, 'bots list');
 
   const appId = resolvedAppId;
   const dataDir = resolveDataDir();
@@ -9943,6 +10152,32 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
   return true;
 }
 
+// ─── Central root-dispatch transport gate ──────────────────────────────────
+// A MANAGED no-transport turn (a CLI turn the daemon spawned for an apiOnly bot
+// or an HTTP virtual session) must not run ANY Lark-facing command. The managed
+// origin is resolved via the pid-marker ANCESTRY (resolveSessionContext walks
+// process.ppid to a worker-written marker) — NOT the mutable BOTMUX_SESSION_ID
+// env — so `env -u BOTMUX_SESSION_ID … botmux create-group` cannot shed the
+// managed identity. We then load THAT session's record and gate on its chatId +
+// its bot's apiOnly (config, not env), so unsetting BOTMUX_CHAT_ID/LARK_APP_ID
+// also can't flip the verdict. Covers every Feishu-facing verb by construction.
+// A BARE host-operator shell (no ancestry marker, no env session) resolves no
+// managed origin → NOT gated: the operator keeps full access. per-command +
+// daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
+const LARK_FACING_COMMANDS = new Set([
+  'send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
+  'vc-agent', 'report',
+]);
+if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
+  console.error(
+    `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
+    `(core-only apiOnly bot or HTTP control-API session).\n` +
+    `Feishu read/write is not possible for this turn — it communicates only over the HTTP\n` +
+    `control API (input via trigger, output via trigger-result). Produce your normal answer.`,
+  );
+  process.exit(2);
+}
+
 switch (command) {
   case '--version':
   case '-v':      console.log(getVersion()); break;
@@ -9966,6 +10201,7 @@ switch (command) {
     break;
   }
   case 'start':   await cmdStart(); break;
+  case 'serve':   await cmdServe(process.argv.slice(3)); break;
   case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
   case 'stop-bot': await cmdStopBot(process.argv.slice(3)); break;
   case 'stop':    await cmdStop(); break;
