@@ -82,6 +82,7 @@ import { createImgNumberer, parseEventMessage, resolveNonsupportMessage, stripLe
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
+import { buildTopicThreadContext } from './im/lark/topic-root-context.js';
 import { logger } from './utils/logger.js';
 import { applyAllowedUsersResolve } from './utils/allowed-users-apply.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
@@ -15377,9 +15378,21 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const codexAppQuoteContext = ctx.forwardSeedData
     ? ''
     : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId));
-  const codexAppMessageContext = codexAppQuoteContext + (workflowGrillPrompt ?? '');
   const codexAppApplicationContext = vcMeetingApplicationContext(ctx);
-  const promptContent = codexAppQuoteContext + codexAppApplicationContext + content;
+  // 普通群「对已有消息发起话题再 @」：入站是话题内回复（root_id 指向另一条更早
+  // 的话题根消息），bot 从未留存该话题历史，且正文里没有任何信号表明存在话题根+
+  // 前情。首轮注入一行 hint（非全文、零网络请求），提示 CLI 可用 `botmux history`
+  // 按需拉取话题历史（对齐 quote hint 的「提示+按需」模式，避免无条件全量预取+
+  // 下载所有历史附件+长话题只取最旧 50 条且把 50 当精确总数的问题）。gate 已证明
+  // 这是话题回复，无需再发网络探测。coalesced forward 已自带上下文不注入。仅首轮
+  // — 后续 handleThreadReply 回合 CLI 已在首轮拿到该 hint，不重复注入。
+  const topicThreadContext = (parsed.rootId && parsed.rootId !== parsed.messageId && !ctx.forwardSeedData)
+    ? buildTopicThreadContext(localeForBot(larkAppId))
+    : '';
+  // 话题 hint 同样前置到 codex-app 结构化 sidecar lane（与 quote hint 一致双 lane
+  // 下发），否则 codex-app（clean input）bot 走 sidecar 时会静默丢掉该 hint。
+  const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');
+  const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a

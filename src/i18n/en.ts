@@ -1097,6 +1097,12 @@ export const messages: Record<string, string> = {
 
   // Quote hint (injected into the CLI prompt)
   'prompt.quote_hint': '[User quoted a message — run `botmux quoted {id}` to view it]',
+  // Topic context hint — prepended on the first turn of a regular-group topic
+  // whose root is a different (earlier) message the bot never retained. It's a
+  // *hint*, not the transcript, and carries NO count (zero first-turn network
+  // probe): signals that prior topic context exists and points at
+  // `botmux history` for on-demand retrieval (thread-scope by default).
+  'prompt.topic_context': '[This is a reply inside a topic that already had prior messages before you (the topic root + possibly other replies) which you never retained. Run `botmux history` to read them if you need that context (defaults to this thread; use `--limit` for count, `botmux quoted <message_id>` for a message’s attachments).]',
 
   // Markdown / contextual reply card chrome
   'card.you': 'You',

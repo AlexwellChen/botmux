@@ -1100,6 +1100,12 @@ export const messages: Record<string, string> = {
 
   // Quote hint (injected into the CLI prompt)
   'prompt.quote_hint': '[用户引用了消息 用 botmux quoted {id} 查看]',
+  // Topic context hint — prepended on the first turn of a 普通群 topic whose
+  // root is a different (earlier) message the bot never retained. It's a
+  // *hint*, not the transcript, and carries NO count (zero first-turn network
+  // probe): signals that prior topic context exists and points at
+  // `botmux history` for on-demand retrieval (thread-scope by default).
+  'prompt.topic_context': '[本条是话题内的回复，此话题在你之前已有前情消息（话题根 + 可能的其它回复），你没有留存。需要这些前情时用 `botmux history` 查看（默认读本话题；用 `--limit` 控制条数，`botmux quoted <消息id>` 取某条的附件）。]',
 
   // Markdown / contextual reply card chrome
   'card.you': '你',
