@@ -692,7 +692,7 @@ function pushStreamBody(
   // Native Context / Token usage line (grey, small) when this bot displays usage
   // on the streaming card. Missing metrics are omitted independently by
   // cardUsageFooterSegment; a fully-empty snapshot renders nothing.
-  const usageSeg = usage ? cardUsageFooterSegment(usage, locale) : null;
+  const usageSeg = usage ? cardUsageFooterSegment(usage, locale, 'streaming') : null;
   if (usageSeg) {
     elements.push({
       tag: 'markdown',

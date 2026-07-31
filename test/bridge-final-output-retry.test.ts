@@ -1418,7 +1418,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const cards = sessionReply.mock.calls.map(call => call[1] as string);
     expect(new Set(cards)).toHaveLength(1);
     expect(cards[0]).toContain('上下文 12.3K/100K (12%)');
-    expect(cards[0]).toContain('Token ↑67.9K ↓123');
+    // Reply-card footer is context-only now; the cumulative token line is not
+    // rendered here (it lives on the live streaming card).
+    expect(cards[0]).not.toContain('Token ↑');
   });
 
   it('reads a sandboxed Claude transcript through the daemon reply-card boundary', async () => {

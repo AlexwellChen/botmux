@@ -199,6 +199,10 @@ export interface DaemonSession {
   riffAccessUrl?: string;
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
+  /** Interval that re-PATCHes the live streaming card with fresh Context/Token
+   *  usage while a turn is executing (streaming display mode). Armed on the
+   *  working edge, cleared on idle/turn-end/card removal. */
+  usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
   lastCodexAppInput?: CodexAppTurnInput;

@@ -446,6 +446,103 @@ describe('getSessionTokenUsage', () => {
     }).context).toEqual({ usedTokens: 227 });
   });
 
+  it('reports the latest user turn delta (turnTokens) separate from the cumulative total', () => {
+    // Turn 1: user + 1 assistant step. Turn 2: user + 2 assistant steps (a
+    // tool_use step then the final answer). turnTokens is turn 2's own delta
+    // (prompt-side input + cache_create + output, cache_read excluded); tokens
+    // is the whole-session cumulative.
+    const userLine = JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' } });
+    setupJsonl([
+      userLine,
+      assistantLine({ input: 100, output: 40, cacheRead: 1_000, cacheCreate: 10 }),
+      userLine,
+      assistantLine({ input: 50, output: 30, cacheRead: 2_000, cacheCreate: 5 }),
+      assistantLine({ input: 20, output: 60, cacheRead: 2_100, cacheCreate: 0 }),
+    ].join('\n'));
+
+    const snap = getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    });
+    // Turn 2 delta: in = (50+5) + (20+0) = 75; out = 30 + 60 = 90.
+    expect(snap.turnTokens).toEqual({ in: 75, out: 90 });
+    // Cumulative in = all input+cacheRead+cacheCreate; out = all output = 130.
+    expect(snap.tokens?.out).toBe(130);
+    expect(snap.tokens?.in).toBe(100 + 1_000 + 10 + 50 + 2_000 + 5 + 20 + 2_100 + 0);
+  });
+
+  it('does not reset the turn delta on a tool_result user line (mid-turn continuation)', () => {
+    const userLine = JSON.stringify({ type: 'user', message: { role: 'user', content: 'go' } });
+    const toolResultLine = JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    });
+    setupJsonl([
+      userLine,
+      assistantLine({ input: 40, output: 20, cacheCreate: 0 }),
+      toolResultLine, // must NOT reset the turn accumulator
+      assistantLine({ input: 15, output: 25, cacheCreate: 0 }),
+    ].join('\n'));
+
+    // Both assistant steps belong to the same user turn → delta spans both.
+    expect(getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    }).turnTokens).toEqual({ in: 55, out: 45 });
+  });
+
+  it('does not reset the turn delta on meta / compact-summary / slash-wrapper / empty user lines', () => {
+    // These are Claude Code's internal machinery, NOT a new human prompt. They
+    // must not zero the per-turn delta (that would make "本轮" undercount after
+    // /clear, auto-compaction, a slash command, or a sidechain spawn). This
+    // reuses the same isMeaningfulUserEvent predicate the bridge turn queue uses.
+    const realPrompt = JSON.stringify({ type: 'user', message: { role: 'user', content: 'do it' } });
+    const metaLine = JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: 'meta' } });
+    const compactLine = JSON.stringify({ type: 'user', isCompactSummary: true, message: { role: 'user', content: 'summary' } });
+    const sidechainLine = JSON.stringify({ type: 'user', isSidechain: true, message: { role: 'user', content: 'sub-agent' } });
+    const slashLine = JSON.stringify({ type: 'user', message: { role: 'user', content: '<command-name>/clear</command-name>' } });
+    const emptyLine = JSON.stringify({ type: 'user', message: { role: 'user', content: '' } });
+    setupJsonl([
+      realPrompt,
+      assistantLine({ input: 30, output: 10, cacheCreate: 0 }),
+      metaLine, compactLine, sidechainLine, slashLine, emptyLine, // none reset
+      assistantLine({ input: 20, output: 40, cacheCreate: 0 }),
+    ].join('\n'));
+
+    // Delta spans BOTH assistant steps (in = 30+20 = 50, out = 10+40 = 50).
+    expect(getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    }).turnTokens).toEqual({ in: 50, out: 50 });
+  });
+
+  it('resets the turn delta on a type-ahead queued_command attachment (real new prompt)', () => {
+    // Type-ahead submissions land as `type:'attachment'` queued_command lines,
+    // not `type:'user'`. They ARE genuine turn starts and must reset the delta.
+    const firstPrompt = JSON.stringify({ type: 'user', message: { role: 'user', content: 'first' } });
+    const queued = JSON.stringify({ type: 'attachment', attachment: { type: 'queued_command', prompt: 'second prompt' } });
+    setupJsonl([
+      firstPrompt,
+      assistantLine({ input: 999, output: 888, cacheCreate: 0 }), // turn 1 — must be excluded
+      queued, // ← new turn boundary
+      assistantLine({ input: 12, output: 34, cacheCreate: 0 }),
+    ].join('\n'));
+
+    // Only turn 2's assistant step counts.
+    expect(getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    }).turnTokens).toEqual({ in: 12, out: 34 });
+  });
+
   it('returns null when an Agent CLI has no native token usage available', () => {
     vi.mocked(existsSync).mockReturnValue(false);
 
@@ -598,6 +695,8 @@ describe('getSessionTokenUsage', () => {
         turns: 0,
         model: '',
       },
+      // Codex folds to a cumulative-only snapshot; no per-turn tracking.
+      turnTokens: null,
     });
   });
 
@@ -628,6 +727,7 @@ describe('getSessionTokenUsage', () => {
     })).toEqual({
       context: { usedTokens: 50_252, windowTokens: 258_400, percentUsed: 19 },
       tokens: null,
+      turnTokens: null,
     });
   });
 

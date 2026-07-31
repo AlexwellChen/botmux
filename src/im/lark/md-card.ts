@@ -51,6 +51,13 @@ export interface CardUsageSnapshot {
     in: number;
     out: number;
   } | null;
+  /** Delta for the latest user turn (small, matches the CLI TUI's per-turn
+   *  ↑↓). Null for dialects without per-turn tracking. Rendered on the live
+   *  streaming card; the reply-card footer stays compact and omits it. */
+  turnTokens?: {
+    in: number;
+    out: number;
+  } | null;
 }
 
 export interface ReplyCardFooter {
@@ -299,11 +306,24 @@ function isNonNegativeFinite(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
-/** Format usage as one footer segment shared by direct `botmux send` cards and
- * daemon fallback cards. The caller supplies native facts; this module only
- * formats them and never infers a context window or token count. Returns null
- * when no valid native metric is available. */
-export function cardUsageFooterSegment(usage: CardUsageSnapshot, locale?: Locale): string | null {
+/** Format usage as one segment shared by reply-card footers and the live
+ * streaming card. The caller supplies native facts; this module only formats
+ * them and never infers a context window or token count. Returns null when no
+ * valid native metric is available.
+ *
+ * `variant`:
+ *   - `'footer'` (default): minimal — context only. Reply-card footers are
+ *     cramped (brand · usage · 发送给), so the large cumulative token string is
+ *     dropped here (it lives on the streaming card / usage ledger). 上下文占用
+ *     is the one glanceable "how full am I" metric worth keeping.
+ *   - `'streaming'`: rich — context + `本轮 ↑X ↓Y`(per-turn delta, matches the
+ *     CLI TUI) + `累计 ↑A ↓B`(session total). The live card has room and
+ *     refreshes during execution. */
+export function cardUsageFooterSegment(
+  usage: CardUsageSnapshot,
+  locale?: Locale,
+  variant: 'footer' | 'streaming' = 'footer',
+): string | null {
   const parts: string[] = [];
   if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
     const used = compactTokenCount(usage.context.usedTokens);
@@ -317,6 +337,22 @@ export function cardUsageFooterSegment(usage: CardUsageSnapshot, locale?: Locale
     const suffix = `${windowSuffix}${percentSuffix}`;
     parts.push(`${t('card.usage.context', undefined, locale)} ${used}${suffix}`);
   }
+  // Footer variant is context-only (keeps the cramped reply-card footer clean);
+  // the token breakdown below is streaming-only.
+  if (variant !== 'streaming') {
+    return parts.length > 0 ? parts.join(' · ') : null;
+  }
+  // Per-turn delta (streaming only): small ↑↓ for the latest turn, labelled 本轮.
+  const turn = usage.turnTokens;
+  if (turn
+    && isNonNegativeFinite(turn.in)
+    && isNonNegativeFinite(turn.out)
+    && (turn.in > 0 || turn.out > 0)) {
+    parts.push(
+      `${t('card.usage.turn', undefined, locale)} `
+      + `↑${compactTokenCount(turn.in)} ↓${compactTokenCount(turn.out)}`,
+    );
+  }
   if (usage.tokens
     && isNonNegativeFinite(usage.tokens.in)
     && isNonNegativeFinite(usage.tokens.out)
@@ -326,7 +362,7 @@ export function cardUsageFooterSegment(usage: CardUsageSnapshot, locale?: Locale
     // other missing metric until there is real usage to show.
     && (usage.tokens.in > 0 || usage.tokens.out > 0)) {
     parts.push(
-      `${t('card.usage.tokens', undefined, locale)} `
+      `${t('card.usage.total', undefined, locale)} `
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
     );
   }
@@ -345,12 +381,14 @@ export function buildReplyCardFooter(opts: {
   const parts: string[] = [];
   const brandSeg = brandFooterSegment(opts.brand);
   if (brandSeg) parts.push(brandSeg);
+  let hasUsage = false;
   if (opts.usage) {
     const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
-    if (usageSeg) parts.push(usageSeg);
+    if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
   }
   const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
-  if (recipientOpenIds.length > 0) {
+  const hasRecipient = recipientOpenIds.length > 0;
+  if (hasRecipient) {
     parts.push(
       `${t('card.sent_to', undefined, opts.locale)}`
       + recipientOpenIds.map(id => `<at id=${id}></at>`).join(' '),
@@ -358,14 +396,26 @@ export function buildReplyCardFooter(opts: {
   }
   if (parts.length === 0) return null;
 
-  // The first ordinary separator doubles as a visible, versioned marker. Lark
-  // preserves non-empty links in its simplified Format A, so custom/disabled
-  // brands remain identifiable without changing the rendered multi-part text.
-  // A one-part footer also gets the marker. The canonical repository URL alone
-  // is legitimate body content, so it must never double as proof of ownership.
-  const signedContent = parts.length > 1
-    ? `${parts[0]} ${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`
-    : `${parts[0]} ${REPLY_CARD_FOOTER_MARKER}`;
+  // The marker is a visible, versioned link that lets the parser identify a
+  // card's footer (and strip it before a bot-to-bot relay). It doubles as the
+  // first separator. But a BRAND-ONLY footer (no usage, no recipient — the
+  // common case now that usageDisplay defaults to the streaming card body and
+  // the reply-card footer is context-only) needs no marker: appending it renders
+  // a dangling "botmux ·". The default/repository brand is plain link text with
+  // no `@`, so it cannot trigger bot-to-bot pollution and does not need the
+  // ownership marker (the parser already treats a bare repo link as ordinary
+  // content, matching the long-standing "brand-only is undecidable, keep it"
+  // contract). Any footer carrying usage or a recipient is still signed.
+  const signMarker = hasUsage || hasRecipient;
+  let signedContent: string;
+  if (!signMarker) {
+    signedContent = parts[0]; // brand-only — no marker
+  } else if (parts.length > 1) {
+    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
+  } else {
+    // usage-only / recipient-only (brand disabled) — still marked for parsing.
+    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER}`;
+  }
   const content = `<font color='grey'>${signedContent}</font>`;
   return {
     content,

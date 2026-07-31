@@ -1124,6 +1124,8 @@ export const messages: Record<string, string> = {
   'card.sent_to': 'Sent to: ',
   'card.usage.context': 'Context',
   'card.usage.tokens': 'Tokens',
+  'card.usage.turn': 'This turn',
+  'card.usage.total': 'Total',
 
   // Adopt preamble card title
   'card.adopt_last_round': '📜 Last exchange before /adopt',

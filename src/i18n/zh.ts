@@ -1127,6 +1127,8 @@ export const messages: Record<string, string> = {
   'card.sent_to': '发送给：',
   'card.usage.context': '上下文',
   'card.usage.tokens': 'Token',
+  'card.usage.turn': '本轮',
+  'card.usage.total': '累计',
 
   // Adopt preamble card title
   'card.adopt_last_round': '📜 /adopt 前最后一轮',

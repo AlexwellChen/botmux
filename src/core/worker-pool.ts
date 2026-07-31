@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
+import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -573,6 +574,108 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
   scheduleLocalCliOpenReadinessPatch(ds);
 }
 
+/** How often the live streaming card is re-PATCHed with fresh usage while a
+ *  turn executes. 12s stays off the prompt-cache-friendly path; the tick reads
+ *  with fresh:true so it bypasses (does not merely out-wait) the usage reader's
+ *  15s reparse throttle — the transcript grows per tool step, so each refresh
+ *  folds only the newly appended bytes. */
+export const USAGE_REFRESH_INTERVAL_MS = 12_000;
+
+/** Single source of truth for "this session should be periodically re-rendering
+ *  its streaming card with fresh usage right now". Used by both the arm gate and
+ *  the interval tick so arm/clear is a state-boundary invariant, not tied to one
+ *  PATCH path. Requires: an actively-working turn, a live (non-sentinel, not a
+ *  new-turn handoff) streaming card, the worker initialized (NOT a Web-Terminal
+ *  port — ZMX reports ready with port=0), usageDisplay='streaming', and a CLI
+ *  that actually has a native-usage transcript (gemini/opencode/pi/… have none
+ *  → nothing to show). */
+export function usageRefreshShouldRun(ds: DaemonSession): boolean {
+  if (ds.lastScreenStatus !== 'working') return false;
+  if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) return false;
+  // New-turn handoff window: beginNewTurn sets streamCardPending=true and swaps
+  // currentTurnTitle while the OLD streamCardId is still present (the live
+  // worker is still `working`). A stray tick here would PATCH the previous
+  // card with the NEW turn's title/content before the next screen_update's
+  // managed/silent gate runs. The POST-in-flight sentinel is also covered.
+  if (ds.streamCardPending) return false;
+  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL) return false;
+  if (!workerHasInitialized(ds)) return false;
+  if (!cliSupportsNativeUsage(sessionCliId(ds, getBot(ds.larkAppId).config))) return false;
+  try {
+    if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') return false;
+  } catch { /* missing config → default streaming → allowed */ }
+  return true;
+}
+
+/** Re-render the current streaming card with the freshest usage snapshot. The
+ *  interval tick is self-correcting: if the session no longer qualifies (turn
+ *  settled, card gone, limit, etc.) it clears its own timer, bounding any missed
+ *  explicit clear to a single interval. Reads with fresh:true so the periodic
+ *  PATCH actually beats the cost reader's 15s reparse throttle. */
+export function refreshStreamingCardUsage(ds: DaemonSession): void {
+  if (!usageRefreshShouldRun(ds)) {
+    clearUsageRefreshTimer(ds);
+    return;
+  }
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    // readableTerminalUrlFor (NOT raw buildTerminalUrl): now that this tick can
+    // run for a port=0 backend (ZMX reports ready without a Web Terminal), a raw
+    // URL would render a fake `:undefined`/backend-less link. Mirror every other
+    // card path — empty string when there is no real terminal.
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
+    ds.lastScreenContent ?? '',
+    ds.lastScreenStatus ?? 'working',
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    cardUsageLimit(ds),
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    // fresh:true — the whole point of the tick is to break the 15s throttle so
+    // the total/turn usage actually climbs on-screen every interval.
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
+  );
+  scheduleCardPatch(ds, cardJson);
+}
+
+/** Bring the periodic usage refresh in line with current state — arm when the
+ *  session qualifies, clear otherwise. Idempotent; safe to call after ANY
+ *  lastScreenStatus assignment or streaming-card lifecycle change. This is the
+ *  single choke point that makes the timer a state-boundary invariant. */
+export function syncUsageRefreshTimer(ds: DaemonSession): void {
+  if (usageRefreshShouldRun(ds)) armUsageRefreshTimer(ds);
+  else clearUsageRefreshTimer(ds);
+}
+
+/** Arm the periodic usage refresh. Idempotent — a running timer is left in
+ *  place. Callers gate via syncUsageRefreshTimer/usageRefreshShouldRun; this
+ *  just owns the setInterval. */
+function armUsageRefreshTimer(ds: DaemonSession): void {
+  if (ds.usageRefreshTimer) return;
+  ds.usageRefreshTimer = setInterval(() => {
+    try { refreshStreamingCardUsage(ds); } catch { /* best-effort */ }
+  }, USAGE_REFRESH_INTERVAL_MS);
+  // Don't keep the daemon event loop alive solely for this cosmetic refresh.
+  ds.usageRefreshTimer.unref?.();
+}
+
+/** Stop the periodic usage refresh (turn ended, card gone, session closing). */
+function clearUsageRefreshTimer(ds: DaemonSession): void {
+  if (ds.usageRefreshTimer) {
+    clearInterval(ds.usageRefreshTimer);
+    ds.usageRefreshTimer = undefined;
+  }
+}
+
 /**
  * PATCH the live streaming card with the freshest riff sandbox URL. Mirrors
  * {@link scheduleLocalCliOpenReadinessPatch}: when the card POST is still
@@ -975,6 +1078,10 @@ export async function postFreshStreamingCard(
     recallFrozenCards(ds);
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
+    // Manual /card during a working turn lands a live card whose subsequent
+    // screen_updates are working→working (no status edge) — arm the periodic
+    // usage refresh here, now that the real id is committed and pending cleared.
+    syncUsageRefreshTimer(ds);
     logger.info(`[${tag(ds)}] Posted streaming card via /card`);
     return true;
   } catch (err) {
@@ -983,6 +1090,9 @@ export async function postFreshStreamingCard(
     ds.streamCardPending = prevPending;
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
+    // Rolled back to the prior card identity — re-sync so a restored still-live
+    // working card keeps (or resumes) its refresh rather than losing the timer.
+    syncUsageRefreshTimer(ds);
     logger.warn(`[${tag(ds)}] /card POST failed: ${err}`);
     return false;
   }
@@ -1553,6 +1663,7 @@ export function killWorker(ds: DaemonSession): void {
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
+  clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
   // Retiring (or observing the absence of) that generation must revoke the
@@ -4106,6 +4217,16 @@ function setupWorkerHandlers(
         }
         startupState.ready = true;
         ds.workerReady = true;
+        // Treat `ready` as a full state boundary for the usage refresh: clear
+        // any timer inherited from a PRIOR worker generation up front, so the
+        // managed/replyAlreadySent/disabled/recovery/sentinel early-breaks below
+        // never keep a dead generation's interval alive. The authorized arm is
+        // re-established after a successful card reuse / fresh POST (below). This
+        // is the third arm point — without it, an auto-restart mid-`working`
+        // (claude_exit rc<=3 → workerReady=false → tick self-clears) would reuse
+        // the old card on ready then never re-arm, because the first post-restart
+        // screen_update is working→working (statusChanged=false → early break).
+        clearUsageRefreshTimer(ds);
         const webPort = Number.isInteger(msg.port) && msg.port > 0 ? msg.port : null;
         ds.workerPort = webPort;
         ds.workerToken = webPort ? msg.token : null;
@@ -4244,6 +4365,11 @@ function setupWorkerHandlers(
             // thread on each restart.
             recallFrozenCards(ds);
             logger.info(`[${t}] Reused existing streaming card ${restoredCardId.substring(0, 12)} after worker (re)start`);
+            // Auto-restart recovery: if the reused card is a still-`working`
+            // turn, re-arm the periodic usage refresh here. The first
+            // post-restart screen_update is typically working→working
+            // (statusChanged=false) and would break before the arm choke point.
+            syncUsageRefreshTimer(ds);
             break;
           } catch (err) {
             if (!ownsLifecycleMutation()) break;
@@ -4317,6 +4443,10 @@ function setupWorkerHandlers(
           recallFrozenCards(ds);
           flushPendingLocalCliOpenReadinessPatch(ds);
           flushPendingRiffUrlPatch(ds);
+          // Fresh ready POST: if this turn is already `working` (e.g. relay
+          // resume where the CLI kept running), arm here — same authorized arm
+          // point as the reuse branch, now that streamCardId is the real id.
+          syncUsageRefreshTimer(ds);
         } catch (err) {
           if (!ownsLifecycleMutation()) break;
           if (err instanceof MessageWithdrawnError) {
@@ -4500,6 +4630,14 @@ function setupWorkerHandlers(
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
 
+        // State-boundary clear: the moment we leave `working` (→ idle/limited),
+        // stop the periodic usage refresh immediately — BEFORE the aux-UI /
+        // card-disabled / recovery early-breaks below, which would otherwise
+        // skip the arm/clear choke point and leave the interval running until it
+        // self-corrects or the worker is killed. Arm stays gated below (needs a
+        // live card + UI gates); only the clear needs to be unconditional here.
+        if (ds.lastScreenStatus !== 'working') clearUsageRefreshTimer(ds);
+
         // Dashboard: publish a patch only when status truly transitioned, so
         // SSE clients reflect real state changes (starting → working → idle)
         // without flooding on every PTY tick. The screen analyzer is the
@@ -4553,18 +4691,18 @@ function setupWorkerHandlers(
           }
         }
 
-        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card. Turn-exact: a
         // substitute turn's screen updates stay card-less even after a queued
         // normal turn overwrote currentReplyTarget (and vice versa).
-        if (streamingCardDisabled(ds, msg.turnId)) break;
+        if (streamingCardDisabled(ds, msg.turnId)) { clearUsageRefreshTimer(ds); break; }
 
         // Restart recovery: a restored worker may emit screen updates as the CLI
         // redraws on resume. Stay silent (no post/patch) until the first real
         // user turn clears the flag. Dashboard SSE above still reflects status.
-        if (ds.suppressRecoveryCard) break;
+        if (ds.suppressRecoveryCard) { clearUsageRefreshTimer(ds); break; }
 
         const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
@@ -4620,6 +4758,11 @@ function setupWorkerHandlers(
               recallFrozenCards(ds);
               flushPendingLocalCliOpenReadinessPatch(ds);
           flushPendingRiffUrlPatch(ds);
+              // New-turn POST is the FIRST working screen_update of the turn —
+              // the else (same-turn PATCH) branch never runs for it, so arm the
+              // periodic usage refresh here (once the real card id exists, not
+              // the POSTING sentinel). syncUsageRefreshTimer re-checks state.
+              syncUsageRefreshTimer(ds);
             })
             .catch(err => {
               if (!ownsLifecycleMutation()) return;
@@ -4663,6 +4806,10 @@ function setupWorkerHandlers(
             }),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
+          // Keep the live usage climbing during a long working phase; stop once
+          // the turn settles (idle/limited). State-boundary invariant — one
+          // choke point re-evaluates arm/clear after this status assignment.
+          syncUsageRefreshTimer(ds);
         }
         break;
       }
@@ -4681,7 +4828,14 @@ function setupWorkerHandlers(
           content: ds.lastScreenContent ?? '',
         });
         persistStreamCardState(ds);
-        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        // screenshot_uploaded never ARMS the usage refresh — screen_update owns
+        // the authorized arm. Here we only tear it down: unconditionally on
+        // leaving `working`, and on a managed/silent turn (below) that must not
+        // keep a group-visible card ticking. Arming here would let a 12s tick
+        // re-render the prior visible card with THIS managed/hidden turn's
+        // content — the same leak class as substitute-turn card suppression.
+        if (ds.lastScreenStatus !== 'working') clearUsageRefreshTimer(ds);
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) break;
         const readUrl = readableTerminalUrlFor(ds);
@@ -5128,6 +5282,10 @@ function setupWorkerHandlers(
             ds.worker!.send({ type: 'park_diagnostic' } as DaemonToWorker);
             restartCounts.delete(key);
             ds.lastScreenStatus = 'idle';
+            // Diagnostic park keeps the worker alive (no killWorker here), so the
+            // periodic usage refresh must be stopped explicitly on this
+            // working→idle boundary — the else branch's killWorker already does.
+            clearUsageRefreshTimer(ds);
             // Survive a daemon restart: mark this as a lazy cold-resume so
             // restore keeps the session active (re-spawns the CLI on the next
             // message) instead of zombie-closing it when the real bmx-<sid> is
@@ -5523,6 +5681,9 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerReady = false;
       ds.workerPort = null;
+      // Dead worker generation — stop the periodic usage refresh immediately
+      // instead of waiting a tick for it to self-clear on !workerHasInitialized.
+      clearUsageRefreshTimer(ds);
       ds.managedTurnOrigin = undefined;
       // This worker generation is gone. Invalidate any stuck-warning card it
       // posted so a late click cannot inject keys into a replacement worker.

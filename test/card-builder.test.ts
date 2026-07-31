@@ -712,16 +712,19 @@ describe('buildStreamingCard', () => {
       expect(hasUsage).toBe(false);
     });
 
-    it('renders only the present metric (context missing → tokens only)', () => {
+    it('renders only the present metric (context missing → cumulative token only)', () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, CONTENT, 'working', 'codex', 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, false,
         { context: null, tokens: { in: 1_200, out: 3_400 } },
       ));
       const md = card.elements.filter((e: any) => e.tag === 'markdown');
-      const usageEl = md.find((e: any) => typeof e.content === 'string' && e.content.includes('Tokens'));
+      // Streaming variant labels cumulative token "Total" (en); no 本轮 line
+      // here because turnTokens was not supplied.
+      const usageEl = md.find((e: any) => typeof e.content === 'string' && e.content.includes('Total'));
       expect(usageEl).toBeTruthy();
       expect(usageEl.content).not.toContain('Context');
+      expect(usageEl.content).not.toContain('This turn');
       expect(usageEl.content).toContain('↑1.2K');
     });
 
