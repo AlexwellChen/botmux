@@ -255,6 +255,7 @@ function sessionCapStateLabel(cap: number | null, tr: ReturnType<typeof useT>): 
 function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
   return {
     ...bot,
+    usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
@@ -1904,9 +1905,10 @@ function ProfileRoles(props: { appId: string }) {
   );
 }
 
-function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
+  const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
@@ -1915,28 +1917,64 @@ function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: Ca
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
+    setUsageDisplay(bot.usageDisplay ?? 'streaming');
     setDisableStreaming(bot.disableStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
-  }, [bot.disableStreamingCard, bot.privateCard, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+  }, [bot.disableStreamingCard, bot.privateCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
-  async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
+  async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
     setStatus(null);
     try {
       const res = await putCardPref(patch);
-      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        rollback?.();
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
     } catch (e: any) {
+      rollback?.();
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
       setBusy(null);
     }
   }
 
+  const usageDisplayOptions: DropdownFieldOption<'streaming' | 'footer' | 'off'>[] = [
+    { value: 'streaming', label: tr('botDefaults.usageDisplayStreaming') },
+    { value: 'footer', label: tr('botDefaults.usageDisplayFooter') },
+    { value: 'off', label: tr('botDefaults.usageDisplayOff') },
+  ];
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
+      {bot.usageSupported === true && (
+        <div className="bd-row">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.usageDisplayHelp')}>{tr('botDefaults.usageDisplay')}</FieldTitle>
+            <DropdownField
+              dataInput="usageDisplay"
+              ariaLabel={tr('botDefaults.usageDisplay')}
+              value={usageDisplay}
+              disabled={busy === 'usage'}
+              options={usageDisplayOptions}
+              onChange={next => {
+                const previous = usageDisplay;
+                setUsageDisplay(next);
+                void savePatch(
+                  { usageDisplay: next },
+                  'usage',
+                  () => setUsageDisplay(previous),
+                );
+              }}
+            />
+          </div>
+        </div>
+      )}
       <div className="bd-toggle-grid bd-card-behavior-grid">
         <ToggleRow
           checked={disableStreaming}

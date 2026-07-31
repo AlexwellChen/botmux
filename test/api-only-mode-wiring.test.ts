@@ -442,7 +442,7 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // getLoadedConfigPath() is host-frozen; the worker must not re-guess from env.
     const block = region(workerPoolSource, 'apiOnly: botCfg.apiOnly,', 'brand: normalizeBrand(botCfg.brand),');
     expect(block).toContain('loadedBotsConfigPath: getLoadedConfigPath(),');
-    expect(workerPoolSource).toContain("import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath }");
+    expect(workerPoolSource).toContain("import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay }");
   });
 });
 

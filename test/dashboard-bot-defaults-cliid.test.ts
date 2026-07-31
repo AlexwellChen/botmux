@@ -2,7 +2,7 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
-import { BotAgentSection, CodexAppDisplaySection } from '../src/dashboard/web/bot-defaults-page.js';
+import { BotAgentSection, CardBehaviorSection, CodexAppDisplaySection } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -200,6 +200,65 @@ describe('Codex App history switch', () => {
 
     expect(renderer.root.findByProps({ 'data-action': 'toggle-codex-app-clean-input' }).props.checked).toBe(false);
     expect(renderer.root.findByProps({ 'data-codex-app-clean-input-status': '' }).children.join(''))
+      .toContain('write_failed');
+  });
+});
+
+describe('reply-card usage display mode', () => {
+  it('defaults to streaming and persists explicit footer/off changes', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, string>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_usage', usageSupported: true },
+        putCardPref,
+      }));
+    });
+
+    const menu = () => renderer.root.findByProps({ id: 'bd-menu-usageDisplay' });
+    expect(menu().props.value).toBe('streaming');
+
+    await act(async () => {
+      menu().props.onChange('footer');
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ usageDisplay: 'footer' });
+    expect(menu().props.value).toBe('footer');
+
+    await act(async () => {
+      menu().props.onChange('off');
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ usageDisplay: 'off' });
+    expect(menu().props.value).toBe('off');
+  });
+
+  it('rolls back when persistence fails', async () => {
+    const putCardPref = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      body: { error: 'write_failed' },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_usage', usageSupported: true },
+        putCardPref,
+      }));
+    });
+
+    const menu = () => renderer.root.findByProps({ id: 'bd-menu-usageDisplay' });
+    await act(async () => {
+      menu().props.onChange('off');
+      await Promise.resolve();
+    });
+
+    expect(menu().props.value).toBe('streaming');
+    expect(renderer.root.findByProps({ 'data-card-pref-status': '' }).children.join(''))
       .toContain('write_failed');
   });
 });

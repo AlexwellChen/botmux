@@ -30,7 +30,13 @@ import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
-import { buildMarkdownCard, buildContextualReplyCard, type LocalHomeLinkMode } from '../im/lark/md-card.js';
+import {
+  buildMarkdownCard,
+  buildContextualReplyCard,
+  type CardUsageSnapshot,
+  type LocalHomeLinkMode,
+} from '../im/lark/md-card.js';
+import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
@@ -38,7 +44,7 @@ import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath } from '../bot-registry.js';
+import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 
@@ -65,6 +71,94 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
     || sandboxEnabled()
     ? 'lexical'
     : 'filesystem';
+}
+
+/** Read one frozen native-usage snapshot at the reply boundary. Card delivery
+ * remains best-effort even when a CLI has no supported transcript or a usage
+ * resolver fails. */
+export function getDaemonSessionUsageSnapshot(
+  ds: DaemonSession,
+  effectiveCliId?: CliId,
+  opts?: { fresh?: boolean },
+): CardUsageSnapshot {
+  try {
+    const resolvedCliId = effectiveCliId ?? (
+      ds.session.cliId
+      ?? ds.session.adoptedFrom?.cliId
+      ?? ds.adoptedFrom?.cliId
+      ?? getBot(ds.larkAppId).config.cliId
+    ) as CliId;
+    return getSessionUsageSnapshot({
+      cliId: resolvedCliId,
+      sessionId: ds.session.sessionId,
+      cliSessionId:
+        ds.session.cliSessionId
+        ?? ds.session.adoptedFrom?.sessionId
+        ?? ds.adoptedFrom?.sessionId,
+      cwd:
+        ds.workingDir
+        ?? ds.session.workingDir
+        ?? ds.session.adoptedFrom?.cwd
+        ?? ds.adoptedFrom?.cwd,
+      // Enable the BOT_HOME transcript fallback for CLI-data-redirected /
+      // sandboxed bots (same as the ledger and dashboard-row readers). Without
+      // it a read-isolated bot's transcript is invisible and the card shows no
+      // usage even though it exists under BOT_HOME.
+      larkAppId: ds.larkAppId ?? ds.session.larkAppId,
+      // Reply cards read at the exact turn boundary (fresh); the live streaming
+      // card refreshes on every status tick and rides the reader's reparse
+      // throttle instead (fresh:false) to stay off the disk.
+      fresh: opts?.fresh ?? true,
+    });
+  } catch (error) {
+    logger.warn(
+      `[${ds.session.sessionId.slice(0, 8)}] Failed to read card usage snapshot: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return { context: null, tokens: null };
+  }
+}
+
+/** Reply-card (final output / adopt preamble / local-turn) usage. Only the
+ * `'footer'` display mode surfaces usage here; `'streaming'` and `'off'` yield a
+ * concrete empty snapshot. Keeping the display decision out of the native usage
+ * reader leaves accounting and dashboard consumers intact; the concrete empty
+ * snapshot (rather than undefined) also freezes "hidden" over final-output
+ * retries. */
+export function getDaemonReplyCardUsageSnapshot(
+  ds: DaemonSession,
+  effectiveCliId?: CliId,
+): CardUsageSnapshot {
+  try {
+    if (resolveUsageDisplay(ds.larkAppId) !== 'footer') {
+      return { context: null, tokens: null };
+    }
+  } catch {
+    // Missing runtime config → default 'streaming' → no footer usage.
+    return { context: null, tokens: null };
+  }
+  return getDaemonSessionUsageSnapshot(ds, effectiveCliId);
+}
+
+/** Streaming-card usage. Only the `'streaming'` display mode (the default)
+ * surfaces usage in the live card body; `'footer'` and `'off'` yield empty.
+ * Returns a concrete empty snapshot on any config failure so the streaming
+ * renderer stays best-effort. `fresh` forces an exact read at meaningful
+ * boundaries (turn end / idle); intra-turn ticks leave it false to ride the
+ * reader's reparse throttle and stay off the disk. */
+export function getDaemonStreamingCardUsageSnapshot(
+  ds: DaemonSession,
+  effectiveCliId?: CliId,
+  opts?: { fresh?: boolean },
+): CardUsageSnapshot {
+  try {
+    if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
+      return { context: null, tokens: null };
+    }
+  } catch {
+    // Missing runtime config → default 'streaming' → show usage (best-effort).
+  }
+  return getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: opts?.fresh ?? false });
 }
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -384,6 +478,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     status === 'limited' ? ds.usageLimit : undefined,
     writableTerminalLinkFor(ds),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -434,6 +529,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     status === 'limited' ? ds.usageLimit : undefined,
     writableTerminalLinkFor(ds),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -591,6 +687,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     ds.usageLimit,
     writableTerminalLinkFor(ds),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -782,6 +879,7 @@ export async function postFreshStreamingCard(
     cardUsageLimit(ds),
     writableTerminalLinkFor(ds),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
@@ -2977,6 +3075,7 @@ function setupWorkerHandlers(
               initStatus === 'limited' ? ds.usageLimit : undefined,
               writableTerminalLinkFor(ds),
               localCliReadyAtBuild,
+              getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             // Worker IPC handlers may run while the direct restore PATCH is in
@@ -3039,6 +3138,7 @@ function setupWorkerHandlers(
             initStatus === 'limited' ? ds.usageLimit : undefined,
             writableTerminalLinkFor(ds),
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+            getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           );
           ds.streamCardId = await scopedReply(streamCardJson, 'interactive', msg.turnId);
           // This card IS the current turn's live card — clear the new-turn flag
@@ -3335,6 +3435,7 @@ function setupWorkerHandlers(
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+            getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -3387,6 +3488,11 @@ function setupWorkerHandlers(
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+            // Turn end (→ idle) reads the exact latest usage; intra-turn status
+            // ticks ride the throttle. See getDaemonStreamingCardUsageSnapshot.
+            getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, {
+              fresh: ds.lastScreenStatus === 'idle',
+            }),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
         }
@@ -3429,6 +3535,7 @@ function setupWorkerHandlers(
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+          getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: ds.lastScreenStatus === 'idle' }),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -3687,6 +3794,7 @@ function setupWorkerHandlers(
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
               isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
               isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+              getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -3728,6 +3836,7 @@ function setupWorkerHandlers(
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
               isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
               isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+              getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -4099,6 +4208,7 @@ function setupWorkerHandlers(
           locale: localeForBot(ds.larkAppId),
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
+          usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId),
         });
         scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
@@ -4277,7 +4387,9 @@ function deliverFinalOutput(
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   attempt: number,
+  frozenUsage?: CardUsageSnapshot,
 ): void {
+  let cardUsage = frozenUsage;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   // Wait Mode / HTTP Sync Override:
   // If this turn is being waited for by an HTTP webhook request, intercept the
@@ -4469,6 +4581,7 @@ function deliverFinalOutput(
         : imOrigin?.replyTargetSenderOpenId
           ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
+      cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
@@ -4482,6 +4595,7 @@ function deliverFinalOutput(
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
+            usage: cardUsage,
           })
         : buildMarkdownCard(
             safeAssistantText,
@@ -4490,6 +4604,7 @@ function deliverFinalOutput(
             localeForBot(ds.larkAppId),
             ds.workingDir,
             localHomeLinkMode,
+            cardUsage,
           );
 
       const proposedOutput = {
@@ -4623,7 +4738,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next);
+      deliverFinalOutput(ds, msg, t, next, cardUsage);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

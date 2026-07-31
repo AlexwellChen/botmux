@@ -182,7 +182,7 @@ describe('getCliDisplayName', () => {
 });
 
 describe('buildConfigCard', () => {
-  it('renders silentTurnReactions as a card-behaviour toggle', () => {
+  it('renders card-behaviour toggles', () => {
     const card = parse(buildConfigCard({
       larkAppId: 'app_cfg',
       botName: 'Config Bot',
@@ -217,6 +217,14 @@ describe('buildConfigCard', () => {
     expect(toggle.value.action).toBe('config_toggle');
     expect(toggle.type).toBe('primary');
     expect(toggle.text.content).toContain('Disable status reactions');
+
+    // usageDisplay is an enum (streaming/footer/off), configured via dashboard
+    // and `/botconfig set` — like skillInjection it is intentionally NOT a
+    // config-card boolean quick-toggle.
+    const usageToggle = allActions(card).find(
+      (a: any) => a.value?.field === 'usageDisplay' || a.value?.field === 'showUsageInCardFooter',
+    );
+    expect(usageToggle).toBeFalsy();
   });
 });
 
@@ -646,6 +654,64 @@ describe('buildStreamingCard', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working'));
       const mdElements = card.elements.filter((e: any) => e.tag === 'markdown');
       expect(mdElements).toHaveLength(0);
+    });
+  });
+
+  // ── Native usage line (Context / Token) ────────────────────────────────
+
+  describe('usage snapshot on the streaming card body', () => {
+    const USAGE = {
+      context: { usedTokens: 159_816, windowTokens: 258_400, percentUsed: 62 },
+      tokens: { in: 3_739_570, out: 23_299 },
+    };
+
+    it('renders a grey Context / Token line when a usage snapshot is supplied', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'codex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false, USAGE,
+      ));
+      const md = card.elements.filter((e: any) => e.tag === 'markdown');
+      const usageEl = md.find((e: any) => typeof e.content === 'string' && e.content.includes('Context'));
+      expect(usageEl).toBeTruthy();
+      expect(usageEl.content).toContain('159.8K/258.4K (62%)');
+      expect(usageEl.content).toContain('↑3.7M');
+      expect(usageEl.content).toContain('↓23.3K');
+      expect(usageEl.content).toContain("color='grey'");
+    });
+
+    it('omits the usage line entirely when no snapshot is supplied', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', 'codex', 'hidden'));
+      const hasUsage = card.elements.some(
+        (e: any) => e.tag === 'markdown' && typeof e.content === 'string'
+          && (e.content.includes('Context') || e.content.includes('Tokens')),
+      );
+      expect(hasUsage).toBe(false);
+    });
+
+    it('renders only the present metric (context missing → tokens only)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'codex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: null, tokens: { in: 1_200, out: 3_400 } },
+      ));
+      const md = card.elements.filter((e: any) => e.tag === 'markdown');
+      const usageEl = md.find((e: any) => typeof e.content === 'string' && e.content.includes('Tokens'));
+      expect(usageEl).toBeTruthy();
+      expect(usageEl.content).not.toContain('Context');
+      expect(usageEl.content).toContain('↑1.2K');
+    });
+
+    it('renders nothing for a fully-empty snapshot (unsupported CLI)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'gemini', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: null, tokens: null },
+      ));
+      const hasUsage = card.elements.some(
+        (e: any) => e.tag === 'markdown' && typeof e.content === 'string'
+          && (e.content.includes('Context') || e.content.includes('Tokens')),
+      );
+      expect(hasUsage).toBe(false);
     });
   });
 

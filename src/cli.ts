@@ -3130,6 +3130,7 @@ interface AdoptedFromData {
   herdrTarget?: string;
   herdrPaneId?: string;
   originalCliPid?: number;
+  sessionId?: string;
   cwd?: string;
   cliId?: string;
 }
@@ -3184,6 +3185,8 @@ interface SessionData {
   // here, so they're typed loosely. Used by cmdList to avoid reporting an
   // unconfirmed /adopt scratch as a crashed CLI session.
   cliId?: string;
+  /** CLI-native resume id when it differs from botmux's Session id. */
+  cliSessionId?: string;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
   /** Deliberately suspended by the resident-session cap. No process/backing
@@ -4364,6 +4367,108 @@ function findDaemon(larkAppId?: string): {
   const all = listOnlineDaemons();
   if (larkAppId) return all.find(d => d.larkAppId === larkAppId) ?? null;
   return all[0] ?? null;
+}
+
+function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const rawContext = raw.context;
+  const rawTokens = raw.tokens;
+
+  let context: CardUsageSnapshot['context'] = null;
+  if (rawContext && typeof rawContext === 'object' && !Array.isArray(rawContext)) {
+    const c = rawContext as Record<string, unknown>;
+    if (typeof c.usedTokens === 'number'
+      && Number.isFinite(c.usedTokens)
+      && c.usedTokens >= 0) {
+      context = {
+        usedTokens: c.usedTokens,
+        ...(typeof c.windowTokens === 'number'
+          && Number.isFinite(c.windowTokens)
+          && c.windowTokens > 0
+          ? { windowTokens: c.windowTokens }
+          : {}),
+        ...(typeof c.percentUsed === 'number'
+          && Number.isFinite(c.percentUsed)
+          && c.percentUsed >= 0
+          ? { percentUsed: c.percentUsed }
+          : {}),
+      };
+    }
+  }
+
+  let tokens: CardUsageSnapshot['tokens'] = null;
+  if (rawTokens && typeof rawTokens === 'object' && !Array.isArray(rawTokens)) {
+    const u = rawTokens as Record<string, unknown>;
+    if (typeof u.in === 'number'
+      && Number.isFinite(u.in)
+      && u.in >= 0
+      && typeof u.out === 'number'
+      && Number.isFinite(u.out)
+      && u.out >= 0) {
+      tokens = { in: u.in, out: u.out };
+    }
+  }
+
+  return { context, tokens };
+}
+
+/** Prefer the resident daemon's incremental transcript cache. Older/offline
+ * daemons and isolated environments fall back to the local reader; either path
+ * degrades to explicit unavailable facts without blocking the reply. */
+async function readCardUsageSnapshotForSend(
+  session: SessionData,
+  larkAppId: string,
+): Promise<CardUsageSnapshot> {
+  let daemonPort: number | undefined;
+  try {
+    daemonPort =
+      findDaemon(larkAppId)?.ipcPort
+      ?? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+  } catch {
+    // A stale/unreadable daemon registry must not prevent the reply.
+  }
+  if (daemonPort) {
+    try {
+      const path = `/api/sessions/${encodeURIComponent(session.sessionId)}/usage`;
+      const response = await fetchDaemonIpc(daemonPort, path, {
+        method: 'GET',
+        signal: AbortSignal.timeout(1_500),
+      });
+      if (response.ok) {
+        const body = await response.json() as { usage?: unknown };
+        const normalized = normalizeCardUsageSnapshot(body.usage);
+        if (normalized) return normalized;
+      }
+    } catch {
+      // No host secret, old daemon, timeout, or transient IPC failure: use the
+      // same bounded local parser below.
+    }
+  }
+
+  // Old/offline daemon fallback. Sandboxed panes receive this per-bot value
+  // explicitly from the worker because bots.json is intentionally unreadable.
+  // This send path renders into the reply-card FOOTER, so only the 'footer'
+  // display mode surfaces usage here; 'streaming' shows it on the daemon's live
+  // card (absent on this offline fallback) and 'off' shows nothing.
+  if (resolveUsageDisplay(larkAppId) !== 'footer') {
+    return { context: null, tokens: null };
+  }
+
+  try {
+    return getSessionUsageSnapshot({
+      cliId: (session.cliId ?? session.adoptedFrom?.cliId ?? 'unknown') as CliId | 'unknown',
+      sessionId: session.sessionId,
+      cliSessionId: session.cliSessionId ?? session.adoptedFrom?.sessionId,
+      cwd: session.workingDir ?? session.adoptedFrom?.cwd,
+      // BOT_HOME transcript fallback for CLI-data-redirected / sandboxed bots
+      // (parity with the daemon reader and the ledger/dashboard consumers).
+      larkAppId: larkAppId ?? session.larkAppId,
+      fresh: true,
+    });
+  } catch {
+    return { context: null, tokens: null };
+  }
 }
 
 /**
@@ -5973,37 +6078,40 @@ function argValues(args: string[], ...flags: string[]): string[] {
 function withCustomCardMentionFooter(
   card: Record<string, unknown>,
   mentionOpenIds: readonly string[],
-  sentToLabel: string,
+  locale?: Locale,
 ): { ok: true; card: Record<string, unknown> } | { ok: false; error: string } {
   if (mentionOpenIds.length === 0) return { ok: true, card };
-  const cloned = JSON.parse(JSON.stringify(card)) as Record<string, unknown>;
-  const body = cloned.body as { elements?: unknown } | undefined;
-  if (!body || !Array.isArray(body.elements)) {
+  const deduped = [...new Set(mentionOpenIds.filter(Boolean))];
+  const cloned = appendReplyCardFooterToV2Card(card, {
+    brand: '',
+    recipientOpenIds: deduped,
+    locale,
+  });
+  if (!cloned) {
     return {
       ok: false,
-      error: '自定义卡片带 --mention/--mention-back 时必须是 schema 2.0 且包含 body.elements；或改用 --no-mention 并在卡片 JSON 内自行处理展示',
+      error: '自定义卡片带 --mention/--mention-back 时必须是 schema 2.0、包含 body.elements，且未占用 botmux_reply_footer 元素 ID；或改用 --no-mention 并在卡片 JSON 内自行处理展示',
     };
   }
-  const deduped = [...new Set(mentionOpenIds.filter(Boolean))];
-  body.elements.push(
-    { tag: 'hr' },
-    {
-      tag: 'markdown',
-      text_size: 'notation_small_v2',
-      content: `<font color='grey'>${sentToLabel}${deduped.map(id => `<at id=${id}></at>`).join(' ')}</font>`,
-    },
-  );
   return { ok: true, card: cloned };
 }
 
 // Card v2 body builder helpers — extracted to im/lark/md-card.ts so the
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildImageCardElements` from there.
-import { buildImageCardElements, brandFooterSegment, prepareCardMarkdown, type LocalHomeLinkMode } from './im/lark/md-card.js';
+import {
+  appendReplyCardFooterToV2Card,
+  buildImageCardElements,
+  buildReplyCardFooter,
+  prepareCardMarkdown,
+  type CardUsageSnapshot,
+  type LocalHomeLinkMode,
+} from './im/lark/md-card.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { resolveBrandLabel } from './bot-registry.js';
+import { resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
 import { config } from './config.js';
+import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
@@ -6283,6 +6391,12 @@ async function registerSelfFromCredFile(): Promise<void> {
     apiOnly: cred.apiOnly === true || undefined,
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
+    usageDisplay:
+      process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'off'
+        ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
+        : undefined,
   } as import('./bot-registry.js').BotConfig);
 }
 
@@ -6348,6 +6462,12 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     brand,
     cliId: 'riff',
     allowedUsers: [],
+    usageDisplay:
+      process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'off'
+        ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
+        : undefined,
   } as unknown as import('./bot-registry.js').BotConfig;
 
   const session: SessionData = {
@@ -7428,7 +7548,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       const withFooter = withCustomCardMentionFooter(
         customCard,
         mentionFooter,
-        t('card.sent_to', undefined, localeForBot(appId)),
+        localeForBot(appId),
       );
       if (!withFooter.ok) { console.error(`botmux send: ${withFooter.error}`); process.exit(2); }
       customCard = withFooter.card;
@@ -7520,9 +7640,6 @@ async function cmdSend(rest: string[]): Promise<void> {
       // Brand segment honours this bot's configured brandLabel (unset →
       // default botmux, '' → suppressed, else custom). Same resolver/rule as
       // the daemon's card builders so both send paths render identically.
-      const footerParts: string[] = [];
-      const brandSeg = brandFooterSegment(renderBrandTemplate(resolveBrandLabel(appId), s.workingDir));
-      if (brandSeg) footerParts.push(brandSeg);
       // All real mentions land on one footer line: human addressee first, then
       // explicit @ targets (incl. handoff bots), then cc. Ids already inlined in
       // the body prose are skipped. Top-level publish keeps sendTo empty.
@@ -7532,9 +7649,13 @@ async function cmdSend(rest: string[]): Promise<void> {
         cc: footerAddressing.cc,
         inlinedIds: usedIds,
       });
-      if (footerRecipients.length > 0) {
-        footerParts.push(`${t('card.sent_to', undefined, localeForBot(appId))}${footerRecipients.map(id => `<at id=${id}></at>`).join(' ')}`);
-      }
+      const usageSnapshot = await readCardUsageSnapshotForSend(s, appId);
+      const footer = buildReplyCardFooter({
+        brand: renderBrandTemplate(resolveBrandLabel(appId), s.workingDir),
+        recipientOpenIds: footerRecipients,
+        usage: usageSnapshot,
+        locale: localeForBot(appId),
+      });
       // Footer line (brand 个性签名 + 发送给) and the optional 🔊 语音总结 button
       // share ONE row: footer text on the left (weighted, fills), button pinned
       // to the far right (auto width). When voice isn't configured the footer
@@ -7550,9 +7671,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           voiceOn = isVoiceConfigured(appId);
         } catch { /* voice module/config unavailable → no button */ }
       }
-      const footerContent = footerParts.length > 0
-        ? `<font color='grey'>${footerParts.join(' · ')}</font>`
-        : '';
+      const footerContent = footer?.content ?? '';
       if (footerContent || voiceOn) {
         elements.push({ tag: 'hr' });
         if (voiceOn) {
@@ -7564,7 +7683,11 @@ async function cmdSend(rest: string[]): Promise<void> {
             columns: [
               {
                 tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-                elements: [{ tag: 'markdown', text_size: 'notation_small_v2', content: footerContent || ' ' }],
+                elements: [footer?.element ?? {
+                  tag: 'markdown',
+                  text_size: 'notation_small_v2',
+                  content: ' ',
+                }],
               },
               {
                 tag: 'column', width: 'auto', vertical_align: 'center',
@@ -7581,11 +7704,7 @@ async function cmdSend(rest: string[]): Promise<void> {
             ],
           });
         } else {
-          elements.push({
-            tag: 'markdown',
-            text_size: 'notation_small_v2',
-            content: footerContent,
-          });
+          if (footer) elements.push(footer.element);
         }
       }
 

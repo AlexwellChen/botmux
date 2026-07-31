@@ -942,11 +942,17 @@ describe('getBot / getBotClient', () => {
 
 describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
-  const saved = { app: process.env.BOTMUX_LARK_APP_ID, brand: process.env.BOTMUX_BRAND_LABEL };
+  const saved = {
+    app: process.env.BOTMUX_LARK_APP_ID,
+    brand: process.env.BOTMUX_BRAND_LABEL,
+    usageDisplay: process.env.BOTMUX_USAGE_DISPLAY,
+  };
   beforeEach(async () => { mod = await freshImport(); });
   afterEach(() => {
     if (saved.app === undefined) delete process.env.BOTMUX_LARK_APP_ID; else process.env.BOTMUX_LARK_APP_ID = saved.app;
     if (saved.brand === undefined) delete process.env.BOTMUX_BRAND_LABEL; else process.env.BOTMUX_BRAND_LABEL = saved.brand;
+    if (saved.usageDisplay === undefined) delete process.env.BOTMUX_USAGE_DISPLAY;
+    else process.env.BOTMUX_USAGE_DISPLAY = saved.usageDisplay;
   });
 
   it('returns the injected env brandLabel for the own appId WITHOUT reading bots.json (the sandbox path)', () => {
@@ -966,6 +972,50 @@ describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () =>
     process.env.BOTMUX_LARK_APP_ID = 'app_self';
     process.env.BOTMUX_BRAND_LABEL = '[self]()';
     expect(mod.resolveBrandLabel('app_other')).toBeUndefined();
+  });
+
+  it('resolves the usage-display mode from registry or sandbox env (default streaming)', () => {
+    expect(mod.resolveUsageDisplay('app_default')).toBe('streaming');
+
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_registered_footer',
+      usageDisplay: 'footer',
+    }));
+    expect(mod.resolveUsageDisplay('app_registered_footer')).toBe('footer');
+
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_registered_off',
+      usageDisplay: 'off',
+    }));
+    expect(mod.resolveUsageDisplay('app_registered_off')).toBe('off');
+
+    process.env.BOTMUX_LARK_APP_ID = 'app_sbx';
+    process.env.BOTMUX_USAGE_DISPLAY = 'footer';
+    expect(mod.resolveUsageDisplay('app_sbx')).toBe('footer');
+    expect(mod.resolveUsageDisplay('app_other')).toBe('streaming');
+  });
+
+  it('reads a legacy showUsageInCardFooter:false as off', () => {
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_legacy_off',
+      // legacy field, no usageDisplay set
+      showUsageInCardFooter: false,
+    } as any));
+    expect(mod.resolveUsageDisplay('app_legacy_off')).toBe('off');
+  });
+
+  it('prefers freshly loaded registry config over a frozen pane env for the same app', () => {
+    process.env.BOTMUX_LARK_APP_ID = 'app_hot';
+    process.env.BOTMUX_USAGE_DISPLAY = 'streaming';
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_hot',
+      usageDisplay: 'off',
+    }));
+    expect(mod.resolveUsageDisplay('app_hot')).toBe('off');
+
+    process.env.BOTMUX_USAGE_DISPLAY = 'off';
+    mod.registerBot(makeCfg({ larkAppId: 'app_hot' }));
+    expect(mod.resolveUsageDisplay('app_hot')).toBe('streaming');
   });
 });
 
