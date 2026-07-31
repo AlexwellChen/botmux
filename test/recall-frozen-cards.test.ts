@@ -52,6 +52,9 @@ vi.mock('../src/bot-registry.js', () => ({
     config: { larkAppId: 'app_test', cliId: 'claude-code' },
   })),
   getAllBots: vi.fn(() => []),
+  // Streaming-card usage gate reads this; 'streaming' lets the snapshot flow
+  // (the reader then finds no transcript → empty snapshot, asserted below).
+  resolveUsageDisplay: vi.fn(() => 'streaming'),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -361,6 +364,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       ds.usageLimit,
       undefined,
       false,
+      // 17th arg: streaming-card usage snapshot (no transcript in this test → empty).
+      { context: null, tokens: null },
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });
