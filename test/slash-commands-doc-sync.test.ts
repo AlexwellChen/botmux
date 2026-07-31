@@ -13,6 +13,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS } from '../src/core/passthrough-commands.js';
+import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import type { CliId } from '../src/adapters/cli/types.js';
 import { messages as en } from '../src/i18n/en.js';
 import { messages as zh } from '../src/i18n/zh.js';
 
@@ -27,19 +29,31 @@ const readDoc = (loc: 'en' | 'zh') => readFileSync(docPath(loc), 'utf8');
 const ALIAS_EXEMPT = new Set(['/g', '/slash', '/disconnect']);
 
 /**
- * adapter 默认透传(非全局集合,但对用户可见、文档已述):claude-code / codex 默认放行 /goal。
- * 手工登记——adapter 层没有导出统一集合,少数几个直接列。
+ * adapter 默认透传命令的真源:遍历所有 CLI adapter 的 defaultPassthroughCommands。
+ * 传 mock 路径避免 eager probe(见 cli-adapters.test.ts 同款用法)。这样新 adapter
+ * 加默认命令、或改了 /goal,guard 自动跟着变红,不靠手抄。
  */
-const ADAPTER_DEFAULT_PASSTHROUGH = new Set(['/goal']);
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'relay', 'aiden', 'coco', 'codex', 'codex-app', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'riff'];
+function adapterDefaultPassthrough(): Set<string> {
+  const out = new Set<string>();
+  for (const id of ALL_CLI_IDS) {
+    for (const c of createCliAdapterSync(id, `/mock/bin/${id}`).defaultPassthroughCommands ?? []) {
+      out.add(c.toLowerCase());
+    }
+  }
+  return out;
+}
 
 /**
- * A 类 pre-routing 自有命令:在会话分配前拦截,不进 DAEMON_COMMANDS switch,也不透传。
- * 代码里没有统一集合(散在 event-dispatcher 的 tryHandle* + 路由改写),故手工登记
- * 已知的这批,让 guard 也守住它们的文档。新增 pre-routing 命令时要补进来。
+ * A 类 pre-routing / daemon-拦截 自有命令:不进 DAEMON_COMMANDS switch、也不透传,而是
+ * 在会话分配前(event-dispatcher 的 tryHandle*、路由改写)或 daemon 路由入口
+ * (isLegacyTemplateCommand 等)被拦截。代码里没有统一集合,故手工登记已知这批,
+ * 让 guard 也守住它们的文档。新增此类命令时要补进来。
+ * /template 是退役 tombstone——两条 daemon 路由都会拦截并回退役提示,故仍是用户可见命令。
  */
 const PREROUTING_COMMANDS = new Set([
   '/reply-mode', '/substitute', '/grant', '/revoke', '/introduce',
-  '/summary', '/t', '/topic', '/workflow',
+  '/summary', '/t', '/topic', '/workflow', '/template',
 ]);
 
 /** 命令在 markdown 里是否作为一个 token 出现(命令语法允许尾随 : _ - ,须全部排除以免 /mcp 误配 /mcp:server)。 */
@@ -58,7 +72,7 @@ describe('slash-commands doc ↔ code 对齐', () => {
   const required = [
     ...[...DAEMON_COMMANDS].filter(c => !ALIAS_EXEMPT.has(c)),
     ...PASSTHROUGH_COMMANDS,
-    ...ADAPTER_DEFAULT_PASSTHROUGH,
+    ...adapterDefaultPassthrough(),
     ...PREROUTING_COMMANDS,
   ];
 
