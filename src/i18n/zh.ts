@@ -102,6 +102,7 @@ export const messages: Record<string, string> = {
   'card.grant.toast_owner_only': '仅 owner 可操作',
   'card.grant.toast_expired': '该授权请求已失效',
   'card.grant.toast_bad_limit': '授权限制参数无效',
+  'card.grant.toast_bad_quota': '消息额度请输入 1–1000 的整数，留空表示不限',
   'card.grant.toast_limit_staged': '已更新限制，点击授权后生效',
   'card.grant.toast_no_repo_perm': '无操作权限',
   'card.grant.toast_failed': '授权失败：{reason}',

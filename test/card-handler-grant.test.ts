@@ -114,6 +114,23 @@ describe('card-handler grant actions', () => {
     };
     const res = await handler.handleCardAction(submitted, deps, 'h1');
     expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toBe('消息额度请输入 1–1000 的整数，留空表示不限');
+    expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+  });
+
+  it('rejects a quota above 1000 with an actionable error', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    const submitted: any = action('grant_chat', { nonce });
+    submitted.action.form_value = {
+      grant_duration: String(60 * 60 * 1000),
+      grant_quota: '10000',
+    };
+    const res = await handler.handleCardAction(submitted, deps, 'h1');
+    expect(res?.toast).toEqual({
+      type: 'error',
+      content: '消息额度请输入 1–1000 的整数，留空表示不限',
+    });
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
   });
 

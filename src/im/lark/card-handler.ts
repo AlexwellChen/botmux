@@ -973,7 +973,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const quota = normalizeGrantQuotaOption(
         typeof formValue.grant_quota === 'string' ? formValue.grant_quota.trim() : formValue.grant_quota,
       );
-      if (duration === null || quota === null) {
+      if (quota === null) {
+        return { toast: { type: 'error', content: t('card.grant.toast_bad_quota', undefined, loc) } };
+      }
+      if (duration === null) {
         return { toast: { type: 'error', content: t('card.grant.toast_bad_limit', undefined, loc) } };
       }
       if (!updatePendingGrantLimits(larkAppId, grantChatId, targets, nonce, {
