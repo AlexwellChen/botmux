@@ -3157,8 +3157,8 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; put
   }
 
   return (
-    <div className="bd-subsection">
-      <h4 className="bd-subsection-title">{tr('botDefaults.sectionSessionCap')}</h4>
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionSessionCap')}</h3>
       <div className="bd-row bd-quota">
         <label>
           <FieldTitle help={tr('botDefaults.maxLiveWorkersHelp')}>{tr('botDefaults.maxLiveWorkers')}</FieldTitle>
@@ -3185,7 +3185,7 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; put
         help={tr('botDefaults.overloadAlertHelp')}
         onChange={checked => void saveOverloadAlert(checked)}
       />
-    </div>
+    </section>
   );
 }
 
@@ -3218,8 +3218,8 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   }
 
   return (
-    <div className="bd-subsection">
-      <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.startupCommandsHelp')}>{tr('botDefaults.sectionStartupCommands')}</FieldTitle></h4>
+    <section className="bd-section">
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.startupCommandsHelp')}>{tr('botDefaults.sectionStartupCommands')}</FieldTitle></h3>
       <textarea
         data-input="startupCommands"
         rows={3}
@@ -3232,7 +3232,7 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         <button type="button" className="primary" data-action="save-startup-commands" disabled={busy} onClick={() => void save()}>{tr('botDefaults.startupCommandsSave')}</button>
         <StatusSpan status={status} attr={{ 'data-startup-commands-status': '' }} />
       </div>
-    </div>
+    </section>
   );
 }
 
