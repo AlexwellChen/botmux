@@ -21753,7 +21753,8 @@ dialog select[multiple]:hover:not(:disabled) {
     "avatar main"
     "status status";
   align-items: center;
-  gap: 12px;
+  column-gap: 12px;
+  row-gap: 0; /* empty status row must add no vertical space (its own margin spaces it when present) */
   margin-bottom: 0;
   padding: 12px 14px;
   border: 0;
@@ -21773,7 +21774,7 @@ dialog select[multiple]:hover:not(:disabled) {
   position: static;
   min-width: 0;
   max-width: none;
-  margin: 2px 0 0;
+  margin: 8px 0 0;
   box-shadow: none;
 }
 .bot-defaults-page .bd-profile-head > .bd-avatar-status:empty { display: none; }
