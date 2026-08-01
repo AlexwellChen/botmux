@@ -846,6 +846,10 @@ export function isKnownPeerBot(dataDir: string, larkAppId: string, senderOpenId:
  * union_id roster）与 isTeamBot（团队群里学来的 union_id）都是 union_id 锚定的
  * bot 专属信任；平台拉的团队群则经 platform: 前缀镜像进 team-groups，走同一个
  * isTeamGroupChat。两条路都算团队模式，都不需要 /grant。
+ *
+ * 调用方只剩 {@link evaluateBotTalk} 一个（bot 闸门的唯一入口）；(1) 的两条腿与
+ * evaluateTalk 的 teamBot 腿重合，真正额外放行的是 (2)。保留本谓词是因为它是
+ * 「bot 团队信任」的定义所在，且有专属单测（team-peer-trust / platform-team-trust）。
  */
 export function isTrustedTeamBotSender(
   dataDir: string,
@@ -1200,18 +1204,31 @@ function mentionAppId(m: any): string | undefined {
 /** 会话类型（与 daemon / DaemonSession 的 chatType 同域）。p2pOpen 腿据此判定。 */
 export type ChatKind = 'group' | 'p2p';
 
-export type TalkReason =
-  | 'allowedUser'
-  | 'oncall'
-  | 'peer'
-  | 'teamBot'
-  | 'teamMember'
-  | 'allowedChatGroup'
-  | 'open'
-  | 'chatGrant'
-  | 'globalGrant'
-  | 'p2pOpen'
-  | 'none';
+/**
+ * 全部 talk 放行源的**运行时**枚举（TalkReason 由它派生）。
+ *
+ * 之所以是数组而不是纯 type：`test/bot-talk-parity.test.ts` 按它逐条核对
+ * 「这条腿对人和对 bot 分别是什么行为」，少一格就红。tsconfig 的 include 只有
+ * `src/**`，测试不过 tsc——纯类型层的穷尽约束在这里执行不了，必须落到运行时。
+ *
+ * 新增一条 talk 源时：改 evaluateTalk（人/bot 同时生效）+ 在那张表补一格说明，
+ * **不要**去 bot 路由闸里加 OR 腿（那正是 allowedChatGroups 漏掉的老路）。
+ */
+export const TALK_REASONS = [
+  'allowedUser',
+  'oncall',
+  'peer',
+  'teamBot',
+  'teamMember',
+  'allowedChatGroup',
+  'open',
+  'chatGrant',
+  'globalGrant',
+  'p2pOpen',
+  'none',
+] as const;
+
+export type TalkReason = typeof TALK_REASONS[number];
 
 export interface TalkEvaluation {
   allowed: boolean;
@@ -1290,6 +1307,12 @@ function grantNotExpired(
       .finally(() => expiryCleanupInFlight.delete(cleanupKey));
   }
   return false;
+}
+
+/** 整群 talk 授权命中判断（裸 `/grant` 写入的 allowedChatGroups）。chat 维度、sender 无关，
+ *  与 oncall 同一个安全模型：只放行 canTalk / bot 路由闸，canOperate 绝不读它。 */
+function hasAllowedChatGroup(larkAppId: string, chatId: string | undefined): boolean {
+  return !!chatId && !!getBot(larkAppId).config.allowedChatGroups?.includes(chatId);
 }
 
 /**
@@ -1373,7 +1396,7 @@ export function evaluateTalk(
   if (memberUnionId && isPlatformTeamMemberChat(config.session.dataDir, chatId, memberUnionId)) {
     return { allowed: true, reason: 'teamMember' };
   }
-  if (chatId && bot.config.allowedChatGroups?.includes(chatId)) return { allowed: true, reason: 'allowedChatGroup' };
+  if (hasAllowedChatGroup(larkAppId, chatId)) return { allowed: true, reason: 'allowedChatGroup' };
 
   // p2pOpen：私聊维度的 talk-open，与 oncall（群维度）同一个安全模型——放行 canTalk，
   // canOperate 一行不读它（管理仍限 allowedUsers）。谁能私聊由飞书应用「可用范围」控制。
@@ -1393,6 +1416,84 @@ export function evaluateTalk(
     return { allowed: true, reason: 'globalGrant', quotaKey: globalQuotaKey(senderOpenId!) };
   }
   return { allowed: false, reason: 'none' };
+}
+
+/**
+ * BOT 发送方的 talk 判定 —— bot 路由闸（外部 bot @ 本 bot）的**唯一**入口。
+ *
+ * = 人侧 evaluateTalk 的完整模型 ＋ 一条 bot 专属腿。历史上 bot 侧手抄了一份
+ * talk 源子集（oncall / peer / teamBot / chatGrant / globalGrant 的 OR 链），
+ * 于是每加一条新 talk 源就漏一次、复发一次同类 bug：oncall 漏过一次、开放模式
+ * 漏过一次、allowedChatGroups 又漏一次（owner 整群 `/grant` 后真人能说话、外部 bot
+ * 一 @ 仍弹授权卡）。收敛成单一谓词后，**新增 talk 源只需改 evaluateTalk**；
+ * test/bot-talk-parity.test.ts 按 TALK_REASONS 逐条盯着这条约束。
+ *
+ * 与人侧仅有的两条差异，都是刻意的，改动前先读：
+ *
+ *  1. `isTrustedTeamBotSender`（+，bot 才有）：其中真正额外放行的是**团队拉群**那条腿
+ *     ——本群是团队拉群（团队掌控成员）→ 说话的 botmux bot 即视为背书队友，首次接触
+ *     也放行，与 oncall 群豁免同构。chat 维度、不看 union，覆盖 sender 事件没带
+ *     `union_id` 的情况（此时 gate 前那次 `recordTeamBot` 被 `senderUnionId &&` 短路，
+ *     evaluateTalk 的 teamBot 腿必然落空）。**这条不能下沉进 evaluateTalk**：那是人/bot
+ *     共用的，加进去等于团队群里任何真人都自动过 canTalk，绕开 teamMember 腿的成员校验
+ *     （isPlatformTeamMemberChat 要求 union 在该团队成员名单里）。它另外两条 union 锚定
+ *     的腿与 evaluateTalk 的 teamBot 腿重合，留着是为了让「bot 团队信任」只有一处定义。
+ *
+ *  2. `p2pOpen`（−）：不传 chatType → 该腿 fail-closed 不生效。飞书里 bot 之间不存在
+ *     私聊，开着只是白扩边界。
+ *
+ * @param senderUnionId 必须是飞书盖章的 bot 发送方 union（`sender_type ∈ app|bot`），
+ *   与 evaluateTalk 的 bot-trust 腿同一契约。真人 union 走 memberUnionId，本函数恒不传。
+ */
+export function evaluateBotTalk(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  senderUnionId?: string,
+): TalkEvaluation {
+  const ev = evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+  if (ev.allowed) return ev;
+  return isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
+    ? { allowed: true, reason: 'teamBot' }
+    : ev;
+}
+
+/** ask 答复者身份上下文（文字作答路径带，卡片点击路径不带）。与 ask-broker 的
+ *  AskAnswerActor 同形；放这里是为了让「ask 答复的 talk 分派」有一个生产共用真源，
+ *  daemon wiring 与回归测试都调 {@link evaluateAskAnswerTalk}，不各自手抄分派。 */
+export interface AskAnswerActorContext {
+  botSender?: boolean;
+  senderUnionId?: string;
+  memberUnionId?: string;
+}
+
+/**
+ * `botmux ask` 答复者是否可作答（= 该 chat 的 canTalk 门）——ask-broker 注入的
+ * canTalkChecker 的**唯一生产实现**，daemon bootstrap 一行转调它。
+ *
+ * 抽成独立导出函数（而非把分派内联进 daemon setter 闭包）的意义：让**分派谓词本身**
+ * 能被回归测试直接咬住——测试对本函数喂真实 team store 状态断言三组行为，改坏这里的
+ * 分派逻辑（如退回旧 evaluateTalk / 不认 actor.botSender）会立刻红。注意测试只覆盖到
+ * 本函数；daemon setter 的一行转调与 submitCustomReply 的 actor 构造仍靠人工核对
+ * （setter 只有一行，不经测试机械覆盖）。
+ *
+ *  - bot 发送方（actor.botSender）→ evaluateBotTalk（含团队拉群那条 chat 维度腿，
+ *    覆盖 sender 事件没带 union_id 的场景），与 dispatcher 外层闸 / quota 复查同源。
+ *  - 人 / 无 actor（卡片点击路径）→ evaluateTalk 全模型：actor.senderUnionId 走
+ *    teamBot 腿（人路径恒 undefined）、actor.memberUnionId 走 teamMember 腿。
+ *    actor 省略时两者都是 undefined → 退化为纯 evaluateTalk(openId, chatType)，
+ *    与本次改动前的卡片点击语义完全一致。
+ */
+export function evaluateAskAnswerTalk(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  chatType?: ChatKind,
+  actor?: AskAnswerActorContext,
+): boolean {
+  return actor?.botSender
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, actor.senderUnionId).allowed
+    : evaluateTalk(larkAppId, chatId, senderOpenId, actor?.senderUnionId, actor?.memberUnionId, chatType).allowed;
 }
 
 export function canOperate(
@@ -1433,6 +1534,12 @@ export function canOperate(
  *
  * chatType 省略时 p2pOpen 腿不生效（fail-closed），与 canTalk 语义一致——
  * 私聊路径的调用点必须把 chatType 传进来。
+ *
+ * botSender：降权到 talk 判定这一段，必须与 dispatcher 外层闸 / quota 复查用**同一个**
+ * 谓词。bot 发送方走 evaluateBotTalk（含团队拉群那条 chat 维度腿，覆盖 sender 事件没带
+ * union_id 的情况）；否则「团队拉群里外部 bot 能 talk 却执行不了降权到 canTalk 的命令
+ * （如 /status）」——单一 talk 谓词在这道 daemon 命令闸继续分叉。不传（人的路径）→
+ * 原样走 canTalk / evaluateTalk，语义不变。canOperate 那段人/bot 通用，不受影响。
  */
 export function canRunDaemonCommand(
   larkAppId: string,
@@ -1442,11 +1549,14 @@ export function canRunDaemonCommand(
   cmd: string,
   memberUnionId?: string | undefined,
   chatType?: 'p2p' | 'group',
+  botSender?: boolean,
 ): boolean {
   if (canOperate(larkAppId, chatId, senderOpenId, senderUnionId)) return true;
   const list = getBot(larkAppId).config.canTalkDaemonCommands;
   if (!list?.includes(cmd)) return false;
-  return canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+  return botSender
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId).allowed
+    : canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
 }
 
 /**
@@ -2427,13 +2537,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const ownsThreadSession = ctx.scope === 'thread'
           ? (handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false)
           : false;
-        const canFoldForeignBotThread = findOncallChat(larkAppId, chatId)
-          || isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
-          || isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
-          || hasChatGrant(larkAppId, chatId, senderOpenId)
-          || hasGlobalGrant(larkAppId, senderOpenId);
+        // 这个 bot 能不能在本群跟我们说话 —— 判定一次，fold 与下面的 gate 共用同一个
+        // 结论（二者之间只有 fold / shared-seed 的路由计算，不改任何授权状态）。
+        // 曾经这里是两条手抄的 OR 链，靠人肉保持同步；漏一处就是「能路由但不能 fold」
+        // 或「fold 了却弹卡」的二次分裂。
+        const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         let replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
-          larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: !!canFoldForeignBotThread, ownsThreadSession,
+          larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: botTalk.allowed, ownsThreadSession,
         });
         if (!replyRootId) {
           replyRootId = await maybeApplySharedTopicSeed({
@@ -2445,70 +2555,43 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // threads. Previously native topic replies skipped this outer gate and
         // were silently dropped by daemon's second evaluateTalk check, so the
         // owner never saw a grant card. Owning an existing session is not an
-        // authorization source; a revoked/unknown bot must still pass one of
-        // the explicit trust or grant legs below.
+        // authorization source; a revoked/unknown bot must still pass
+        // evaluateBotTalk (the single talk predicate — see its doc for the two
+        // deliberate human/bot deltas) or prove itself a sibling below.
         //
-        // 注意 isKnownPeerBot 查的是 cross-ref（bot-openids-<appId>.json），它只
-        // 收录 bots-info.json 里有名字的 bot，即本机 daemon 自己配置的 bot
-        // （getAllBots）。"别人的 bot" 永远进不了这个 cross-ref，所以 isKnownPeerBot
-        // 对外部 bot 恒为 false——这跟 /introduce 是两套独立存储：/introduce 写的是
-        // observed-bots-store，只负责让发送方"发现并能 @ 到"对方，过不了这道接收闸。
+        // 这里**只判 evaluateBotTalk**。以前是手抄的 OR 链，每加一条 talk 源就漏一次：
+        // oncall 漏过、开放模式漏过、allowedChatGroups 又漏过（整群 /grant 后人通 bot 卡）。
+        // 要加新的 talk 放行源，改 evaluateTalk（人/bot 同时生效），不要在这里加腿；
+        // test/bot-talk-parity.test.ts 会盯着这条约束。
         //
-        // Oncall 群是当前接收 bot 显式部署的协作工作区，canTalk 已对任何成员
-        // （含真人）放行；这里对 bot 同等放行，跳过 cross-ref vetting。否则本
-        // bot 已绑定的 oncall 群里外部 bot 互相 @ 会被静默丢弃、只有真人能拉起会话。
-        // 注意 oncall talk access 是 bot-scoped：一个 bot 的 /oncall bind 不会放开
-        // sibling bot 的 talk 权限；如果 sibling bot 也要开放，需要自己绑定同一个 chat。
-        //
-        // owner 还可用 `/grant @bot` 把外部 bot 加进本群 chatGrants（与真人 /grant
-        // 同一存储、同一 per-chat 语义）。命中 chatGrants 的 bot 即便不在 cross-ref，
-        // 也与已注册 peer 同等放行——这是「授权外部 bot 在本群协作」的入口。
-        // 全局授权（globalGrants）同理：命中即在任意群放行，是上面的全局版。
-        //
-        // 团队 bot 免 /grant：isTrustedTeamBotSender 命中（sender 的租户稳定
-        // union_id 已学进 team-bots，或本群就是团队拉群组建的协作群）即放行——
-        // 与「同部署兄弟 bot」(isKnownPeerBot) 对等，但覆盖跨部署的团队 peer。
-        // 这正是「加入团队即免 introduce/grant」的接收闸：身份只认 union_id /
-        // 团队群成员，绝不认自报名字（防同名 bot 冒名蹭权）。
-        //
-        // 开放模式（未配任何 allowlist：allowedUsers / allowedChatGroups /
-        // globalGrants 全空）与人侧 evaluateTalk 的 `reason:'open'`（1011 行）对齐：
-        // 「谁都能触发」本应人、bot 同权。过去这道 gate 漏了这一腿，导致开放模式下
-        // 外部 bot @ 仍被丢弃，必须真人先 @ 一次建 session 才救活。
-        // 补上 hasConfiguredAllowlist 短路后两条路径统一：一旦配了任一 allowlist，
-        // 立刻恢复「限制态」设闸，安全边界不变。
-        if (!findOncallChat(larkAppId, chatId)
-            && hasConfiguredAllowlist(getBot(larkAppId))) {
-          if (!isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
-              && !isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
-              && !hasChatGrant(larkAppId, chatId, senderOpenId)
-              && !hasGlobalGrant(larkAppId, senderOpenId)) {
-            // Cold-start self-heal: the cross-ref (bot-openids-<appId>.json) is
-            // learned lazily from observed mentions[], so the FIRST bot→bot
-            // direct @ from a same-deployment sibling can arrive before the
-            // receiver has learned that sibling's receiver-scoped open_id
-            // (Lark open_id is per-app). That raced a real sibling into this
-            // "unknown external bot" branch and mis-fired a /grant card
-            // (regression from ec146a49). Before deciding unknown, confirm the
-            // sender against the group's LIVE `/members/bots` roster: accept
-            // only when it binds to exactly one locally-configured sibling of
-            // the same unique name that independently confirms is_in_chat.
-            // Fails closed to the grant card on any API error / ambiguity /
-            // genuine external bot — never a name-only shortcut.
-            const sibling = await resolveSiblingBotBySenderOpenId(larkAppId, chatId, senderOpenId)
-              .catch((err): { ok: false; reason: string } => ({ ok: false, reason: `resolve_threw: ${err?.message ?? String(err)}` }));
-            if (sibling.ok) {
-              // Persist the newly-proven mapping so subsequent @s from this
-              // sibling hit isKnownPeerBot directly (no live API roundtrip).
-              updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, [
-                { name: sibling.botName, id: { open_id: sibling.senderOpenId } },
-              ]);
-              logger.info(`Lazy sibling cross-ref backfill: ${sibling.botName} → ${senderOpenId?.substring(0, 12)} (was cold; skipping /grant)`);
-            } else {
-              logger.info(`Foreign bot @mention not a known sibling (${sibling.reason}); sending grant request card`);
-              await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
-              return;
-            }
+        // 唯一留在闸门里的 bot 专属逻辑是下面的 cross-ref 冷启动自愈：它不是一条
+        // 授权来源，而是「同部署兄弟 bot 的身份还没学到」这个**识别**问题的补救。
+        if (!botTalk.allowed) {
+          // Cold-start self-heal: the cross-ref (bot-openids-<appId>.json) is
+          // learned lazily from observed mentions[], so the FIRST bot→bot
+          // direct @ from a same-deployment sibling can arrive before the
+          // receiver has learned that sibling's receiver-scoped open_id
+          // (Lark open_id is per-app). That raced a real sibling into this
+          // "unknown external bot" branch and mis-fired a /grant card
+          // (regression from ec146a49). Before deciding unknown, confirm the
+          // sender against the group's LIVE `/members/bots` roster: accept
+          // only when it binds to exactly one locally-configured sibling of
+          // the same unique name that independently confirms is_in_chat.
+          // Fails closed to the grant card on any API error / ambiguity /
+          // genuine external bot — never a name-only shortcut.
+          const sibling = await resolveSiblingBotBySenderOpenId(larkAppId, chatId, senderOpenId)
+            .catch((err): { ok: false; reason: string } => ({ ok: false, reason: `resolve_threw: ${err?.message ?? String(err)}` }));
+          if (sibling.ok) {
+            // Persist the newly-proven mapping so subsequent @s from this
+            // sibling hit isKnownPeerBot directly (no live API roundtrip).
+            updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, [
+              { name: sibling.botName, id: { open_id: sibling.senderOpenId } },
+            ]);
+            logger.info(`Lazy sibling cross-ref backfill: ${sibling.botName} → ${senderOpenId?.substring(0, 12)} (was cold; skipping /grant)`);
+          } else {
+            logger.info(`Foreign bot @mention not a known sibling (${sibling.reason}); sending grant request card`);
+            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+            return;
           }
         }
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
