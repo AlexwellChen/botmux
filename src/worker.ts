@@ -36,6 +36,7 @@ import {
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
+import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
@@ -8785,6 +8786,37 @@ async function spawnCli(
       }
     }
 
+    // No-Lark-transport turn (apiOnly bot OR HTTP virtual chat) has no Feishu
+    // sender identity and no business with the role system — it gets NO role
+    // library grant, and we skip both the resolve and the diagnostic below.
+    // (buildFsPolicy independently re-gates roleLibrarySubtree on larkTransport;
+    // this mirror keeps the worker from resolving/diagnosing a subtree the policy
+    // will discard.)
+    const larkTransportEnabled = !(cfg.apiOnly === true
+      || cfg.chatId?.startsWith('http_async_') === true
+      || cfg.chatId?.startsWith('http_wait_') === true);
+    // Own role-library subtree, plus the ONE diagnosable failure mode of keying it
+    // on appId: a deployment that named the per-bot dir something else (the layout
+    // pre-2026-07 runbooks used) gets no rule, and "the role system EPERMs" is
+    // indistinguishable from "sandbox working as intended". Say so out loud instead
+    // — the session still runs, only role switching/creation is unavailable.
+    const roleLibSubtree = larkTransportEnabled
+      ? (roleLibrarySubtree(cfg.larkAppId) ?? undefined)
+      : undefined;
+    if (larkTransportEnabled && !roleLibSubtree) {
+      try {
+        // 两种形态都比：配置路径表面在库内、但经中间 symlink 解析到库外时，
+        // 只比 canonical 会漏报（而这恰恰也是 roleLibrarySubtree 返回空的场景）。
+        const lexicalRoot = roleLibraryRoot(), rolesRoot = canonical(lexicalRoot);
+        const under = (root: string, p: string) => p === root || p.startsWith(`${root}/`);
+        if (under(rolesRoot, canonical(cfg.workingDir)) || under(lexicalRoot, cfg.workingDir)) {
+          log(`[sandbox] role library dir mismatch: workingDir is under ${rolesRoot} but ${rolesRoot}/${cfg.larkAppId} `
+            + 'is not a real directory — the role system (list/switch/create roles, post-switch knowledge writes) will '
+            + 'EPERM in this sandboxed session. Rename the per-bot dir to the appId; see docs/roles/deploy-runbook.md.');
+        }
+      } catch { /* diagnostics only — never block the spawn */ }
+    }
+
     const fsPolicyCtx = {
       platform: process.platform as 'darwin' | 'linux',
       homeDir: sandboxHome,
@@ -8794,12 +8826,18 @@ async function spawnCli(
       currentAppId: cfg.larkAppId,
       sessionId: cfg.sessionId,
       botHome: canonical(ownBotHome!),
-      // No-Lark-transport credential profile: apiOnly bot OR HTTP virtual chat.
-      // buildFsPolicy suppresses every Feishu-cred grant + hard-denies bots.json/
-      // lark-cli stores so a workingDir=~ grant can't re-expose them.
-      larkTransportEnabled: !(cfg.apiOnly === true
-        || cfg.chatId?.startsWith('http_async_') === true
-        || cfg.chatId?.startsWith('http_wait_') === true),
+      // Resolved above (gated on larkTransportEnabled). roleLibrarySubtree() does
+      // the existence + canonicalization + "must be a real dir, not a symlink"
+      // checks itself (deliberately NOT via keepExisting: its realpath would follow
+      // a planted link and hand rw to the target). A library created after spawn
+      // only takes effect for the next session — bwrap cannot bind a nonexistent
+      // source anyway.
+      roleLibrarySubtree: roleLibSubtree,
+      // No-Lark-transport credential profile: apiOnly bot OR HTTP virtual chat
+      // (computed above as larkTransportEnabled). buildFsPolicy suppresses every
+      // Feishu-cred grant + hard-denies bots.json/lark-cli stores so a workingDir=~
+      // grant can't re-expose them, and independently withholds the role-library grant.
+      larkTransportEnabled,
       // ALWAYS freeze BOTH botmux authority roots for a no-transport turn: the
       // configured one (`botmuxHome` above = dirname(dataDir)) AND the canonical
       // default `~/.botmux`. A custom SESSION_DATA_DIR moves the data dir, but the

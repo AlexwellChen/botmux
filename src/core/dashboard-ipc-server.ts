@@ -1001,16 +1001,34 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_cd_unsupported' });
   }
-  const v = validateRoleLibraryPath(body?.dir ?? '');
+  // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
+  // 下面 repinSessionWorkingDir 把 ds.workingDir 钉过去之后，那个 bot 的沙盒会话
+  // 就拿到了对方整棵角色库的 readWrite（打穿 fs-policy 的跨 bot 隔离）。
+  const v = validateRoleLibraryPath(body?.dir ?? '', undefined, ds.larkAppId);
   if (!v.ok) {
-    return jsonRes(res, v.error === 'outside_role_library' ? 403 : 400, { ok: false, error: v.error });
+    const forbidden = v.error === 'outside_role_library' || v.error === 'outside_own_role_library';
+    // own_role_library_missing：本 bot 的 `<角色库根>/<appId>` 不是真目录（存量用
+    // 人类 slug 命名这一层，未按 deploy-runbook §8 迁移）。FAIL-CLOSED——不回落全局
+    // 根（回落是 fail-open，会让存量部署继续能跨 bot 切并经 workingDir 拿 rw）。回
+    // 409 + 迁移指引，让运营看得见查得到，而不是静默放行或静默拒绝。
+    if (v.error === 'own_role_library_missing') {
+      logger.warn(`[role] 角色库每-bot 目录名不是 appId（期望 ~/botmux-roles/${ds.larkAppId}）——`
+        + 'role switch 已 fail-closed 拒绝，避免跨 bot 越权。按 docs/roles/deploy-runbook.md '
+        + '§8「迁移：每-bot 目录名改为 appId」重命名该目录即恢复。');
+      return jsonRes(res, 409, { ok: false, error: v.error });
+    }
+    return jsonRes(res, forbidden ? 403 : 400, { ok: false, error: v.error });
   }
   repinSessionWorkingDir(ds, v.resolvedPath);
+  // ds.initConfig 与 repin 同步，且**无条件**（不只在 live-worker 分支里）：下次
+  // forkWorker 用 initConfig 重建 init 消息，只在有活 worker 时更新的话，no-worker /
+  // worker.killed 两条分支会留下「记录新、initConfig 旧」的分裂状态，冷启动把会话
+  // 带回旧 cwd（= 旧角色，连记忆桶都是旧的）。codex review 抓出的既有 bug，与本 PR
+  // 的收窄同一处理，顺手修掉。
+  if (ds.initConfig) ds.initConfig.workingDir = v.resolvedPath;
   if (ds.worker && !ds.worker.killed) {
     // updateWorkingDir 随 restart 带给 worker：respawn 必须收敛到新目录，而不是
-    // 陈旧的 lastInitConfig.workingDir。daemon 侧的 ds.initConfig 同步更新，保持
-    // 与 worker 侧一致（下次 forkWorker 用它重建 init 消息）。
-    if (ds.initConfig) ds.initConfig.workingDir = v.resolvedPath;
+    // 陈旧的 lastInitConfig.workingDir（daemon 侧 initConfig 已在上面同步）。
     try {
       ds.workerReady = false;
       ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
