@@ -904,6 +904,7 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
   }
 
   return (
+    <>
     <div className="bd-profile-avatar bd-avatar-editable" data-avatar-control>
       <button
         type="button"
@@ -929,14 +930,6 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
           void handleFile(file);
         }}
       />
-      {status ? (
-        <small className={statusClass(status, 'bd-avatar-status')} data-avatar-status>
-          {status.text}
-          {loginVisible ? (
-            <button type="button" className="bd-feishu-login" data-action="feishu-login-avatar" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
-          ) : null}
-        </small>
-      ) : null}
       {loginOpen ? (
         <FeishuLoginModal
           onClose={() => setLoginOpen(false)}
@@ -948,6 +941,18 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
         />
       ) : null}
     </div>
+    {/* Status renders as a full-width in-flow strip on the header's second grid
+        row (not absolutely positioned under the avatar), so it never overlaps
+        the name-status or the tab bar below. */}
+    {status ? (
+      <small className={statusClass(status, 'bd-avatar-status')} data-avatar-status>
+        {status.text}
+        {loginVisible ? (
+          <button type="button" className="bd-feishu-login" data-action="feishu-login-avatar" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
+        ) : null}
+      </small>
+    ) : null}
+    </>
   );
 }
 
