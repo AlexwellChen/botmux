@@ -308,7 +308,7 @@ const zh: DashboardMessages = {
   'sessions.workingDir': '工作目录',
   'sessions.created': '创建',
   'sessions.last': '最近',
-  'sessions.preview.latestExchange': '最近消息',
+  'sessions.preview.latestExchange': '最近问答',
   'sessions.preview.showFull': '查看完整问答',
   'sessions.adopt': '接入',
   'sessions.actions': '操作',
