@@ -10,13 +10,13 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatBotMembers, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, extractMentionIdentities, type MentionIdentity } from './message-parser.js';
+import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
@@ -58,6 +58,7 @@ import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
+import { evaluateMessageListener, resolveListenerSenderIdentity, buildListenerBotAppIdToOpenId, collectListenerBotAppIds, type MessageListenerMatch } from '../../services/message-listener.js';
 import {
   parseVcMeetingPushEvent,
   VC_BOT_MEETING_ACTIVITY_EVENT,
@@ -1024,39 +1025,18 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
     return false;
   }
 
-  // 1. Check message.mentions array (populated for user-sent text messages).
-  //    mentionOpenId() tolerates both the WS event object shape and the REST
-  //    string shape, so a Lark mention-shape change can't silently break
-  //    @-detection (which would make the bot ignore every @ with no error).
-  const mentions: any[] = message.mentions ?? [];
   // Early-warning: today's WS events carry mention.id as an object; the REST
   // API carries a bare string. A string-form id on the event path means Lark
   // has converged the event onto the REST shape — surface it (once) so a silent
-  // @-routing regression announces itself even though mentionOpenId absorbs it.
+  // @-routing regression announces itself even though the shared gate absorbs it.
+  const mentions: any[] = message?.mentions ?? [];
   if (!warnedStringMentionShape && mentions.some((m: any) => typeof m?.id === 'string')) {
     warnedStringMentionShape = true;
     logger.warn(`[${larkAppId}] mention.id arrived in string form on the event path — Lark may have converged the WS event onto the REST shape. mentionOpenId() absorbs it, but verify group @-routing. (logged once per process)`);
   }
-  if (mentions.some((m: any) => mentionMatchesBot(m, larkAppId, botOpenId))) {
-    return true;
-  }
 
-  // 2. Check post content for inline at tags (bot-sent post messages may not
-  //    populate message.mentions — the @mention is embedded in the content structure)
-  try {
-    const content = JSON.parse(message.content ?? '{}');
-    const inner = content.zh_cn ?? content.en_us ?? content;
-    if (Array.isArray(inner?.content)) {
-      for (const paragraph of inner.content) {
-        if (!Array.isArray(paragraph)) continue;
-        for (const node of paragraph) {
-          if (node.tag === 'at' && node.user_id === botOpenId) return true;
-        }
-      }
-    }
-  } catch { /* ignore parse errors */ }
-
-  return false;
+  // Single source of truth shared with the poll + dashboard-preview legs.
+  return messageMentionsBot(message, larkAppId, botOpenId);
 }
 
 /** Does this message @mention a *specific other member* (a person or bot that
@@ -1174,23 +1154,6 @@ function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boole
   // flow through mentionOpenId(), which is persisted and used as an open_id.
   const appId = mentionAppId(m);
   return Boolean(larkAppId && appId === larkAppId);
-}
-
-function mentionIdType(m: any): string | undefined {
-  if (!m || typeof m !== 'object') return undefined;
-  if (typeof m.id_type === 'string') return m.id_type;
-  if (typeof m.idType === 'string') return m.idType;
-  return undefined;
-}
-
-function mentionAppId(m: any): string | undefined {
-  if (!m || typeof m !== 'object') return undefined;
-  if (typeof m.appId === 'string') return m.appId;
-  if (typeof m.app_id === 'string') return m.app_id;
-  const idType = mentionIdType(m);
-  if (idType === 'app_id' && typeof m.id === 'string') return m.id;
-  if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
-  return undefined;
 }
 
 // ─── Permission gates ────────────────────────────────────────────────────
@@ -1700,6 +1663,8 @@ export interface RoutingContext {
   summaryCommand?: SummaryCommandRuntimeContext;
   /** This turn was triggered by @mentioning a configured substitute person. */
   substituteTrigger?: import('../../types.js').SubstituteTrigger;
+  /** This turn was triggered by a configured group message listener. */
+  messageListener?: MessageListenerMatch;
   /** Earlier topic seed coalesced into this root-linked clarification. */
   forwardSeedData?: any;
   larkAppId: string;
@@ -1709,6 +1674,201 @@ interface PendingForwardTopicPayload {
   data: any;
   ctx: RoutingContext;
   ownsSession: boolean;
+}
+
+function listenerRoutingContext(input: {
+  data: any;
+  match: MessageListenerMatch;
+  chatId: string;
+  messageId: string;
+  chatType: 'group' | 'p2p';
+  larkAppId: string;
+}): PendingForwardTopicPayload {
+  return {
+    data: input.data,
+    ctx: {
+      chatId: input.chatId,
+      messageId: input.messageId,
+      chatType: input.chatType,
+      larkAppId: input.larkAppId,
+      scope: 'thread',
+      anchor: input.messageId,
+      messageListener: input.match,
+    },
+    ownsSession: false,
+  };
+}
+
+const MESSAGE_LISTENER_POLL_INTERVAL_MS = Math.max(
+  5_000,
+  Number(process.env.BOTMUX_MESSAGE_LISTENER_POLL_INTERVAL_MS) || 30_000,
+);
+const MESSAGE_LISTENER_BACKFILL_WINDOW_MS = Math.max(
+  60_000,
+  Number(process.env.BOTMUX_MESSAGE_LISTENER_BACKFILL_WINDOW_MS) || 30 * 60_000,
+);
+const MESSAGE_LISTENER_BACKFILL_SCAN_LIMIT = Math.max(
+  1,
+  Number(process.env.BOTMUX_MESSAGE_LISTENER_BACKFILL_SCAN_LIMIT) || 100,
+);
+const MESSAGE_LISTENER_BACKFILL_PAGE_SIZE = Math.min(50, Math.max(
+  1,
+  Number(process.env.BOTMUX_MESSAGE_LISTENER_BACKFILL_PAGE_SIZE) || 50,
+));
+
+function enabledMessageListenerChatIds(bot: BotState): string[] {
+  return Object.entries(bot.config.messageListeners ?? {})
+    .filter(([, listener]) => listener?.enabled === true && !!listener.prompt?.trim())
+    .map(([chatId]) => chatId);
+}
+
+function messageCreateTimeMs(message: any): number | undefined {
+  const raw = message?.create_time ?? message?.createTime;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function historyMessageSender(message: any): {
+  senderOpenId?: string;
+  senderTypeRaw?: string;
+  senderIdType?: string;
+} {
+  const sender = message?.sender ?? {};
+  const senderId = sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
+    ?? message?.sender_id?.open_id ?? message?.sender_id?.user_id ?? message?.sender_id?.app_id;
+  const senderIdType = sender.id_type ?? sender.sender_id_type;
+  const inferredType = sender.sender_type
+    ?? message?.sender_type
+    ?? (senderIdType === 'app_id' ? 'app' : undefined);
+  return {
+    senderOpenId: typeof senderId === 'string' ? senderId : undefined,
+    senderTypeRaw: typeof inferredType === 'string' ? inferredType : undefined,
+    senderIdType: typeof senderIdType === 'string' ? senderIdType : undefined,
+  };
+}
+
+function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
+  const { senderOpenId, senderTypeRaw, senderIdType } = historyMessageSender(message);
+  const isAppId = senderIdType === 'app_id' || senderTypeRaw === 'app' || senderTypeRaw === 'bot';
+  return {
+    message: {
+      ...message,
+      message_type: message?.message_type ?? message?.msg_type,
+      chat_id: message?.chat_id ?? chatId,
+      chat_type: message?.chat_type ?? 'group',
+    },
+    sender: {
+      sender_type: senderTypeRaw ?? (isAppId ? 'app' : 'user'),
+      sender_id: isAppId
+        ? { app_id: senderOpenId }
+        : { open_id: senderOpenId },
+    },
+  };
+}
+
+async function dispatchHumanMessageViaHandlers(
+  larkAppId: string,
+  handlers: EventHandlers,
+  payload: PendingForwardTopicPayload,
+): Promise<void> {
+  await serializeByAnchor(payload.ctx.anchor, () => {
+    const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
+    return ownsSession
+      ? handlers.handleThreadReply(payload.data, payload.ctx)
+      : handlers.handleNewTopic(payload.data, payload.ctx);
+  });
+}
+
+async function dispatchPolledMessageListenerMatch(input: {
+  larkAppId: string;
+  handlers: EventHandlers;
+  data: any;
+  match: MessageListenerMatch;
+  chatId: string;
+  messageId: string;
+}): Promise<void> {
+  if (!claimMessageOnce(input.larkAppId, input.messageId)) {
+    logger.debug(`[message-listener:${input.larkAppId}] polled duplicate ignored msg=${input.messageId.substring(0, 12)}`);
+    return;
+  }
+  logger.info(
+    `[message-listener:${input.larkAppId}] matched polled chat=${input.chatId.substring(0, 12)} ` +
+    `msg=${input.messageId.substring(0, 12)} sender=${input.match.senderOpenId?.substring(0, 12) ?? '-'}`,
+  );
+  await dispatchHumanMessageViaHandlers(input.larkAppId, input.handlers, listenerRoutingContext({
+    data: input.data,
+    match: input.match,
+    chatId: input.chatId,
+    messageId: input.messageId,
+    chatType: 'group',
+    larkAppId: input.larkAppId,
+  }));
+}
+
+async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandlers, now = Date.now()): Promise<void> {
+  const bot = getBot(larkAppId);
+  const chatIds = enabledMessageListenerChatIds(bot);
+  if (chatIds.length === 0) return;
+
+  const cutoff = now - MESSAGE_LISTENER_BACKFILL_WINDOW_MS;
+  await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
+
+  for (const chatId of chatIds) {
+    let messages: any[];
+    try {
+      messages = await listChatMessagesUntil(larkAppId, chatId, {
+        pageSize: MESSAGE_LISTENER_BACKFILL_PAGE_SIZE,
+        stopAfter: (message, seenCount) => {
+          const createdAt = messageCreateTimeMs(message);
+          return seenCount >= MESSAGE_LISTENER_BACKFILL_SCAN_LIMIT ||
+            (Number.isFinite(createdAt) && (createdAt as number) < cutoff);
+        },
+      });
+    } catch (err) {
+      logger.warn(`[message-listener:${larkAppId}] failed to poll chat=${chatId.substring(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+
+    // Build the app_id→open_id map once per chat (shared with the dashboard
+    // preview leg) so bot senders (reported by app_id in history) match sender
+    // filters keyed on open_id, and unprovable bots fail closed on exclusion.
+    const candidateBotAppIds = collectListenerBotAppIds(messages, historyMessageSender);
+    const appIdToOpenId = await buildListenerBotAppIdToOpenId(larkAppId, chatId, candidateBotAppIds);
+
+    for (const message of messages) {
+      const messageId = String(message?.message_id ?? '');
+      if (!messageId) continue;
+      const createdAt = messageCreateTimeMs(message);
+      if (Number.isFinite(createdAt) && (createdAt as number) < cutoff) continue;
+
+      const data = larkReceiveEventFromHistoryMessage(message, chatId);
+      const rawSender = historyMessageSender(message);
+      const resolved = resolveListenerSenderIdentity(rawSender, appIdToOpenId);
+      const match = evaluateMessageListener({
+        bot,
+        chatId,
+        message: data.message,
+        senderOpenId: resolved.senderOpenId,
+        senderTypeRaw: rawSender.senderTypeRaw,
+        senderIdentityUnverified: resolved.identityUnverified,
+        explicitlyMentionedThisBot: isBotMentioned(larkAppId, data.message, resolved.senderOpenId),
+      });
+      if (!match) continue;
+
+      await dispatchPolledMessageListenerMatch({
+        larkAppId,
+        handlers,
+        data,
+        match,
+        chatId,
+        messageId,
+      }).catch(err => logger.error(`Error handling polled message listener event: ${err}`));
+    }
+  }
+}
+
+export async function __pollMessageListenersOnceForTest(larkAppId: string, handlers: EventHandlers, now = Date.now()): Promise<void> {
+  await pollMessageListenersOnce(larkAppId, handlers, now);
 }
 
 function usesForwardFollowupDelay(mentionMode: GroupMentionMode): boolean {
@@ -2356,12 +2516,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   if (sessionsReadyApps.has(larkAppId)) resolveSessionsReady();
   sessionsReadyBarriers.set(larkAppId, { promise: sessionsReady, resolve: resolveSessionsReady });
   const dispatchHumanMessage = async (payload: PendingForwardTopicPayload): Promise<void> => {
-    await serializeByAnchor(payload.ctx.anchor, () => {
-      const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
-      return ownsSession
-        ? handlers.handleThreadReply(payload.data, payload.ctx)
-        : handlers.handleNewTopic(payload.data, payload.ctx);
-    });
+    await dispatchHumanMessageViaHandlers(larkAppId, handlers, payload);
   };
   const dispatchPersistedForwardFollowup = async (
     seedMessageId: string,
@@ -2468,7 +2623,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const senderType = sender?.sender_type;
       const isBotSenderType = senderType === 'app' || senderType === 'bot';
       if (isBotSenderType) {
-        const senderOpenId = sender.sender_id?.open_id;
+        const senderOpenId = sender.sender_id?.open_id ?? sender.sender_id?.app_id;
+        // When Feishu gave us only an app_id (no open_id), this bot sender's
+        // identity is not in the open_id domain the listener filters use, so
+        // the matcher must fail closed on open_id-based exclusion. Realtime
+        // events normally carry open_id; the app_id fallback is the rare case.
+        const senderIdentityUnverified = !sender.sender_id?.open_id && !!sender.sender_id?.app_id;
         const isSelfMessage = senderOpenId === getBot(larkAppId).botOpenId;
         // Self messages: learn our OWN union_id from the echo first (the only
         // reliable source — see bot-union-ids-store; reported to the platform
@@ -2525,6 +2685,32 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             }
           } catch { /* content 非 JSON → 忽略 */ }
           logger.debug(`[${larkAppId}] hall bot message swallowed after learning (chat=${chatId.substring(0, 12)})`);
+          return;
+        }
+        const botMessageListener = chatType === 'group'
+          ? evaluateMessageListener({
+              bot: getBot(larkAppId),
+              chatId,
+              message,
+              senderOpenId,
+              senderTypeRaw: sender?.sender_type,
+              senderIdentityUnverified,
+              explicitlyMentionedThisBot: isBotMentioned(larkAppId, message, senderOpenId),
+            })
+          : undefined;
+        if (botMessageListener) {
+          logger.info(
+            `[message-listener:${larkAppId}] matched bot-sender chat=${chatId.substring(0, 12)} ` +
+            `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
+          );
+          await dispatchHumanMessage(listenerRoutingContext({
+            data,
+            match: botMessageListener,
+            chatId,
+            messageId,
+            chatType,
+            larkAppId,
+          })).catch(err => logger.error(`Error handling bot message listener event: ${err}`));
           return;
         }
         // Foreign bot: only route on @mention of us.
@@ -2685,6 +2871,26 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         replyRootId = message.root_id;
       }
       const explicitlyMentionedThisBot = isBotMentioned(larkAppId, message, senderOpenId);
+      const messageListener = chatType === 'group'
+        ? evaluateMessageListener({
+            bot: getBot(larkAppId),
+            chatId,
+            message,
+            senderOpenId,
+            senderTypeRaw: sender?.sender_type,
+            explicitlyMentionedThisBot,
+          })
+        : undefined;
+      if (messageListener) {
+        routing.scope = 'thread';
+        routing.anchor = messageId;
+        routingSource = 'topic-chat';
+        replyRootId = undefined;
+        logger.info(
+          `[message-listener:${larkAppId}] matched chat=${chatId.substring(0, 12)} ` +
+          `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
+        );
+      }
       // Cheap in-memory gate FIRST: skip the getChatMode roundtrip and the
       // per-chat toggle disk read entirely for bots that never configured a
       // substitute target (the overwhelming majority on the hot path).
@@ -2808,6 +3014,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // Runs BEFORE /t override so a `@bot /t …` in a now-flat 普通群 still
       // gets the explicit topic seed it asked for.
       if (
+        !messageListener &&
         routing.scope === 'thread' &&
         routing.anchor === messageId &&
         !message.thread_id &&
@@ -3041,6 +3248,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 故该守卫不影响「群聊 @ 策略」配置的 never 语义。
         const relax = (!!replyRootId && isAllowed)
           || (!!substituteTrigger && isAllowed)
+          || !!messageListener
           || (isAllowed && mentionMode === 'never')
           || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
           || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
@@ -3103,6 +3311,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           ? { name: 'summary-command', chatKind: summaryCommandMatch.chatKind }
           : undefined,
         substituteTrigger,
+        messageListener,
         forwardSeedData: pairedForwardSeed?.payload.data,
       };
       if (explicitlyMentionedThisBot) {
@@ -3350,6 +3559,30 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
 
   wsClient.start({ eventDispatcher });
   logger.info('Daemon WSClient started');
+
+  let listenerPollInFlight = false;
+  const listenerPollTimer = setInterval(() => {
+    if (listenerPollInFlight) return;
+    listenerPollInFlight = true;
+    void pollMessageListenersOnce(larkAppId, handlers)
+      .catch(err => logger.error(`[message-listener:${larkAppId}] poll failed: ${err instanceof Error ? err.message : String(err)}`))
+      .finally(() => { listenerPollInFlight = false; });
+  }, MESSAGE_LISTENER_POLL_INTERVAL_MS);
+  listenerPollTimer.unref();
+  const hasListenerBackfill = enabledMessageListenerChatIds(getBot(larkAppId)).length > 0;
+  if (hasListenerBackfill) {
+    setTimeout(() => {
+      if (listenerPollInFlight) return;
+      listenerPollInFlight = true;
+      void pollMessageListenersOnce(larkAppId, handlers)
+        .catch(err => logger.error(`[message-listener:${larkAppId}] initial poll failed: ${err instanceof Error ? err.message : String(err)}`))
+        .finally(() => { listenerPollInFlight = false; });
+    }, 2_000).unref();
+    logger.info(
+      `[message-listener:${larkAppId}] polling backfill enabled interval=${MESSAGE_LISTENER_POLL_INTERVAL_MS}ms ` +
+      `window=${MESSAGE_LISTENER_BACKFILL_WINDOW_MS}ms chats=${enabledMessageListenerChatIds(getBot(larkAppId)).length}`,
+    );
+  }
 
   // ② SDK 重连耗尽后停在 terminalError（getConnectionStatus().state === 'failed'）并
   //    永久放弃。每分钟探测一次，发现已放弃就 start() 重新发起一轮全新握手 —— start()
