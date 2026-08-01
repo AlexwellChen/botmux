@@ -22926,6 +22926,18 @@ dialog select[multiple]:hover:not(:disabled) {
   min-width: 148px;
 }
 
+/* Bot-config toggle-rows all carry a single-line label, so the switch should
+   sit vertically centered against it. The base .toggle-row uses
+   align-items:flex-start (for multi-line labels elsewhere, e.g. plugin/settings
+   pages), which top-aligns the 20px switch above the single text line and looks
+   misaligned here. Center them within this page only. */
+.bot-defaults-page .toggle-row {
+  align-items: center;
+}
+.bot-defaults-page .toggle-row .switch {
+  margin-top: 0;
+}
+
 .bot-defaults-page .bd-tile :where(input[type="text"], input[type="number"], textarea) {
   box-sizing: border-box;
   width: 100%;
