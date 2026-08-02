@@ -49,6 +49,7 @@ import {
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
+import { resolveLiveBotTransport } from './services/team-roster.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
@@ -2047,12 +2048,24 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; wrap
   };
 }
 
-function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
+function liveBots(): { larkAppId: string; botName: string; cliId?: string; larkTransportEnabled?: boolean }[] {
   const ids = configuredCliIds();
-  return registry.list().map(d => {
+  // core-only (apiOnly) bots have no Feishu transport → flag them so the
+  // aggregated roster (and any spoke pulling it) can exclude them from group
+  // membership/creation (#668). Mirror federation-spoke-api's spoke-side advert.
+  // FAIL-CLOSED: config unreadable → apiOnlyIds=null → resolveLiveBotTransport
+  // marks every bot transport=false (a remote consumer then won't invite any),
+  // because we cannot confirm transport for a roster federated off-box. (Do NOT
+  // fail-open here like the local isNoTransportBot: that has a config backstop
+  // beside it; a remote spoke consuming this roster has none.)
+  let apiOnlyIds: Set<string> | null;
+  try { apiOnlyIds = new Set(loadBotConfigs().filter(b => b.apiOnly === true).map(b => b.larkAppId)); }
+  catch { apiOnlyIds = null; }
+  const base = registry.list().map(d => {
     const b = withConfiguredCliId(d, ids);
     return { larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId };
   });
+  return resolveLiveBotTransport(base, apiOnlyIds);
 }
 
 async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[]; transferOwnerUnionId?: string; roleProfileId?: string }): Promise<TeamGroupCreateResult & {
