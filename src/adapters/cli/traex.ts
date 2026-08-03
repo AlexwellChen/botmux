@@ -179,6 +179,34 @@ function goalEnvConfigArgs(env: NodeJS.ProcessEnv = process.env): string[] {
   return args;
 }
 
+/**
+ * First-run "Legacy TRAE CLI data detected → migrate?" done-markers at the
+ * ~/.trae ROOT. traecli treats a marker's mere EXISTENCE (content/mode
+ * irrelevant — verified with a 0-byte `chmod 444` file) as "migration already
+ * done" and skips the interactive prompt. Under the file sandbox the migration
+ * SOURCE ~/.cache/coco is visible (baseline rw bind) but ~/.trae root is not, so
+ * without these the TUI wedges on a prompt no human can answer in goal mode.
+ *
+ * Exposed READ-ONLY (via sandboxReadonlyPaths → fs-policy readonlyRoots), NOT by
+ * widening authPaths to the whole ~/.trae: that root also holds hooks/ plugins/
+ * skills/ traecli.toml and authPaths compile to readWrite, which would let a
+ * chat-driven sandbox mutate shared hook/plugin code other bots execute.
+ *
+ *  · .coco-rollouts-migrated  → gates the "recent SESSIONS" prompt (the wedge)
+ *  · .coco-migrated           → gates the config-migration prompt (defence in depth)
+ * Both are dirt-cheap read-only single-file binds; a marker absent on this host is
+ * dropped by the worker's existence filter (keepExisting) so it can't cause a bind
+ * FAILURE — but note that is not the same as "goal-mode is fine": if the migration
+ * SOURCE (~/.cache/coco) exists while the marker is genuinely missing, the prompt
+ * legitimately fires. In practice the markers are written host-side once migration
+ * has run (the normal fleet state); this bind just makes that host truth visible
+ * through the sandbox instead of hidden behind the ~/.trae/cli-only carve-out.
+ */
+export const TRAE_MIGRATION_DONE_MARKERS = [
+  '~/.trae/.coco-rollouts-migrated',
+  '~/.trae/.coco-migrated',
+] as const;
+
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'traex';
   let cachedBin: string | undefined;
@@ -188,7 +216,14 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // state/log DBs there (state_*.sqlite / logs_*.sqlite) — under the deny-by-
     // default file sandbox a path not in authPaths doesn't exist, so the DBs are
     // unreachable / lack the fcntl locks SQLite needs (same failure as codex.ts).
+    // NOTE: we deliberately do NOT widen this to the whole ~/.trae — that root
+    // holds hooks/ plugins/ skills/ traecli.toml, and authPaths compile to
+    // readWrite (fs-policy `push(authPaths,'readWrite')`), so a chat-driven
+    // sandbox could mutate shared hook/plugin CODE that later bots (or the user's
+    // own non-sandboxed traecli) execute. The first-run migration markers that
+    // must be visible are exposed READ-ONLY via sandboxReadonlyPaths() instead.
     authPaths: ['~/.trae/cli'],
+    sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {

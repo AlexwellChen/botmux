@@ -240,6 +240,39 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
   });
 });
 
+// ─── #714: new spawn-time sandbox mount (traex/coco migration markers) ────────
+
+/**
+ * Regression guard. #714 adds a new spawn-time bwrap mount (traex/coco's
+ * read-only migration done-markers via sandboxReadonlyPaths). A warm reattach
+ * keeps the live process + its ORIGINAL mount set, so a pane spawned before this
+ * change would reattach without the marker mount and keep wedging on the TRAE
+ * migration prompt. The marker version is the only lever that turns such a pane
+ * into kill + cold-spawn, so bumping past the pre-#714 versions is load-bearing.
+ *
+ * Ordering note: #709 took 8 (env contract); #714 takes 9. Both prior versions
+ * must be rejected. If the merge order flips, rebase so this stays monotonic.
+ */
+describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn of pre-9 panes', () => {
+  const full = ['credential', 'read', 'write'] as const;
+  for (const v of [7, 8]) {
+    it(`rejects a v${v} pane even with full capabilities (its bwrap lacks the marker mount)`, () => {
+      const marker = JSON.stringify({ version: v, bootId: `pre-714-v${v}`, capabilities: [...full] });
+      expect(isolatedPaneReattachSafe(marker, ['read', 'write'])).toBe(false);
+    });
+  }
+
+  it('accepts a pane stamped with the current version', () => {
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent('fresh', [...full]), ['read', 'write'])).toBe(true);
+  });
+
+  it('has moved the version past 8 (the #709 env-contract version)', () => {
+    // Reverting below 9 would silently warm-reattach panes that predate the
+    // migration-marker mount. ≥ 9 is required.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(8);
+  });
+});
+
 describe('worker capability carve-out ordering', () => {
   const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
@@ -284,6 +317,16 @@ describe('worker capability carve-out ordering', () => {
     expect(source).not.toContain(
       'cfg.skillReadonlyRoots = [...(cfg.skillReadonlyRoots ?? []), ...prepared.readonlyRoots]',
     );
+  });
+
+  it('wires adapter sandboxReadonlyPaths() into the readonlyRoots channel (traex/coco migration markers)', () => {
+    // Guards a call-site blind spot: the adapter test only checks the method's
+    // RETURN value and the fs-policy test hand-feeds readonlyRoots, so if this
+    // spread were deleted the markers would silently stop reaching the sandbox
+    // and BOTH of those tests would stay green (goal-mode traex would wedge again
+    // on the migration prompt). Assert the worker actually threads the method
+    // output into readonlyRoots.
+    expect(source).toContain('...[...(cliAdapter.sandboxReadonlyPaths?.() ?? [])].map(expandTildeLexical),');
   });
 
   it('enforces the mandatory credential gate before adopt and wraps wrapperCli from the outside', () => {
