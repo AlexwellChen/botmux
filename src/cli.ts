@@ -22,6 +22,7 @@
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
+import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -363,6 +364,12 @@ function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000)
 }
 
 function loadBotsJson(): any[] {
+  // NOTE: this stays FATAL on a read error, deliberately. Several callers treat
+  // an empty list as "nothing references this" and go on to delete things
+  // (plugin dematerialize / uninstall dependency check) — degrading the read to
+  // [] would turn a denied read into silent destructive action. Anything that
+  // must survive an unreadable bots.json has to opt out explicitly, the way
+  // allBotAppIds() and currentBotIsApiOnly() do.
   if (existsSync(BOTS_JSON_FILE)) {
     try {
       return parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE);
@@ -6524,6 +6531,42 @@ async function relaySend(
  *  with a clear message. Reads bots.json best-effort; an apiOnly bot runs
  *  non-isolated (no Feishu secret to protect), so bots.json is readable here. */
 function currentBotIsApiOnly(larkAppId: string): boolean {
+  // Under read isolation bots.json is denied ON PURPOSE, so loadBotsJson() below
+  // can only ever answer "no bots at all". Letting that stand would silently turn
+  // this check into a no-op for EVERY sandboxed bot — including the apiOnly ones
+  // it exists to catch — and managedOriginHasNoTransport() (which advertises
+  // itself as tamper-resistant) delegates its verdict here.
+  //
+  // The worker already hands this bot its OWN config through the designed private
+  // channel: <BOT_HOME>/send-cred.json, written host-side, carrying apiOnly. Take
+  // the verdict from there instead of degrading it away. Only valid for our own
+  // appId — a sandboxed bot cannot see (and must not answer for) its siblings.
+  // Absent key = not apiOnly: JSON.stringify drops `apiOnly: undefined`, which is
+  // exactly what the worker writes for a normal transport-enabled bot.
+  if (underReadIsolation()) {
+    // bots.json is denied in here and loadBotsJson() is FATAL on that — never
+    // reach it from the root dispatch gate. This bot's own apiOnly comes from the
+    // designed private channel instead: <BOT_HOME>/send-cred.json, written
+    // host-side by the worker, carrying apiOnly (worker.ts). Absent key = not
+    // apiOnly (JSON.stringify drops `apiOnly: undefined`, which is exactly what
+    // the worker writes for a normal transport-enabled bot).
+    if (process.env.BOTMUX_LARK_APP_ID !== larkAppId) return false; // can't see siblings
+    // Host-owned verdict first: a no-transport bot's own send-cred.json is denied
+    // by fs-policy (`!larkTransport` branch denies <BOT_HOME>/send-cred.json), so
+    // for exactly the bots this gate exists to catch the file read below cannot
+    // succeed. The worker therefore also states it in the env.
+    if (process.env.BOTMUX_API_ONLY === '1') return true;
+    try {
+      const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR as string, larkAppId);
+      return JSON.parse(readFileSync(credPath, 'utf-8'))?.apiOnly === true;
+    } catch {
+      // No readable cred file: we cannot tell. Say "not apiOnly" rather than
+      // crash — the transport boundary still fail-closes downstream
+      // (getBotClient throws for apiOnly, and an apiOnly bot has no secret to
+      // talk to Feishu with in the first place).
+      return false;
+    }
+  }
   try {
     return loadBotsJson().some((b: any) => b?.larkAppId === larkAppId && b?.apiOnly === true);
   } catch {
