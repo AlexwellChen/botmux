@@ -266,7 +266,7 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { detectCliUsageLimit, usageLimitStateKey, structuredRateLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { detectCliUsageLimit, usageLimitStateKey, structuredRateLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { decideSubmitConfirmationAction, type SubmitActivityEvidence } from './services/submit-confirmation.js';
@@ -2039,22 +2039,30 @@ let lastStructuredBridgeActivityAtMs = 0;
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
 
 /**
- * True when this CLI has an authoritative STRUCTURED rate-limit signal in its
- * transcript (Claude family — `error:"rate_limit"`, surfaced by
- * maybeEmitStructuredRateLimit). For those CLIs the screen-text `rate`
- * heuristic is not just redundant but harmful: the model's own output or a dev
- * editing rate-limit code/tests puts phrases like "429 Too Many Requests" /
- * "exceeded retry limit" on screen, which the scraper cannot distinguish from a
- * real limit. So we suppress the screen-scan `rate` verdict and let the
- * structured path be the sole authority. `usage` (quota "hit your limit …")
- * has no structured equivalent yet, so it still comes from the screen.
+ * True when this CLI has an authoritative STRUCTURED rate-limit signal that is
+ * actually PUBLISHED as a `limited` screen_update — i.e. the Claude family,
+ * whose `bridgeIngest → maybeEmitStructuredRateLimit()` reads the transcript's
+ * `error:"rate_limit"` record. For those CLIs the screen-text `rate` heuristic
+ * is not just redundant but harmful: the model's own output or a dev editing
+ * rate-limit code/tests puts phrases like "429 Too Many Requests" / "exceeded
+ * retry limit" on screen, which the scraper cannot distinguish from a real
+ * limit. So we suppress the screen-scan `rate` verdict and let the structured
+ * path be the sole authority. `usage` (quota "hit your limit …") has no
+ * structured equivalent yet, so it still comes from the screen.
  *
- * reliableTurnTerminal is exactly the "transcript-backed" capability flag
- * (claude-code / seed set it); non-transcript CLIs (Codex, gemini, …) keep the
- * screen scanner as their only rate-limit signal.
+ * Gate on `claudeDataDir` (the Claude-family marker: claude-code / seed /
+ * genius), NOT on `reliableTurnTerminal`. Both are "transcript-backed", but the
+ * structured rate-limit EMIT only exists on the Claude bridge (`bridgeJsonlPath`
+ * path). The codexBridgeQueue CLIs (codex / grok / traex / pi) map an `error`
+ * terminal to a failed/ambiguous receipt but publish NO `limited` state — so
+ * suppressing their screen `rate` verdict would silently drop the Dashboard
+ * 「需要你」signal + backoff on a real 429. Pi joining reliableTurnTerminal made
+ * that latent over-suppression concrete; scoping to claudeDataDir fixes it for
+ * every codexBridgeQueue CLI at once. (A future structured rate-limit emit for
+ * those CLIs can widen this predicate.)
  */
 function structuredRateLimitAuthoritative(): boolean {
-  return cliAdapter?.reliableTurnTerminal === true;
+  return isStructuredRateLimitAuthoritative(cliAdapter);
 }
 
 // Per-turn usage-limit state machine. Owns the turn counter plus the
