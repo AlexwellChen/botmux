@@ -726,6 +726,70 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
 // ─── Structural footer strip (brand-agnostic, for per-bot custom brands) ──
 
 describe('Interactive card parsing: footer stripped structurally (custom brand)', () => {
+  it('drops a schema 2.0 footer element without text_size when it carries the exact split-font marker', () => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission' },
+        { tag: 'hr' },
+        {
+          element_id: 'botmux_reply_footer',
+          tag: 'markdown',
+          content: '[botmux](https://github.com/deepcoldy/botmux)'
+            + "<font color='grey'> </font>"
+            + '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)'
+            + "<font color='grey'> 发送给：</font><at id=ou_owner></at>",
+        },
+      ] },
+    };
+
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toBe('/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission');
+  });
+
+  it.each([
+    {
+      name: 'wrong marker text',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        content: '[footer spec](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+      },
+      expected: 'footer spec',
+    },
+    {
+      name: 'wrong marker URL',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1-guide)',
+      },
+      expected: 'reply-card-footer-v1-guide',
+    },
+    {
+      name: 'unexpected text_size',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        text_size: 'normal_v2',
+        content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+      },
+      expected: 'reply-card-footer-v1',
+    },
+  ])('keeps a schema 2.0 element-id collision with $name', ({ footer, expected }) => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        footer,
+      ] },
+    };
+
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).toContain(expected);
+  });
+
   it('drops a footer carrying the complete Botmux structural signature', () => {
     const footer = buildReplyCardFooter({
       brand: 'Acme',

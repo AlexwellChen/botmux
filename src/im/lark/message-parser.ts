@@ -1246,14 +1246,15 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   const tag = el.tag;
 
   // The public element id alone is not ownership proof: third-party cards may
-  // collide with it. New botmux footers carry all four invariants together.
+  // collide with it. New botmux footers carry the id plus the exact reserved
+  // marker; unexpected large text stays visible rather than being stripped.
   const elementText = el.text?.content ?? el.content;
   if (
     el.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
     && tag === 'markdown'
-    && el.text_size === 'notation_small_v2'
+    && (el.text_size === undefined || el.text_size === 'notation_small_v2')
     && typeof elementText === 'string'
-    && isSignedFormatBFooterLine(elementText)
+    && hasExactMarkerMarkdown(elementText)
   ) {
     return;
   }
