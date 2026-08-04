@@ -104,6 +104,7 @@ vi.mock('../src/core/worker-pool.js', async () => {
 
 import { registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
+import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
@@ -115,6 +116,7 @@ const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
 const OWNER = 'ou_owner';
 const PEER = 'ou_peer_bot';
+const PEER_UNION = 'on_peer_bot';
 const NOW = new Date().toISOString();
 
 function makeEventData(messageId: string, text: string, rootId?: string): any {
@@ -141,9 +143,20 @@ function makeMentionOnlyEventData(messageId: string, rootId?: string): any {
   return data;
 }
 
-function makePeerRepoEventData(messageId: string, senderType: 'app' | 'bot', rootId?: string): any {
+function makePeerRepoEventData(
+  messageId: string,
+  senderType: 'app' | 'bot' | 'user',
+  rootId?: string,
+  senderUnionId: string | null = PEER_UNION,
+): any {
   const data = makeEventData(messageId, '/repo', rootId);
-  data.sender = { sender_id: { open_id: PEER }, sender_type: senderType };
+  data.sender = {
+    sender_id: {
+      open_id: PEER,
+      ...(typeof senderUnionId === 'string' ? { union_id: senderUnionId } : {}),
+    },
+    sender_type: senderType,
+  };
   return data;
 }
 
@@ -249,9 +262,30 @@ function crossRefPath(): string {
   return join(mocks.dataDir, `bot-openids-${APP}.json`);
 }
 
+function botsInfoPath(): string {
+  return join(mocks.dataDir, 'bots-info.json');
+}
+
+function botUnionIdsPath(): string {
+  return join(mocks.dataDir, 'bot-union-ids.json');
+}
+
 function seedSiblingCrossRef(): void {
   mkdirSync(mocks.dataDir, { recursive: true });
   writeFileSync(crossRefPath(), JSON.stringify({ Codex: PEER }));
+}
+
+function seedConfiguredSiblingIdentity(): void {
+  registerBot({
+    larkAppId: 'repo_sibling_route',
+    larkAppSecret: 's',
+    cliId: 'codex',
+  });
+  writeFileSync(botsInfoPath(), JSON.stringify([
+    { larkAppId: APP, botOpenId: 'ou_receiver_self', botName: 'Receiver', cliId: 'claude-code' },
+    { larkAppId: 'repo_sibling_route', botOpenId: 'ou_peer_self', botName: 'Codex', cliId: 'codex' },
+  ]));
+  recordBotUnionId(mocks.dataDir, 'repo_sibling_route', PEER_UNION);
 }
 
 function resetRouteTestState(): void {
@@ -262,6 +296,8 @@ function resetRouteTestState(): void {
   mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
   activeSessions.clear();
   rmSync(crossRefPath(), { force: true });
+  rmSync(botsInfoPath(), { force: true });
+  rmSync(botUnionIdsPath(), { force: true });
   const bot = registerBot({
     larkAppId: APP,
     larkAppSecret: 's',
@@ -486,10 +522,13 @@ describe('/repo trusted sibling production routing', () => {
   beforeEach(() => {
     resetRouteTestState();
     seedSiblingCrossRef();
+    seedConfiguredSiblingIdentity();
   });
 
   afterEach(() => {
     rmSync(crossRefPath(), { force: true });
+    rmSync(botsInfoPath(), { force: true });
+    rmSync(botUnionIdsPath(), { force: true });
   });
 
   it.each(['app', 'bot'] as const)('new topic: sender_type=%s sibling /repo reaches repo launch path', async (senderType) => {
@@ -510,6 +549,27 @@ describe('/repo trusted sibling production routing', () => {
     expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
   });
 
+  it('new topic: rejects stamped sibling /repo when sender union is missing or wrong', async () => {
+    await handleNewTopic(
+      makePeerRepoEventData('om_repo_new_missing_union', 'app', undefined, null),
+      makeCtx('om_repo_new_missing_union', 'om_repo_new_missing_union'),
+    );
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    resetRouteTestState();
+    seedSiblingCrossRef();
+    seedConfiguredSiblingIdentity();
+    await handleNewTopic(
+      makePeerRepoEventData('om_repo_new_wrong_union', 'bot', undefined, 'on_wrong_peer_bot'),
+      makeCtx('om_repo_new_wrong_union', 'om_repo_new_wrong_union'),
+    );
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
   it.each(['app', 'bot'] as const)('thread reply: sender_type=%s sibling /repo reaches repo launch path', async (senderType) => {
     const rootId = `om_repo_root_${senderType}`;
     const messageId = `om_repo_reply_${senderType}`;
@@ -528,5 +588,56 @@ describe('/repo trusted sibling production routing', () => {
     expect(ds?.pendingRepo).toBe(false);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
+  });
+
+  it('thread reply: rejects stamped sibling /repo when sender union is missing or wrong', async () => {
+    await handleThreadReply(
+      makePeerRepoEventData('om_repo_reply_missing_union', 'app', 'om_repo_root_missing_union', null),
+      makeCtx('om_repo_root_missing_union', 'om_repo_reply_missing_union'),
+    );
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    resetRouteTestState();
+    seedSiblingCrossRef();
+    seedConfiguredSiblingIdentity();
+    await handleThreadReply(
+      makePeerRepoEventData('om_repo_reply_wrong_union', 'bot', 'om_repo_root_wrong_union', 'on_wrong_peer_bot'),
+      makeCtx('om_repo_root_wrong_union', 'om_repo_reply_wrong_union'),
+    );
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('thread reply: rejects cross-ref-only /repo when sender is not Lark-stamped as a bot', async () => {
+    await handleThreadReply(
+      makePeerRepoEventData('om_repo_reply_user_stamp', 'user', 'om_repo_root_user_stamp'),
+      makeCtx('om_repo_root_user_stamp', 'om_repo_reply_user_stamp'),
+    );
+
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('thread reply: rejects stale sibling identity for an app no longer in the current config', async () => {
+    resetRouteTestState();
+    seedSiblingCrossRef();
+    writeFileSync(botsInfoPath(), JSON.stringify([
+      { larkAppId: APP, botOpenId: 'ou_receiver_self', botName: 'Receiver', cliId: 'claude-code' },
+      { larkAppId: 'removed_sibling_app', botOpenId: 'ou_peer_self', botName: 'Codex', cliId: 'codex' },
+    ]));
+    recordBotUnionId(mocks.dataDir, 'removed_sibling_app', PEER_UNION);
+
+    await handleThreadReply(
+      makePeerRepoEventData('om_repo_reply_removed_app', 'bot', 'om_repo_root_removed_app'),
+      makeCtx('om_repo_root_removed_app', 'om_repo_reply_removed_app'),
+    );
+
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 });

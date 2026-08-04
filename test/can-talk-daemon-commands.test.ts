@@ -27,6 +27,7 @@ vi.mock('node-pty', () => ({
 import { parseBotConfigsFromText, registerBot, getBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js';
 import { canRunDaemonCommand, canOperate, canTalk } from '../src/im/lark/event-dispatcher.js';
 import { parseCanTalkDaemonCommandsInput } from '../src/core/passthrough-commands.js';
+import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 import { config } from '../src/config.js';
 import { recordTeamBot } from '../src/services/team-bots-store.js';
 
@@ -140,7 +141,17 @@ describe('canRunDaemonCommand /repo trusted same-deployment peer exception', () 
     });
     bot.resolvedAllowedUsers = ['ou_owner'];
     bot.config.chatGrants = { oc_repo: ['ou_granted'] };
+    registerBot({
+      larkAppId: 'repo_sibling',
+      larkAppSecret: 's',
+      cliId: 'codex',
+    });
     writeFileSync(join(tmp, 'bot-openids-repo1.json'), JSON.stringify({ Codex: 'ou_sibling' }));
+    writeFileSync(join(tmp, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'repo1', botOpenId: 'ou_self', botName: 'Receiver', cliId: 'claude-code' },
+      { larkAppId: 'repo_sibling', botOpenId: 'ou_sibling_self', botName: 'Codex', cliId: 'codex' },
+    ]));
+    recordBotUnionId(tmp, 'repo_sibling', 'on_sibling');
   });
 
   afterEach(() => {
@@ -152,20 +163,54 @@ describe('canRunDaemonCommand /repo trusted same-deployment peer exception', () 
   it('allows a known Lark-stamped sibling bot to run /repo at the shared gate', () => {
     expect(canOperate('repo1', 'oc_repo', 'ou_sibling')).toBe(false);
 
-    expect(repoGate('ou_sibling', '/repo', true)).toBe(true);
+    expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', '/repo', undefined, 'group', true, true)).toBe(true);
   });
 
   it('does not give the sibling bot general daemon-command authority', () => {
     for (const cmd of ['/cd', '/restart', '/botconfig', '/term']) {
-      expect(repoGate('ou_sibling', cmd, true), cmd).toBe(false);
+      expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', cmd, undefined, 'group', true, true), cmd).toBe(false);
     }
   });
 
   it('requires the sender to be Lark-stamped as a bot', () => {
-    expect(repoGate('ou_sibling', '/repo', false)).toBe(false);
+    expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', '/repo', undefined, 'group', false, false)).toBe(false);
     expect(
-      canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', undefined, '/repo', undefined, 'group', true, false),
+      canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', '/repo', undefined, 'group', true, false),
     ).toBe(false);
+  });
+
+  it('requires the sender union_id to match the exact configured sibling app', () => {
+    expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', undefined, '/repo', undefined, 'group', true, true)).toBe(false);
+    expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_wrong', '/repo', undefined, 'group', true, true)).toBe(false);
+  });
+
+  it('rejects stale cross-ref and union records for an app that is no longer configured', () => {
+    __testOnly_resetBotRegistry();
+    const bot = registerBot({
+      larkAppId: 'repo1',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+    });
+    bot.resolvedAllowedUsers = ['ou_owner'];
+
+    expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', '/repo', undefined, 'group', true, true)).toBe(false);
+  });
+
+  it('rejects ambiguous configured sibling name bindings', () => {
+    registerBot({
+      larkAppId: 'repo_sibling_2',
+      larkAppSecret: 's',
+      cliId: 'codex',
+    });
+    recordBotUnionId(tmp, 'repo_sibling_2', 'on_sibling');
+    writeFileSync(join(tmp, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'repo1', botOpenId: 'ou_self', botName: 'Receiver', cliId: 'claude-code' },
+      { larkAppId: 'repo_sibling', botOpenId: 'ou_sibling_self', botName: 'Codex', cliId: 'codex' },
+      { larkAppId: 'repo_sibling_2', botOpenId: 'ou_sibling_2_self', botName: 'Codex', cliId: 'codex' },
+    ]));
+
+    expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', '/repo', undefined, 'group', true, true)).toBe(false);
   });
 
   it('keeps /repo denied for human owners only when they are not allowed users, chat grants, and unknown external bots', () => {
