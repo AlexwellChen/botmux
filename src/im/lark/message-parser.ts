@@ -933,6 +933,8 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
                 const beforeFooter = line.slice(0, lastBreak).trim();
                 if (beforeFooter) parts.push(beforeFooter);
               }
+              // No newline before the signed marker means the whole paragraph is
+              // footer chrome (brand/usage/recipient). Keep nothing.
             } else {
               parts.push(line);
             }
