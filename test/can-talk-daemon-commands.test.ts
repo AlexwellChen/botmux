@@ -123,9 +123,7 @@ describe('canRunDaemonCommand /repo trusted same-deployment peer exception', () 
   let prevDataDir: string;
   let tmp: string;
 
-  const newTopicRoute = (senderOpenId: string, cmd = '/repo', botSender = true) =>
-    canRunDaemonCommand('repo1', 'oc_repo', senderOpenId, undefined, cmd, undefined, 'group', botSender, botSender);
-  const threadReplyRoute = (senderOpenId: string, cmd = '/repo', botSender = true) =>
+  const repoGate = (senderOpenId: string, cmd = '/repo', botSender = true) =>
     canRunDaemonCommand('repo1', 'oc_repo', senderOpenId, undefined, cmd, undefined, 'group', botSender, botSender);
 
   beforeEach(() => {
@@ -151,38 +149,31 @@ describe('canRunDaemonCommand /repo trusted same-deployment peer exception', () 
     __testOnly_resetBotRegistry();
   });
 
-  it('allows a known sibling bot to run /repo through both daemon routes', () => {
+  it('allows a known Lark-stamped sibling bot to run /repo at the shared gate', () => {
     expect(canOperate('repo1', 'oc_repo', 'ou_sibling')).toBe(false);
 
-    expect(newTopicRoute('ou_sibling', '/repo', true)).toBe(true);
-    expect(threadReplyRoute('ou_sibling', '/repo', true)).toBe(true);
+    expect(repoGate('ou_sibling', '/repo', true)).toBe(true);
   });
 
   it('does not give the sibling bot general daemon-command authority', () => {
     for (const cmd of ['/cd', '/restart', '/botconfig', '/term']) {
-      expect(newTopicRoute('ou_sibling', cmd, true), `new-topic ${cmd}`).toBe(false);
-      expect(threadReplyRoute('ou_sibling', cmd, true), `thread-reply ${cmd}`).toBe(false);
+      expect(repoGate('ou_sibling', cmd, true), cmd).toBe(false);
     }
   });
 
   it('requires the sender to be Lark-stamped as a bot', () => {
-    expect(newTopicRoute('ou_sibling', '/repo', false)).toBe(false);
-    expect(threadReplyRoute('ou_sibling', '/repo', false)).toBe(false);
+    expect(repoGate('ou_sibling', '/repo', false)).toBe(false);
     expect(
       canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', undefined, '/repo', undefined, 'group', true, false),
     ).toBe(false);
   });
 
   it('keeps /repo denied for human owners only when they are not allowed users, chat grants, and unknown external bots', () => {
-    expect(newTopicRoute('ou_owner', '/repo', false)).toBe(true);
-    expect(threadReplyRoute('ou_owner', '/repo', false)).toBe(true);
+    expect(repoGate('ou_owner', '/repo', false)).toBe(true);
 
-    expect(newTopicRoute('ou_human', '/repo', false)).toBe(false);
-    expect(threadReplyRoute('ou_human', '/repo', false)).toBe(false);
-    expect(newTopicRoute('ou_granted', '/repo', false)).toBe(false);
-    expect(threadReplyRoute('ou_granted', '/repo', false)).toBe(false);
-    expect(newTopicRoute('ou_external_bot', '/repo', true)).toBe(false);
-    expect(threadReplyRoute('ou_external_bot', '/repo', true)).toBe(false);
+    expect(repoGate('ou_human', '/repo', false)).toBe(false);
+    expect(repoGate('ou_granted', '/repo', false)).toBe(false);
+    expect(repoGate('ou_external_bot', '/repo', true)).toBe(false);
   });
 
   it('preserves existing cross-deployment team bot operate semantics', () => {

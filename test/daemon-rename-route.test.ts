@@ -21,7 +21,9 @@
  *
  * Run:  pnpm vitest run test/daemon-rename-route.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => {
   // Isolate every sessionStore/config read-write under a per-process temp dir
@@ -29,11 +31,13 @@ const mocks = vi.hoisted(() => {
   // and make sure hook events run the local (no-op, nothing configured) path
   // instead of forwarding to a live daemon when the test itself runs inside a
   // botmux session shell.
-  process.env.SESSION_DATA_DIR = `${process.env.TMPDIR ?? '/tmp'}/botmux-rename-route-${process.pid}`;
+  const dataDir = `${process.env.TMPDIR ?? '/tmp'}/botmux-rename-route-${process.pid}`;
+  process.env.SESSION_DATA_DIR = dataDir;
   delete process.env.BOTMUX_SESSION_ID;
   delete process.env.BOTMUX_LARK_APP_ID;
   let seq = 0;
   return {
+    dataDir,
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
@@ -61,6 +65,16 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }
   return { Client: FakeClient };
 });
+
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(() => ({
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+  })),
+}));
 
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
@@ -100,6 +114,7 @@ import type { DaemonSession } from '../src/core/types.js';
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
 const OWNER = 'ou_owner';
+const PEER = 'ou_peer_bot';
 const NOW = new Date().toISOString();
 
 function makeEventData(messageId: string, text: string, rootId?: string): any {
@@ -123,6 +138,12 @@ function makeMentionOnlyEventData(messageId: string, rootId?: string): any {
     name: 'TestBot',
     id: { open_id: 'ou_bot' },
   }];
+  return data;
+}
+
+function makePeerRepoEventData(messageId: string, senderType: 'app' | 'bot', rootId?: string): any {
+  const data = makeEventData(messageId, '/repo', rootId);
+  data.sender = { sender_id: { open_id: PEER }, sender_type: senderType };
   return data;
 }
 
@@ -224,22 +245,40 @@ function repliedText(): string {
     .join('\n');
 }
 
+function crossRefPath(): string {
+  return join(mocks.dataDir, `bot-openids-${APP}.json`);
+}
+
+function seedSiblingCrossRef(): void {
+  mkdirSync(mocks.dataDir, { recursive: true });
+  writeFileSync(crossRefPath(), JSON.stringify({ Codex: PEER }));
+}
+
+function resetRouteTestState(): void {
+  vi.clearAllMocks();
+  mocks.replyMessage.mockResolvedValue('om_reply');
+  mocks.sendMessage.mockResolvedValue('om_top');
+  mocks.getChatMode.mockResolvedValue('group');
+  mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
+  activeSessions.clear();
+  rmSync(crossRefPath(), { force: true });
+  const bot = registerBot({
+    larkAppId: APP,
+    larkAppSecret: 's',
+    cliId: 'claude-code',
+    allowedUsers: [OWNER],
+    oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+  });
+  bot.resolvedAllowedUsers = [OWNER];
+}
+
 describe('/rename production routing — must not pre-create a session (review P1)', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.replyMessage.mockResolvedValue('om_reply');
-    mocks.sendMessage.mockResolvedValue('om_top');
-    mocks.getChatMode.mockResolvedValue('group');
-    mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
-    activeSessions.clear();
-    const bot = registerBot({
-      larkAppId: APP,
-      larkAppSecret: 's',
-      cliId: 'claude-code',
-      allowedUsers: [OWNER],
-      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
-    });
-    bot.resolvedAllowedUsers = [OWNER];
+    resetRouteTestState();
+  });
+
+  afterEach(() => {
+    rmSync(crossRefPath(), { force: true });
   });
 
   it('new topic: `/rename Foo` replies no-active-session and creates NOTHING', async () => {
@@ -440,5 +479,54 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds.pendingFollowUps).toHaveLength(2);
     expect(ds.session.quoteTargetId).toBe(strangerMessageId);
     expect(ds.session.lastCallerOpenId).toBe('ou_stranger');
+  });
+});
+
+describe('/repo trusted sibling production routing', () => {
+  beforeEach(() => {
+    resetRouteTestState();
+    seedSiblingCrossRef();
+  });
+
+  afterEach(() => {
+    rmSync(crossRefPath(), { force: true });
+  });
+
+  it.each(['app', 'bot'] as const)('new topic: sender_type=%s sibling /repo reaches repo launch path', async (senderType) => {
+    const messageId = `om_repo_new_${senderType}`;
+
+    await handleNewTopic(
+      makePeerRepoEventData(messageId, senderType),
+      makeCtx(messageId, messageId),
+    );
+
+    const ds = activeSessions.get(sessionKey(messageId, APP));
+    expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(ds).toBeTruthy();
+    expect(ds?.ownerOpenId).toBe(PEER);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
+  });
+
+  it.each(['app', 'bot'] as const)('thread reply: sender_type=%s sibling /repo reaches repo launch path', async (senderType) => {
+    const rootId = `om_repo_root_${senderType}`;
+    const messageId = `om_repo_reply_${senderType}`;
+
+    await handleThreadReply(
+      makePeerRepoEventData(messageId, senderType, rootId),
+      makeCtx(rootId, messageId),
+    );
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(ds).toBeTruthy();
+    expect(ds?.ownerOpenId).toBe(PEER);
+    expect(ds?.session.creatorOpenId).toBe(PEER);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
   });
 });
