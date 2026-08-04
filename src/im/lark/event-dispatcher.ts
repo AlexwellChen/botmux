@@ -1735,12 +1735,20 @@ function historyMessageSender(message: any): {
   senderIdType?: string;
 } {
   const sender = message?.sender ?? {};
-  const senderId = sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
+  // A bot sender is reported by app_id (cli_) in `sender.id`, but with
+  // `with_sender_name=true` (which listChatMessagesUntil always sets) Lark also
+  // returns `sender.open_bot_id` — the bot's per-app open_id, IDENTICAL to what
+  // /members/bots reports and to what the dashboard bot-picker stores. Prefer it
+  // so a third-party bot resolves to the same ou_ the include/exclude lists use
+  // (otherwise it stays an unresolvable cli_ and never matches an open_id list).
+  const senderId = sender.open_bot_id ?? sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
     ?? message?.sender_id?.open_id ?? message?.sender_id?.user_id ?? message?.sender_id?.app_id;
-  const senderIdType = sender.id_type ?? sender.sender_id_type;
+  const rawIdType = sender.id_type ?? sender.sender_id_type;
+  // open_bot_id is an open_id even though the row's id_type still says app_id.
+  const senderIdType = sender.open_bot_id ? 'open_id' : rawIdType;
   const inferredType = sender.sender_type
     ?? message?.sender_type
-    ?? (senderIdType === 'app_id' ? 'app' : undefined);
+    ?? (rawIdType === 'app_id' ? 'app' : undefined);
   return {
     senderOpenId: typeof senderId === 'string' ? senderId : undefined,
     senderTypeRaw: typeof inferredType === 'string' ? inferredType : undefined,
@@ -1750,7 +1758,16 @@ function historyMessageSender(message: any): {
 
 function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
   const { senderOpenId, senderTypeRaw, senderIdType } = historyMessageSender(message);
-  const isAppId = senderIdType === 'app_id' || senderTypeRaw === 'app' || senderTypeRaw === 'bot';
+  // sender_type and the ID DOMAIN are independent axes. A bot sender keeps
+  // sender_type='app', but when we resolved its identity to an open_id (via
+  // sender.open_bot_id, senderIdType==='open_id'), the value MUST go in the
+  // open_id slot — the whole downstream chain (message-parser senderId,
+  // handleNewTopic owner/quote target, --mention-back) reads sender_id.open_id
+  // ONLY. Putting an ou_ into { app_id } both mislabels the field and drops the
+  // identity (senderId becomes ''). Choose the key by domain, not by type.
+  const isBotSenderType = senderIdType === 'app_id' || senderTypeRaw === 'app' || senderTypeRaw === 'bot';
+  const isOpenIdDomain = senderIdType === 'open_id'
+    || (typeof senderOpenId === 'string' && senderOpenId.startsWith('ou_'));
   return {
     message: {
       ...message,
@@ -1759,10 +1776,14 @@ function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
       chat_type: message?.chat_type ?? 'group',
     },
     sender: {
-      sender_type: senderTypeRaw ?? (isAppId ? 'app' : 'user'),
-      sender_id: isAppId
-        ? { app_id: senderOpenId }
-        : { open_id: senderOpenId },
+      // Preserve the bot sender_type (talk/quota gates and foreign-bot owner
+      // suppression key off it) even when the id itself is an open_id.
+      sender_type: senderTypeRaw ?? (isBotSenderType ? 'app' : 'user'),
+      sender_id: isOpenIdDomain
+        ? { open_id: senderOpenId }
+        : isBotSenderType
+          ? { app_id: senderOpenId }
+          : { open_id: senderOpenId },
     },
   };
 }
