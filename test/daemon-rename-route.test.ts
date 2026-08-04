@@ -161,6 +161,32 @@ function makePeerRepoEventData(
   return data;
 }
 
+function makePeerRepoEventDataWithSplitFooter(
+  messageId: string,
+  rootId?: string,
+): any {
+  return {
+    sender: { sender_id: { open_id: PEER, union_id: PEER_UNION }, sender_type: 'app' },
+    message: {
+      message_id: messageId,
+      root_id: rootId,
+      chat_id: CHAT,
+      message_type: 'interactive',
+      content: JSON.stringify({
+        elements: [[
+          { tag: 'text', text: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission\n' },
+          { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+          { tag: 'text', text: "<font color='grey'> </font>" },
+          { tag: 'a', text: '·', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
+          { tag: 'text', text: "<font color='grey'> 发送给：</font>" },
+          { tag: 'at', user_name: 'jihong traex' },
+        ]],
+      }),
+      create_time: String(Date.now()),
+    },
+  };
+}
+
 function makeCtx(anchor: string, messageId: string): any {
   return {
     chatId: CHAT,
@@ -594,6 +620,26 @@ describe('/repo trusted sibling production routing', () => {
     expect(ds?.pendingRepo).toBe(false);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
+  });
+
+  it('thread reply: strips live split-font footer before /repo command routing', async () => {
+    const rootId = 'om_repo_root_split_footer';
+    const messageId = 'om_repo_reply_split_footer';
+
+    await handleThreadReply(
+      makePeerRepoEventDataWithSplitFooter(messageId, rootId),
+      makeCtx(rootId, messageId),
+    );
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(ds).toBeTruthy();
+    expect(ds?.ownerOpenId).toBe(PEER);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
+    expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
   });
 
   it('thread reply: rejects stamped sibling /repo when sender union is missing or wrong', async () => {

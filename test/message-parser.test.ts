@@ -618,6 +618,37 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).toContain('稍后对比');
   });
 
+  it('drops the live split-font signed footer appended after a command', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission\n' },
+        { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+        { tag: 'text', text: "<font color='grey'> </font>" },
+        { tag: 'a', text: '·', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
+        { tag: 'text', text: "<font color='grey'> 发送给：</font>" },
+        { tag: 'at', user_name: 'jihong traex' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toBe('/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission');
+  });
+
+  it('keeps ordinary links that mention botmux and the marker URL without footer structure', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '正文提到 ' },
+        { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+        { tag: 'text', text: ' 以及 ' },
+        { tag: 'a', text: 'footer spec', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
+        { tag: 'text', text: '，但这不是签名页脚。' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('botmux(https://github.com/deepcoldy/botmux)');
+    expect(result.content).toContain('footer spec(https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)');
+    expect(result.content).toContain('不是签名页脚');
+  });
+
   it('keeps a usage-shaped final line when it belongs to the same body paragraph', () => {
     const card = {
       elements: [[

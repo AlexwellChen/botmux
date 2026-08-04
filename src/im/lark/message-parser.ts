@@ -875,12 +875,14 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
           }
           const textNodes: string[] = [];
           const buttons: string[] = [];
-          let hasFooterProof = false;
+          let inSignedFooter = false;
           for (const node of paragraph) {
+            if (inSignedFooter) continue;
             if (node.tag === 'text') { if (node.text) textNodes.push(node.text); }
             else if (node.tag === 'a') {
               if (isBotmuxFooterMarkerAnchor(node.href, node.text)) {
-                hasFooterProof = true;
+                inSignedFooter = true;
+                continue;
               }
               // Keep the href so links survive — Format A separates text/href,
               // and dropping href loses real content (规则配置/详情/Trace 链接).
@@ -924,7 +926,17 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
             }
           }
           const line = textNodes.join('').trim();
-          if (line && !hasFooterProof) parts.push(line);
+          if (line) {
+            if (inSignedFooter) {
+              const lastBreak = line.lastIndexOf('\n');
+              if (lastBreak >= 0) {
+                const beforeFooter = line.slice(0, lastBreak).trim();
+                if (beforeFooter) parts.push(beforeFooter);
+              }
+            } else {
+              parts.push(line);
+            }
+          }
           if (buttons.length) parts.push(buttons.join(' '));
         }
       } else {
