@@ -22,6 +22,7 @@ import {
   buildPrivateSnapshotCard,
   buildConfigCard,
   buildTuiPromptFailedCard,
+  buildSlashListCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
@@ -122,6 +123,28 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     // The selectable container carries a resume: entry_key.
     const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
     expect(container.behaviors[0].value.entry_key).toBe('resume:codex-rollout-abc123');
+  });
+
+  it('uses a configured runtime name for both live and resume rows', () => {
+    const live = {
+      source: 'tmux' as const,
+      tmuxTarget: 'dev:0.0',
+      cliPid: 42,
+      cliId: 'codex' as const,
+      cwd: '/work/live',
+      paneCols: 80,
+      paneRows: 24,
+    };
+    const resume = [{ cliSessionId: 'resume-1', cwd: '/work/resume', title: 'old task', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard(
+      [live], 'om_root', 'en', resume, undefined, undefined, undefined,
+      'codex', 'Vendor Codex',
+    ));
+
+    const texts = cardTexts(card);
+    expect(texts).toHaveLength(2);
+    expect(texts.every(text => text.includes('Vendor Codex'))).toBe(true);
+    expect(texts.every(text => !text.includes('CLI: Codex\n'))).toBe(true);
   });
 
   it('shows the confirm button only after an entry is selected', () => {
@@ -315,6 +338,32 @@ describe('getCliDisplayName', () => {
   });
 });
 
+describe('buildSlashListCard', () => {
+  it('escapes a runtime display name only in Markdown fields', () => {
+    const displayName = 'Forge *Codex* <at id=all></at>';
+    const card = parse(buildSlashListCard({
+      cliName: displayName,
+      builtin: [],
+      custom: [],
+      discovered: [],
+      workingDir: '/workspace',
+      mcpServers: [],
+      discoverySupported: false,
+    }, 'en'));
+
+    expect(card.header.title).toEqual({
+      tag: 'plain_text',
+      content: `🧩 Slash commands available now (${displayName})`,
+    });
+    const markdown = card.body.elements
+      .filter((element: any) => element.tag === 'markdown')
+      .map((element: any) => element.content)
+      .join('\n');
+    expect(markdown).toContain('Forge \\*Codex\\* \\<at id=all\\>\\</at\\>');
+    expect(markdown).not.toContain('<at id=all></at>');
+  });
+});
+
 describe('buildConfigCard', () => {
   it('renders card-behaviour toggles', () => {
     const card = parse(buildConfigCard({
@@ -475,6 +524,15 @@ describe('buildSessionCard', () => {
         session_id: SID,
         cli_id: 'codex',
       });
+    });
+
+    it('uses a configured runtime name in the header and local-open button', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(
+        SID, ROOT, URL, TITLE, 'codex', false, false, 'en', true, 'Vendor Codex',
+      ));
+      expect(card.header.title.content).toContain('Vendor Codex');
+      expect(buttonTexts(findActions(card))).toContain('💻 Open Vendor Codex');
     });
 
     it('includes Open TRAE beside Web Terminal for traex sessions', () => {
@@ -999,6 +1057,25 @@ describe('buildStreamingCard', () => {
     const json = buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle');
     expect(() => JSON.parse(json)).not.toThrow();
   });
+
+  it('uses a configured runtime name and escapes it in markdown notices', () => {
+    enableLocalCliOpen();
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'limited', 'codex', 'hidden', undefined, undefined,
+      false, false, 'en', {
+        limited: true,
+        kind: 'usage',
+        retryAtMs: Date.now() + 60_000,
+        retryLabel: 'later',
+        retryReady: false,
+      }, undefined, true, undefined, 'Vendor [Codex] <at id=ou_fake></at>',
+    ));
+    expect(card.header.title.content).toContain('Vendor [Codex] <at id=ou_fake></at>');
+    expect(buttonTexts(findActions(card))).toContain('💻 Open Vendor [Codex] <at id=ou_fake></at>');
+    const markdown = card.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(markdown).toContain('Vendor \\[Codex\\] \\<at id=ou\\_fake\\>\\</at\\>');
+    expect(markdown).not.toContain('<at id=ou_fake>');
+  });
 });
 
 // ─── buildRepoSelectCard ──────────────────────────────────────────────────
@@ -1363,6 +1440,16 @@ describe('buildSessionClosedCard', () => {
     expect(resumeBtn.value.root_id).toBe('om_root_X');
     expect(resumeBtn.type).toBe('primary');
   });
+
+  it('escapes a configured runtime name in markdown copy', () => {
+    const card = parse(buildSessionClosedCard(
+      'sess-5', 'om_root', '', 'codex', undefined, null, 'en',
+      'Vendor [Codex] <at id=ou_fake></at>',
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('Vendor \\[Codex\\] \\<at id=ou\\_fake\\>\\</at\\>');
+    expect(md).not.toContain('<at id=ou_fake>');
+  });
 });
 
 describe('buildRelayPickerCard', () => {
@@ -1711,6 +1798,14 @@ describe('buildPrivateSnapshotCard', () => {
     const btns = allButtons(card);
     expect(btns.some((b: any) => b.value?.action === 'open_local_cli')).toBe(false);
     expect(btns.map((b: any) => b.value?.action ?? 'url')).toEqual(['url', 'get_write_link', 'close']);
+  });
+
+  it('uses a configured runtime name in the private snapshot header', () => {
+    const card = parse(buildPrivateSnapshotCard(
+      'https://t.example/ro', 'my session', 'idle', 'codex', undefined, 'hello',
+      'sess-9', 'om_anchor', 'en', undefined, 'Vendor Codex',
+    ));
+    expect(card.header.title.content).toContain('Vendor Codex');
   });
 
   it('keeps the snapshot and close control but hides terminal links when unavailable', () => {
