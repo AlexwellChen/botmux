@@ -1149,7 +1149,6 @@ function seedAndTrustClaudeState(statePath: string, workingDir: string, log: (m:
 }
 
 const IDLE_PROBE_INTERVAL_MS = 3_500;
-const IDLE_PROBE_MAX_ATTEMPTS = 24;
 let busyPatternIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let codexRunnerFreshness: CodexRunnerFreshnessState = 'current';
@@ -7255,6 +7254,7 @@ function setupAdoptInputAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>):
 function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>, label: string): void {
   idleDetector = new IdleDetector(adoptIdleAdapter(cfg));
   idleDetector.onIdle(() => {
+    if (backend && deferPromptReadyWhileBusy(`${label} adopt-idle`, backend)) return;
     log(`Prompt detected (idle) — ${label} adopt mode`);
     try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
     try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
@@ -7281,13 +7281,32 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
 }
 
 function captureBackendScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): string {
-  return be.captureViewport?.() ?? be.captureCurrentScreen?.() ?? '';
+  return be.captureViewport?.() ?? be.captureCurrentScreen?.() ?? renderer?.rawSnapshot() ?? '';
+}
+
+function canCaptureBusyPatternScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): boolean {
+  return !!(be.captureCurrentScreen || be.captureViewport || renderer);
 }
 
 function busyProbeRegion(content: string): string {
   const lines = content.split(/\r?\n/);
   const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));
   return lines.slice(-tailLineCount).join('\n');
+}
+
+function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
+  if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
+  try {
+    const content = captureBackendScreen(be);
+    if (!content || !cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
+    log(`${source}: authoritative viewport still shows busy marker; deferring prompt ready`);
+    idleDetector?.reset();
+    scheduleBusyPatternIdleProbe(source);
+    return true;
+  } catch (err: any) {
+    log(`${source} busy viewport capture failed: ${err.message}`);
+    return false;
+  }
 }
 
 function probeBusyPatternIdle(
@@ -7362,15 +7381,25 @@ function stopBusyPatternIdleProbe(): void {
 
 function scheduleBusyPatternIdleProbe(source: string): void {
   stopBusyPatternIdleProbe();
-  if (!cliAdapter?.busyPattern || (!backend?.captureCurrentScreen && !backend?.captureViewport)) return;
+  if (!cliAdapter?.busyPattern || !backend || !canCaptureBusyPatternScreen(backend)) return;
+  // Don't arm on a backend whose screen geometry is not authoritative for
+  // mutation (ZMX): probeBusyPatternIdle() bails at that same gate every tick
+  // and can never mark ready, so — with the attempt cap now removed — the timer
+  // would re-arm on `!isPromptReady` forever. On ZMX an alt-screen CLI's
+  // busy→idle redraw arrives as a screen-resync (reset-only, deliberately not
+  // fed to IdleDetector — see onBackendScreenResync), so screen quiescence never
+  // flips isPromptReady either; a Pi turn ending via a `terminate:true` custom
+  // tool (no assistant_final → no fireIdle) would then leave a live worker
+  // logging a skip line every IDLE_PROBE_INTERVAL_MS with no terminator. The
+  // authoritative screen-idle path (settle + drainBridgesThenMarkReady) already
+  // owns completion for these backends.
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
 
-  let attempts = 0;
   const tick = () => {
     busyPatternIdleProbeTimer = null;
     if (!backend || isPromptReady) return;
-    attempts += 1;
     if (probeBusyPatternIdle(source, backend)) return;
-    if (attempts < IDLE_PROBE_MAX_ATTEMPTS && !isPromptReady) {
+    if (!isPromptReady) {
       busyPatternIdleProbeTimer = setTimeout(tick, IDLE_PROBE_INTERVAL_MS);
       busyPatternIdleProbeTimer.unref?.();
     }
@@ -9654,6 +9683,8 @@ async function spawnCli(
           log('Screen settle barrier degraded after bounded retries; finalizing from the last successful snapshot');
         }
       }
+      if (evidenceSource === 'screen' && idleBackend
+        && deferPromptReadyWhileBusy(`${cliName()} screen-idle`, idleBackend)) return;
       drainBridgesThenMarkReady(evidenceSource);
     });
   }
@@ -9856,8 +9887,9 @@ async function spawnCli(
     log(forced
       ? `WARN First prompt hard timeout — ${cliName()} readyPattern did not arrive; forcing queued message flush`
       : 'First prompt timeout — enabling screen updates and flushing queued messages');
-    if (backend && cliAdapter?.busyPattern && probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)) {
-      return;
+    if (backend && cliAdapter?.busyPattern) {
+      if (deferPromptReadyWhileBusy(`${cliName()} first-prompt-timeout`, backend)
+        || probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)) return;
     }
     // For type-ahead adapters (Codex/CoCo/Claude/TraeX) the TUI is usually booted
     // enough to park input even if the idle detector hasn't fired yet. Directly
