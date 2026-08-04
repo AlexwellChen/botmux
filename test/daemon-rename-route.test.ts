@@ -33,6 +33,7 @@ const mocks = vi.hoisted(() => {
   // botmux session shell.
   const dataDir = `${process.env.TMPDIR ?? '/tmp'}/botmux-rename-route-${process.pid}`;
   process.env.SESSION_DATA_DIR = dataDir;
+  process.env.BOTS_CONFIG = `${dataDir}/bots.json`;
   delete process.env.BOTMUX_SESSION_ID;
   delete process.env.BOTMUX_LARK_APP_ID;
   let seq = 0;
@@ -266,6 +267,10 @@ function botsInfoPath(): string {
   return join(mocks.dataDir, 'bots-info.json');
 }
 
+function botsConfigPath(): string {
+  return join(mocks.dataDir, 'bots.json');
+}
+
 function botUnionIdsPath(): string {
   return join(mocks.dataDir, 'bot-union-ids.json');
 }
@@ -276,11 +281,10 @@ function seedSiblingCrossRef(): void {
 }
 
 function seedConfiguredSiblingIdentity(): void {
-  registerBot({
-    larkAppId: 'repo_sibling_route',
-    larkAppSecret: 's',
-    cliId: 'codex',
-  });
+  writeFileSync(botsConfigPath(), JSON.stringify([
+    { larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER] },
+    { larkAppId: 'repo_sibling_route', larkAppSecret: 's', cliId: 'codex' },
+  ]));
   writeFileSync(botsInfoPath(), JSON.stringify([
     { larkAppId: APP, botOpenId: 'ou_receiver_self', botName: 'Receiver', cliId: 'claude-code' },
     { larkAppId: 'repo_sibling_route', botOpenId: 'ou_peer_self', botName: 'Codex', cliId: 'codex' },
@@ -296,6 +300,7 @@ function resetRouteTestState(): void {
   mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
   activeSessions.clear();
   rmSync(crossRefPath(), { force: true });
+  rmSync(botsConfigPath(), { force: true });
   rmSync(botsInfoPath(), { force: true });
   rmSync(botUnionIdsPath(), { force: true });
   const bot = registerBot({
@@ -527,6 +532,7 @@ describe('/repo trusted sibling production routing', () => {
 
   afterEach(() => {
     rmSync(crossRefPath(), { force: true });
+    rmSync(botsConfigPath(), { force: true });
     rmSync(botsInfoPath(), { force: true });
     rmSync(botUnionIdsPath(), { force: true });
   });
@@ -625,6 +631,9 @@ describe('/repo trusted sibling production routing', () => {
   it('thread reply: rejects stale sibling identity for an app no longer in the current config', async () => {
     resetRouteTestState();
     seedSiblingCrossRef();
+    writeFileSync(botsConfigPath(), JSON.stringify([
+      { larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER] },
+    ]));
     writeFileSync(botsInfoPath(), JSON.stringify([
       { larkAppId: APP, botOpenId: 'ou_receiver_self', botName: 'Receiver', cliId: 'claude-code' },
       { larkAppId: 'removed_sibling_app', botOpenId: 'ou_peer_self', botName: 'Codex', cliId: 'codex' },
@@ -634,6 +643,29 @@ describe('/repo trusted sibling production routing', () => {
     await handleThreadReply(
       makePeerRepoEventData('om_repo_reply_removed_app', 'bot', 'om_repo_root_removed_app'),
       makeCtx('om_repo_root_removed_app', 'om_repo_reply_removed_app'),
+    );
+
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('thread reply: rejects registry-only sibling identity that is absent from current config', async () => {
+    resetRouteTestState();
+    seedSiblingCrossRef();
+    registerBot({ larkAppId: 'registry_only_route', larkAppSecret: 's', cliId: 'codex' });
+    writeFileSync(botsConfigPath(), JSON.stringify([
+      { larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER] },
+    ]));
+    writeFileSync(botsInfoPath(), JSON.stringify([
+      { larkAppId: APP, botOpenId: 'ou_receiver_self', botName: 'Receiver', cliId: 'claude-code' },
+      { larkAppId: 'registry_only_route', botOpenId: 'ou_peer_self', botName: 'Codex', cliId: 'codex' },
+    ]));
+    recordBotUnionId(mocks.dataDir, 'registry_only_route', PEER_UNION);
+
+    await handleThreadReply(
+      makePeerRepoEventData('om_repo_reply_registry_only', 'bot', 'om_repo_root_registry_only'),
+      makeCtx('om_repo_root_registry_only', 'om_repo_reply_registry_only'),
     );
 
     expect(repliedText()).toContain('仅 allowedUsers 可执行');

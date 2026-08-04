@@ -8,7 +8,7 @@ import { ProxyAgent } from 'proxy-agent';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
-import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, findOncallChat, getOwnerOpenId, loadBotConfigs, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
@@ -831,10 +831,10 @@ export function isKnownPeerBot(dataDir: string, larkAppId: string, senderOpenId:
 /**
  * Auth-grade local sibling check for the narrow `/repo` exception.
  *
- * Cross-ref proves only "this receiver has seen a bot name -> open_id" and may
- * be stale or name-poisoned. For authorization we additionally require the name
- * to bind to exactly one CURRENTLY configured sibling app, then match the Lark-
- * stamped sender union_id against that exact app's learned own union_id.
+ * Cross-ref proves only "this receiver has seen this sender open_id as some
+ * peer" and may be stale or name-poisoned. For authorization we additionally
+ * require the Lark-stamped sender union_id to match exactly one currently
+ * configured, transport-enabled sibling app's learned own union_id.
  */
 export function isVerifiedLocalSiblingBot(
   dataDir: string,
@@ -846,37 +846,20 @@ export function isVerifiedLocalSiblingBot(
   const unionId = (senderUnionId ?? '').trim();
   if (!openId || !unionId) return false;
 
-  const matchingNames = [...readBotOpenIdCrossRef(dataDir, larkAppId).entries()]
-    .filter(([, peerOpenId]) => peerOpenId === openId)
-    .map(([name]) => name.toLowerCase());
-  if (matchingNames.length === 0) return false;
+  if (!isKnownPeerBot(dataDir, larkAppId, openId)) return false;
 
-  const configuredSiblingAppIds = new Set(
-    getAllBots()
-      .map(b => b.config.larkAppId)
-      .filter(appId => appId && appId !== larkAppId),
-  );
-  if (configuredSiblingAppIds.size === 0) return false;
-
-  let candidateAppId: string | undefined;
+  let matchingConfiguredSiblings = 0;
   try {
-    const infoPath = join(dataDir, 'bots-info.json');
-    if (!existsSync(infoPath)) return false;
-    const entries: Array<{ larkAppId?: unknown; botName?: unknown }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
-    if (!Array.isArray(entries)) return false;
-    for (const entry of entries) {
-      const appId = typeof entry?.larkAppId === 'string' ? entry.larkAppId.trim() : '';
-      const botName = typeof entry?.botName === 'string' ? entry.botName.trim().toLowerCase() : '';
-      if (!appId || !botName || !configuredSiblingAppIds.has(appId)) continue;
-      if (!matchingNames.includes(botName)) continue;
-      if (candidateAppId && candidateAppId !== appId) return false;
-      candidateAppId = appId;
+    for (const cfg of loadBotConfigs()) {
+      const appId = (cfg.larkAppId ?? '').trim();
+      if (!appId || appId === larkAppId || cfg.apiOnly === true) continue;
+      if (getBotUnionId(dataDir, appId) === unionId) matchingConfiguredSiblings += 1;
+      if (matchingConfiguredSiblings > 1) return false;
     }
   } catch {
     return false;
   }
-  if (!candidateAppId) return false;
-  return getBotUnionId(dataDir, candidateAppId) === unionId;
+  return matchingConfiguredSiblings === 1;
 }
 
 /**
@@ -1565,8 +1548,8 @@ export function canOperate(
  * 原样走 canTalk / evaluateTalk，语义不变。canOperate 那段人/bot 通用，不受影响。
  *
  * `/repo` 另有一个更窄的同部署 sibling bot 例外：仅当飞书事件把发送方盖章为 bot，
- * cross-ref 关联到当前仍配置的本机 sibling app，且 sender union_id 精确匹配该 app
- * 已学习的自身 union_id 时放行；不把 sibling 提升为 canOperate，也不把其他 daemon 命令降权。
+ * receiver cross-ref 命中 sender open_id，且 sender union_id 精确匹配当前仍配置的唯一
+ * 本机 sibling app 已学习的自身 union_id 时放行；不把 sibling 提升为 canOperate，也不把其他 daemon 命令降权。
  */
 export function canRunDaemonCommand(
   larkAppId: string,

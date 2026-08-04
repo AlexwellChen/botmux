@@ -122,7 +122,9 @@ describe('canRunDaemonCommand gate', () => {
 
 describe('canRunDaemonCommand /repo trusted same-deployment peer exception', () => {
   let prevDataDir: string;
+  let prevBotsConfig: string | undefined;
   let tmp: string;
+  let botsConfigPath: string;
 
   const repoGate = (senderOpenId: string, cmd = '/repo', botSender = true) =>
     canRunDaemonCommand('repo1', 'oc_repo', senderOpenId, undefined, cmd, undefined, 'group', botSender, botSender);
@@ -130,7 +132,9 @@ describe('canRunDaemonCommand /repo trusted same-deployment peer exception', () 
   beforeEach(() => {
     __testOnly_resetBotRegistry();
     prevDataDir = config.session.dataDir;
+    prevBotsConfig = process.env.BOTS_CONFIG;
     tmp = mkdtempSync(join(tmpdir(), 'repo-peer-gate-'));
+    botsConfigPath = join(tmp, 'bots.json');
     config.session.dataDir = tmp;
 
     const bot = registerBot({
@@ -141,11 +145,11 @@ describe('canRunDaemonCommand /repo trusted same-deployment peer exception', () 
     });
     bot.resolvedAllowedUsers = ['ou_owner'];
     bot.config.chatGrants = { oc_repo: ['ou_granted'] };
-    registerBot({
-      larkAppId: 'repo_sibling',
-      larkAppSecret: 's',
-      cliId: 'codex',
-    });
+    writeFileSync(botsConfigPath, JSON.stringify([
+      { larkAppId: 'repo1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
+      { larkAppId: 'repo_sibling', larkAppSecret: 's', cliId: 'codex' },
+    ]));
+    process.env.BOTS_CONFIG = botsConfigPath;
     writeFileSync(join(tmp, 'bot-openids-repo1.json'), JSON.stringify({ Codex: 'ou_sibling' }));
     writeFileSync(join(tmp, 'bots-info.json'), JSON.stringify([
       { larkAppId: 'repo1', botOpenId: 'ou_self', botName: 'Receiver', cliId: 'claude-code' },
@@ -156,6 +160,8 @@ describe('canRunDaemonCommand /repo trusted same-deployment peer exception', () 
 
   afterEach(() => {
     config.session.dataDir = prevDataDir;
+    if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+    else process.env.BOTS_CONFIG = prevBotsConfig;
     rmSync(tmp, { recursive: true, force: true });
     __testOnly_resetBotRegistry();
   });
@@ -185,32 +191,63 @@ describe('canRunDaemonCommand /repo trusted same-deployment peer exception', () 
   });
 
   it('rejects stale cross-ref and union records for an app that is no longer configured', () => {
-    __testOnly_resetBotRegistry();
-    const bot = registerBot({
-      larkAppId: 'repo1',
-      larkAppSecret: 's',
-      cliId: 'claude-code',
-      allowedUsers: ['ou_owner'],
-    });
-    bot.resolvedAllowedUsers = ['ou_owner'];
+    writeFileSync(botsConfigPath, JSON.stringify([
+      { larkAppId: 'repo1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
+    ]));
 
     expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', '/repo', undefined, 'group', true, true)).toBe(false);
   });
 
-  it('rejects ambiguous configured sibling name bindings', () => {
+  it('rejects duplicate configured sibling union matches', () => {
     registerBot({
       larkAppId: 'repo_sibling_2',
       larkAppSecret: 's',
       cliId: 'codex',
     });
     recordBotUnionId(tmp, 'repo_sibling_2', 'on_sibling');
-    writeFileSync(join(tmp, 'bots-info.json'), JSON.stringify([
-      { larkAppId: 'repo1', botOpenId: 'ou_self', botName: 'Receiver', cliId: 'claude-code' },
-      { larkAppId: 'repo_sibling', botOpenId: 'ou_sibling_self', botName: 'Codex', cliId: 'codex' },
-      { larkAppId: 'repo_sibling_2', botOpenId: 'ou_sibling_2_self', botName: 'Codex', cliId: 'codex' },
+    writeFileSync(botsConfigPath, JSON.stringify([
+      { larkAppId: 'repo1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
+      { larkAppId: 'repo_sibling', larkAppSecret: 's', cliId: 'codex' },
+      { larkAppId: 'repo_sibling_2', larkAppSecret: 's', cliId: 'codex' },
     ]));
 
     expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', '/repo', undefined, 'group', true, true)).toBe(false);
+  });
+
+  it('rejects apiOnly sibling config even when union and cross-ref match', () => {
+    writeFileSync(botsConfigPath, JSON.stringify([
+      { larkAppId: 'repo1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
+      { larkAppId: 'repo_sibling', apiOnly: true, cliId: 'codex' },
+    ]));
+
+    expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', '/repo', undefined, 'group', true, true)).toBe(false);
+  });
+
+  it('rejects missing or corrupt current config', () => {
+    rmSync(botsConfigPath, { force: true });
+    expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', '/repo', undefined, 'group', true, true)).toBe(false);
+
+    writeFileSync(botsConfigPath, '{not json');
+    expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_sibling', 'on_sibling', '/repo', undefined, 'group', true, true)).toBe(false);
+  });
+
+  it('rejects a sibling that exists only in the current daemon registry but not in fresh config', () => {
+    registerBot({
+      larkAppId: 'registry_only_sibling',
+      larkAppSecret: 's',
+      cliId: 'codex',
+    });
+    recordBotUnionId(tmp, 'registry_only_sibling', 'on_registry_only');
+    writeFileSync(join(tmp, 'bot-openids-repo1.json'), JSON.stringify({ Codex: 'ou_registry_only' }));
+    writeFileSync(join(tmp, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'repo1', botOpenId: 'ou_self', botName: 'Receiver', cliId: 'claude-code' },
+      { larkAppId: 'registry_only_sibling', botOpenId: 'ou_registry_self', botName: 'Codex', cliId: 'codex' },
+    ]));
+    writeFileSync(botsConfigPath, JSON.stringify([
+      { larkAppId: 'repo1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
+    ]));
+
+    expect(canRunDaemonCommand('repo1', 'oc_repo', 'ou_registry_only', 'on_registry_only', '/repo', undefined, 'group', true, true)).toBe(false);
   });
 
   it('keeps /repo denied for human owners only when they are not allowed users, chat grants, and unknown external bots', () => {
