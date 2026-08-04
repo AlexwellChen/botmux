@@ -1512,6 +1512,10 @@ export function canOperate(
  * union_id 的情况）；否则「团队拉群里外部 bot 能 talk 却执行不了降权到 canTalk 的命令
  * （如 /status）」——单一 talk 谓词在这道 daemon 命令闸继续分叉。不传（人的路径）→
  * 原样走 canTalk / evaluateTalk，语义不变。canOperate 那段人/bot 通用，不受影响。
+ *
+ * `/repo` 另有一个更窄的同部署 sibling bot 例外：仅当飞书事件把发送方盖章为 bot
+ * 且 cross-ref 命中 isKnownPeerBot 时放行，支持可信编排 bot 先用 `/repo` 绑定工作区；
+ * 不把 sibling 提升为 canOperate，也不把其他 daemon 命令降权。
  */
 export function canRunDaemonCommand(
   larkAppId: string,
@@ -1522,8 +1526,12 @@ export function canRunDaemonCommand(
   memberUnionId?: string | undefined,
   chatType?: 'p2p' | 'group',
   botSender?: boolean,
+  larkStampedBotSender?: boolean,
 ): boolean {
   if (canOperate(larkAppId, chatId, senderOpenId, senderUnionId)) return true;
+  if (cmd === '/repo' && larkStampedBotSender === true && isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) {
+    return true;
+  }
   const list = getBot(larkAppId).config.canTalkDaemonCommands;
   if (!list?.includes(cmd)) return false;
   return botSender
