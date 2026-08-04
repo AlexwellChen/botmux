@@ -3309,6 +3309,251 @@ export async function transferSession(
   }
 }
 
+/** Backends whose conversation state is a local, copyable transcript file and
+ *  whose CLI exposes a native "fork/branch this session" primitive that botmux
+ *  can drive at cold spawn (Claude family: `--fork-session`; Codex terminal:
+ *  `codex fork <id>`). App-server backends (codex-app, or a codex CLI running in
+ *  Hybrid RPC mode) keep state in a live app-server process + SQLite and have no
+ *  byte-level fork we can reproduce — they are refused. Riff / other pure-remote
+ *  backends have no local rollout to fork either. */
+const FORK_CAPABLE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
+  'claude-code', 'seed', 'relay', 'aiden', 'codex',
+]);
+
+/** True when this session can be byte-level forked via a CLI-native primitive.
+ *  Refuses codex-app outright, and refuses a plain `codex` session that is
+ *  running in Hybrid RPC mode (its live thread lives in the app-server, not a
+ *  forkable local rollout). */
+export function isForkCapableSession(ds: DaemonSession): boolean {
+  const botCfg = getBot(ds.larkAppId).config;
+  const cliId = sessionCliId(ds, botCfg);
+  if (!FORK_CAPABLE_CLI_IDS.has(cliId)) return false;
+  // Codex terminal mode is forkable; Codex under Hybrid RPC input is not (the
+  // thread is an app-server live session, no local rollout to `codex fork`).
+  //
+  // Read BOTH the live config AND the SPAWN-TIME truth (ds.initConfig): a pane
+  // is committed to RPC-or-terminal at spawn (buildArgs runs once) and does NOT
+  // hot-swap its argv when the global toggle flips later. So a worker started
+  // with codexRpcInput=true that is still running after the operator disables
+  // the global default is STILL an RPC pane (live thread in the app-server) —
+  // the live config alone (both false) would wrongly re-classify it as terminal
+  // and let `/fork` run `codex fork` against a rollout that does not exist.
+  // ORing the frozen init flag closes that window (over-refuse, never leak).
+  const rpcAtSpawn = ds.initConfig?.codexRpcInput === true;
+  if (cliId === 'codex' && (rpcAtSpawn || botCfg.codexRpcInput === true || config.codexRpcInputDefault)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Fork a session: create a SECOND, independent botmux session that inherits the
+ * source's full context at the current node, landing at a different anchor
+ * (another group / topic). The source session is left completely untouched and
+ * keeps running — this is the non-destructive sibling of {@link transferSession}
+ * (relay MOVES one session shell; fork COPIES into a new shell).
+ *
+ * Context inheritance is delegated to the CLI's native fork primitive
+ * (`--fork-session` / `codex fork`) via the child's one-shot
+ * `pendingForkSession` marker: the child's first spawn resumes the SOURCE's
+ * CLI-native transcript but writes forward into a fresh CLI-minted id. botmux
+ * never copies transcript bytes itself.
+ *
+ * Shares transferSession's front guards (mid-turn / adopt / pendingRepo /
+ * vc-receiver / target-anchor occupancy) but performs NONE of its destructive
+ * steps (no source card freeze, no worker detach, no source registry delete, no
+ * source routing rewrite).
+ */
+export async function forkSession(
+  sessionId: string,
+  targetChatId: string,
+  targetRootMessageId: string,
+  targetChatType: 'group' | 'p2p',
+  targetScope: 'thread' | 'chat',
+  opts?: { forkWorkerImpl?: typeof forkWorker },
+): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> {
+  if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
+    return { ok: false, error: 'target_chat_type_unsupported' };
+  }
+  const ds = findActiveBySessionId(sessionId);
+  if (!ds) return { ok: false, error: 'session_not_active' };
+
+  // ── Capability gate: only byte-level-forkable backends (§ design doc §4) ──
+  if (!isForkCapableSession(ds)) return { ok: false, error: 'fork_unsupported_backend' };
+
+  // ── Front guards (mirror transferSession; a fork needs a clean, complete
+  //    source node exactly as a relay does) ──
+  if (ds.session.vcMeetingReceiver) return { ok: false, error: 'vc_receiver_not_forkable' };
+  if (ds.pendingRepo) return { ok: false, error: 'not_started_yet' };
+  if (!isRelayableRealSession(ds)) return { ok: false, error: 'not_started_yet' };
+  if (ds.session.adoptedFrom) return { ok: false, error: 'adopt_not_forkable' };
+  if (isSessionLifecycleInFlight(ds)) return { ok: false, error: 'worker_busy' };
+  const st = ds.lastScreenStatus;
+  if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
+    return { ok: false, error: 'worker_busy' };
+  }
+  if (currentDeviceIsolationFreezeLease()) return { ok: false, error: 'worker_busy' };
+
+  // The source's CLI-native id is what we fork from. Without it there is no
+  // transcript node to inherit (should be present for any real session).
+  const srcCliSessionId = ds.session.cliSessionId;
+  if (!srcCliSessionId) return { ok: false, error: 'not_started_yet' };
+
+  // ── Target anchor occupancy (per-bot; sessionKey carries larkAppId) ──
+  const sourceAnchor = sessionAnchorId(ds);
+  const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootMessageId;
+  if (targetAnchor === sourceAnchor) return { ok: false, error: 'same_anchor' };
+  const targetKey = sessionKey(targetAnchor, ds.larkAppId);
+  if (activeSessionsRegistry) {
+    const scratchesToClose: string[] = [];
+    for (const existing of activeSessionsRegistry.values()) {
+      if (existing === ds) continue;
+      if (existing.larkAppId !== ds.larkAppId) continue;
+      if (sessionAnchorId(existing) !== targetAnchor) continue;
+      if (isDisposableCommandScratch(existing)) {
+        scratchesToClose.push(existing.session.sessionId);
+        continue;
+      }
+      return { ok: false, error: 'target_chat_has_session' };
+    }
+    for (const sid of scratchesToClose) await closeSession(sid);
+    const occupant = activeSessionsRegistry.get(targetKey);
+    if (occupant && occupant !== ds) return { ok: false, error: 'target_chat_has_session' };
+  }
+
+  // ── Mint the child session row (new botmux sessionId) ──
+  const parentTitle = ds.session.title || '';
+  const childTitle = parentTitle ? `🔱 ${parentTitle}` : '🔱 分身';
+  const childSession = sessionStore.createSession(
+    targetChatId,
+    targetRootMessageId,
+    childTitle,
+    targetChatType,
+    targetScope,
+  );
+  // Provenance + fork wiring. cliSessionId points at the SOURCE's CLI id: the
+  // child's first spawn resumes it and forks forward (pendingForkSession), then
+  // the worker persists the child's own new id and clears the marker.
+  childSession.forkedFrom = ds.session.sessionId;
+  childSession.pendingForkSession = true;
+  childSession.cliSessionId = srcCliSessionId;
+  childSession.cliId = ds.session.cliId;
+  childSession.workingDir = ds.session.workingDir;
+  childSession.ownerOpenId = ds.session.ownerOpenId;
+  childSession.backendType = ds.session.backendType;
+  // Bot identity on the PERSISTED row. Every other createSession caller sets
+  // this immediately after minting (trigger-session / session-manager /
+  // card-handler / daemon); the fork child must too. The runtime childDs below
+  // carries larkAppId, but if the daemon restarts before the child's first
+  // spawn persists its own cliSessionId, restoreActiveSessions resolves the bot
+  // via `session.larkAppId ?? getAllBots()[0]` — a missing value silently
+  // misattributes the fork to the FIRST bot in the roster (cross-bot identity
+  // bug in a multi-bot fleet), and destabilises sandbox transcript/BOT_HOME
+  // location.
+  childSession.larkAppId = ds.larkAppId;
+  // Frozen launch posture — inherit the source's RECORDED decisions wholesale
+  // rather than letting forkWorker re-derive them for a brand-new row. Two
+  // reasons this is mandatory, not cosmetic:
+  //   • sandbox*: a fresh child row has sandbox===undefined, and forkWorker's
+  //     cold-spawn runs with resume=true → it hits the "resume + no recorded
+  //     decision → sandbox=false" branch meant for pre-sandbox-era legacy
+  //     sessions. A fork of a sandboxed session would therefore run UNSANDBOXED
+  //     (bwrap credential seal — bots.json deny / sibling appsecrets /
+  //     master.key / network deny — silently dropped). This is a security
+  //     escape, so copy the recorded decision and its path lists verbatim.
+  //   • model / reasoningEffort / cliPathOverride / wrapperCli / agentFrozen:
+  //     without these the child's sessionAgentConfig() sees !agentFrozen and
+  //     re-freezes from the CURRENT bot config, silently dropping any per-session
+  //     /model or /effort override the source carried (reasoningEffort has no
+  //     botCfg fallback at all → drops to undefined). Copying the frozen tuple
+  //     keeps the clone's launch identity == the source's.
+  // readIsolation is intentionally NOT copied: it is not a persisted Session
+  // field (forkWorker derives it from botCfg at spawn), and the child runs the
+  // SAME bot, so it is preserved automatically. persistentBackendTarget is also
+  // intentionally NOT inherited — that is the parent's specific pane/Herdr
+  // affinity; the child cold-spawns its own fresh backing.
+  childSession.sandbox = ds.session.sandbox;
+  childSession.sandboxPaths = ds.session.sandboxPaths;
+  childSession.sandboxHidePaths = ds.session.sandboxHidePaths;
+  childSession.sandboxReadonlyPaths = ds.session.sandboxReadonlyPaths;
+  childSession.sandboxNetwork = ds.session.sandboxNetwork;
+  childSession.model = ds.session.model;
+  childSession.reasoningEffort = ds.session.reasoningEffort;
+  childSession.cliPathOverride = ds.session.cliPathOverride;
+  childSession.wrapperCli = ds.session.wrapperCli;
+  childSession.agentFrozen = ds.session.agentFrozen;
+  childSession.nativeSessionTitle = childTitle;
+  childSession.nativeSessionTitleUserDefined = true;
+  sessionStore.updateSession(childSession);
+
+  // ── Build the child runtime DaemonSession (mirrors the restore-path literal;
+  //    worker:null → forkWorker cold-spawns a fresh worker for it) ──
+  const childDs: DaemonSession = {
+    session: childSession,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    larkAppId: ds.larkAppId,
+    chatId: targetChatId,
+    chatType: targetChatType,
+    scope: targetScope,
+    spawnedAt: ds.spawnedAt,
+    cliVersion: getCurrentCliVersion(),
+    lastMessageAt: Date.now(),
+    hasHistory: true,           // forked child resumes (forks) prior history on first spawn
+    workingDir: ds.session.workingDir,
+    ownerOpenId: ds.session.ownerOpenId,
+    // Fresh card in the target anchor — never inherit the source's card id.
+    streamCardId: undefined,
+    streamCardNonce: undefined,
+    displayMode: ds.displayMode ?? 'hidden',
+    suppressRecoveryCard: false,
+  };
+
+  if (activeSessionsRegistry) {
+    if (!(await setActiveSessionSafe(activeSessionsRegistry, targetKey, childDs))) {
+      // Target slot was taken between the guard and here — roll back the child
+      // row so it doesn't linger as a ghost-active session.
+      await closeSession(childSession.sessionId).catch(() => { /* best effort */ });
+      return { ok: false, error: 'target_chat_has_session' };
+    }
+  }
+
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId: childSession.sessionId,
+      patch: {
+        chatId: targetChatId,
+        rootMessageId: targetRootMessageId,
+        scope: targetScope,
+        chatType: targetChatType,
+      },
+    },
+  });
+
+  // Cold-spawn the child worker with resume=true → the adapter sees
+  // pendingForkSession and passes the native fork flag (--fork-session /
+  // codex fork). The SOURCE ds is never touched.
+  const fkw = opts?.forkWorkerImpl ?? forkWorker;
+  try {
+    fkw(childDs, '', /*resume*/true);
+  } catch (err) {
+    logger.error(
+      `[${childSession.sessionId.substring(0, 8)}] fork child worker spawn failed: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    await closeSession(childSession.sessionId).catch(() => { /* best effort */ });
+    return { ok: false, error: 'fork_spawn_failed' };
+  }
+
+  logger.info(
+    `[${sessionId.substring(0, 8)}] forked → child ${childSession.sessionId.substring(0, 8)} `
+    + `at anchor ${targetAnchor.substring(0, 8)} (source untouched)`,
+  );
+  return { ok: true, childSessionId: childSession.sessionId };
+}
+
 // ─── Fork worker ────────────────────────────────────────────────────────────
 
 /** True if `p` resolves (via realpath) to the user's home dir. Used to exclude
@@ -3807,6 +4052,12 @@ export function forkWorker(
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
     resume,
+    // One-shot native fork intent (see Session.pendingForkSession). Only the
+    // child's FIRST spawn resumes the SOURCE transcript (cliSessionId still
+    // points at the parent's CLI id here) while forking forward into a new id;
+    // the worker clears the marker + persists the child's own new id, so a
+    // later refork resumes the child normally (pendingForkSession=false).
+    forkSession: ds.session.pendingForkSession === true,
     cliSessionId: ds.session.cliSessionId,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
@@ -4601,6 +4852,14 @@ function setupWorkerHandlers(
       case 'cli_session_id': {
         const wasLocalCliOpenReady = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
         ds.session.cliSessionId = msg.cliSessionId;
+        // One-shot native fork completed: the child now has its OWN CLI-native
+        // id (Claude/Codex minted it during --fork-session / codex fork). Clear
+        // the pending-fork marker so any later refork resumes THIS transcript
+        // instead of re-forking the parent's again.
+        if (ds.session.pendingForkSession) {
+          ds.session.pendingForkSession = undefined;
+          if (ds.initConfig) ds.initConfig.forkSession = false;
+        }
         if (ds.adoptedFrom) ds.adoptedFrom.sessionId = msg.cliSessionId;
         if (ds.session.adoptedFrom) ds.session.adoptedFrom.sessionId = msg.cliSessionId;
         sessionStore.updateSession(ds.session);

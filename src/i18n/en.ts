@@ -521,6 +521,22 @@ export const messages: Record<string, string> = {
   'cmd.relay.report_peer_failed': '• {bot} — relay failed: {error}',
   'cmd.relay.failed': '⚠️ /relay --create failed: {error}',
 
+  // ─── /fork (session clone) ─────────────────────────────────────────────────
+  'cmd.fork.no_bot': '⚠️ Could not determine the bot identity, /fork cancelled.',
+  'cmd.fork.no_sender': '⚠️ Could not resolve sender open_id, /fork cancelled.',
+  'cmd.fork.no_session': '⚠️ /fork must be invoked inside a thread with an existing session.',
+  'cmd.fork.no_source_here': '⚠️ No active session to fork here. Invoke /fork **inside the thread the session lives in** (the topic where you normally @ the bot), not at the group top level.',
+  'cmd.fork.not_owner': '⚠️ Only the session owner can fork it.',
+  'cmd.fork.wrong_bot': '⚠️ Fork can only clone the current session to **this same bot** (the clone must run the same CLI). No need to @ another bot; just `/fork --create <new group name>` — it defaults to the current bot.',
+  'cmd.fork.unsupported_backend': 'ℹ️ The current {cli} session does not support fork yet (only Claude family / Codex terminal mode; Codex App, RPC-enabled Codex, and pure-remote backends run an app-server live session with no byte-level copy).',
+  'cmd.fork.mid_turn': '⚠️ The session is mid-turn and cannot be forked. Wait until it is idle, then /fork.',
+  'cmd.fork.not_started_yet': '⚠️ The session has not really started (no repo / CLI not up / no context) and cannot be forked.',
+  'cmd.fork.adopt_not_forkable': '⚠️ This session was adopted from an external CLI and cannot be forked.',
+  'cmd.fork.created': '✅ Created group "{name}" and forked a clone (the source session is left running untouched)\n👉 {link}\n\nThe clone carries the full context at fork time — go to the new group and @ the bot to continue.',
+  'cmd.fork.failed': '⚠️ /fork --create failed: {error}',
+  'cmd.fork.picker_pending': 'ℹ️ Forking in place isn\'t supported in this group. Use `/fork --create <new group name> @bot` — it creates a new group and forks a clone of the current session into it, leaving the source untouched. (Creating a Branch in place, in this group, is coming later.)',
+  'cmd.fork.orphan_group_left': '⚠️ Fork did not succeed, but the new group "{name}" was already created (auto-disband failed, likely because ownership was transferred to you). You can delete this empty group manually.',
+
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': 'No scheduled tasks yet.\n\nExamples:\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report',
   'schedule.list_header': 'Scheduled tasks ({count}):',
@@ -575,6 +591,7 @@ export const messages: Record<string, string> = {
   'help.introduce': '/introduce          - Register the bots in this chat with each other by open_id for precise collaboration mentions',
   'help.relay': '/relay              - Pick a live session from another chat/topic and relay it into the current chat/topic',
   'help.relay_create': '/relay --create [name] - Create a collaboration group and relay the current session there (mention target bots in a group; in a DM just send it — new group = you + this bot)',
+  'help.fork': '/fork --create <name>  - Clone the current session into a freshly-created group (the source session keeps running untouched); the clone carries full context (Claude family / Codex terminal only)',
   'help.heading_login': '🔐 User OAuth:',
   'help.login': '/login              - Lark user OAuth (lets you download images etc. from third-party cards)',
   'help.login_status': '/login status       - Show auth status',

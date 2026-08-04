@@ -524,6 +524,22 @@ export const messages: Record<string, string> = {
   'cmd.relay.report_peer_failed': '• {bot} — 接力失败：{error}',
   'cmd.relay.failed': '⚠️ /relay --create 失败：{error}',
 
+  // ─── /fork（会话分身）─────────────────────────────────────────────────────
+  'cmd.fork.no_bot': '⚠️ 无法确定机器人身份，/fork 取消。',
+  'cmd.fork.no_sender': '⚠️ 无法获取发起人 open_id，/fork 取消。',
+  'cmd.fork.no_session': '⚠️ /fork 必须在一个已有会话的话题里发起。',
+  'cmd.fork.no_source_here': '⚠️ 这里没有可 fork 的活跃会话。/fork 要在**会话所在的那个话题里**发起（就是你平时 @ 机器人聊天的那条话题），不要在群顶层发。',
+  'cmd.fork.not_owner': '⚠️ 只有会话发起人能 fork 它。',
+  'cmd.fork.wrong_bot': '⚠️ fork 只能把当前会话复制给**当前这个机器人**（分身要跑同一个 CLI）。不用 @ 别的机器人；直接 `/fork --create <新群名>` 即可，会默认用当前机器人。',
+  'cmd.fork.unsupported_backend': 'ℹ️ 当前 {cli} 会话暂不支持 fork（目前仅 Claude 系 / Codex 终端模式；Codex App、开启 RPC 的 Codex、纯远端后端走 app-server 活会话，无法字节级复制）。',
+  'cmd.fork.mid_turn': '⚠️ 会话正在处理中（mid-turn），无法 fork。请等它空闲（idle）后再发 /fork。',
+  'cmd.fork.not_started_yet': '⚠️ 会话还没真正跑起来（没选仓库 / CLI 没起 / 无上下文），无法 fork。',
+  'cmd.fork.adopt_not_forkable': '⚠️ 该会话是 /adopt 接入的外部会话，无法 fork。',
+  'cmd.fork.created': '✅ 已创建群「{name}」并 fork 出分身（源会话原样保留继续）\n👉 {link}\n\n分身带着 fork 时刻的完整上下文，去新群 @ 机器人即可继续。',
+  'cmd.fork.failed': '⚠️ /fork --create 失败：{error}',
+  'cmd.fork.picker_pending': 'ℹ️ 本群暂不支持在原地 fork。请用 `/fork --create <新群名> @机器人` —— 会新建一个群、把当前会话 fork 一份分身放进去，源会话保持不动。（在本群原地创建 Branch 的能力后续提供。）',
+  'cmd.fork.orphan_group_left': '⚠️ fork 没成功，但新群「{name}」已经建出来了（我尝试自动解散失败，可能因为群主已转给你）。这个空群可以手动删掉。',
+
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': '暂无定时任务。\n\n用法示例：\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报',
   'schedule.list_header': '定时任务列表 ({count})：',
@@ -578,6 +594,7 @@ export const messages: Record<string, string> = {
   'help.introduce': '/introduce          - 让本群机器人互相登记 open_id，用于协作时精确 @ 对方',
   'help.relay': '/relay              - 选择一个其他群/话题里的活跃会话，接力到当前群/话题',
   'help.relay_create': '/relay --create [群名]  - 新建协作群，并把当前会话接力过去（群里需 @ 目标 bot；私聊直接发即可，新群 = 你 + 本机器人）',
+  'help.fork': '/fork --create <群名>  - 把当前会话「分身」一份到新建群（源会话原样保留继续），分身带完整上下文（仅 Claude 系 / Codex 终端模式）',
   'help.heading_login': '🔐 用户授权：',
   'help.login': '/login              - 飞书用户授权（可下载第三方卡片图片等）',
   'help.login_status': '/login status       - 查看授权状态',
