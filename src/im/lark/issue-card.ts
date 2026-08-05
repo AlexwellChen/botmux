@@ -607,6 +607,10 @@ export interface IssueStatusCardData {
   claimMine?: boolean;
   /** 发件箱里还没发出去的回写条数。 */
   pendingWrites: number;
+  /** 已被判死、不再重投的回写条数（平台明确拒绝）。 */
+  failedWrites?: number;
+  /** 最后一条判死行的错误原文。 */
+  lastFailure?: string;
   /** 本机认为已同步到的状态（用于和平台对照）。 */
   lastSyncedStatus?: string;
   issueUrl?: string;
@@ -657,6 +661,17 @@ export function buildIssueStatusCard(data: IssueStatusCardData, _locale?: Locale
   if (data.pendingWrites > 0) {
     elements.push(
       h(`⏳ 还有 **${data.pendingWrites}** 条状态回写没发出去，后台每 30 秒重投一次（不用手动重试）。`),
+    );
+  }
+  // 判死的行不在 pendingWrites 里。不单独报出来，界面上一声不吭就等于"已经同步好了"，
+  // 而那次状态变更**永远不会**到平台——给了 fatal 就得给能看见它的地方。
+  if ((data.failedWrites ?? 0) > 0) {
+    elements.push(
+      h(
+        `❗ 有 **${data.failedWrites}** 条状态回写被平台拒绝、已放弃重投`
+        + `${data.lastFailure ? `：${escapeLarkMd(truncateDisplay(data.lastFailure, 80))}` : ''}。`
+        + '重试不会好转，去平台上看看这条任务还在不在、领取有没有被收回。',
+      ),
     );
   }
 

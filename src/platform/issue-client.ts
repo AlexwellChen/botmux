@@ -90,6 +90,22 @@ export function isRetriable(f: IssueClientFailure): boolean {
   return f.reason === 'network' || (f.reason === 'server' && f.status >= 500);
 }
 
+/**
+ * 这次失败是否**永远**不会成功——发件箱据此把行标 fatal，彻底停止重投。
+ *
+ * 注意它**不是** `!isRetriable`，那两个的补集差着两类，混用会把好行判死：
+ *  - `conflict`（409）：是竞争不是错误。上层先重新对账再重发，对账本身可能因为网络问题
+ *    没做成，此时判死等于把一条完全正常的回写扔了。留给下一轮。
+ *  - `unbound`：本机当前没绑平台。绑回来之后这条行照样该发，判死就再也发不出去了。
+ *
+ * 剩下的两类才是真死：`forbidden`（401/403，凭证失效 / machine_mismatch / claim 被 revoke）
+ * 与 `client`（400 参数错 / 404 issue 被删或归档）。对它们退避重投，就是每 5 分钟朝一个
+ * 永远不会变的死端点打一发，同时 `/issue status` 上那句「N 条回写没发出去」永不清零。
+ */
+export function isPermanentFailure(f: IssueClientFailure): boolean {
+  return f.reason === 'forbidden' || f.reason === 'client';
+}
+
 export interface IssueClientOptions {
   /** 覆盖平台地址与凭证（测试用；缺省读 ~/.botmux/platform.json）。 */
   binding?: { platformUrl: string; machineToken: string; machineId: string } | null;

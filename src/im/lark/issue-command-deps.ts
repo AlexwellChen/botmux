@@ -196,7 +196,7 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
         anchorId,
       );
       if (!r.ok) return { ok: false, reason: r.reason };
-      const { binding, issue, pendingWrites, claimMine } = r.view;
+      const { binding, issue, pendingWrites, failedWrites, lastFailure, claimMine } = r.view;
       const url = issueDetailUrl(binding.platformBaseUrl, binding.issueId);
       return {
         ok: true,
@@ -204,6 +204,8 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
           issueId: binding.issueId,
           bindState: binding.bindState,
           pendingWrites,
+          ...(failedWrites > 0 ? { failedWrites } : {}),
+          ...(lastFailure ? { lastFailure } : {}),
           ...(binding.lastSyncedStatus ? { lastSyncedStatus: binding.lastSyncedStatus } : {}),
           ...(claimMine !== undefined ? { claimMine } : {}),
           ...(issue
@@ -243,7 +245,7 @@ async function settle(
   return {
     ok: false,
     reason: r.reason,
-    ...(r.reason === 'platform' ? { detail: r.detail } : {}),
+    ...(r.reason === 'platform' ? { detail: r.detail, ...(r.permanent ? { permanent: true } : {}) } : {}),
     // 终态是哪一种决定了给人的说法（作废 / 已释放 / 已完成）。
     ...(r.reason === 'already_released' ? { bindState: r.binding.bindState } : {}),
   };

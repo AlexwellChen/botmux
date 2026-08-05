@@ -25,6 +25,15 @@ export interface IssueStatusView {
   issue: PlatformIssue | null;
   /** 发件箱里还没发出去的回写条数。>0 说明本机与平台之间存在滞后。 */
   pendingWrites: number;
+  /**
+   * 已被判死、不再重投的回写条数（平台 401/403/400/404，见 `isPermanentFailure`）。
+   *
+   * 必须单独报出来：这些行不在 `pendingWrites` 里，界面上一声不吭就等于"已经同步好了"，
+   * 而实际上那次状态变更**永远不会**到平台。给了 fatal 就得给能看见它的地方。
+   */
+  failedWrites: number;
+  /** 最后一条判死行的错误，直接给人看，省得去翻日志。 */
+  lastFailure?: string;
   /** 平台上这条 claim 是否还归本机。issue 拉不到时为 undefined（无法判定，别猜）。 */
   claimMine?: boolean;
 }
@@ -44,9 +53,10 @@ export async function describeIssue(deps: IssueStatusDeps, anchorId: string): Pr
   if (!binding) return { ok: false, reason: 'no_binding' };
 
   const issue = await deps.fetchIssue(binding.teamId, binding.issueId);
-  const pendingWrites = listOutbox(deps.dataDir, anchorId).filter(
-    (r) => r.state === 'pending' || r.state === 'inflight',
-  ).length;
+  const rows = listOutbox(deps.dataDir, anchorId);
+  const pendingWrites = rows.filter((r) => r.state === 'pending' || r.state === 'inflight').length;
+  const failed = rows.filter((r) => r.state === 'failed');
+  const lastFailure = failed[failed.length - 1]?.lastError;
 
   return {
     ok: true,
@@ -54,6 +64,8 @@ export async function describeIssue(deps: IssueStatusDeps, anchorId: string): Pr
       binding,
       issue,
       pendingWrites,
+      failedWrites: failed.length,
+      ...(lastFailure ? { lastFailure } : {}),
       // claim 字段被平台清掉（done/open/reopened）时也是"不归本机"，与被别人领走同样处理。
       ...(issue ? { claimMine: issue.claim?.claimId === binding.claimId } : {}),
     },

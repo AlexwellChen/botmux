@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  claimGroupName,
   claimIssueIntoGroup,
   claimMarker,
   issueDetailUrl,
@@ -356,5 +357,35 @@ describe('重复领取', () => {
     expect(r).toMatchObject({ ok: false, stage: 'claim', reason: 'already_claimed_locally' });
     expect(calls).toEqual([]); // 不白占一次平台代次
     if (!r.ok && r.stage === 'claim') expect(r.alreadyLocal?.anchorId).toBe('oc_old');
+  });
+});
+
+// 不自己截的话飞书会从尾部截，先吃掉的正是尾部那个 #claimId 标记——而那是双通道反查的
+// 一条腿，断了不会报错，只会让对账认不出这个群。
+describe('群名长度', () => {
+  const ID = 'abcdef0123456789abcdef0123456789';
+
+  it('长标题被截，标记完整保留', () => {
+    const name = claimGroupName('很长的标题'.repeat(20), ID);
+    expect(name.length).toBeLessThanOrEqual(50);
+    expect(name.endsWith(claimMarker(ID))).toBe(true);
+    expect(matchesClaimMarker(name, ID)).toBe(true);
+    expect(name).toContain('…');
+  });
+
+  it('短标题原样保留，不画蛇添足', () => {
+    expect(claimGroupName('修一个 bug', ID)).toBe(`修一个 bug ${claimMarker(ID)}`);
+  });
+
+  it('标题只有空白也拼得出可反查的群名', () => {
+    const name = claimGroupName('   ', ID);
+    expect(matchesClaimMarker(name, ID)).toBe(true);
+  });
+
+  it('实际建群用的就是这个名字', async () => {
+    const { d, groupOpts } = deps();
+    await claimIssueIntoGroup(d, { ...ARGS, issue: { ...ISSUE, title: '很长的标题'.repeat(20) } });
+    expect(groupOpts[0].name.length).toBeLessThanOrEqual(50);
+    expect(matchesClaimMarker(groupOpts[0].name, 'c'.repeat(32))).toBe(true);
   });
 });

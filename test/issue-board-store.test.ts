@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withFileLockSync } from '../src/utils/file-lock.js';
 import {
   buildLocalTaskRef,
   claimNextOutboxRow,
@@ -432,4 +433,41 @@ describe('用平台 lastSourceSeq 校准本地计数器', () => {
     expect(b.nextSourceSeq).toBe(2);
     expect(b.platformStateRev).toBe(3);
   });
+});
+
+/**
+ * 跨进程锁。`botmux report` 跑在 agent 的 CLI 子进程、发件箱 pump 跑在 daemon——两个真实
+ * 写者。两个文件都是整份 map/数组重写，快照式 RMW 交错会让**另一条 binding 整个消失**。
+ */
+describe('并发写保护', () => {
+  const lockTarget = () => join(dataDir, 'issue-board');
+
+  it('正常路径下锁用完即还，不留锁文件', () => {
+    createBinding(dataDir, {
+      anchorId: 'oc_lock', larkAppId: 'cli_a', scope: 'chat', issueId: 'iss-lock', teamId: 't1',
+      platformBaseUrl: 'https://p', claimId: 'f'.repeat(32), claimEpoch: 1,
+    });
+    enqueueDesiredStatus(dataDir, 'oc_lock', 'in_progress');
+    expect(existsSync(`${lockTarget()}.lock`)).toBe(false);
+  });
+
+  // 别的进程持锁期间，写必须**等**（等不到就报错），绝不能拿着旧快照直接写回去。
+  it('别人持锁时不会带着旧快照硬写', () => {
+    createBinding(dataDir, {
+      anchorId: 'oc_first', larkAppId: 'cli_a', scope: 'chat', issueId: 'iss-first', teamId: 't1',
+      platformBaseUrl: 'https://p', claimId: 'a'.repeat(32), claimEpoch: 1,
+    });
+    withFileLockSync(lockTarget(), () => {
+      // 锁不可重入：同进程里再写就是「拿不到锁」，等到超时抛错——正是我们要的"不硬写"。
+      expect(() =>
+        createBinding(dataDir, {
+          anchorId: 'oc_second', larkAppId: 'cli_a', scope: 'chat', issueId: 'iss-second', teamId: 't1',
+          platformBaseUrl: 'https://p', claimId: 'b'.repeat(32), claimEpoch: 1,
+        }),
+      ).toThrow(/file-lock timeout/);
+    });
+    // 关键断言：先写进去的那条没有被后来者的快照抹掉
+    expect(getBinding(dataDir, 'oc_first')).not.toBeNull();
+    expect(getBinding(dataDir, 'oc_second')).toBeNull();
+  }, 15_000);
 });

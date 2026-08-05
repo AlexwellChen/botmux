@@ -75,7 +75,14 @@ export interface IssueCommandDeps {
  */
 export type TerminalResult =
   | { ok: true; issueId: string; alreadyReleasedOnPlatform: boolean }
-  | { ok: false; reason: 'no_binding' | 'already_released' | 'platform'; detail?: string; bindState?: string };
+  | {
+      ok: false;
+      reason: 'no_binding' | 'already_released' | 'platform';
+      detail?: string;
+      bindState?: string;
+      /** 平台明确拒绝且重试无意义（凭证失效 / issue 被删或归档）。措辞必须换掉"稍后再试"。 */
+      permanent?: boolean;
+    };
 
 /** 命令入口的返回：card 是卡片 JSON 字符串，直接喂 `sessionReply(..., 'interactive')`。 */
 export type IssueCardResult = { card: string } | { toast: { type: 'error' | 'info'; content: string } };
@@ -254,9 +261,13 @@ export async function handleIssueRelease(
   if (last.reason === 'no_binding') return err('这个会话没有领取任何平台任务，没什么可释放的。');
   if (last.reason === 'already_released') return info(terminalHint(last.bindState));
 
-  logger.warn(`[issue] 释放失败 detail=${last.detail}`);
+  logger.warn(`[issue] 释放失败 detail=${last.detail} permanent=${last.permanent === true}`);
+  // 劝人重试之前先看这次失败是不是永久性的：401/403/404 再发一百次也一样，那句"稍后再试"
+  // 会让人一直重试到放弃，而真正该做的是去平台上看这条任务还在不在。
   return err(
-    `❌ 释放失败：${last.detail}\n\n本机记录保持不变（平台仍认为这台机器持有），稍后可以再发一次 \`/issue release\`。`,
+    last.permanent
+      ? `❌ 释放失败：${last.detail}\n\n平台明确拒绝了，重试也不会好转（凭证失效、或这条任务已被删除/归档）。去平台上确认这条任务的状态。`
+      : `❌ 释放失败：${last.detail}\n\n本机记录保持不变（平台仍认为这台机器持有），稍后可以再发一次 \`/issue release\`。`,
   );
 }
 
@@ -292,13 +303,15 @@ export async function handleIssueDone(
   if (last.reason === 'no_binding') return err('这个会话没有领取任何平台任务，没什么可验收的。');
   if (last.reason === 'already_released') return info(terminalHint(last.bindState));
 
-  logger.warn(`[issue] 验收完成失败 detail=${last.detail}`);
+  logger.warn(`[issue] 验收完成失败 detail=${last.detail} permanent=${last.permanent === true}`);
   // 平台的追赶白名单不允许 needs_attention → done。这是设计而不是故障，得说清楚下一步。
   const blocked = /invalid_transition/.test(last.detail ?? '');
   return err(
     blocked
       ? `❌ 平台拒绝了这次状态变更：${last.detail}\n\n多半是这条任务当前在「需要关注」——平台不允许从那里直接标完成。先去平台上处理（或发 \`/issue release\` 退回待领取）。`
-      : `❌ 标记完成失败：${last.detail}\n\n本机记录保持不变，稍后可以再发一次 \`/issue done\`。`,
+      : last.permanent
+        ? `❌ 标记完成失败：${last.detail}\n\n平台明确拒绝了，重试也不会好转（凭证失效、或这条任务已被删除/归档）。去平台上确认这条任务的状态。`
+        : `❌ 标记完成失败：${last.detail}\n\n本机记录保持不变，稍后可以再发一次 \`/issue done\`。`,
   );
 }
 

@@ -36,9 +36,22 @@
  *  - 有 binding 且 `bindState==='pending'` → 重试 bind；被平台拒（issue 被回收/别人领走/
  *    代次过期）则置 void 并解散那个 held 群，此刻同样没有 agent 在跑
  *
- * 单写者假设：claim 流程与 outbox pump 都只跑在 dashboard 进程（machineToken 与隧道都在
- * 那儿），故 read-modify-write 不加文件锁——与 [[invite-store]] 同一部署模型。真出现多
- * dashboard 并发写，这里需要补 file-lock。
+ * ## 写者不止一个，所以每次 RMW 都要拿锁
+ *
+ * 曾经这里写着「单写者假设：claim 流程与 outbox pump 都只跑在 dashboard 进程，故不加锁」。
+ * **那句话是错的**：`botmux report` 跑在 **agent 的 CLI 子进程**里（见 cli.ts 的 report
+ * issue 分支），它照样 enqueue/claim/settle 这两个文件，而发件箱 pump 跑在 **daemon 进程**。
+ *
+ * 危害不是"字段短暂回退"这么轻。两个文件都是**整份 map/数组重写**：进程 A 读到快照、进程 B
+ * 在这期间新建了一条 binding、A 再把自己的快照写回去 —— **B 那条 binding 直接消失**，那个群
+ * 与 issue 的关联凭空丢掉，而且全程无声。概率低（要求毫秒级交错），后果不可恢复。
+ *
+ * 所以所有 RMW 走 `withIssueLock`（[[utils/file-lock]] 的跨进程 advisory lock，与多 daemon
+ * 并发写 `bots.json` 同一套）。只读函数不加锁：原子写保证读者要么看到旧的完整文件、要么看到
+ * 新的完整文件，不存在半截状态。
+ *
+ * ⚠️ 锁**不可重入**：加锁的公开函数之间不能互相调用（`settleOutboxRow` 要改 binding，就用
+ * 下面的 `updateBindingUnlocked` 而不是 `updateBinding`）。
  *
  * 存储：`{dataDir}/issue-bindings.json`、`{dataDir}/issue-outbox.json`。
  */
@@ -46,7 +59,21 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 import { sessionKey } from '../core/types.js';
+
+/**
+ * 串行化对 issue board 本地状态的读-改-写。
+ *
+ * 一把锁覆盖 bindings / outbox / claim-intents 三个文件而不是各锁各的：`enqueueDesiredStatus`
+ * 本来就要跨两个文件写（bump 计数器 + 排行），分开锁等于没锁。
+ *
+ * 3s 上限：这些临界区都是一次读一次写的毫秒级操作，等到 3 秒基本就是持锁进程死了——
+ * file-lock 自己会 stale-break，这里超时抛错让调用方看见，好过无限等。
+ */
+function withIssueLock<T>(dataDir: string, fn: () => T): T {
+  return withFileLockSync(join(dataDir, 'issue-board'), fn, { maxWaitMs: 3_000 });
+}
 
 /**
  * localTaskRef 的**唯一**构造入口，且 `createBinding` 会自己调它——`CreateBindingInput`
@@ -265,13 +292,15 @@ export function recordClaimIntent(
   input: Omit<IssueClaimIntent, 'createdAt' | 'updatedAt'>,
   now: number = Date.now(),
 ): IssueClaimIntent {
-  const all = readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {});
-  const existing = all[input.claimId];
-  if (existing) return existing;
-  const intent: IssueClaimIntent = { ...input, createdAt: now, updatedAt: now };
-  all[intent.claimId] = intent;
-  writeClaimIntents(dataDir, all);
-  return intent;
+  return withIssueLock(dataDir, () => {
+    const all = readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {});
+    const existing = all[input.claimId];
+    if (existing) return existing;
+    const intent: IssueClaimIntent = { ...input, createdAt: now, updatedAt: now };
+    all[intent.claimId] = intent;
+    writeClaimIntents(dataDir, all);
+    return intent;
+  });
 }
 
 /** 回填 anchorId / chatId（建群成功后）。 */
@@ -281,13 +310,15 @@ export function updateClaimIntent(
   patch: Partial<Omit<IssueClaimIntent, 'claimId' | 'createdAt'>>,
   now: number = Date.now(),
 ): IssueClaimIntent | null {
-  const all = readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {});
-  const cur = all[claimId];
-  if (!cur) return null;
-  const next = { ...cur, ...patch, claimId: cur.claimId, createdAt: cur.createdAt, updatedAt: now };
-  all[claimId] = next;
-  writeClaimIntents(dataDir, all);
-  return next;
+  return withIssueLock(dataDir, () => {
+    const all = readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {});
+    const cur = all[claimId];
+    if (!cur) return null;
+    const next = { ...cur, ...patch, claimId: cur.claimId, createdAt: cur.createdAt, updatedAt: now };
+    all[claimId] = next;
+    writeClaimIntents(dataDir, all);
+    return next;
+  });
 }
 
 /**
@@ -297,11 +328,13 @@ export function updateClaimIntent(
  * 证据，那个群彻底认不回来——这正是意图存在的意义。
  */
 export function clearClaimIntent(dataDir: string, claimId: string): boolean {
-  const all = readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {});
-  if (!all[claimId]) return false;
-  delete all[claimId];
-  writeClaimIntents(dataDir, all);
-  return true;
+  return withIssueLock(dataDir, () => {
+    const all = readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {});
+    if (!all[claimId]) return false;
+    delete all[claimId];
+    writeClaimIntents(dataDir, all);
+    return true;
+  });
 }
 
 /** 对账分类：意图还在、但没有对应 binding 的，就是需要人/流程接手的悬空领取。 */
@@ -334,29 +367,31 @@ export function createBinding(
   input: CreateBindingInput,
   now: number = Date.now(),
 ): IssueBinding {
-  const all = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
-  const existing = Object.values(all).find((b) => b.claimId === input.claimId);
-  if (existing) return existing;
-  const activeSameIssue = Object.values(all).find(
-    (b) => b.issueId === input.issueId && isActiveBindState(b.bindState),
-  );
-  if (activeSameIssue) {
-    throw new Error(
-      `issue ${input.issueId} 已有活跃 binding（anchor=${activeSameIssue.anchorId}, claimId=${activeSameIssue.claimId}）；`
-      + '重复领取前应先 findActiveBindingByIssue 复用，或释放后再领',
+  return withIssueLock(dataDir, () => {
+    const all = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
+    const existing = Object.values(all).find((b) => b.claimId === input.claimId);
+    if (existing) return existing;
+    const activeSameIssue = Object.values(all).find(
+      (b) => b.issueId === input.issueId && isActiveBindState(b.bindState),
     );
-  }
-  const binding: IssueBinding = {
-    ...input,
-    localTaskRef: buildLocalTaskRef(input.anchorId, input.larkAppId),
-    bindState: input.bindState ?? 'pending',
-    nextSourceSeq: 1,
-    createdAt: now,
-    updatedAt: now,
-  };
-  all[binding.anchorId] = binding;
-  writeBindings(dataDir, all);
-  return binding;
+    if (activeSameIssue) {
+      throw new Error(
+        `issue ${input.issueId} 已有活跃 binding（anchor=${activeSameIssue.anchorId}, claimId=${activeSameIssue.claimId}）；`
+        + '重复领取前应先 findActiveBindingByIssue 复用，或释放后再领',
+      );
+    }
+    const binding: IssueBinding = {
+      ...input,
+      localTaskRef: buildLocalTaskRef(input.anchorId, input.larkAppId),
+      bindState: input.bindState ?? 'pending',
+      nextSourceSeq: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    all[binding.anchorId] = binding;
+    writeBindings(dataDir, all);
+    return binding;
+  });
 }
 
 /** 局部更新一条 binding（read-modify-write，保住并发写入的其它字段）。 */
@@ -365,6 +400,16 @@ export function updateBinding(
   anchorId: string,
   patch: Partial<Omit<IssueBinding, 'anchorId' | 'createdAt'>>,
   now: number = Date.now(),
+): IssueBinding | null {
+  return withIssueLock(dataDir, () => updateBindingUnlocked(dataDir, anchorId, patch, now));
+}
+
+/** 已经持有 issue 锁时用这个——锁不可重入，嵌套调 `updateBinding` 会自己等死自己。 */
+function updateBindingUnlocked(
+  dataDir: string,
+  anchorId: string,
+  patch: Partial<Omit<IssueBinding, 'anchorId' | 'createdAt'>>,
+  now: number,
 ): IssueBinding | null {
   const all = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
   const cur = all[anchorId];
@@ -377,11 +422,13 @@ export function updateBinding(
 
 /** 删除一条 binding（会话彻底结束且 issue 已终态后清理）。返回是否删掉。 */
 export function removeBinding(dataDir: string, anchorId: string): boolean {
-  const all = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
-  if (!(anchorId in all)) return false;
-  delete all[anchorId];
-  writeBindings(dataDir, all);
-  return true;
+  return withIssueLock(dataDir, () => {
+    const all = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
+    if (!(anchorId in all)) return false;
+    delete all[anchorId];
+    writeBindings(dataDir, all);
+    return true;
+  });
 }
 
 // ── outbox ──────────────────────────────────────────────────────────────────
@@ -419,72 +466,74 @@ export function enqueueDesiredStatus(
   opts: { attentionReason?: AttentionReason; expectedStateRev?: number } = {},
   now: number = Date.now(),
 ): IssueOutboxRow | null {
-  const bindings = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
-  const binding = bindings[anchorId];
-  // 终态（void/released）之后不再回写：那个 issue 已经不归本机管了，继续发只会被平台拒。
-  // 释放本身也走这里，但它是在 binding 还是 bound 的时候排的行——先排队再改状态，见
-  // [[issue-release]] 的「平台先行、本地后写」。
-  if (!binding || !isActiveBindState(binding.bindState)) return null;
+  return withIssueLock(dataDir, () => {
+    const bindings = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
+    const binding = bindings[anchorId];
+    // 终态（void/released）之后不再回写：那个 issue 已经不归本机管了，继续发只会被平台拒。
+    // 释放本身也走这里，但它是在 binding 还是 bound 的时候排的行——先排队再改状态，见
+    // [[issue-release]] 的「平台先行、本地后写」。
+    if (!binding || !isActiveBindState(binding.bindState)) return null;
 
-  const rows = readOutbox(dataDir);
-  const mine = rows.filter((r) => r.anchorId === anchorId);
-  const pendingIdx = rows.findIndex((r) => r.anchorId === anchorId && r.state === 'pending');
-  const latestUnsettled = mine
-    .filter((r) => r.state === 'pending' || r.state === 'inflight')
-    .sort((a, b) => b.sourceSeq - a.sourceSeq)[0];
+    const rows = readOutbox(dataDir);
+    const mine = rows.filter((r) => r.anchorId === anchorId);
+    const pendingIdx = rows.findIndex((r) => r.anchorId === anchorId && r.state === 'pending');
+    const latestUnsettled = mine
+      .filter((r) => r.state === 'pending' || r.state === 'inflight')
+      .sort((a, b) => b.sourceSeq - a.sourceSeq)[0];
 
-  // 已经在追同一个目标（或已经同步到位）→ 无事可做。
-  if (pendingIdx < 0) {
-    const latestTarget = latestUnsettled?.targetStatus;
-    if (desired === latestTarget || (latestTarget === undefined && desired === binding.lastSyncedStatus)) {
+    // 已经在追同一个目标（或已经同步到位）→ 无事可做。
+    if (pendingIdx < 0) {
+      const latestTarget = latestUnsettled?.targetStatus;
+      if (desired === latestTarget || (latestTarget === undefined && desired === binding.lastSyncedStatus)) {
+        return null;
+      }
+    } else if (rows[pendingIdx].targetStatus === desired && rows[pendingIdx].attentionReason === opts.attentionReason) {
       return null;
     }
-  } else if (rows[pendingIdx].targetStatus === desired && rows[pendingIdx].attentionReason === opts.attentionReason) {
-    return null;
-  }
 
-  // 分配序号时取「计数器」与「本 binding 在 outbox 里出现过的最大序号 + 1」的较大者。
-  //
-  // 写序（见下）已经保证正常路径不会复用序号；这一层是**自愈**：万一计数器因为任何原因
-  // 落后于已排出的行（历史遗留数据、外部改文件、未来重构把写序改回去），复用序号的后果是
-  // 平台按 `sourceSeq <= lastSourceSeq` 静默 no-op ——**新状态永远上不去且毫无报错**。
-  // 这种失败太安静，值得用两行把它变成不可能，而不是只靠写序的正确性来担保。
-  // prune 删掉旧的 done 行会让 max 变小，但计数器只增不减，取较大者天然安全。
-  const maxSeen = mine.reduce((m, r) => Math.max(m, r.sourceSeq), 0);
-  const sourceSeq = Math.max(binding.nextSourceSeq, maxSeen + 1);
-  const row: IssueOutboxRow = {
-    writeId: randomUUID(),
-    anchorId,
-    sourceSeq,
-    targetStatus: desired,
-    ...(opts.attentionReason ? { attentionReason: opts.attentionReason } : {}),
-    claimId: binding.claimId,
-    claimEpoch: binding.claimEpoch,
-    ...(opts.expectedStateRev !== undefined
-      ? { expectedStateRev: opts.expectedStateRev }
-      : binding.platformStateRev !== undefined
-        ? { expectedStateRev: binding.platformStateRev }
-        : {}),
-    state: 'pending',
-    attempts: 0,
-    createdAt: now,
-  };
-  // ⚠️ 写序不能反：**先 bump 计数器落盘，再写 outbox**。
-  //
-  // 这是两个文件的 RMW，单文件 atomicWrite 保不了跨文件原子性，中间必然存在崩溃窗口。
-  // 两种写序的崩溃后果完全不同：
-  //  - 先 outbox 后 binding（错）：outbox 已有 seq=N、计数器还停在 N。该行 settle 后
-  //    下一次投影会**复用 N**，平台见 `sourceSeq <= lastSourceSeq` 直接 no-op —— 新状态
-  //    **永远上不去**，而且一路静默，真机上极难查。
-  //  - 先 binding 后 outbox（对）：最坏是 outbox 那条没写成、序号 N 被跳过。平台只要求
-  //    单调、不要求连续，跳号无害；丢掉的投影下一拍 tick 会用更大的 seq 重新排出来。
-  bindings[anchorId] = { ...binding, nextSourceSeq: sourceSeq + 1, updatedAt: now };
-  writeBindings(dataDir, bindings);
+    // 分配序号时取「计数器」与「本 binding 在 outbox 里出现过的最大序号 + 1」的较大者。
+    //
+    // 写序（见下）已经保证正常路径不会复用序号；这一层是**自愈**：万一计数器因为任何原因
+    // 落后于已排出的行（历史遗留数据、外部改文件、未来重构把写序改回去），复用序号的后果是
+    // 平台按 `sourceSeq <= lastSourceSeq` 静默 no-op ——**新状态永远上不去且毫无报错**。
+    // 这种失败太安静，值得用两行把它变成不可能，而不是只靠写序的正确性来担保。
+    // prune 删掉旧的 done 行会让 max 变小，但计数器只增不减，取较大者天然安全。
+    const maxSeen = mine.reduce((m, r) => Math.max(m, r.sourceSeq), 0);
+    const sourceSeq = Math.max(binding.nextSourceSeq, maxSeen + 1);
+    const row: IssueOutboxRow = {
+      writeId: randomUUID(),
+      anchorId,
+      sourceSeq,
+      targetStatus: desired,
+      ...(opts.attentionReason ? { attentionReason: opts.attentionReason } : {}),
+      claimId: binding.claimId,
+      claimEpoch: binding.claimEpoch,
+      ...(opts.expectedStateRev !== undefined
+        ? { expectedStateRev: opts.expectedStateRev }
+        : binding.platformStateRev !== undefined
+          ? { expectedStateRev: binding.platformStateRev }
+          : {}),
+      state: 'pending',
+      attempts: 0,
+      createdAt: now,
+    };
+    // ⚠️ 写序不能反：**先 bump 计数器落盘，再写 outbox**。
+    //
+    // 这是两个文件的 RMW，单文件 atomicWrite 保不了跨文件原子性，中间必然存在崩溃窗口。
+    // 两种写序的崩溃后果完全不同：
+    //  - 先 outbox 后 binding（错）：outbox 已有 seq=N、计数器还停在 N。该行 settle 后
+    //    下一次投影会**复用 N**，平台见 `sourceSeq <= lastSourceSeq` 直接 no-op —— 新状态
+    //    **永远上不去**，而且一路静默，真机上极难查。
+    //  - 先 binding 后 outbox（对）：最坏是 outbox 那条没写成、序号 N 被跳过。平台只要求
+    //    单调、不要求连续，跳号无害；丢掉的投影下一拍 tick 会用更大的 seq 重新排出来。
+    bindings[anchorId] = { ...binding, nextSourceSeq: sourceSeq + 1, updatedAt: now };
+    writeBindings(dataDir, bindings);
 
-  if (pendingIdx >= 0) rows[pendingIdx] = row; // 就地覆盖未发送行
-  else rows.push(row);
-  writeOutbox(dataDir, rows);
-  return row;
+    if (pendingIdx >= 0) rows[pendingIdx] = row; // 就地覆盖未发送行
+    else rows.push(row);
+    writeOutbox(dataDir, rows);
+    return row;
+  });
 }
 
 /**
@@ -498,21 +547,23 @@ export function claimNextOutboxRow(
   anchorId: string,
   now: number = Date.now(),
 ): IssueOutboxRow | null {
-  const rows = readOutbox(dataDir);
-  const mine = rows.filter((r) => r.anchorId === anchorId);
-  if (mine.some((r) => r.state === 'inflight')) return null;
-  // 按 sourceSeq 最小的先发，不依赖数组顺序。今天「追加保序 + 就地覆盖」恰好也对，但
-  // 一旦以后 prune/compaction 重排数组，按下标取就可能先发高序号再发低序号——平台按
-  // 单调判重，低序号那条会被静默丢弃。显式排序把这条契约钉在代码里而不是数组布局上。
-  const nextRow = mine
-    .filter((r) => r.state === 'pending' && (r.nextRetryAt ?? 0) <= now)
-    .sort((a, b) => a.sourceSeq - b.sourceSeq)[0];
-  if (!nextRow) return null;
-  const idx = rows.findIndex((r) => r.writeId === nextRow.writeId);
-  if (idx < 0) return null;
-  rows[idx] = { ...rows[idx], state: 'inflight', attempts: rows[idx].attempts + 1 };
-  writeOutbox(dataDir, rows);
-  return rows[idx];
+  return withIssueLock(dataDir, () => {
+    const rows = readOutbox(dataDir);
+    const mine = rows.filter((r) => r.anchorId === anchorId);
+    if (mine.some((r) => r.state === 'inflight')) return null;
+    // 按 sourceSeq 最小的先发，不依赖数组顺序。今天「追加保序 + 就地覆盖」恰好也对，但
+    // 一旦以后 prune/compaction 重排数组，按下标取就可能先发高序号再发低序号——平台按
+    // 单调判重，低序号那条会被静默丢弃。显式排序把这条契约钉在代码里而不是数组布局上。
+    const nextRow = mine
+      .filter((r) => r.state === 'pending' && (r.nextRetryAt ?? 0) <= now)
+      .sort((a, b) => a.sourceSeq - b.sourceSeq)[0];
+    if (!nextRow) return null;
+    const idx = rows.findIndex((r) => r.writeId === nextRow.writeId);
+    if (idx < 0) return null;
+    rows[idx] = { ...rows[idx], state: 'inflight', attempts: rows[idx].attempts + 1 };
+    writeOutbox(dataDir, rows);
+    return rows[idx];
+  });
 }
 
 /**
@@ -528,35 +579,37 @@ export function settleOutboxRow(
   result: { platformStateRev?: number; platformLastSourceSeq?: number; applied?: boolean },
   now: number = Date.now(),
 ): void {
-  const rows = readOutbox(dataDir);
-  const idx = rows.findIndex((r) => r.writeId === writeId);
-  if (idx < 0) return;
-  const row = rows[idx];
-  rows[idx] = { ...row, state: 'done' };
-  writeOutbox(dataDir, rows);
-  const binding = getBinding(dataDir, row.anchorId);
-  // 用平台回传的 `claim.lastSourceSeq` 校准本地计数器。
-  //
-  // 平台才是「已应用到哪一号」的权威：它按 `sourceSeq <= lastSourceSeq` 判重，本地计数器
-  // 一旦落后（dataDir 从旧快照恢复、文件被外部改、其它路径抢跑过序号），之后每一条回写都
-  // 会被静默丢弃——平台回 200、本地记成功、状态却永远上不去。真机 e2e 里就撞到过这一幕。
-  //
-  // 单写者假设下计数器本该恒领先，所以这只是兜底；但代价是一次 max()，而漏掉的代价是
-  // 无声的状态停更，值得。
-  const syncedSeq =
-    result.platformLastSourceSeq !== undefined && binding
-      ? Math.max(binding.nextSourceSeq, result.platformLastSourceSeq + 1)
-      : undefined;
-  updateBinding(
-    dataDir,
-    row.anchorId,
-    {
-      ...(result.applied === false ? {} : { lastSyncedStatus: row.targetStatus }),
-      ...(result.platformStateRev !== undefined ? { platformStateRev: result.platformStateRev } : {}),
-      ...(syncedSeq !== undefined && syncedSeq !== binding?.nextSourceSeq ? { nextSourceSeq: syncedSeq } : {}),
-    },
-    now,
-  );
+  withIssueLock(dataDir, () => {
+    const rows = readOutbox(dataDir);
+    const idx = rows.findIndex((r) => r.writeId === writeId);
+    if (idx < 0) return;
+    const row = rows[idx];
+    rows[idx] = { ...row, state: 'done' };
+    writeOutbox(dataDir, rows);
+    const binding = getBinding(dataDir, row.anchorId);
+    // 用平台回传的 `claim.lastSourceSeq` 校准本地计数器。
+    //
+    // 平台才是「已应用到哪一号」的权威：它按 `sourceSeq <= lastSourceSeq` 判重，本地计数器
+    // 一旦落后（dataDir 从旧快照恢复、文件被外部改、其它路径抢跑过序号），之后每一条回写都
+    // 会被静默丢弃——平台回 200、本地记成功、状态却永远上不去。真机 e2e 里就撞到过这一幕。
+    //
+    // 单写者假设下计数器本该恒领先，所以这只是兜底；但代价是一次 max()，而漏掉的代价是
+    // 无声的状态停更，值得。
+    const syncedSeq =
+      result.platformLastSourceSeq !== undefined && binding
+        ? Math.max(binding.nextSourceSeq, result.platformLastSourceSeq + 1)
+        : undefined;
+    updateBindingUnlocked(
+      dataDir,
+      row.anchorId,
+      {
+        ...(result.applied === false ? {} : { lastSyncedStatus: row.targetStatus }),
+        ...(result.platformStateRev !== undefined ? { platformStateRev: result.platformStateRev } : {}),
+        ...(syncedSeq !== undefined && syncedSeq !== binding?.nextSourceSeq ? { nextSourceSeq: syncedSeq } : {}),
+      },
+      now,
+    );
+  });
 }
 
 /** 发送失败：退回 pending + 指数退避（上限 5min）。`fatal` 用于平台明确拒绝、重试无意义的情况。 */
@@ -567,18 +620,20 @@ export function failOutboxRow(
   opts: { fatal?: boolean } = {},
   now: number = Date.now(),
 ): void {
-  const rows = readOutbox(dataDir);
-  const idx = rows.findIndex((r) => r.writeId === writeId);
-  if (idx < 0) return;
-  const row = rows[idx];
-  const backoff = Math.min(1_000 * 2 ** Math.max(0, row.attempts - 1), 5 * 60_000);
-  rows[idx] = {
-    ...row,
-    state: opts.fatal ? 'failed' : 'pending',
-    lastError: error.slice(0, 500),
-    ...(opts.fatal ? {} : { nextRetryAt: now + backoff }),
-  };
-  writeOutbox(dataDir, rows);
+  withIssueLock(dataDir, () => {
+    const rows = readOutbox(dataDir);
+    const idx = rows.findIndex((r) => r.writeId === writeId);
+    if (idx < 0) return;
+    const row = rows[idx];
+    const backoff = Math.min(1_000 * 2 ** Math.max(0, row.attempts - 1), 5 * 60_000);
+    rows[idx] = {
+      ...row,
+      state: opts.fatal ? 'failed' : 'pending',
+      lastError: error.slice(0, 500),
+      ...(opts.fatal ? {} : { nextRetryAt: now + backoff }),
+    };
+    writeOutbox(dataDir, rows);
+  });
 }
 
 /**
@@ -591,25 +646,29 @@ export function failOutboxRow(
  * 返回被退回的行数。
  */
 export function resetInflightToPending(dataDir: string): number {
-  const rows = readOutbox(dataDir);
-  let n = 0;
-  const next = rows.map((r) => {
-    if (r.state !== 'inflight') return r;
-    n += 1;
-    return { ...r, state: 'pending' as const };
+  return withIssueLock(dataDir, () => {
+    const rows = readOutbox(dataDir);
+    let n = 0;
+    const next = rows.map((r) => {
+      if (r.state !== 'inflight') return r;
+      n += 1;
+      return { ...r, state: 'pending' as const };
   });
   if (n > 0) writeOutbox(dataDir, next);
   return n;
+  });
 }
 
 /** 清理已完成的发件箱行（保留最近 `keep` 条便于排查）。返回清掉的行数。 */
 export function pruneOutbox(dataDir: string, keep = 50): number {
-  const rows = readOutbox(dataDir);
-  const settled = rows.filter((r) => r.state === 'done');
-  if (settled.length <= keep) return 0;
-  const drop = new Set(
-    settled.sort((a, b) => a.createdAt - b.createdAt).slice(0, settled.length - keep).map((r) => r.writeId),
-  );
-  writeOutbox(dataDir, rows.filter((r) => !drop.has(r.writeId)));
-  return drop.size;
+  return withIssueLock(dataDir, () => {
+    const rows = readOutbox(dataDir);
+    const settled = rows.filter((r) => r.state === 'done');
+    if (settled.length <= keep) return 0;
+    const drop = new Set(
+      settled.sort((a, b) => a.createdAt - b.createdAt).slice(0, settled.length - keep).map((r) => r.writeId),
+    );
+    writeOutbox(dataDir, rows.filter((r) => !drop.has(r.writeId)));
+    return drop.size;
+  });
 }

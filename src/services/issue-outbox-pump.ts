@@ -80,8 +80,13 @@ export async function pumpOnce(opts: OutboxPumpOptions): Promise<number> {
         `[issue] 发件箱重投成功 issue=${binding.issueId} ${r.applied ? `→ ${r.issue.status}` : '（平台已不认本机 claim，就此结算）'}`,
       );
     } else if (r.reason === 'platform') {
-      // 已经退避过了，这里只留痕；下一轮到点再试。
-      logger.warn(`[issue] 发件箱重投失败 issue=${binding.issueId}: ${r.detail}`);
+      // permanent = 平台明确拒绝（凭证失效 / issue 已删或归档），行已标 fatal 不再重投。
+      // 用 error 而不是 warn：它不会自愈，等人去看；`/issue status` 上也会显示这一条。
+      if (r.permanent) {
+        logger.error(`[issue] 发件箱回写被平台拒绝、已放弃重投 issue=${binding.issueId}: ${r.detail}`);
+      } else {
+        logger.warn(`[issue] 发件箱重投失败 issue=${binding.issueId}: ${r.detail}`);
+      }
     }
   }
   return sent;

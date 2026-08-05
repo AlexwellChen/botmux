@@ -51,6 +51,27 @@ export function matchesClaimMarker(groupName: string, claimId: string): boolean 
   return groupName.includes(claimMarker(claimId));
 }
 
+/** 群名长度上限。与本仓其它建群点一致（command-handler 的 MAX_NAME / FORK_MAX_NAME）。 */
+const GROUP_NAME_MAX = 50;
+
+/**
+ * 拼领取群名：`<标题> #<claimId 前 8 位>`，**标题被截、标记一定完整**。
+ *
+ * 不截的话飞书自己会截，而它从尾部截——先吃掉的正是尾部那个 `#claimId` 标记，也就是双通道
+ * 反查的一条腿。那条腿断了不会报错：对账时只是"这个群不像是任何一次领取的"，然后被当成
+ * 无主群跳过。宁可标题短一点。
+ *
+ * 标记放尾部而不是挪到前面：群列表里先看到的应该是任务在说什么，一串十六进制不配占开头。
+ * 长度自己控住了，位置就不再是风险。
+ */
+export function claimGroupName(title: string, claimId: string): string {
+  const marker = claimMarker(claimId);
+  const room = GROUP_NAME_MAX - marker.length - 1; // 1 = 中间那个空格
+  const trimmed = title.trim();
+  const head = trimmed.length > room ? `${trimmed.slice(0, Math.max(0, room - 1))}…` : trimmed;
+  return `${head} ${marker}`;
+}
+
 /**
  * 平台上这条 issue 的详情深链。
  *
@@ -216,7 +237,7 @@ export async function claimIssueIntoGroup(
   let binding: IssueBinding | null = null;
   let chatId = '';
   let shareLink: string | undefined;
-  const groupName = `${args.issue.title} ${claimMarker(claimId)}`;
+  const groupName = claimGroupName(args.issue.title, claimId);
   const botIds = Array.from(new Set([args.larkAppId, ...(args.peerLarkAppIds ?? [])]));
   try {
     const group = await deps.createGroup({

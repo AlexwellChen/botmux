@@ -471,3 +471,25 @@ describe('行内代码块', () => {
     expect(line).toContain('`abc`');
   });
 });
+
+describe('现状卡：已放弃的回写', () => {
+  const base = { issueId: 'iss-1', bindState: 'bound', pendingWrites: 0 };
+
+  it('报出条数与错误，并说明重试不会好', () => {
+    const flat = buildIssueStatusCard({ ...base, failedWrites: 1, lastFailure: 'forbidden: revoked' });
+    expect(flat).toContain('已放弃重投');
+    expect(flat).toContain('revoked');
+    expect(flat).toContain('重试不会好转');
+  });
+
+  it('没有判死行时不出现这一段', () => {
+    expect(buildIssueStatusCard(base)).not.toContain('已放弃重投');
+    expect(buildIssueStatusCard({ ...base, failedWrites: 0 })).not.toContain('已放弃重投');
+  });
+
+  // 错误原文里可能带平台回传的任意文本。
+  it('错误原文被转义', () => {
+    const flat = buildIssueStatusCard({ ...base, failedWrites: 1, lastFailure: '</font><at user_id="all"></at>' });
+    expect(flat).not.toContain('<at user_id=');
+  });
+});

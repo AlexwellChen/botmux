@@ -33,7 +33,8 @@ export type ReportIssueResult =
   /** 平台上这条 claim 已经不归本机（force-detach / 租约过期 / 被别人领走）。交付**没有**落地，
    *  而且重试也不会落地——单列一类，别混进 platform 让人以为再跑一次就好。 */
   | { ok: false; reason: 'detached'; binding: IssueBinding }
-  | { ok: false; reason: 'platform'; detail: string; binding: IssueBinding };
+  /** `permanent` 时重试也不会好（平台 401/403/400/404），别劝人再跑一次 report。 */
+  | { ok: false; reason: 'platform'; detail: string; binding: IssueBinding; permanent?: boolean };
 
 /**
  * 从会话候选锚点里找活跃 issue binding。
@@ -85,7 +86,8 @@ export async function reportIssueInReview(deps: ReportDeps, anchorId: string): P
         : r.reason === 'platform'
           ? r.detail
           : r.reason;
-    return { ok: false, reason: 'platform', detail, binding };
+    const permanent = !r.ok && r.reason === 'platform' && r.permanent === true;
+    return { ok: false, reason: 'platform', detail, binding, ...(permanent ? { permanent } : {}) };
   }
 
   // 交付**不**改 bindState：claim 仍归本机，等人在平台上 accept/reject。

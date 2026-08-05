@@ -7,6 +7,7 @@ import {
   claimNextOutboxRow,
   createBinding,
   enqueueDesiredStatus,
+  failOutboxRow,
   updateBinding,
 } from '../src/services/issue-board-store.js';
 
@@ -117,5 +118,33 @@ describe('describeIssue', () => {
     expect(r.view.binding.bindState).toBe(before.bindState);
     expect(r.view.binding.nextSourceSeq).toBe(before.nextSourceSeq);
     expect(r.view.pendingWrites).toBe(0);
+  });
+});
+
+// 判死的行不在 pendingWrites 里。不单独报出来，界面上一声不吭就等于"已经同步好了"，
+// 而那次状态变更永远不会到平台——给了 fatal 就得给能看见它的地方。
+describe('已放弃的回写', () => {
+  function failRow(err = 'forbidden: revoked') {
+    enqueueDesiredStatus(dataDir, ANCHOR, 'in_review');
+    const row = claimNextOutboxRow(dataDir, ANCHOR)!;
+    failOutboxRow(dataDir, row.writeId, err, { fatal: true });
+  }
+
+  it('单独计数并带出最后一条错误，且不混进 pendingWrites', async () => {
+    seed();
+    failRow();
+    const r = await describeIssue(deps(), ANCHOR);
+    if (!r.ok) throw new Error('unreachable');
+    expect(r.view.failedWrites).toBe(1);
+    expect(r.view.pendingWrites).toBe(0);
+    expect(r.view.lastFailure).toMatch(/revoked/);
+  });
+
+  it('没有判死行时为 0，也不给 lastFailure', async () => {
+    seed();
+    const r = await describeIssue(deps(), ANCHOR);
+    if (!r.ok) throw new Error('unreachable');
+    expect(r.view.failedWrites).toBe(0);
+    expect(r.view.lastFailure).toBeUndefined();
   });
 });

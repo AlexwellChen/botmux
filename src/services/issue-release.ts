@@ -53,8 +53,9 @@ export type ReleaseResult =
   | { ok: false; reason: 'no_binding' }
   /** 已经是终态（释放过 / 作废 / 已验收完成）。幂等，不重复打平台。终态是哪一种看 `binding.bindState`。 */
   | { ok: false; reason: 'already_released'; binding: IssueBinding }
-  /** 平台拒绝且 claim 仍归本机所有 —— 本地**不改**，让人重试。 */
-  | { ok: false; reason: 'platform'; detail: string; binding: IssueBinding };
+  /** 平台拒绝且 claim 仍归本机所有 —— 本地**不改**。`permanent` 时重试也不会好（见
+   *  [[issue-client]] 的 isPermanentFailure），调用方别再劝人"稍后再试一次"。 */
+  | { ok: false; reason: 'platform'; detail: string; binding: IssueBinding; permanent?: boolean };
 
 /**
  * 结束一次领取的共同实现：投影终态 → 平台确认 → 才改本地 bindState。
@@ -89,7 +90,8 @@ async function settleTerminal(
     const detail = r.reason === 'busy'
       ? 'outbox_busy（上一条回写还在发送中，稍后重试）'
       : r.reason === 'platform' ? r.detail : r.reason;
-    return { ok: false, reason: 'platform', detail, binding };
+    const permanent = !r.ok && r.reason === 'platform' && r.permanent === true;
+    return { ok: false, reason: 'platform', detail, binding, ...(permanent ? { permanent } : {}) };
   }
 
   // 平台已确认，现在才动本地。

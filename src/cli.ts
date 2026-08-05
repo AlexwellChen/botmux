@@ -8618,7 +8618,11 @@ async function cmdReport(rest: string[]): Promise<void> {
         );
         if (!result.ok) {
           if (result.reason === 'platform') {
-            console.error(`issue 交付失败（${result.detail}）。可稍后重试同一 botmux report。`);
+            console.error(
+              result.permanent
+                ? `issue 交付失败（${result.detail}）。平台明确拒绝，重试不会好转——去平台看看这条任务还在不在、领取有没有被收回。`
+                : `issue 交付失败（${result.detail}）。可稍后重试同一 botmux report。`,
+            );
           } else if (result.reason === 'detached') {
             // 重试没有意义：平台上这条 claim 已经不是本机的了。
             console.error(

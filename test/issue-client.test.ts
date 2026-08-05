@@ -5,6 +5,7 @@ import {
   fetchIssues,
   fetchTeams,
   isRetriable,
+  isPermanentFailure,
   writeIssueStatus,
   type IssueClientOptions,
 } from '../src/platform/issue-client.js';
@@ -188,5 +189,29 @@ describe('响应解析', () => {
     const { o } = opts([{ status: 200, json: { issue } }]);
     const r = await bindIssue('iss-1', { claimId: 'c1', localTaskRef: 'a::b', expectedStateRev: 1 }, o);
     expect((r as any).value.issue).toEqual(issue);
+  });
+});
+
+// isPermanentFailure **不是** !isRetriable：两者的补集差着 conflict 与 unbound 两类，
+// 混用会把完全正常的行判死（409 是竞争、unbound 是本机暂时没绑平台）。
+describe('永久失败判定', () => {
+  const f = (o: any) => o as any;
+  it('只有 forbidden / client 算永久失败', () => {
+    expect(isPermanentFailure(f({ ok: false, reason: 'forbidden', status: 403, error: 'x' }))).toBe(true);
+    expect(isPermanentFailure(f({ ok: false, reason: 'client', status: 404, error: 'x' }))).toBe(true);
+  });
+
+  it('conflict / unbound / network / server 都不判死', () => {
+    expect(isPermanentFailure(f({ ok: false, reason: 'conflict', status: 409, error: 'x' }))).toBe(false);
+    expect(isPermanentFailure(f({ ok: false, reason: 'unbound' }))).toBe(false);
+    expect(isPermanentFailure(f({ ok: false, reason: 'network', error: 'x' }))).toBe(false);
+    expect(isPermanentFailure(f({ ok: false, reason: 'server', status: 503, error: 'x' }))).toBe(false);
+  });
+
+  // 这两个谓词各管各的一端，中间那段（409 / unbound）刻意两边都不属于：既不盲重试、也不判死。
+  it('与 isRetriable 不是互补关系', () => {
+    const conflict = f({ ok: false, reason: 'conflict', status: 409, error: 'x' });
+    expect(isRetriable(conflict)).toBe(false);
+    expect(isPermanentFailure(conflict)).toBe(false);
   });
 });

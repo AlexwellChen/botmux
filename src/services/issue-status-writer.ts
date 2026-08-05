@@ -37,6 +37,7 @@ import {
   type AttentionReason,
   type IssueStatus,
 } from './issue-board-store.js';
+import { isPermanentFailure } from '../platform/issue-client.js';
 import type { IssueClientResult, PlatformIssue } from '../platform/issue-client.js';
 
 export interface StatusWriterDeps {
@@ -68,7 +69,8 @@ export type FlushOutcome =
   | { ok: false; reason: 'busy' }
   /** binding 不存在或已是终态。 */
   | { ok: false; reason: 'no_binding' }
-  | { ok: false; reason: 'platform'; detail: string };
+  /** `permanent` = 平台明确拒绝且重试无意义，行已标 fatal 不再重投（见 isPermanentFailure）。 */
+  | { ok: false; reason: 'platform'; detail: string; permanent?: boolean };
 
 /**
  * 把发件箱里该 binding 的下一条待发行发出去。
@@ -124,8 +126,14 @@ export async function flushNextStatus(deps: StatusWriterDeps, anchorId: string):
 
   if (!res.ok) {
     const detail = 'error' in res ? `${res.reason}: ${res.error}` : res.reason;
-    failOutboxRow(deps.dataDir, row.writeId, detail, {}, now());
-    return { ok: false, reason: 'platform', detail };
+    // 分清「等会儿再试」和「再试也没用」。401/403（凭证失效、machine_mismatch、claim 被
+    // revoke）与 400/404（参数错、issue 被删或归档）是后者：不标 fatal 的话这条行会每 ≤5
+    // 分钟朝一个永远不会变的死端点打一发，而且 `/issue status` 上那句「N 条回写没发出去」
+    // 永不清零，验收的人会一直以为"过会儿就好"。判据见 [[issue-client]] 的
+    // isPermanentFailure——它刻意不等于 !isRetriable（409 与 unbound 都不该判死）。
+    const fatal = isPermanentFailure(res);
+    failOutboxRow(deps.dataDir, row.writeId, detail, fatal ? { fatal: true } : {}, now());
+    return { ok: false, reason: 'platform', detail, ...(fatal ? { permanent: true as const } : {}) };
   }
 
   settleOutboxRow(

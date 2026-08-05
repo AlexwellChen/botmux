@@ -187,3 +187,50 @@ describe('claim 已不归本机', () => {
     expect(getBinding(dataDir, 'oc_task')?.bindState).toBe('bound'); // 泵不改 bindState
   });
 });
+
+// 之前 flushNextStatus 永远传 `{}`，于是 401/403/404 这些「再发一次结果不变」的失败
+// 也退回 pending 无限退避重投：每 ≤5 分钟朝死端点打一发，而 /issue status 上那句
+// 「N 条回写没发出去」永不清零。
+describe('永久失败就此打住', () => {
+  const perm = (reason: string, status: number) =>
+    writer({ writeStatus: vi.fn(async () => ({ ok: false, reason, status, error: 'nope' })) });
+
+  it('403 → 标 failed，后续轮次不再重投', async () => {
+    seed();
+    enqueueDesiredStatus(dataDir, 'oc_task', 'in_progress');
+    const w = perm('forbidden', 403);
+    expect(await pumpOnce({ dataDir, writer: w as any })).toBe(0);
+    expect(listOutbox(dataDir, 'oc_task')[0].state).toBe('failed');
+
+    // 再跑一轮：failed 行不再被领取，一次平台调用都不该发
+    expect(await pumpOnce({ dataDir, writer: w as any })).toBe(0);
+    expect(w.writeStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('404 同样判死', async () => {
+    seed();
+    enqueueDesiredStatus(dataDir, 'oc_task', 'in_progress');
+    await pumpOnce({ dataDir, writer: perm('client', 404) as any });
+    expect(listOutbox(dataDir, 'oc_task')[0].state).toBe('failed');
+  });
+
+  // 反面：可恢复的失败必须留在 pending，否则一次网络抖动就把状态永久丢了。
+  it('503 / 网络失败仍退回 pending 等重投', async () => {
+    seed();
+    enqueueDesiredStatus(dataDir, 'oc_task', 'in_progress');
+    await pumpOnce({ dataDir, writer: perm('server', 503) as any });
+    expect(listOutbox(dataDir, 'oc_task')[0].state).toBe('pending');
+  });
+
+  // 409 是竞争不是错误：对账本身可能因为网络问题没做成，判死等于扔掉一条正常的回写。
+  it('409 对账失败后不判死', async () => {
+    seed();
+    enqueueDesiredStatus(dataDir, 'oc_task', 'in_progress');
+    const w = writer({
+      writeStatus: vi.fn(async () => ({ ok: false, reason: 'conflict', status: 409, error: 'rev' })),
+      fetchIssue: vi.fn(async () => null), // 拉不到 → 无法判定，不猜
+    });
+    await pumpOnce({ dataDir, writer: w as any });
+    expect(listOutbox(dataDir, 'oc_task')[0].state).toBe('pending');
+  });
+});
