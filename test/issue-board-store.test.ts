@@ -30,7 +30,6 @@ afterEach(() => rmSync(dataDir, { recursive: true, force: true }));
 function seed(over: Partial<CreateBindingInput> = {}): CreateBindingInput {
   return {
     anchorId: 'oc_group1',
-    localTaskRef: 'oc_group1::cli_app',
     larkAppId: 'cli_app',
     scope: 'chat',
     issueId: 'iss-1',
@@ -64,10 +63,27 @@ describe('bindings', () => {
     expect(findActiveBindingByIssue(dataDir, 'iss-1')?.anchorId).toBe('oc_group1');
   });
 
+  // 类型上已经不给传，这条守的是「将来别改回 pass-through」：手拼拼反了不会当场报错，
+  // 要等平台 bind 与崩溃恢复的重确认对不上、held 会话被判 claim_mismatch 才暴露。
+  it('localTaskRef 由 anchorId + larkAppId 内生，不接受调用方传入', () => {
+    const b = createBinding(dataDir, seed({ anchorId: 'om_root9', larkAppId: 'cli_other' }));
+    expect(b.localTaskRef).toBe(buildLocalTaskRef('om_root9', 'cli_other'));
+    expect(b.localTaskRef).toBe('om_root9::cli_other');
+    // 即便调用方硬塞（绕过类型）也不生效
+    const forced = createBinding(
+      dataDir,
+      {
+        ...seed({ anchorId: 'oc_g3', claimId: 'c-3', issueId: 'iss-3' }),
+        localTaskRef: 'cli_app::oc_g3', // 顺序拼反的老写法
+      } as CreateBindingInput,
+    );
+    expect(forced.localTaskRef).toBe('oc_g3::cli_app');
+  });
+
   // 领取重试必须幂等：否则一次网络重试就会多建一个群、多起一个会话。
   it('同 claimId 重入返回既有 binding，不新建第二条', () => {
     const first = createBinding(dataDir, seed());
-    const again = createBinding(dataDir, seed({ anchorId: 'oc_group2', localTaskRef: 'oc_group2::cli_app' }));
+    const again = createBinding(dataDir, seed({ anchorId: 'oc_group2' }));
     expect(again.anchorId).toBe(first.anchorId);
     expect(getBinding(dataDir, 'oc_group2')).toBeNull();
   });
@@ -249,7 +265,7 @@ describe('一 issue 一活跃 binding', () => {
   it('同 issue 不同 claimId → 抛错，不静默写第二条', () => {
     createBinding(dataDir, seed());
     expect(() =>
-      createBinding(dataDir, seed({ anchorId: 'oc_group2', localTaskRef: 'oc_group2::cli_app', claimId: 'c-random-2' })),
+      createBinding(dataDir, seed({ anchorId: 'oc_group2', claimId: 'c-random-2' })),
     ).toThrow(/已有活跃 binding/);
     expect(getBinding(dataDir, 'oc_group2')).toBeNull();
   });
@@ -259,7 +275,7 @@ describe('一 issue 一活跃 binding', () => {
     updateBinding(dataDir, 'oc_group1', { bindState: 'void' });
     const again = createBinding(
       dataDir,
-      seed({ anchorId: 'oc_group2', localTaskRef: 'oc_group2::cli_app', claimId: 'c-random-2' }),
+      seed({ anchorId: 'oc_group2', claimId: 'c-random-2' }),
     );
     expect(again.anchorId).toBe('oc_group2');
   });

@@ -3,13 +3,34 @@
  *
  * 平台侧契约见 platform 仓 DESIGN-issue-board.md §六/§七。那份设计是按 Desktop 写的，
  * Desktop 有 SQLite、能把「建本地任务」和「写 binding」放进**同一个事务**。botmux 没有
- * SQLite（全仓都是 JSON + 原子写），所以这里换一套等价的崩溃安全约定：
+ * SQLite（全仓都是 JSON + 原子写），所以这里换一套等价的崩溃安全约定。
  *
- *   **先写 binding（bindState='pending'），再建群/开会话。**
+ * ## 时序：binding 只能在拿到 anchor 之后写
  *
- * 顺序不能反。反了就是「群建出来了但没人知道它属于哪个 issue」的孤儿——重启后既补不了
- * bind、也认不出该撤回哪个群。反过来「binding 写了但群没建成」是安全的：启动对账看到
- * pending 且无 chatId，重建或作废即可，此刻**本机还没有任何 agent 在跑**。
+ * binding 的主键 `anchorId` 是 `chatId` / `rootMessageId`——**建群/发 seed 之后才存在**，
+ * 所以不可能「先写 binding 再建群」。实际顺序是：
+ *
+ *   1. platform claim            → 拿到 claimId / claimEpoch / stateRev
+ *   2. 建群（或发无 @ 的 seed）  → 拿到 anchorId。**held**：不传 kickoffBot/kickoffPrompt
+ *   3. createBinding(anchorId…)  → 落盘，durable boundary（放在 createGroupWithBots 的
+ *                                  `onChatCreated` 同步钩子里写，函数返回前就已持久化）
+ *   4. platform bind(localTaskRef) → bindState 转 'bound'
+ *   5. kickoff（@bot）→ activate  → daemon 这时才真正起会话
+ *
+ * ## 崩溃语义：危险窗口在 2→3，靠「held」兜底
+ *
+ * 「群已建、binding 未写」= **孤儿群**。它比旧叙事里的「binding 有、群没有」难对账，但
+ * 危害被第 2 步的 held 挡住了：没发 kickoff 就没有任何 bot 被 @ 起来，daemon 不会创建
+ * 会话，**本机没有 agent 在跑**——与旧叙事想要的安全性质相同，只是换了达成方式。
+ *
+ * 对账要认出孤儿群，就必须在建群**之前**留下 claimId→issue 的痕迹（否则 claimId 只活在
+ * 内存里，崩了既找不回 claim、也认不出哪个群是它的）。⚠️ 这份「claim 意图」存储**本刀还
+ * 没有**——本模块只含 binding + outbox。拉群领取那一刀必须补上，并把 claimId 也写进群名/
+ * seed 正文，让启动对账能反查。届时的对账策略：
+ *  - 有 claim 意图、无 binding → 按 claimId 反查群：找到就补写 binding 续跑，找不到就
+ *    释放 claim（或直接等平台 lease 到期由 sweeper 回收）
+ *  - 有 binding 且 `bindState==='pending'` → 重试 bind；被平台拒（issue 被回收/别人领走/
+ *    代次过期）则置 void 并解散那个 held 群，此刻同样没有 agent 在跑
  *
  * 单写者假设：claim 流程与 outbox pump 都只跑在 dashboard 进程（machineToken 与隧道都在
  * 那儿），故 read-modify-write 不加文件锁——与 [[invite-store]] 同一部署模型。真出现多
@@ -24,9 +45,12 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { sessionKey } from '../core/types.js';
 
 /**
- * localTaskRef 的**唯一**构造入口。别在调用方手拼：拼反了顺序，平台侧 bind 记下的
- * localTaskRef 就与后续崩溃恢复的重确认对不上，那条 held 会话会被判为 claim_mismatch 作废。
- * 直接复用 botmux 自己的 `sessionKey`，与 activeSessions 的键完全同源。
+ * localTaskRef 的**唯一**构造入口，且 `createBinding` 会自己调它——`CreateBindingInput`
+ * 里没有 localTaskRef 字段，调用方**没有**手拼的机会。
+ *
+ * 之所以做成内生而不是「约定调用方用这个函数」：拼反了顺序不会当场报错，要等平台 bind
+ * 记下的 localTaskRef 与崩溃恢复时的重确认对不上，那条 held 会话被判 claim_mismatch 作废
+ * 才暴露——离出错点太远。直接复用 botmux 自己的 `sessionKey`，与 activeSessions 键同源。
  */
 export function buildLocalTaskRef(anchorId: string, larkAppId: string): string {
   return sessionKey(anchorId, larkAppId);
@@ -158,13 +182,16 @@ function writeBindings(dataDir: string, all: Record<string, IssueBinding>): void
   atomicWriteFileSync(bindingsPath(dataDir), JSON.stringify(all, null, 2) + '\n');
 }
 
+/** 注意没有 `localTaskRef`：它由 `buildLocalTaskRef(anchorId, larkAppId)` 内生，见上。 */
 export type CreateBindingInput = Omit<
   IssueBinding,
-  'nextSourceSeq' | 'createdAt' | 'updatedAt' | 'bindState'
+  'nextSourceSeq' | 'createdAt' | 'updatedAt' | 'bindState' | 'localTaskRef'
 > & { bindState?: IssueBinding['bindState'] };
 
 /**
- * 写入一条 pending binding。**必须在建群/开会话之前调用**（见文件头）。
+ * 写入一条 pending binding。**在建群/发 seed 拿到 anchorId 之后调用**——主键就是那个
+ * anchor，之前不可能有。放在 `createGroupWithBots` 的 `onChatCreated` 同步钩子里写，
+ * 让它成为「群已存在」到「群已归属某个 issue」之间的 durable boundary（见文件头时序）。
  *
  * 两条不变式都在这层强制，不指望调用方自觉：
  *  - **claimId 唯一**：同 claimId 重入直接返回既有行（本地幂等，对应 Desktop 侧的
@@ -193,6 +220,7 @@ export function createBinding(
   }
   const binding: IssueBinding = {
     ...input,
+    localTaskRef: buildLocalTaskRef(input.anchorId, input.larkAppId),
     bindState: input.bindState ?? 'pending',
     nextSourceSeq: 1,
     createdAt: now,
