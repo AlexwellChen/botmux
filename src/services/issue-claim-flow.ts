@@ -56,7 +56,13 @@ export interface ClaimFlowDeps {
   ) => Promise<IssueClientResult<{ claim: { claimEpoch: number }; issue: PlatformIssue }>>;
   bind: (
     issueId: string,
-    args: { claimId: string; localTaskRef: string; expectedStateRev: number },
+    args: {
+      claimId: string;
+      localTaskRef: string;
+      expectedStateRev: number;
+      localTaskLabel?: string;
+      localTaskUrl?: string;
+    },
   ) => Promise<IssueClientResult<{ issue: PlatformIssue }>>;
   createGroup: (opts: CreateGroupOpts) => Promise<CreateGroupResult>;
   /** 发 kickoff（@ 目标 bot）把会话激活。返回 messageId。 */
@@ -151,12 +157,14 @@ export async function claimIssueIntoGroup(
   // 创建会话。这是「群已建、binding 未写」那个窗口的兜底——孤儿群里没有 agent 在跑。
   let binding: IssueBinding | null = null;
   let chatId = '';
+  let shareLink: string | undefined;
+  const groupName = `${args.issue.title} ${claimMarker(claimId)}`;
   const botIds = Array.from(new Set([args.larkAppId, ...(args.peerLarkAppIds ?? [])]));
   try {
     const group = await deps.createGroup({
       creatorLarkAppId: args.creatorLarkAppId,
       larkAppIds: botIds,
-      name: `${args.issue.title} ${claimMarker(claimId)}`,
+      name: groupName,
       bindWorkingDir: args.workingDir,
       ...(args.ownerUnionIds?.length ? { ownerUnionIds: args.ownerUnionIds } : {}),
       onChatCreated: (createdChatId: string) => {
@@ -182,6 +190,7 @@ export async function claimIssueIntoGroup(
       },
     });
     chatId = group.chatId || chatId;
+    shareLink = group.shareLink ?? undefined;
   } catch (e) {
     return { ok: false, stage: 'group', reason: String((e as Error)?.message ?? e), claimId };
   }
@@ -191,10 +200,15 @@ export async function claimIssueIntoGroup(
   const bound: IssueBinding = binding;
 
   // ── 5. bind ───────────────────────────────────────────────────────────────
+  // 一并把「这个本地任务长什么样」告诉平台：localTaskRef 是机器标识（`oc_xxx::cli_xxx`），
+  // 平台详情页直接渲染它等于给人看一串 ID。群名 + applink 让人一眼认出是哪个群、点一下就能
+  // 进去。两个都是纯展示、可缺省（分享链接是 best-effort 拿的，拿不到就只显示群名）。
   const bindRes = await deps.bind(args.issue._id, {
     claimId,
     localTaskRef: buildLocalTaskRef(chatId, args.larkAppId),
     expectedStateRev: stateRev,
+    localTaskLabel: groupName,
+    ...(shareLink ? { localTaskUrl: shareLink } : {}),
   });
   if (!bindRes.ok) {
     // 平台拒绝 = 这条领取作废（issue 被回收 / 别人领走 / 代次过期）。置 void 而不是删：

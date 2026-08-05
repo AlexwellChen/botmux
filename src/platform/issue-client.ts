@@ -26,6 +26,10 @@ export interface PlatformIssueClaim {
   name: string;
   machineId: string;
   localTaskRef?: string;
+  /** 本地任务的可读名（本仓传 issue 群的群名）。平台详情页优先显示它而不是 localTaskRef。 */
+  localTaskLabel?: string;
+  /** 本地任务深链（本仓传飞书群 applink）。平台只接受 https，非法值会被静默丢弃。 */
+  localTaskUrl?: string;
   agent?: string;
   repoLabel?: string;
   claimedAt: number;
@@ -175,10 +179,23 @@ export function claimIssue(
   return call(opts, 'POST', `/v1/machine/issues/${encodeURIComponent(issueId)}/claim`, args);
 }
 
-/** 绑定本地任务。`localTaskRef` = `<larkAppId>::<sessionId>`。 */
+/**
+ * 绑定本地任务。`localTaskRef` = `<anchorId>::<larkAppId>`（见 [[issue-board-store]] 的
+ * `buildLocalTaskRef`）。
+ *
+ * `localTaskLabel` / `localTaskUrl` 是**纯展示**的可选项：前者给人看（群名），后者是点进去
+ * 的深链。平台只接受 https 深链，其余静默丢弃且**不会**让 bind 失败——展示字段不该有能力
+ * 弄砸一次真实绑定。
+ */
 export function bindIssue(
   issueId: string,
-  args: { claimId: string; localTaskRef: string; expectedStateRev: number },
+  args: {
+    claimId: string;
+    localTaskRef: string;
+    expectedStateRev: number;
+    localTaskLabel?: string;
+    localTaskUrl?: string;
+  },
   opts: IssueClientOptions = {},
 ): Promise<IssueClientResult<{ issue: PlatformIssue }>> {
   return call(opts, 'POST', `/v1/machine/issues/${encodeURIComponent(issueId)}/bind`, args);

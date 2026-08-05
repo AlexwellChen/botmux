@@ -123,6 +123,40 @@ describe('顺利路径', () => {
     expect(seen[0].agent).toBe('cli_worker');
   });
 
+  // 平台详情页拿 localTaskRef（`oc_xxx::cli_xxx`）当"绑定"那一行的值显示，等于给人看一串
+  // ID。群名 + applink 让人认得出、点得进。
+  it('bind 时一并上送群名与群分享链接', async () => {
+    const seen: any[] = [];
+    const { d } = deps({
+      createGroup: async (opts) => {
+        opts.onChatCreated?.('oc_new');
+        return { ok: true, chatId: 'oc_new', shareLink: 'https://applink.feishu.cn/x' } as any;
+      },
+      bind: async (_id, a) => {
+        seen.push(a);
+        return { ok: true, value: { issue: { ...ISSUE, stateRev: 3 } } } as any;
+      },
+    });
+    await claimIssueIntoGroup(d, ARGS);
+    expect(seen[0].localTaskLabel).toBe(`修一个 bug ${claimMarker('c'.repeat(32))}`);
+    expect(seen[0].localTaskUrl).toBe('https://applink.feishu.cn/x');
+  });
+
+  // 分享链接是 best-effort 拿的，拿不到不能连群名一起丢，更不能因此让 bind 失败。
+  it('拿不到分享链接时仍上送群名，只是没有深链', async () => {
+    const seen: any[] = [];
+    const { d } = deps({
+      bind: async (_id, a) => {
+        seen.push(a);
+        return { ok: true, value: { issue: { ...ISSUE, stateRev: 3 } } } as any;
+      },
+    });
+    const r = await claimIssueIntoGroup(d, ARGS);
+    expect(r.ok).toBe(true);
+    expect(seen[0].localTaskLabel).toContain('修一个 bug');
+    expect(seen[0].localTaskUrl).toBeUndefined();
+  });
+
   it('群名带 claimId 标记，人被按 union_id 拉进来', async () => {
     const { d, groupOpts } = deps();
     await claimIssueIntoGroup(d, ARGS);
