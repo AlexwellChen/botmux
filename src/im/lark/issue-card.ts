@@ -35,6 +35,9 @@ export const ISSUE_ACTION_CLAIM_CANCEL = 'issue_claim_cancel' as const;
 /** 一页放几条。看板是给人扫的，多了反而看不动；和 groups-card 保持一致。 */
 const PAGE_SIZE = 5;
 
+/** 「需要关注」最多铺几条。见 buildIssueBoardCard 里为什么必须封顶。 */
+const ATTENTION_PREVIEW = 3;
+
 /** Lark 的 select_static 选项数上限（与 groups-card 的 JUMP_PAGE_MAX_OPTIONS 同源）。
  *  实测一个工作区能扫出 58 个仓库/worktree，不截断会直接超限。 */
 const MAX_REPO_OPTIONS = 50;
@@ -154,6 +157,60 @@ function h(content: string): any {
   return { tag: 'div', text: { tag: 'lark_md', content } };
 }
 
+/**
+ * lark_md 文本位消毒。issue 的标题/正文/仓库标签都是**人在平台上自由填的**，直接拼进
+ * lark_md 会被标签与强调语法击穿：一个 `<font>` 或 `</font><at …>` 就能改掉整张卡的观感，
+ * 一个落单的反引号能让后面半张卡变成代码块。
+ *
+ * 转义顺序抄 [[brand-template]] 的 `safeText`（那是仓库里唯一做对的一份）：**反斜杠必须最先**
+ * ——否则 `\*` 里的反斜杠自成偶数对，让紧跟的 `*` 重新变回有效强调。groups-card 等 5 处旧
+ * 拷贝都缺这一步，这里不跟着抄错。
+ */
+export function escapeLarkMd(s: string): string {
+  return s
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\\/g, '\\\\')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/([*_~`])/g, '\\$1');
+}
+
+/**
+ * 按**显示宽度**截断（CJK 算两列），不是按字符数。
+ *
+ * 按 `length` 截会让中英文两种标题在卡片上宽窄差一倍：30 个汉字铺满两行，30 个字母才半行。
+ * 看板每行右边还挂着「领取」按钮，正文列本来就窄，超了就换行、按钮被挤到下一行，一排下来
+ * 参差不齐。
+ */
+export function truncateDisplay(s: string, maxWidth: number): string {
+  const width = (ch: string) => (/[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹯＀-｠￠-￦]/.test(ch) ? 2 : 1);
+  let w = 0;
+  let out = '';
+  for (const ch of s) {
+    const cw = width(ch);
+    if (w + cw > maxWidth) return `${out}…`;
+    w += cw;
+    out += ch;
+  }
+  return out;
+}
+
+/** 标题在看板行里的最大显示宽度。右边挂着「领取」按钮，正文列没有整行那么宽。 */
+const BOARD_TITLE_WIDTH = 34;
+/** 仓库标签的最大显示宽度。它是次要信息，不该跟标题抢地方。 */
+const REPO_LABEL_WIDTH = 20;
+
+/**
+ * 仓库标签的呈现：灰色小字，不是反引号包的行内代码。
+ *
+ * 行内代码在飞书里是带底色的等宽块，视觉重量比标题还大——一眼看过去先看到仓库名再看到任务，
+ * 主次颠倒。灰字是本仓卡片里次要元信息的既有写法（见 groups-card 的 chatId/appId 后缀）。
+ */
+function repoTag(label: string): string {
+  return `　<font color="grey">${escapeLarkMd(truncateDisplay(label, REPO_LABEL_WIDTH))}</font>`;
+}
+
 function pageOf<T>(rows: T[], page: number): { slice: T[]; page: number; pages: number } {
   const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const p = Math.min(Math.max(0, page), pages - 1);
@@ -188,7 +245,14 @@ export function buildIssueBoardCard(data: IssueBoardCardData, _locale?: Locale):
 
   if (s.needsAttention.length) {
     elements.push(h(`🔴 **需要关注 (${s.needsAttention.length})**`));
-    for (const r of s.needsAttention) elements.push(h(`　${r.title}`));
+    // 必须封顶：这一段原来是无条件全量铺开的，团队里积压几十条 needs_attention 就会把整张
+    // 卡撑爆（飞书对卡片元素数与总长度都有上限，超了直接发不出去），而且把下面的待领取挤到
+    // 屏幕外。它只是提醒，不是操作区，列几条足够。
+    for (const r of s.needsAttention.slice(0, ATTENTION_PREVIEW)) {
+      elements.push(h(`　${escapeLarkMd(truncateDisplay(r.title, BOARD_TITLE_WIDTH))}`));
+    }
+    const restAttention = s.needsAttention.length - ATTENTION_PREVIEW;
+    if (restAttention > 0) elements.push(h(`　<font color="grey">…另有 ${restAttention} 条</font>`));
   }
 
   elements.push(h(`⚪️ **待领取 (${s.todo.length})**`));
@@ -198,7 +262,10 @@ export function buildIssueBoardCard(data: IssueBoardCardData, _locale?: Locale):
   for (const r of slice) {
     elements.push({
       tag: 'div',
-      text: { tag: 'lark_md', content: `　${r.title}${r.repoLabel ? `　\`${r.repoLabel}\`` : ''}` },
+      text: {
+        tag: 'lark_md',
+        content: `　${escapeLarkMd(truncateDisplay(r.title, BOARD_TITLE_WIDTH))}${r.repoLabel ? repoTag(r.repoLabel) : ''}`,
+      },
       extra: {
         tag: 'button',
         text: { tag: 'plain_text', content: '领取' },
@@ -254,7 +321,7 @@ export function buildIssueBoardCard(data: IssueBoardCardData, _locale?: Locale):
 /** 领取确认视图：选仓库 + 确认/取消。就地替换看板，不新发卡片。 */
 export function buildClaimConfirmCard(data: ClaimConfirmCardData, _locale?: Locale): string {
   const elements: any[] = [];
-  elements.push(h(`**领取「${data.title}」**`));
+  elements.push(h(`**领取「${escapeLarkMd(truncateDisplay(data.title, 60))}」**`));
 
   const base = {
     invoker_open_id: data.invokerOpenId,
@@ -288,7 +355,7 @@ export function buildClaimConfirmCard(data: ClaimConfirmCardData, _locale?: Loca
   elements.push(
     h(
       data.repoLabel
-        ? `平台标注仓库：\`${data.repoLabel}\`${data.selectedDir ? '（已自动匹配）' : '（未匹配到本地仓库，请手动选择）'}`
+        ? `平台标注仓库${repoTag(data.repoLabel)}${data.selectedDir ? '　（已自动匹配）' : '　（未匹配到本地仓库，请手动选择）'}`
         : '平台未标注仓库，请选择工作仓库',
     ),
   );
@@ -336,8 +403,8 @@ export function buildClaimConfirmCard(data: ClaimConfirmCardData, _locale?: Loca
 export function buildClaimResultCard(data: ClaimResultCardData, _locale?: Locale): string {
   const elements: any[] = [];
   if (data.ok) {
-    elements.push(h(`✅ **已领取「${data.title}」**`));
-    elements.push(h(`群：${data.chatName}`));
+    elements.push(h(`✅ **已领取「${escapeLarkMd(truncateDisplay(data.title, 60))}」**`));
+    elements.push(h(`群：${escapeLarkMd(data.chatName)}`));
     if (data.shareLink) {
       elements.push({
         tag: 'action',
@@ -354,8 +421,8 @@ export function buildClaimResultCard(data: ClaimResultCardData, _locale?: Locale
     }
     return JSON.stringify({ config: { wide_screen_mode: true }, elements });
   }
-  elements.push(h(`❌ **领取「${data.title}」失败**`));
-  elements.push(h(`失败在：\`${data.stage}\`　原因：\`${data.reason}\``));
+  elements.push(h(`❌ **领取「${escapeLarkMd(truncateDisplay(data.title, 60))}」失败**`));
+  elements.push(h(`失败在：\`${escapeLarkMd(data.stage)}\`　原因：\`${escapeLarkMd(data.reason)}\``));
   if (data.hint) elements.push(h(data.hint));
   return JSON.stringify({ config: { wide_screen_mode: true }, elements });
 }
@@ -387,12 +454,14 @@ const KICKOFF_BODY_MAX = 400;
  */
 export function buildIssueKickoffCard(data: IssueKickoffCardData, _locale?: Locale): string {
   const elements: any[] = [];
-  elements.push(h(`🚀 **已开工：${data.title}**`));
+  elements.push(h(`🚀 **已开工：${escapeLarkMd(truncateDisplay(data.title, 60))}**`));
 
   const body = data.body?.trim();
   if (body) {
     const excerpt = body.length > KICKOFF_BODY_MAX ? `${body.slice(0, KICKOFF_BODY_MAX)}…` : body;
-    elements.push(h(excerpt));
+    // 正文是人在平台上自由填的，同样要消毒——一个落单的反引号能让后面半张卡变成代码块。
+    // 这里保留换行（正文本来就是多行），所以按行转义后再拼回去。
+    elements.push(h(excerpt.split('\n').map(escapeLarkMd).join('\n')));
   } else {
     elements.push(h('_这条任务没有填写详细描述_'));
   }

@@ -5,6 +5,8 @@ import {
   buildClaimConfirmCard,
   buildClaimResultCard,
   buildIssueBoardCard,
+  escapeLarkMd,
+  truncateDisplay,
   buildIssueKickoffCard,
   claimFailureHint,
   matchRepo,
@@ -247,5 +249,87 @@ describe('开工播报卡', () => {
     expect(buildIssueKickoffCard({ ...base, issueUrl: 'https://p/?issue=iss-1#issues' }))
       .toContain('在平台上查看');
     expect(buildIssueKickoffCard(base)).not.toContain('在平台上查看');
+  });
+});
+
+function renderBoard(sections: any = {}, page = 0) {
+  return buildIssueBoardCard(board({
+    sections: { needsAttention: [], todo: [], inProgress: [], inReview: [], done: [], ...sections },
+    page,
+  }));
+}
+const row = (n: number, title = `任务${n}`, repoLabel?: string) => ({
+  issueId: `i${n}`, title, stateRev: 1, ...(repoLabel ? { repoLabel } : {}),
+});
+describe('长标题', () => {
+  // 按 length 截会让中英文标题在卡上宽窄差一倍；行右边还挂着「领取」按钮，超了就换行。
+  it('按显示宽度截断，CJK 算两列', () => {
+    expect(truncateDisplay('abcdefghij', 5)).toBe('abcde…');
+    expect(truncateDisplay('一二三四五', 4)).toBe('一二…');
+    expect(truncateDisplay('短', 10)).toBe('短');
+  });
+
+  it('看板行里的超长标题被截，不会整段铺进卡片', () => {
+    const flat = renderBoard({ todo: [row(1, '很长的标题'.repeat(20))] });
+    expect(flat).toContain('…');
+    expect(flat.length).toBeLessThan(2000);
+  });
+});
+
+describe('lark_md 消毒', () => {
+  // 标题/正文/仓库标签都是人在平台上自由填的，直接拼进 lark_md 会被标签和强调语法击穿。
+  it('标签与强调字符都被中和', () => {
+    expect(escapeLarkMd('<font color="red">x</font>')).not.toContain('<font');
+    expect(escapeLarkMd('*粗* _斜_ `码`')).toBe('\\*粗\\* \\_斜\\_ \\`码\\`');
+    expect(escapeLarkMd('a\nb')).toBe('a b');
+  });
+
+  // 反斜杠必须最先转义，否则 `\*` 里的反斜杠自成偶数对，让紧跟的 * 重新变回有效强调。
+  it('反斜杠先转义，不给强调留逃逸口', () => {
+    expect(escapeLarkMd('\\*x*')).toBe('\\\\\\*x\\*');
+  });
+
+  it('恶意标题进不了看板卡的渲染层', () => {
+    const flat = renderBoard({ todo: [row(1, '</font><at user_id="all">')] });
+    expect(flat).not.toContain('<at ');
+    expect(flat).toContain('&lt;');
+  });
+});
+
+describe('仓库标签样式', () => {
+  // 行内代码在飞书里是带底色的等宽块，比标题还抢眼，主次颠倒。
+  it('用灰字而不是反引号包的行内代码', () => {
+    const flat = renderBoard({ todo: [row(1, '修个 bug', 'botmux平台')] });
+    expect(flat).toContain('<font color=\\"grey\\">botmux平台</font>'.replace(/\\\\/g, '\\'));
+    expect(flat).not.toContain('`botmux平台`');
+  });
+});
+
+describe('需要关注段封顶', () => {
+  // 原来是无条件全量铺开：积压几十条就会把卡片撑爆，并把待领取挤出屏幕。
+  it('只铺前几条，其余折成计数', () => {
+    const flat = renderBoard({ needsAttention: Array.from({ length: 30 }, (_, i) => row(i)) });
+    expect(flat).toContain('另有 27 条');
+    expect(flat).not.toContain('任务29');
+  });
+
+  it('条数不超上限时不显示"另有"', () => {
+    const flat = renderBoard({ needsAttention: [row(1)] });
+    expect(flat).not.toContain('另有');
+  });
+});
+
+describe('待领取翻页', () => {
+  it('超过一页才出翻页按钮，页码显示 当前/总数', () => {
+    const many = Array.from({ length: 12 }, (_, i) => row(i));
+    expect(renderBoard({ todo: many })).toContain('1/3');
+    expect(renderBoard({ todo: [row(1)] })).not.toContain('上一页');
+  });
+
+  it('页码越界时夹回有效范围，不会渲染空页', () => {
+    const many = Array.from({ length: 12 }, (_, i) => row(i));
+    const flat = renderBoard({ todo: many }, 99);
+    expect(flat).toContain('3/3');
+    expect(flat).toContain('任务11');
   });
 });
