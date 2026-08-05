@@ -69,13 +69,21 @@ export type IssueClientFailure =
   | { ok: false; reason: 'network'; error: string }
   | { ok: false; reason: 'conflict'; status: number; error: string }
   | { ok: false; reason: 'forbidden'; status: number; error: string }
+  /** 其余 4xx（400 invalid / 404 not_found …）：请求本身有问题，重发多少次都一样。 */
+  | { ok: false; reason: 'client'; status: number; error: string }
   | { ok: false; reason: 'server'; status: number; error: string };
 
 export type IssueClientResult<T> = { ok: true; value: T } | IssueClientFailure;
 
-/** 该失败是否值得退避后重投（网络/5xx 值得；鉴权失败与 409 不值得——后者要先重新投影）。 */
+/**
+ * 该失败是否值得退避后重投。
+ *
+ * 只有 `network` 与**真正的 5xx** 值得：4xx 全都是「再发一次结果不变」——401/403 是凭证/
+ * 归属问题，409 要先重新投影再发（不是盲重试），400/404 是请求本身错了。把它们混进可重试
+ * 一类，pump 会对着一个永远不会成功的请求指数退避到天荒地老，日志里还只看得到"在重试"。
+ */
 export function isRetriable(f: IssueClientFailure): boolean {
-  return f.reason === 'network' || f.reason === 'server';
+  return f.reason === 'network' || (f.reason === 'server' && f.status >= 500);
 }
 
 export interface IssueClientOptions {
@@ -99,6 +107,8 @@ function classify(status: number, json: unknown): IssueClientFailure {
   const error = typeof (json as { error?: unknown })?.error === 'string' ? String((json as { error: string }).error) : `http_${status}`;
   if (status === 401 || status === 403) return { ok: false, reason: 'forbidden', status, error };
   if (status === 409) return { ok: false, reason: 'conflict', status, error };
+  // 其余 4xx 单列一类：既不是鉴权问题（别误导排查方向），也绝不该被重试。
+  if (status >= 400 && status < 500) return { ok: false, reason: 'client', status, error };
   return { ok: false, reason: 'server', status, error };
 }
 

@@ -145,9 +145,27 @@ describe('错误分型', () => {
     expect(r).toMatchObject({ ok: false, reason: 'server', error: 'http_502' });
   });
 
-  it('404 归 server 类（路径写错该被看见，而不是当成鉴权问题吞掉）', async () => {
+  // 4xx 单列 client 类：既不是鉴权问题（别把排查方向带偏），也绝不能重试——
+  // 混进可重试一类的话，pump 会对着一个永远不会成功的请求指数退避到天荒地老。
+  it('404 → client（不当鉴权吞掉，也不可重试）', async () => {
     const { o } = opts([{ status: 404, json: { error: 'not_found' } }]);
-    expect(await fetchTeams(o)).toMatchObject({ ok: false, reason: 'server', status: 404 });
+    const r = await fetchTeams(o);
+    expect(r).toMatchObject({ ok: false, reason: 'client', status: 404, error: 'not_found' });
+    expect(isRetriable(r as any)).toBe(false);
+  });
+
+  it('400 → client（不可重试）', async () => {
+    const { o } = opts([{ status: 400, json: { error: 'invalid' } }]);
+    const r = await claimIssue('iss-1', { claimId: 'c1', expectedStateRev: 1 }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'client', status: 400 });
+    expect(isRetriable(r as any)).toBe(false);
+  });
+
+  it('只有 network 与真正的 5xx 可重试', async () => {
+    for (const status of [500, 502, 503]) {
+      const { o } = opts([{ status, json: {} }]);
+      expect(isRetriable((await fetchTeams(o)) as any)).toBe(true);
+    }
   });
 });
 

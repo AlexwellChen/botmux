@@ -1,5 +1,5 @@
 /**
- * Issue Board 本地状态：binding（issue ↔ 本机会话）与 outbox（状态回写发件箱）。
+ * Issue Board 本地状态：binding（issue ↔ 本机会话锚点）与 outbox（状态回写发件箱）。
  *
  * 平台侧契约见 platform 仓 DESIGN-issue-board.md §六/§七。那份设计是按 Desktop 写的，
  * Desktop 有 SQLite、能把「建本地任务」和「写 binding」放进**同一个事务**。botmux 没有
@@ -21,6 +21,16 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { sessionKey } from '../core/types.js';
+
+/**
+ * localTaskRef 的**唯一**构造入口。别在调用方手拼：拼反了顺序，平台侧 bind 记下的
+ * localTaskRef 就与后续崩溃恢复的重确认对不上，那条 held 会话会被判为 claim_mismatch 作废。
+ * 直接复用 botmux 自己的 `sessionKey`，与 activeSessions 的键完全同源。
+ */
+export function buildLocalTaskRef(anchorId: string, larkAppId: string): string {
+  return sessionKey(anchorId, larkAppId);
+}
 
 /** 平台 IssueStatus 的线上取值（回写目标只用得到其中一部分，但解析要认全）。 */
 export type IssueStatus =
@@ -48,10 +58,20 @@ export type AttentionReason =
  *  - `void`   ：补 bind 被平台拒（issue 被回收 / 别人领走 / 代次过期），这条作废
  */
 export interface IssueBinding {
-  /** 本机会话 id —— 主键，也是「本地任务」。 */
-  sessionId: string;
-  /** 平台契约的 localTaskRef = `<larkAppId>::<sessionId>`。localTaskId 只在其所属
-   *  runtime 内有意义，必须带命名空间；botmux 的 runtime 边界就是 bot（larkAppId）。 */
+  /**
+   * **路由锚点**——主键，也是平台契约里的「本地任务」标识。
+   *
+   * 这里必须是 anchor 而**不是** botmux 的 session id：协议要求 bind（带 localTaskRef）
+   * 发生在 activate 之前，而 botmux 的会话是 kickoff 消息把 bot @ 起来之后才由 daemon
+   * 创建的——bind 那一刻根本还没有 session id。anchor 则在 kickoff 之前就存在：
+   *  - 拉群模式 → `chatId`（chat-scope 会话的路由键，建群即得）
+   *  - 话题模式 → `rootMessageId`（先发无 @ 的 seed 拿到，再发 threaded kickoff）
+   * 见 core/types.ts 的 `sessionAnchorId` / `sessionKey`。
+   */
+  anchorId: string;
+  /** 平台契约的 localTaskRef，取值就是 botmux 自己的 `sessionKey(anchorId, larkAppId)`
+   *  = `<anchorId>::<larkAppId>`。复用它而不是另造一套：它本来就是本仓跨 bot 的规范会话
+   *  身份，且 `om_`（消息）与 `oc_`（群）两个地址空间不会碰撞。 */
   localTaskRef: string;
   larkAppId: string;
   issueId: string;
@@ -63,8 +83,11 @@ export interface IssueBinding {
   /** 领取代次快照——回写栅栏，旧代次的迟到回写会被平台按 stale_epoch 丢弃。 */
   claimEpoch: number;
   bindState: 'pending' | 'bound' | 'void';
-  /** 拉群模式下为这个 issue 建的群。崩溃恢复据此复用而不是再建一个。 */
+  /** 会话所在的群。拉群模式下 === anchorId；话题模式下是承载话题的那个群。
+   *  崩溃恢复据此复用已建的群而不是再建一个。 */
   chatId?: string;
+  /** 会话作用域：拉群 → 'chat'（一群一 issue 一会话）；话题 → 'thread'。 */
+  scope: 'chat' | 'thread';
   /** 本 binding 的 sourceSeq 分配计数器：单调、每 binding 唯一，平台的线上幂等只认它。 */
   nextSourceSeq: number;
   /** 已成功回写的状态（离线期间不动——去重合并要拿它和「最新未完成目标」一起比）。 */
@@ -78,7 +101,7 @@ export interface IssueBinding {
 export interface IssueOutboxRow {
   /** 仅本地行主键（去重发送用），不上送平台——平台幂等只认 sourceSeq。 */
   writeId: string;
-  sessionId: string;
+  anchorId: string;
   sourceSeq: number;
   targetStatus: IssueStatus;
   attentionReason?: AttentionReason;
@@ -117,8 +140,8 @@ export function listBindings(dataDir: string): IssueBinding[] {
   return Object.values(readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {}));
 }
 
-export function getBinding(dataDir: string, sessionId: string): IssueBinding | null {
-  return readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {})[sessionId] ?? null;
+export function getBinding(dataDir: string, anchorId: string): IssueBinding | null {
+  return readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {})[anchorId] ?? null;
 }
 
 /** 按 claimId 反查——崩溃恢复的入口（§六：不依赖平台「按 claimId 查 issue」的接口，那个接口不存在）。 */
@@ -143,8 +166,13 @@ export type CreateBindingInput = Omit<
 /**
  * 写入一条 pending binding。**必须在建群/开会话之前调用**（见文件头）。
  *
- * claimId 唯一：同 claimId 重入直接返回既有行（本地幂等，对应 Desktop 侧的
- * `UNIQUE(claim_id)`）——领取重试不会产生第二条 binding、也不会重复建群。
+ * 两条不变式都在这层强制，不指望调用方自觉：
+ *  - **claimId 唯一**：同 claimId 重入直接返回既有行（本地幂等，对应 Desktop 侧的
+ *    `UNIQUE(claim_id)`）——领取重试不会产生第二条 binding、也不会重复建群。
+ *  - **一 issue 一活跃 binding**：同 issue 已有非 void 的 binding 却拿着不同 claimId 进来，
+ *    是调用方漏查（比如没先 `findActiveBindingByIssue`）。此时**抛错**而不是照写——写下去
+ *    就是同一个 issue 两个群、两个 agent 同时开工，而平台侧只认最后一次 claim，另一个群
+ *    会变成谁也不管的孤儿。抛在这里离原因最近；释放后重领是安全的（旧 binding 已置 void）。
  */
 export function createBinding(
   dataDir: string,
@@ -154,6 +182,15 @@ export function createBinding(
   const all = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
   const existing = Object.values(all).find((b) => b.claimId === input.claimId);
   if (existing) return existing;
+  const activeSameIssue = Object.values(all).find(
+    (b) => b.issueId === input.issueId && b.bindState !== 'void',
+  );
+  if (activeSameIssue) {
+    throw new Error(
+      `issue ${input.issueId} 已有活跃 binding（anchor=${activeSameIssue.anchorId}, claimId=${activeSameIssue.claimId}）；`
+      + '重复领取前应先 findActiveBindingByIssue 复用，或释放后再领',
+    );
+  }
   const binding: IssueBinding = {
     ...input,
     bindState: input.bindState ?? 'pending',
@@ -161,7 +198,7 @@ export function createBinding(
     createdAt: now,
     updatedAt: now,
   };
-  all[binding.sessionId] = binding;
+  all[binding.anchorId] = binding;
   writeBindings(dataDir, all);
   return binding;
 }
@@ -169,24 +206,24 @@ export function createBinding(
 /** 局部更新一条 binding（read-modify-write，保住并发写入的其它字段）。 */
 export function updateBinding(
   dataDir: string,
-  sessionId: string,
-  patch: Partial<Omit<IssueBinding, 'sessionId' | 'createdAt'>>,
+  anchorId: string,
+  patch: Partial<Omit<IssueBinding, 'anchorId' | 'createdAt'>>,
   now: number = Date.now(),
 ): IssueBinding | null {
   const all = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
-  const cur = all[sessionId];
+  const cur = all[anchorId];
   if (!cur) return null;
-  const next: IssueBinding = { ...cur, ...patch, sessionId: cur.sessionId, createdAt: cur.createdAt, updatedAt: now };
-  all[sessionId] = next;
+  const next: IssueBinding = { ...cur, ...patch, anchorId: cur.anchorId, createdAt: cur.createdAt, updatedAt: now };
+  all[anchorId] = next;
   writeBindings(dataDir, all);
   return next;
 }
 
 /** 删除一条 binding（会话彻底结束且 issue 已终态后清理）。返回是否删掉。 */
-export function removeBinding(dataDir: string, sessionId: string): boolean {
+export function removeBinding(dataDir: string, anchorId: string): boolean {
   const all = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
-  if (!(sessionId in all)) return false;
-  delete all[sessionId];
+  if (!(anchorId in all)) return false;
+  delete all[anchorId];
   writeBindings(dataDir, all);
   return true;
 }
@@ -202,9 +239,9 @@ function writeOutbox(dataDir: string, rows: IssueOutboxRow[]): void {
   atomicWriteFileSync(outboxPath(dataDir), JSON.stringify(rows, null, 2) + '\n');
 }
 
-export function listOutbox(dataDir: string, sessionId?: string): IssueOutboxRow[] {
+export function listOutbox(dataDir: string, anchorId?: string): IssueOutboxRow[] {
   const rows = readOutbox(dataDir);
-  return sessionId === undefined ? rows : rows.filter((r) => r.sessionId === sessionId);
+  return anchorId === undefined ? rows : rows.filter((r) => r.anchorId === anchorId);
 }
 
 /**
@@ -221,18 +258,18 @@ export function listOutbox(dataDir: string, sessionId?: string): IssueOutboxRow[
  */
 export function enqueueDesiredStatus(
   dataDir: string,
-  sessionId: string,
+  anchorId: string,
   desired: IssueStatus,
   opts: { attentionReason?: AttentionReason; expectedStateRev?: number } = {},
   now: number = Date.now(),
 ): IssueOutboxRow | null {
   const bindings = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
-  const binding = bindings[sessionId];
+  const binding = bindings[anchorId];
   if (!binding || binding.bindState === 'void') return null;
 
   const rows = readOutbox(dataDir);
-  const mine = rows.filter((r) => r.sessionId === sessionId);
-  const pendingIdx = rows.findIndex((r) => r.sessionId === sessionId && r.state === 'pending');
+  const mine = rows.filter((r) => r.anchorId === anchorId);
+  const pendingIdx = rows.findIndex((r) => r.anchorId === anchorId && r.state === 'pending');
   const latestUnsettled = mine
     .filter((r) => r.state === 'pending' || r.state === 'inflight')
     .sort((a, b) => b.sourceSeq - a.sourceSeq)[0];
@@ -247,10 +284,18 @@ export function enqueueDesiredStatus(
     return null;
   }
 
-  const sourceSeq = binding.nextSourceSeq;
+  // 分配序号时取「计数器」与「本 binding 在 outbox 里出现过的最大序号 + 1」的较大者。
+  //
+  // 写序（见下）已经保证正常路径不会复用序号；这一层是**自愈**：万一计数器因为任何原因
+  // 落后于已排出的行（历史遗留数据、外部改文件、未来重构把写序改回去），复用序号的后果是
+  // 平台按 `sourceSeq <= lastSourceSeq` 静默 no-op ——**新状态永远上不去且毫无报错**。
+  // 这种失败太安静，值得用两行把它变成不可能，而不是只靠写序的正确性来担保。
+  // prune 删掉旧的 done 行会让 max 变小，但计数器只增不减，取较大者天然安全。
+  const maxSeen = mine.reduce((m, r) => Math.max(m, r.sourceSeq), 0);
+  const sourceSeq = Math.max(binding.nextSourceSeq, maxSeen + 1);
   const row: IssueOutboxRow = {
     writeId: randomUUID(),
-    sessionId,
+    anchorId,
     sourceSeq,
     targetStatus: desired,
     ...(opts.attentionReason ? { attentionReason: opts.attentionReason } : {}),
@@ -265,12 +310,21 @@ export function enqueueDesiredStatus(
     attempts: 0,
     createdAt: now,
   };
+  // ⚠️ 写序不能反：**先 bump 计数器落盘，再写 outbox**。
+  //
+  // 这是两个文件的 RMW，单文件 atomicWrite 保不了跨文件原子性，中间必然存在崩溃窗口。
+  // 两种写序的崩溃后果完全不同：
+  //  - 先 outbox 后 binding（错）：outbox 已有 seq=N、计数器还停在 N。该行 settle 后
+  //    下一次投影会**复用 N**，平台见 `sourceSeq <= lastSourceSeq` 直接 no-op —— 新状态
+  //    **永远上不去**，而且一路静默，真机上极难查。
+  //  - 先 binding 后 outbox（对）：最坏是 outbox 那条没写成、序号 N 被跳过。平台只要求
+  //    单调、不要求连续，跳号无害；丢掉的投影下一拍 tick 会用更大的 seq 重新排出来。
+  bindings[anchorId] = { ...binding, nextSourceSeq: sourceSeq + 1, updatedAt: now };
+  writeBindings(dataDir, bindings);
+
   if (pendingIdx >= 0) rows[pendingIdx] = row; // 就地覆盖未发送行
   else rows.push(row);
   writeOutbox(dataDir, rows);
-
-  bindings[sessionId] = { ...binding, nextSourceSeq: sourceSeq + 1, updatedAt: now };
-  writeBindings(dataDir, bindings);
   return row;
 }
 
@@ -282,15 +336,20 @@ export function enqueueDesiredStatus(
  */
 export function claimNextOutboxRow(
   dataDir: string,
-  sessionId: string,
+  anchorId: string,
   now: number = Date.now(),
 ): IssueOutboxRow | null {
   const rows = readOutbox(dataDir);
-  const mine = rows.filter((r) => r.sessionId === sessionId);
+  const mine = rows.filter((r) => r.anchorId === anchorId);
   if (mine.some((r) => r.state === 'inflight')) return null;
-  const idx = rows.findIndex(
-    (r) => r.sessionId === sessionId && r.state === 'pending' && (r.nextRetryAt ?? 0) <= now,
-  );
+  // 按 sourceSeq 最小的先发，不依赖数组顺序。今天「追加保序 + 就地覆盖」恰好也对，但
+  // 一旦以后 prune/compaction 重排数组，按下标取就可能先发高序号再发低序号——平台按
+  // 单调判重，低序号那条会被静默丢弃。显式排序把这条契约钉在代码里而不是数组布局上。
+  const nextRow = mine
+    .filter((r) => r.state === 'pending' && (r.nextRetryAt ?? 0) <= now)
+    .sort((a, b) => a.sourceSeq - b.sourceSeq)[0];
+  if (!nextRow) return null;
+  const idx = rows.findIndex((r) => r.writeId === nextRow.writeId);
   if (idx < 0) return null;
   rows[idx] = { ...rows[idx], state: 'inflight', attempts: rows[idx].attempts + 1 };
   writeOutbox(dataDir, rows);
@@ -312,7 +371,7 @@ export function settleOutboxRow(
   writeOutbox(dataDir, rows);
   updateBinding(
     dataDir,
-    row.sessionId,
+    row.anchorId,
     {
       lastSyncedStatus: row.targetStatus,
       ...(result.platformStateRev !== undefined ? { platformStateRev: result.platformStateRev } : {}),
