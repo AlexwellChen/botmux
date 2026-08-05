@@ -1041,6 +1041,22 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
   });
 
+  it('forwards /fast as a global passthrough WITHOUT cold-start (not adapter-scoped)', () => {
+    // /fast is a tier toggle, not "start a unit of work": it lives in the global
+    // PASSTHROUGH_COMMANDS (forwarded to Codex on an existing session), and is
+    // deliberately NOT in any adapter's defaultPassthroughCommands — so a bare
+    // /fast in an empty topic must not cold-start a session (owner policy).
+    // Regression guard: an earlier revision put /fast in the codex adapter
+    // default, which both broke that no-cold-start policy and (before that) a
+    // revision that removed /fast from every set left it never reaching Codex.
+    expect(PASSTHROUGH_COMMANDS.has('/fast')).toBe(true);
+    expect(resolvePassthroughCommands('app-2').has('/fast')).toBe(true); // codex
+    expect(resolvePassthroughCommands('app-1').has('/fast')).toBe(true); // claude-code (harmless unknown-command)
+    expect(resolvePassthroughCommands(undefined).has('/fast')).toBe(true);
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).not.toContain('/fast'); // no cold-start
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/fast');
+  });
+
   it('exposes /effort globally to every CLI (best-effort passthrough)', () => {
     // /effort 放在全局 PASSTHROUGH_COMMANDS,而非某个 adapter 的 defaultPassthroughCommands
     // ——所有 CLI 都尽力透传(Claude 家族 / Codex 原生支持;其它 CLI 认不得顶多回

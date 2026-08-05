@@ -109,6 +109,7 @@ import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
@@ -3976,6 +3977,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
     const runtimeDisplayName = sessionConfiguredRuntimeDisplayName(ds.session, dsBotCfg.cliRuntime);
     const prevTitle = ds.currentTurnTitle || ds.session.title || runtimeDisplayName || getCliDisplayName(effectiveCliId);
     const prevMode = ds.displayMode ?? 'hidden';
+    const previousCodexTierBadge = codexServiceTierBadge(effectiveCliId, ds.codexServiceTier);
     const frozenCard = buildStreamingCard(
       ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
       ds.lastScreenContent ?? '', previousStatus, effectiveCliId,
@@ -3985,17 +3987,20 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
       isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
       getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
       runtimeDisplayName,
+      previousCodexTierBadge,
     );
     scheduleCardPatch(ds, frozenCard);
 
     if (ds.streamCardNonce && ds.streamCardId !== CARD_POSTING_SENTINEL) {
       if (!ds.frozenCards) ds.frozenCards = new Map();
+      ds.parkedStreamCardNonce = ds.streamCardNonce;
       ds.frozenCards.set(ds.streamCardNonce, {
         messageId: ds.streamCardId,
         content: ds.lastScreenContent ?? '',
         title: prevTitle,
         displayMode: prevMode,
         imageKey: ds.currentImageKey,
+        ...(previousCodexTierBadge ? { codexServiceTierBadge: previousCodexTierBadge } : {}),
       });
       saveFrozenCards(ds.session.sessionId, ds.frozenCards);
     }
@@ -15360,6 +15365,20 @@ function isInitialSessionPassthrough(larkAppId: string, cmd: string): boolean {
   return resolveAdapterDefaultPassthroughCommands(larkAppId).includes(cmd);
 }
 
+/** `/fast` is a passthrough keystroke to Codex's native tier toggle — it only
+ *  reaches the executor on a real paste TUI. In RPC input mode the pane is a
+ *  pure viewer (turns go over JSON-RPC, keystrokes never reach the app-server),
+ *  and the Riff backend turns the text+Enter into two remote task writes. On
+ *  those backends the toggle is a silent no-op (or worse), so fail closed:
+ *  reject with a clear message instead of pretending it worked. The read-only
+ *  card badge is unaffected — it reflects whatever tier Codex actually runs. */
+function fastToggleUnsupportedBackend(ds: DaemonSession | undefined): boolean {
+  if (!ds) return false;
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (backendType === 'riff') return true;
+  return ds.initConfig?.codexRpcInput === true;
+}
+
 /** Preserve the established mid-session passthrough semantics when a cold-start
  * scratch loses its registration race to a concurrently-created real session. */
 function deliverPassthroughToExistingSession(
@@ -16956,6 +16975,14 @@ async function handleThreadReply(
       // 收紧到与 daemon 命令同档；这会同时改变真人 oncall 成员的现有行为，应单独评估。
       const ds = existingDs;
       if (ds) {
+        // /fast fail-closed: on RPC-input / Riff backends the keystroke can't
+        // reach Codex's executor (see fastToggleUnsupportedBackend). Reject with
+        // a clear message rather than deliver a silent no-op (or spawn junk Riff
+        // tasks). Other passthrough commands are unaffected.
+        if (cmd === '/fast' && fastToggleUnsupportedBackend(ds)) {
+          await sessionReply(anchor, tr('daemon.fast_unsupported_backend', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+          return;
+        }
         deliverPassthroughToExistingSession(ds, cmd, commandContent, anchor, larkAppId, {
           messageId: parsed.messageId,
           replyRootId,

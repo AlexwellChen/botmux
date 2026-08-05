@@ -10,6 +10,7 @@ import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
+import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
   applyConfigField,
@@ -2255,6 +2256,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           isLocalCliOpenReady(ds, { cliId: sessionCliId(ds) }),
           getDaemonStreamingCardUsageSnapshot(ds, sessionCliId(ds)),
           sessionRuntimeDisplayName(ds),
+          codexServiceTierBadge(sessionCliId(ds), ds.codexServiceTier),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -2660,6 +2662,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds),
+              codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -2705,6 +2708,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
+          effectiveCliId === 'codex' ? frozen.codexServiceTierBadge : undefined,
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -2748,6 +2752,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
+          codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -2816,6 +2821,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
+          codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -2867,6 +2873,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
+          codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

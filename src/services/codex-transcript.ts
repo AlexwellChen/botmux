@@ -51,6 +51,7 @@ import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
 import { join } from 'node:path';
 import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
+import type { CodexThreadSettings } from './codex-service-tier.js';
 
 const IS_LINUX = platform() === 'linux';
 const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
@@ -207,6 +208,8 @@ export interface CodexDrainResult {
   /** A line that was written without its terminating \n yet. Currently
    *  informational — only complete lines produce events. */
   pendingTail: string;
+  /** Latest complete settings record in this byte range, if any. */
+  latestThreadSettings?: CodexThreadSettings;
 }
 
 /** Locate the rollout file for a given Codex sessionId. Codex names files
@@ -409,6 +412,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
   const newOffset = start + Buffer.byteLength(completeText, 'utf8');
 
   const events: CodexBridgeEvent[] = [];
+  let latestThreadSettings: CodexThreadSettings | undefined;
   // Track byte offset within the file as we walk lines so synthetic uuids
   // are stable across re-drains.
   let cursor = start;
@@ -422,6 +426,11 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += lineByteLen;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
+    const settings = codexThreadSettingsFromEvent(obj);
+    if (settings) {
+      latestThreadSettings = settings;
+      continue;
+    }
     const p = obj?.payload;
     if (!p || typeof p !== 'object') continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
@@ -479,5 +488,68 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     // reasoning, function_call*, and every assistant `response_item` message
     // (mid-turn OR final) — the turn boundary comes only from task_complete.
   }
-  return { events, newOffset, pendingTail };
+  return { events, newOffset, pendingTail, latestThreadSettings };
+}
+
+function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined {
+  if (obj?.type !== 'event_msg' || obj.payload?.type !== 'thread_settings_applied') return undefined;
+  const raw = obj.payload.thread_settings;
+  const serviceTier = raw?.service_tier;
+  if (typeof serviceTier !== 'string' || !serviceTier) return undefined;
+  const model = typeof raw?.model === 'string' && raw.model ? raw.model : undefined;
+  return { ...(model ? { model } : {}), serviceTier };
+}
+
+/**
+ * One-shot bootstrap for an existing rollout. Reads backwards in fixed-size
+ * chunks and stops at the newest settings record, keeping memory bounded even
+ * for long sessions. Live changes use `drainCodexRollout`'s byte offset and do
+ * not call this function.
+ */
+export function scanCodexThreadSettings(
+  path: string,
+  opts: { chunkBytes?: number } = {},
+): CodexThreadSettings | undefined {
+  if (!existsSync(path)) return undefined;
+  const chunkBytes = Math.max(1024, opts.chunkBytes ?? 64 * 1024);
+  let fd: number | undefined;
+  try {
+    const size = statSync(path).size;
+    if (size === 0) return undefined;
+    fd = openSync(path, 'r');
+    let end = size;
+    let carry = Buffer.alloc(0);
+    while (end > 0) {
+      const start = Math.max(0, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const line = block.subarray(i + 1, lineEnd).toString('utf8');
+        lineEnd = i;
+        carryEnd = i;
+        if (!line.includes('thread_settings_applied')) continue;
+        let obj: any;
+        try { obj = JSON.parse(line); } catch { continue; }
+        const settings = codexThreadSettingsFromEvent(obj);
+        if (settings) return settings;
+      }
+      carry = block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) {
+      let obj: any;
+      try { obj = JSON.parse(carry.toString('utf8')); } catch { return undefined; }
+      return codexThreadSettingsFromEvent(obj);
+    }
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return undefined;
 }
