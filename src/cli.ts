@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -89,7 +89,8 @@ import {
   freezeManagedZmxAttachTarget,
 } from './cli/zmx-managed-attach.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
-import { dispatchDeferredTopicSend, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
+import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
+import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
@@ -7431,7 +7432,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   // is idempotent, so the downstream send path reuses these same clients.
   // envPinnedRiffBot is re-registered LAST so a remote env credential is never
   // clobbered by a stale bots.json entry for the same app.
-  const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
+  const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
+  const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
@@ -7479,7 +7481,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -7487,6 +7489,49 @@ async function cmdSend(rest: string[]): Promise<void> {
   // reply_in_thread, otherwise Lark would force every reply into a fresh
   // topic — defeating the whole point of chat-scope routing.
   const isChatScope = s.scope === 'chat';
+  // Compute the actual outbound anchor before the advisory guard. A chat-scope
+  // sender can still reply into a per-turn topic, so sender scope alone does
+  // not describe which peer sessions are reachable.
+  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  const dataDir = resolveDataDir();
+  const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
+    ? readDeferredTopicBinding(dataDir, s.sessionId)
+    : undefined;
+  const deferredRoot = reusableDeferredTopicRoot({
+    session: s as SessionData & { larkAppId: string },
+    binding: deferredBinding,
+    explicitTopLevel: sendTopLevel,
+    reuseBoundRootWhenTopLevel: deferredMaterializedByThisCommand,
+  });
+  const reachabilityTarget = deferredRoot
+    ? { mode: 'thread' as const, rootMessageId: deferredRoot }
+    : sendTarget;
+
+  // Load the sender-scoped bot identity map once. Besides prose @Name
+  // injection below, it lets the sub-bot hint recognize peers that already
+  // have an active session in THIS conversation.
+  let botEntries: BotMentionEntry[] = [];
+  let crossRef: Record<string, string> = {};
+  try {
+    const botInfoPath = join(dataDir, 'bots-info.json');
+    const parsedBotEntries = existsSync(botInfoPath)
+      ? JSON.parse(readFileSync(botInfoPath, 'utf-8'))
+      : [];
+    botEntries = Array.isArray(parsedBotEntries)
+      ? parsedBotEntries.filter((entry): entry is BotMentionEntry =>
+          !!entry
+          && typeof entry === 'object'
+          && typeof entry.larkAppId === 'string'
+          && (entry.botName === null || typeof entry.botName === 'string'))
+      : [];
+    const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
+    const parsedCrossRef = existsSync(crossRefPath)
+      ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
+      : {};
+    crossRef = parsedCrossRef && typeof parsedCrossRef === 'object' && !Array.isArray(parsedCrossRef)
+      ? parsedCrossRef
+      : {};
+  } catch { /* best-effort identity map */ }
 
   // ── Footgun guard: orchestrator → sub-bot ──
   // A dispatched sub-bot's session lives in its sub-topic; @-ing it from the main
@@ -7496,22 +7541,47 @@ async function cmdSend(rest: string[]): Promise<void> {
   // `@OtherSubBot` can't slip past after this explicit guard already ran.
   let dispatchReg: Record<string, { orchChatId?: string; bots?: string[] }> = {};
   try {
-    const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+    const regPath = join(dataDir, 'orchestrate-dispatch.json');
     if (existsSync(regPath)) dispatchReg = JSON.parse(readFileSync(regPath, 'utf-8'));
   } catch { /* no/!corrupt registry → no guard */ }
   const dispatchActiveSeeds = new Set<string>();
+  let allSessions: SessionData[] = [];
   if (Object.keys(dispatchReg).length > 0) {
-    for (const sess of loadSessions().values()) {
-      if (sess.status === 'active' && sess.scope !== 'chat' && sess.rootMessageId) {
+    allSessions = [...loadSessions().values()];
+    for (const sess of allSessions) {
+      if (sess.status !== 'active') continue;
+      if (sess.scope !== 'chat' && sess.rootMessageId) {
         dispatchActiveSeeds.add(sess.rootMessageId);
       }
     }
   }
+  // An active chat-scope session can outlive a /reply-mode switch. Verify the
+  // target bot's current effective mode before assuming mentions still fold
+  // back into that old session.
+  const foldableChatAppIds = await foldableChatSessionAppIds({
+    sessions: allSessions,
+    targetChatId,
+    outboundMode: reachabilityTarget.mode,
+    resolveMode: (larkAppId, chatId) => {
+      getBot(larkAppId); // unknown target bot must fail closed
+      return resolveRegularGroupMode(larkAppId, chatId);
+    },
+    resolveChatMode: chatId => getChatModeStrict(appId, chatId),
+  });
+  const reachableOpenIds = activeConversationBotOpenIds({
+    sessions: allSessions,
+    targetChatId,
+    outboundRootMessageId: threadRootForReachability(reachabilityTarget),
+    foldableChatAppIds,
+    botEntries,
+    crossRef,
+  });
   // Sub-topic seed if `openId` is a dispatched sub-bot in an active topic that is
-  // NOT reachable in the current conversation; else null. The bot I'm replying to
-  // here (quoteTargetSenderOpenId) is reachable, so it's never treated as off-topic.
+  // NOT reachable in the current conversation; else null. Both the bot I'm
+  // replying to and any peer with an active session at this conversation anchor
+  // are reachable, so an unrelated old dispatch topic must not be recommended.
   const offTopicSubBotSeed = (openId: string): string | null =>
-    offTopicSubBotTopic({ mentionOpenId: openId, quoteTargetSenderOpenId: replyTargetSenderOpenId, chatId: targetChatId, registry: dispatchReg, activeSeeds: dispatchActiveSeeds });
+    offTopicSubBotTopic({ mentionOpenId: openId, quoteTargetSenderOpenId: replyTargetSenderOpenId, reachableOpenIds, chatId: targetChatId, registry: dispatchReg, activeSeeds: dispatchActiveSeeds });
   // Explicit --mention / --mention-back of an off-topic sub-bot → block + point to
   // the right command (--anyway overrides). Prose @Name injection is filtered
   // (dropped, not blocked) at its own site below.
@@ -7541,9 +7611,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     rootMessageId: s.rootMessageId,
     title: s.title,
   };
-  // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
-  // decision point. Used for file attachments (always plain in chat scope).
-  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  // Ordinary delivery uses the nominal target. Deferred delivery gets first
+  // refusal below; the advisory mirrors its existing binding in
+  // `reachabilityTarget` above so both paths agree about the effective root.
   const dispatch = async (
     content: string,
     msgType: string,
@@ -7769,16 +7839,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // "获取群组中其他机器人和用户@当前机器人的消息"权限），不再走任何本地
     // 转发——botmux 历史上为绕过 Lark 不投递跨 bot 事件搞过 signal-file，
     // 那套已经在该权限上线后整体下线。
-    let botEntries: BotMentionEntry[] = [];
-    let crossRef: Record<string, string> = {};
     try {
-      const dataDir = resolveDataDir();
-      const botInfoPath = join(dataDir, 'bots-info.json');
-      botEntries = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
-      const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
-      crossRef = existsSync(crossRefPath)
-        ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
-        : {};
       // --no-mention 显式不 @ 任何人：跳过正文 @BotName 的自动注入，否则正文里
       // 出现的 @名字 仍会被注入成 <at>，破坏 --no-mention 语义、还可能误触发对方
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
