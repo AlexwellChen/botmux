@@ -5,6 +5,7 @@ import {
   buildClaimConfirmCard,
   buildClaimResultCard,
   buildIssueBoardCard,
+  buildIssueKickoffCard,
   claimFailureHint,
   matchRepo,
   rankRepos,
@@ -224,5 +225,27 @@ describe('候选排序与截断', () => {
     const flat = JSON.stringify(card);
     expect(flat).not.toContain('"initial_option":"/w/repo-57"');
     expect(flat).toContain('"initial_option":"/w/repo-00"');
+  });
+});
+
+// 群里唯一能看到"agent 在干什么"的东西。见 issue-claim-flow 的「开工播报」那组用例。
+describe('开工播报卡', () => {
+  const base = { title: '修一个 bug', workingDir: '/w/botmux', issueId: 'iss-1' };
+
+  it('没有正文时明说，而不是留一块空白', () => {
+    expect(buildIssueKickoffCard(base)).toContain('没有填写详细描述');
+  });
+
+  // 任务正文可能很长，整段贴进来会把群第一屏占满。
+  it('长正文截断并留省略号', () => {
+    const card = buildIssueKickoffCard({ ...base, body: 'x'.repeat(900) });
+    expect(card).toContain('…');
+    expect(card.length).toBeLessThan(1200);
+  });
+
+  it('有平台地址就给按钮，没有就不给（少个按钮而已，不该报错）', () => {
+    expect(buildIssueKickoffCard({ ...base, issueUrl: 'https://p/?issue=iss-1#issues' }))
+      .toContain('在平台上查看');
+    expect(buildIssueKickoffCard(base)).not.toContain('在平台上查看');
   });
 });

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   claimIssueIntoGroup,
   claimMarker,
+  issueDetailUrl,
   matchesClaimMarker,
   type ClaimFlowDeps,
 } from '../src/services/issue-claim-flow.js';
@@ -171,6 +172,76 @@ describe('顺利路径', () => {
     const { d, groupOpts } = deps();
     await claimIssueIntoGroup(d, ARGS);
     expect(groupOpts[0].bindWorkingDir).toBe('/w/botmux');
+  });
+});
+
+// kickoff prompt 是内部投递的，群里一个字都看不到；新建的群又是普通群、默认 reply mode
+// 不是 shared，handleBotAdded 的 seed 也不发。没有这张卡，人进群只看到一个空群，直到
+// agent 干完才有第一条消息——实测反馈就是"找不到他已经开始工作了"。
+describe('开工播报', () => {
+  function withAnnounce(over: Partial<ClaimFlowDeps> = {}) {
+    const sent: Array<{ chatId: string; card: any }> = [];
+    const { d, calls } = deps({
+      announce: async (chatId, card) => {
+        calls.push('announce');
+        sent.push({ chatId, card: JSON.parse(card) });
+      },
+      ...over,
+    });
+    return { d, sent, calls };
+  }
+
+  it('bind 成功后、activate 之前发到新群里', async () => {
+    const { d, sent, calls } = withAnnounce();
+    await claimIssueIntoGroup(d, ARGS);
+    // 先播报再激活：agent 的输出要跟在任务说明后面，顺序读起来才对
+    expect(calls).toEqual(['claim', 'createGroup', 'bind', 'announce', 'activate']);
+    expect(sent[0].chatId).toBe('oc_new');
+  });
+
+  it('卡片摊开 agent 拿到的东西：标题、正文、目录、任务 id', async () => {
+    const { d, sent } = withAnnounce();
+    await claimIssueIntoGroup(d, { ...ARGS, issue: { ...ISSUE, body: '复现步骤：点两下就炸' } });
+    const text = JSON.stringify(sent[0].card);
+    expect(text).toContain('修一个 bug');
+    expect(text).toContain('复现步骤：点两下就炸');
+    expect(text).toContain('/w/botmux');
+    expect(text).toContain('iss-1');
+    // 释放入口只在这张卡上露出来，不写人根本不知道有这个命令
+    expect(text).toContain('/issue release');
+  });
+
+  // 播报纯展示，不该有能力弄砸一次已经 bind 成功的领取。
+  it('播报失败不影响领取结果，只走旁路报告', async () => {
+    const errs: string[] = [];
+    const { d } = deps({
+      announce: async () => {
+        throw new Error('lark 限流');
+      },
+      onAnnounceError: (r) => errs.push(r),
+    });
+    const r = await claimIssueIntoGroup(d, ARGS);
+    expect(r.ok).toBe(true);
+    expect(errs).toEqual(['lark 限流']);
+  });
+
+  it('不注入 announce 时整条流程照常走完', async () => {
+    const { d, calls } = deps();
+    expect((await claimIssueIntoGroup(d, ARGS)).ok).toBe(true);
+    expect(calls).not.toContain('announce');
+  });
+});
+
+describe('平台任务深链', () => {
+  it('按平台前端的路由形状拼：tab 在 hash、详情在 query', () => {
+    expect(issueDetailUrl('https://p.example', 'iss-1')).toBe('https://p.example/?issue=iss-1#issues');
+    expect(issueDetailUrl('https://p.example/', 'iss-1')).toBe('https://p.example/?issue=iss-1#issues');
+  });
+
+  it('id 会被转义，拼不出合法地址时返回 undefined 而不是抛', () => {
+    expect(issueDetailUrl('https://p.example', 'a b&c')).toContain('issue=a%20b%26c');
+    expect(issueDetailUrl('', 'iss-1')).toBeUndefined();
+    expect(issueDetailUrl('不是地址', 'iss-1')).toBeUndefined();
   });
 });
 

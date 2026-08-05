@@ -19,6 +19,7 @@ import {
 import { claimIssueIntoGroup } from '../../services/issue-claim-flow.js';
 import { releaseIssue } from '../../services/issue-release.js';
 import { createGroupWithBots } from '../../services/group-creator.js';
+import { sendMessage } from './client.js';
 import type { IssueCommandDeps } from './issue-command.js';
 
 /**
@@ -141,6 +142,10 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
             shareLink = res.shareLink ?? undefined;
             return res;
           },
+          announce: async (chatId, card) => {
+            await sendMessage(larkAppId, chatId, card, 'interactive');
+          },
+          onAnnounceError: (reason) => logger.warn(`[issue] 开工播报失败（不影响领取）：${reason}`),
           activate: async (chatId, botLarkAppId, prompt) => {
             if (!activate) throw new Error('activate_not_wired');
             return activate({ chatId, larkAppId: botLarkAppId, prompt, workingDir });

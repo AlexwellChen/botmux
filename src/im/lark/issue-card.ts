@@ -360,6 +360,67 @@ export function buildClaimResultCard(data: ClaimResultCardData, _locale?: Locale
   return JSON.stringify({ config: { wide_screen_mode: true }, elements });
 }
 
+export interface IssueKickoffCardData {
+  title: string;
+  body?: string;
+  workingDir: string;
+  issueId: string;
+  /** 平台任务详情深链。拿不到平台地址时省略，卡片只是少一个按钮。 */
+  issueUrl?: string;
+}
+
+/** 正文摘要长度。够看清要干什么，又不至于把整个群第一屏占满。 */
+const KICKOFF_BODY_MAX = 400;
+
+/**
+ * 开工播报：领取建群后**发在任务群里**的第一条消息。
+ *
+ * 为什么必须有这么一张卡：kickoff prompt 是**内部投递**的（daemon 直接建会话，见
+ * [[issue-command-deps]] 的 ActivateSession），它不经过飞书，群里一个字都看不到。而新建的
+ * 群是普通群、默认 reply mode 不是 shared，`handleBotAdded` 的那条 seed 也不会发。两下一
+ * 叠，群从建好到 agent 吐出第一段输出之间**完全是空的**——人进群只看到一个空群，不知道
+ * agent 有没有开始干、在干什么、在哪个仓库干。实测反馈就是「找不到他已经开始工作了，
+ * 干完了才汇报一下」。
+ *
+ * 所以这张卡要把「agent 现在拿到的是什么」原样摊开：任务标题、正文、工作目录、平台任务
+ * 深链。它同时也是释放入口的说明书——不写在这里，人根本不知道 `/issue release` 存在。
+ */
+export function buildIssueKickoffCard(data: IssueKickoffCardData, _locale?: Locale): string {
+  const elements: any[] = [];
+  elements.push(h(`🚀 **已开工：${data.title}**`));
+
+  const body = data.body?.trim();
+  if (body) {
+    const excerpt = body.length > KICKOFF_BODY_MAX ? `${body.slice(0, KICKOFF_BODY_MAX)}…` : body;
+    elements.push(h(excerpt));
+  } else {
+    elements.push(h('_这条任务没有填写详细描述_'));
+  }
+
+  elements.push({ tag: 'hr' });
+  elements.push(h(`📁 工作目录　\`${data.workingDir}\``));
+  elements.push(h(`🔖 平台任务　\`${data.issueId}\``));
+
+  if (data.issueUrl) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '在平台上查看' },
+          url: data.issueUrl,
+          value: {},
+        },
+      ],
+    });
+  }
+
+  elements.push({ tag: 'hr' });
+  // 释放入口只在这里露出来。不说的话人不会知道有这个命令，只能去平台上 force-detach。
+  elements.push(h('_做完会自动汇报。不想做了就在本群发 `/issue release`，任务退回「待领取」（群不会解散）。_'));
+  return JSON.stringify({ config: { wide_screen_mode: true }, elements });
+}
+
 /** 失败阶段 → 给人的下一步提示。措辞对应 issue-claim-flow 里那张「失败留下什么」表。 */
 export function claimFailureHint(stage: string): string | undefined {
   switch (stage) {

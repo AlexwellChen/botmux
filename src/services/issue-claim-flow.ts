@@ -21,6 +21,7 @@
 import { randomBytes } from 'node:crypto';
 import type { CreateGroupOpts, CreateGroupResult } from './group-creator.js';
 import type { IssueClientResult, PlatformIssue } from '../platform/issue-client.js';
+import { buildIssueKickoffCard } from '../im/lark/issue-card.js';
 import {
   buildLocalTaskRef,
   clearClaimIntent,
@@ -47,6 +48,24 @@ export function matchesClaimMarker(groupName: string, claimId: string): boolean 
   return groupName.includes(claimMarker(claimId));
 }
 
+/**
+ * 平台上这条 issue 的详情深链。
+ *
+ * 路由形状来自平台前端：tab 在 hash（`#issues`）、详情在 query（`?issue=<id>`），见
+ * platform 仓 `frontend/src/App.tsx` 的 Tabs 与 `IssueBoard.tsx` 的 `openDetail`。
+ * 拼不出来（平台地址为空/非法）就返回 undefined，卡片少一个按钮而已，不该因此报错。
+ */
+export function issueDetailUrl(platformBaseUrl: string, issueId: string): string | undefined {
+  const base = (platformBaseUrl ?? '').trim().replace(/\/+$/, '');
+  if (!base) return undefined;
+  try {
+    new URL(base);
+  } catch {
+    return undefined;
+  }
+  return `${base}/?issue=${encodeURIComponent(issueId)}#issues`;
+}
+
 export interface ClaimFlowDeps {
   dataDir: string;
   platformBaseUrl: string;
@@ -65,6 +84,15 @@ export interface ClaimFlowDeps {
     },
   ) => Promise<IssueClientResult<{ issue: PlatformIssue }>>;
   createGroup: (opts: CreateGroupOpts) => Promise<CreateGroupResult>;
+  /**
+   * 往新群里发开工播报（[[issue-card]] 的 `buildIssueKickoffCard`）。
+   *
+   * **best-effort**：失败只记日志，绝不让领取失败——它是给人看的，不是协议的一环。
+   * 不传就不播报（单测里默认不传）。
+   */
+  announce?: (chatId: string, card: string) => Promise<void>;
+  /** 播报失败时的旁路（生产接 logger；不注入就静默）。 */
+  onAnnounceError?: (reason: string) => void;
   /** 发 kickoff（@ 目标 bot）把会话激活。返回 messageId。 */
   activate: (chatId: string, botLarkAppId: string, prompt: string) => Promise<string>;
   newClaimId?: () => string;
@@ -72,7 +100,8 @@ export interface ClaimFlowDeps {
 }
 
 export interface ClaimFlowArgs {
-  issue: Pick<PlatformIssue, '_id' | 'title' | 'stateRev' | 'targetRepoLabel'>;
+  /** `body` 只进开工播报（平台侧允许为空），所以这里放宽成可选。 */
+  issue: Pick<PlatformIssue, '_id' | 'title' | 'stateRev' | 'targetRepoLabel'> & { body?: string };
   teamId: string;
   /** 由哪个 bot 承接这个 issue —— 决定 localTaskRef 的 appId 段与 kickoff 目标。 */
   larkAppId: string;
@@ -219,6 +248,32 @@ export async function claimIssueIntoGroup(
   stateRev = bindRes.value.issue.stateRev;
   const readyBinding =
     updateBinding(deps.dataDir, bound.anchorId, { bindState: 'bound', platformStateRev: stateRev }, now()) ?? bound;
+
+  // ── 5.5 开工播报 ──────────────────────────────────────────────────────────
+  //
+  // 放在 activate **之前**：kickoff prompt 是内部投递的，群里看不到；这张卡是人进群后
+  // 唯一能看到的「在干什么」。先播报，agent 的输出随后跟上，顺序读起来才对。
+  // activate 万一失败，群里至少还留着任务说明，不是一个空群。
+  //
+  // try/catch 吞掉异常：播报纯展示，不该有能力弄砸一次已经 bind 成功的领取。
+  if (deps.announce) {
+    try {
+      await deps.announce(
+        chatId,
+        buildIssueKickoffCard({
+          title: args.issue.title,
+          ...(args.issue.body ? { body: args.issue.body } : {}),
+          workingDir: args.workingDir,
+          issueId: args.issue._id,
+          ...(issueDetailUrl(deps.platformBaseUrl, args.issue._id)
+            ? { issueUrl: issueDetailUrl(deps.platformBaseUrl, args.issue._id)! }
+            : {}),
+        }),
+      );
+    } catch (e) {
+      deps.onAnnounceError?.(String((e as Error)?.message ?? e));
+    }
+  }
 
   // ── 6. activate ───────────────────────────────────────────────────────────
   let kickoffMessageId: string;
