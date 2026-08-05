@@ -2045,8 +2045,24 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc));
           break;
         }
-        const { handleIssueCommand } = await import('../im/lark/issue-command.js');
+        const sub = message.content.replace(/^\/issue\s*/i, '').trim().split(/\s+/, 1)[0]?.toLowerCase();
+        const { handleIssueCommand, handleIssueRelease } = await import('../im/lark/issue-command.js');
         const { buildIssueCommandDeps } = await import('../im/lark/issue-command-deps.js');
+
+        // `/issue release` 在**领取时建出来的那个群里**发，锚点从当前会话推。两个候选按
+        // sessionAnchorId 的语义给（拉群 → chatId，话题 → rootMessageId），由 handler 依次试。
+        if (sub === 'release') {
+          const rel = await handleIssueRelease(
+            appId,
+            message.senderId,
+            [message.chatId, rootId],
+            buildIssueCommandDeps(),
+          );
+          await sessionReply(rootId, rel.toast.content);
+          logger.info(`[${logTag}] Issue release handled: ${rel.toast.type}`);
+          break;
+        }
+
         const r = await handleIssueCommand(appId, message.senderId, buildIssueCommandDeps());
         if ('card' in r) await sessionReply(rootId, r.card, 'interactive');
         else await sessionReply(rootId, r.toast.content);

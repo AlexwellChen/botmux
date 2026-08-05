@@ -56,6 +56,11 @@ export interface IssueCommandDeps {
   allowedUsers: (larkAppId: string) => string[];
   /** 该 bot 配置的工作目录（未展开 `~`）。 */
   workingDirs: (larkAppId: string) => string[];
+  /** 跑 [[issue-release]]。按锚点释放，锚点由调用方从当前会话推出来。 */
+  runRelease: (anchorId: string) => Promise<
+    | { ok: true; issueId: string; alreadyReleasedOnPlatform: boolean }
+    | { ok: false; reason: 'no_binding' | 'already_released' | 'platform'; detail?: string }
+  >;
 }
 
 /** 命令入口的返回：card 是卡片 JSON 字符串，直接喂 `sessionReply(..., 'interactive')`。 */
@@ -158,6 +163,66 @@ export async function handleIssueCommand(
   if (!admins.length) return toast('这个 bot 还没有配置管理员');
   if (!admins.includes(senderOpenId)) return toast('只有管理员可以操作 Issue Board');
   return buildBoard(larkAppId, deps, { invokerOpenId: senderOpenId });
+}
+
+/**
+ * `/issue release` → 释放当前会话领取的那个 issue。
+ *
+ * 在**领取时建出来的那个群里**发。锚点候选按 [[core/types]] 的 `sessionAnchorId` 语义给：
+ * 拉群会话锚在 chatId、话题会话锚在 rootMessageId。调用方两个都传，这里依次试——比让
+ * 调用方先判 scope 简单，两个地址空间（`oc_` / `om_`）不会撞，试错没有歧义。
+ *
+ * 返回文本而不是卡片：这是个一次性动作，结果就一句话，发张卡反而重。
+ */
+export async function handleIssueRelease(
+  larkAppId: string,
+  senderOpenId: string | undefined,
+  anchorCandidates: Array<string | undefined>,
+  deps: IssueCommandDeps,
+): Promise<{ toast: { type: 'error' | 'info'; content: string } }> {
+  if (!senderOpenId) return { toast: { type: 'error', content: '无法识别操作者身份' } };
+  const admins = deps.allowedUsers(larkAppId);
+  if (!admins.length) return { toast: { type: 'error', content: '这个 bot 还没有配置管理员' } };
+  if (!admins.includes(senderOpenId)) {
+    return { toast: { type: 'error', content: '只有管理员可以操作 Issue Board' } };
+  }
+
+  const anchors = anchorCandidates.filter((a): a is string => !!a);
+  if (!anchors.length) return { toast: { type: 'error', content: '拿不到当前会话的锚点，无法定位领取记录' } };
+
+  // 逐个试，把「真的没有绑定」和「有绑定但释放失败」分开：只要有一个锚点给出了非
+  // no_binding 的结果，那就是它，别再往下试（试下去会把真实失败盖成"没有领取记录"）。
+  let last: Awaited<ReturnType<IssueCommandDeps['runRelease']>> | undefined;
+  for (const anchorId of anchors) {
+    last = await deps.runRelease(anchorId);
+    if (last.ok || last.reason !== 'no_binding') break;
+  }
+  if (!last) return { toast: { type: 'error', content: '拿不到当前会话的锚点，无法定位领取记录' } };
+
+  if (last.ok) {
+    logger.info(`[issue] 释放成功 issue=${last.issueId} platform_already=${last.alreadyReleasedOnPlatform}`);
+    return {
+      toast: {
+        type: 'info',
+        content: last.alreadyReleasedOnPlatform
+          ? `✅ 已释放。平台上这条任务此前就已经不归本机了（可能被回收或已被别人领走），本机记录已同步。\n\n群和会话都还在，需要的话自己停会话或退群。`
+          : `✅ 已释放，任务已退回平台「待领取」，别人可以领了。\n\n群和会话都还在，**不会自动解散**——里面的对话记录还留着，要停会话发 \`/stop\`。`,
+      },
+    };
+  }
+  if (last.reason === 'no_binding') {
+    return { toast: { type: 'error', content: '这个会话没有领取任何平台任务，没什么可释放的。' } };
+  }
+  if (last.reason === 'already_released') {
+    return { toast: { type: 'info', content: '这条领取此前就已经释放/作废了，无需重复操作。' } };
+  }
+  logger.warn(`[issue] 释放失败 detail=${last.detail}`);
+  return {
+    toast: {
+      type: 'error',
+      content: `❌ 释放失败：${last.detail}\n\n本机记录保持不变（平台仍认为这台机器持有），稍后可以再发一次 \`/issue release\`。`,
+    },
+  };
 }
 
 /** 卡片回调。所有 `issue_*` action 都走这里。 */

@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   handleIssueCardAction,
   handleIssueCommand,
+  handleIssueRelease,
   type IssueCommandDeps,
 } from '../src/im/lark/issue-command.js';
 import {
@@ -24,7 +25,9 @@ const ISSUE = {
 
 function deps(over: Partial<IssueCommandDeps> = {}) {
   const runClaim = vi.fn(async () => ({ ok: true as const, chatId: 'oc_new', chatName: 'g #abcd', shareLink: 'https://l' }));
+  const runRelease = vi.fn(async () => ({ ok: true as const, issueId: 'iss-1', alreadyReleasedOnPlatform: false }));
   const base: IssueCommandDeps = {
+    runRelease,
     fetchTeams: async () => ({ ok: true, value: [{ teamId: 't1', teamName: 'A' }, { teamId: 't2', teamName: 'B' }] }),
     fetchIssues: async () => ({
       ok: true,
@@ -35,7 +38,7 @@ function deps(over: Partial<IssueCommandDeps> = {}) {
     workingDirs: () => [],
     ...over,
   };
-  return { d: base, runClaim };
+  return { d: base, runClaim, runRelease: base.runRelease as any };
 }
 
 function cb(value: Record<string, string>, operator = ME, option?: string) {
@@ -211,6 +214,73 @@ describe('领取', () => {
     const card = JSON.stringify((r as any).card.data);
     expect(card).toContain('activate');
     expect(card).toContain('不必重新领取');
+  });
+});
+
+describe('释放', () => {
+  it('管理员在任务群里释放 → 成功，并说明群不会自动解散', async () => {
+    const { d, runRelease } = deps();
+    const r = await handleIssueRelease(APP, ME, ['oc_task', 'om_root'], d);
+    expect(runRelease).toHaveBeenCalledWith('oc_task');
+    expect(r.toast.type).toBe('info');
+    expect(r.toast.content).toContain('不会自动解散');
+  });
+
+  // 释放会真的改平台状态，和 /issue 同一道门。
+  it('非管理员被拒，且不触发释放', async () => {
+    const { d, runRelease } = deps();
+    const r = await handleIssueRelease(APP, 'ou_stranger', ['oc_task'], d);
+    expect(r.toast).toMatchObject({ type: 'error', content: '只有管理员可以操作 Issue Board' });
+    expect(runRelease).not.toHaveBeenCalled();
+  });
+
+  it('拿不到操作者身份时拒绝（fail-closed）', async () => {
+    const { d, runRelease } = deps();
+    expect((await handleIssueRelease(APP, undefined, ['oc_task'], d)).toast.type).toBe('error');
+    expect(runRelease).not.toHaveBeenCalled();
+  });
+
+  // 拉群会话锚在 chatId、话题会话锚在 rootMessageId，两个都要试得到。
+  it('第一个锚点没有绑定时继续试第二个', async () => {
+    const runRelease = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, reason: 'no_binding' })
+      .mockResolvedValueOnce({ ok: true, issueId: 'iss-1', alreadyReleasedOnPlatform: false });
+    const { d } = deps({ runRelease: runRelease as any });
+    const r = await handleIssueRelease(APP, ME, ['oc_task', 'om_root'], d);
+    expect(runRelease.mock.calls.map((c) => c[0])).toEqual(['oc_task', 'om_root']);
+    expect(r.toast.type).toBe('info');
+  });
+
+  // 真实失败不能被后一个锚点的 "no_binding" 盖成「没有领取记录」——那会让人以为不用管。
+  it('第一个锚点释放失败时就地停下，不继续试', async () => {
+    const runRelease = vi.fn(async () => ({ ok: false, reason: 'platform', detail: 'network: ETIMEDOUT' }) as any);
+    const { d } = deps({ runRelease });
+    const r = await handleIssueRelease(APP, ME, ['oc_task', 'om_root'], d);
+    expect(runRelease).toHaveBeenCalledTimes(1);
+    expect(r.toast.type).toBe('error');
+    expect(r.toast.content).toContain('ETIMEDOUT');
+    expect(r.toast.content).toContain('本机记录保持不变');
+  });
+
+  it('这个会话根本没领过任务 → 说清楚而不是报错', async () => {
+    const { d } = deps({ runRelease: async () => ({ ok: false, reason: 'no_binding' }) as any });
+    const r = await handleIssueRelease(APP, ME, ['oc_task'], d);
+    expect(r.toast.content).toContain('没有领取任何平台任务');
+  });
+
+  it('平台侧此前已释放 → 提示已同步，措辞不同于正常释放', async () => {
+    const { d } = deps({ runRelease: async () => ({ ok: true, issueId: 'iss-1', alreadyReleasedOnPlatform: true }) as any });
+    const r = await handleIssueRelease(APP, ME, ['oc_task'], d);
+    expect(r.toast.type).toBe('info');
+    expect(r.toast.content).toContain('此前就已经不归本机');
+  });
+
+  it('一个锚点都没有时不静默成功', async () => {
+    const { d, runRelease } = deps();
+    const r = await handleIssueRelease(APP, ME, [undefined, undefined], d);
+    expect(r.toast.type).toBe('error');
+    expect(runRelease).not.toHaveBeenCalled();
   });
 });
 

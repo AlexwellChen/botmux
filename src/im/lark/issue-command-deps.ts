@@ -5,11 +5,19 @@
  * bot 注册表都在这里装配。card-handler 与 command-handler 都从这里取。
  */
 import { config } from '../../config.js';
-import { getBot } from '../../bot-registry.js';
+import { effectiveBotDisplayName, getBot } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
 import { readPlatformBinding } from '../../platform/binding.js';
-import { bindIssue, claimIssue, fetchIssues, fetchTeams } from '../../platform/issue-client.js';
+import {
+  bindIssue,
+  claimIssue,
+  fetchIssues,
+  fetchTeams,
+  writeIssueStatus,
+  type PlatformIssue,
+} from '../../platform/issue-client.js';
 import { claimIssueIntoGroup } from '../../services/issue-claim-flow.js';
+import { releaseIssue } from '../../services/issue-release.js';
 import { createGroupWithBots } from '../../services/group-creator.js';
 import type { IssueCommandDeps } from './issue-command.js';
 
@@ -108,6 +116,13 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
       // 建群拿到的 chatId 之后要用来发 kickoff，先接住。
       let shareLink: string | undefined;
       let chatName = '';
+      // bot 不在注册表里就回落到 appId——展示名拿不到不该让领取失败。
+      let agentLabel: string | undefined;
+      try {
+        agentLabel = effectiveBotDisplayName(getBot(larkAppId));
+      } catch {
+        agentLabel = undefined;
+      }
 
       const r = await claimIssueIntoGroup(
         {
@@ -138,6 +153,8 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
           creatorLarkAppId: larkAppId,
           ownerUnionIds: [],
           workingDir,
+          // 平台详情页直接渲染这个值，给它人能认的名字而不是 appId。
+          ...(agentLabel ? { agentLabel } : {}),
           kickoffPrompt: buildKickoffPrompt({
             title: issue.title,
             ...(issue.body ? { body: issue.body } : {}),
@@ -157,6 +174,32 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
         };
       }
       return { ok: false, stage: r.stage, reason: r.reason };
+    },
+
+    runRelease: async (anchorId: string) => {
+      const r = await releaseIssue(
+        {
+          dataDir: config.session.dataDir,
+          writeStatus: (issueId, args) => writeIssueStatus(issueId, args) as any,
+          fetchIssue: async (teamId, issueId) => {
+            const list = await fetchIssues(teamId);
+            if (!list.ok) return null;
+            for (const section of Object.values(list.value)) {
+              const hit = (section as PlatformIssue[]).find((i) => i._id === issueId);
+              if (hit) return hit;
+            }
+            // 列表里没有 ≠ 拿不到。分段列表只覆盖活跃状态，issue 被归档就不在里面了——
+            // 那种情况平台上肯定已经不是本机的 claim，返回 null 会让释放停在"无法判定"。
+            // 但也不能凭空造一个"不是我的"，所以这里如实返回 null，由上层报错让人去平台看。
+            return null;
+          },
+        },
+        anchorId,
+      );
+      if (r.ok) {
+        return { ok: true, issueId: r.issueId, alreadyReleasedOnPlatform: r.alreadyReleasedOnPlatform };
+      }
+      return { ok: false, reason: r.reason, ...(r.reason === 'platform' ? { detail: r.detail } : {}) };
     },
   };
 }

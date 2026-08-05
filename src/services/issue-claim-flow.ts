@@ -70,6 +70,12 @@ export interface ClaimFlowArgs {
   teamId: string;
   /** 由哪个 bot 承接这个 issue —— 决定 localTaskRef 的 appId 段与 kickoff 目标。 */
   larkAppId: string;
+  /**
+   * 上送平台 `claim.agent` 的展示名。平台把这个值原样渲染在 issue 详情里，所以必须是**人能
+   * 认出来的名字**（`claude-loopy`），不是 `cli_xxx` ——早先直接传 larkAppId，看板上只能看到
+   * 一串 appId，谁在干这活完全看不出来。缺省回落到 larkAppId，保证总有值。
+   */
+  agentLabel?: string;
   /** 建群者（通常是 dashboard 所属的那个 bot）。 */
   creatorLarkAppId: string;
   /** 一并拉进群的其它 bot。 */
@@ -114,7 +120,7 @@ export async function claimIssueIntoGroup(
   const claimId = newClaimId();
   const claimed = await deps.claim(args.issue._id, {
     claimId,
-    agent: args.larkAppId,
+    agent: args.agentLabel || args.larkAppId,
     ...(args.issue.targetRepoLabel ? { repoLabel: args.issue.targetRepoLabel } : {}),
     expectedStateRev: args.issue.stateRev,
   });

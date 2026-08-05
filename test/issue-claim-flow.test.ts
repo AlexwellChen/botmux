@@ -98,6 +98,31 @@ describe('顺利路径', () => {
     expect(groupOpts[0].kickoffPrompt).toBeUndefined();
   });
 
+  // 平台把 claim.agent 原样渲染在 issue 详情里，传 appId 的话看板上只有一串 cli_xxx，
+  // 谁在干这活完全看不出来。
+  function spyClaimAgent(): { d: ClaimFlowDeps; seen: any[] } {
+    const seen: any[] = [];
+    const { d } = deps({
+      claim: async (_id, a) => {
+        seen.push(a);
+        return { ok: true, value: { claim: { claimEpoch: 3 }, issue: { ...ISSUE, stateRev: 2 } } } as any;
+      },
+    });
+    return { d, seen };
+  }
+
+  it('上送平台的 agent 用展示名', async () => {
+    const { d, seen } = spyClaimAgent();
+    await claimIssueIntoGroup(d, { ...ARGS, agentLabel: 'claude-loopy' });
+    expect(seen[0].agent).toBe('claude-loopy');
+  });
+
+  it('拿不到展示名时回落到 appId，不会漏传', async () => {
+    const { d, seen } = spyClaimAgent();
+    await claimIssueIntoGroup(d, ARGS);
+    expect(seen[0].agent).toBe('cli_worker');
+  });
+
   it('群名带 claimId 标记，人被按 union_id 拉进来', async () => {
     const { d, groupOpts } = deps();
     await claimIssueIntoGroup(d, ARGS);

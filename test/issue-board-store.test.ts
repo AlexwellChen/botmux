@@ -101,6 +101,15 @@ describe('bindings', () => {
     expect(findBindingByClaimId(dataDir, 'c-random-1')).not.toBeNull(); // 反查仍能拿到，供对账
   });
 
+  // 终态有两个（void / released），漏改任何一处判断都会让已释放的 issue 仍被当成已领取：
+  // 重领被拦、回写继续发，而且全程不报错。
+  it('released 的 binding 同样不再算活跃', () => {
+    createBinding(dataDir, seed());
+    updateBinding(dataDir, 'oc_group1', { bindState: 'released' });
+    expect(findActiveBindingByIssue(dataDir, 'iss-1')).toBeNull();
+    expect(findBindingByClaimId(dataDir, 'c-random-1')).not.toBeNull();
+  });
+
   it('updateBinding 不动 anchorId/createdAt，removeBinding 删得掉', () => {
     const b = createBinding(dataDir, seed());
     const p = updateBinding(dataDir, 'oc_group1', { bindState: 'bound', chatId: 'oc_x' });

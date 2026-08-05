@@ -80,10 +80,15 @@ export type AttentionReason =
 /**
  * 一条 issue ↔ 本机会话的绑定。
  *
- * `bindState` 三态对应 §六 的三个崩溃恢复分支：
- *  - `pending`：claim 成功、binding 已落盘，但还没向平台 bind（群可能还没建出来）
- *  - `bound`  ：平台已接受 bind，本地会话可以 activate（发 kickoff @ bot）
- *  - `void`   ：补 bind 被平台拒（issue 被回收 / 别人领走 / 代次过期），这条作废
+ * `bindState` 对应 §六 的崩溃恢复分支，外加一个人为终态：
+ *  - `pending` ：claim 成功、binding 已落盘，但还没向平台 bind（群可能还没建出来）
+ *  - `bound`   ：平台已接受 bind，本地会话可以 activate（发 kickoff @ bot）
+ *  - `void`    ：补 bind 被平台拒（issue 被回收 / 别人领走 / 代次过期），这条作废
+ *  - `released`：人主动释放（[[issue-release]]），issue 已退回平台待领取池
+ *
+ * `void` 与 `released` 都是终态、都不再回写，但**不能合并**：`void` 是"平台不认这次领取"，
+ * 对账见到它要考虑群是不是白建了；`released` 是"领取本来是好的，人不做了"，群里有正经的
+ * 工作记录，对账不该去动它。区分开也让日志能说清一个群到底是怎么结束的。
  */
 export interface IssueBinding {
   /**
@@ -110,7 +115,7 @@ export interface IssueBinding {
   claimId: string;
   /** 领取代次快照——回写栅栏，旧代次的迟到回写会被平台按 stale_epoch 丢弃。 */
   claimEpoch: number;
-  bindState: 'pending' | 'bound' | 'void';
+  bindState: 'pending' | 'bound' | 'void' | 'released';
   /** 会话所在的群。拉群模式下 === anchorId；话题模式下是承载话题的那个群。
    *  崩溃恢复据此复用已建的群而不是再建一个。 */
   chatId?: string;
@@ -172,14 +177,25 @@ export function getBinding(dataDir: string, anchorId: string): IssueBinding | nu
   return readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {})[anchorId] ?? null;
 }
 
+/**
+ * 这条 binding 是否还代表「本机正持有这个 issue」。
+ *
+ * 抽成一个谓词而不是到处写 `!== 'void'`：终态从一个变成两个（`void` / `released`）时，
+ * 散落各处的判断只要漏改一处，就会出现「已释放的 issue 仍被当成已领取」——重领被拦、
+ * 回写继续发，而且全程不报错。加状态就改这一个地方。
+ */
+export function isActiveBindState(state: IssueBinding['bindState']): boolean {
+  return state === 'pending' || state === 'bound';
+}
+
 /** 按 claimId 反查——崩溃恢复的入口（§六：不依赖平台「按 claimId 查 issue」的接口，那个接口不存在）。 */
 export function findBindingByClaimId(dataDir: string, claimId: string): IssueBinding | null {
   return listBindings(dataDir).find((b) => b.claimId === claimId) ?? null;
 }
 
-/** 某 issue 当前在本机的活跃 binding（void 的不算）。用于「这个 issue 是不是我已经领了」。 */
+/** 某 issue 当前在本机的活跃 binding（作废/已释放的不算）。用于「这个 issue 是不是我已经领了」。 */
 export function findActiveBindingByIssue(dataDir: string, issueId: string): IssueBinding | null {
-  return listBindings(dataDir).find((b) => b.issueId === issueId && b.bindState !== 'void') ?? null;
+  return listBindings(dataDir).find((b) => b.issueId === issueId && isActiveBindState(b.bindState)) ?? null;
 }
 
 function writeBindings(dataDir: string, all: Record<string, IssueBinding>): void {
@@ -318,7 +334,7 @@ export function createBinding(
   const existing = Object.values(all).find((b) => b.claimId === input.claimId);
   if (existing) return existing;
   const activeSameIssue = Object.values(all).find(
-    (b) => b.issueId === input.issueId && b.bindState !== 'void',
+    (b) => b.issueId === input.issueId && isActiveBindState(b.bindState),
   );
   if (activeSameIssue) {
     throw new Error(
@@ -401,7 +417,10 @@ export function enqueueDesiredStatus(
 ): IssueOutboxRow | null {
   const bindings = readJson<Record<string, IssueBinding>>(bindingsPath(dataDir), {});
   const binding = bindings[anchorId];
-  if (!binding || binding.bindState === 'void') return null;
+  // 终态（void/released）之后不再回写：那个 issue 已经不归本机管了，继续发只会被平台拒。
+  // 释放本身也走这里，但它是在 binding 还是 bound 的时候排的行——先排队再改状态，见
+  // [[issue-release]] 的「平台先行、本地后写」。
+  if (!binding || !isActiveBindState(binding.bindState)) return null;
 
   const rows = readOutbox(dataDir);
   const mine = rows.filter((r) => r.anchorId === anchorId);
