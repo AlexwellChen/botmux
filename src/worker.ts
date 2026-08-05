@@ -7487,8 +7487,18 @@ function setupAdoptInputAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>):
   }
 }
 
+function wireIdleDetectorBusyTransition(detector: IdleDetector, label: string): void {
+  detector.onBusy(() => {
+    if (!isPromptReady) return;
+    isPromptReady = false;
+    log(`Explicit busy marker detected — ${label}`);
+    publishScreenStatus('working', { force: true });
+  });
+}
+
 function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>, label: string): void {
   idleDetector = new IdleDetector(adoptIdleAdapter(cfg));
+  wireIdleDetectorBusyTransition(idleDetector, `${label} adopt mode`);
   idleDetector.onIdle(() => {
     if (backend && deferPromptReadyWhileBusy(`${label} adopt-idle`, backend)) return;
     log(`Prompt detected (idle) — ${label} adopt mode`);
@@ -9948,6 +9958,7 @@ async function spawnCli(
   // quiescence, repeatedly triggering markPromptReady() and duplicate cards.
   if (effectiveBackendType !== 'riff') {
     idleDetector = new IdleDetector(cliAdapter);
+    wireIdleDetectorBusyTransition(idleDetector, `${cliName()} PTY`);
     idleDetector.onIdle(async (evidenceSource) => {
       log('Prompt detected (idle)');
       // Snapshot-only backends (ZMX) must complete one authoritative refresh
