@@ -496,7 +496,7 @@ export function claimNextOutboxRow(
 export function settleOutboxRow(
   dataDir: string,
   writeId: string,
-  result: { platformStateRev?: number },
+  result: { platformStateRev?: number; platformLastSourceSeq?: number },
   now: number = Date.now(),
 ): void {
   const rows = readOutbox(dataDir);
@@ -505,12 +505,26 @@ export function settleOutboxRow(
   const row = rows[idx];
   rows[idx] = { ...row, state: 'done' };
   writeOutbox(dataDir, rows);
+  const binding = getBinding(dataDir, row.anchorId);
+  // 用平台回传的 `claim.lastSourceSeq` 校准本地计数器。
+  //
+  // 平台才是「已应用到哪一号」的权威：它按 `sourceSeq <= lastSourceSeq` 判重，本地计数器
+  // 一旦落后（dataDir 从旧快照恢复、文件被外部改、其它路径抢跑过序号），之后每一条回写都
+  // 会被静默丢弃——平台回 200、本地记成功、状态却永远上不去。真机 e2e 里就撞到过这一幕。
+  //
+  // 单写者假设下计数器本该恒领先，所以这只是兜底；但代价是一次 max()，而漏掉的代价是
+  // 无声的状态停更，值得。
+  const syncedSeq =
+    result.platformLastSourceSeq !== undefined && binding
+      ? Math.max(binding.nextSourceSeq, result.platformLastSourceSeq + 1)
+      : undefined;
   updateBinding(
     dataDir,
     row.anchorId,
     {
       lastSyncedStatus: row.targetStatus,
       ...(result.platformStateRev !== undefined ? { platformStateRev: result.platformStateRev } : {}),
+      ...(syncedSeq !== undefined && syncedSeq !== binding?.nextSourceSeq ? { nextSourceSeq: syncedSeq } : {}),
     },
     now,
   );

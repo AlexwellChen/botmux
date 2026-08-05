@@ -381,3 +381,34 @@ describe('claim 意图（补 claim 成功→建群之间的窗口）', () => {
     expect(() => recordClaimIntent(dataDir, intent())).not.toThrow();
   });
 });
+
+describe('用平台 lastSourceSeq 校准本地计数器', () => {
+  beforeEach(() => createBinding(dataDir, seed()));
+
+  // 真机 e2e 撞到过：本地计数器落后于平台已应用的序号后，之后每条回写都被平台按单调判重
+  // 静默丢弃——平台回 200、本地 settle 成功、状态却永远上不去。平台是权威，settle 时校准。
+  it('平台 lastSourceSeq 领先时把计数器顶上去', () => {
+    enqueueDesiredStatus(dataDir, 'oc_group1', 'in_progress');
+    const row = claimNextOutboxRow(dataDir, 'oc_group1')!;
+    settleOutboxRow(dataDir, row.writeId, { platformStateRev: 5, platformLastSourceSeq: 14 });
+    expect(getBinding(dataDir, 'oc_group1')!.nextSourceSeq).toBe(15);
+    // 下一条排队即领先平台，不会再被判重丢弃
+    expect(enqueueDesiredStatus(dataDir, 'oc_group1', 'done')!.sourceSeq).toBe(15);
+  });
+
+  it('平台落后于本地时不回退计数器（单调只增）', () => {
+    enqueueDesiredStatus(dataDir, 'oc_group1', 'in_progress');
+    const row = claimNextOutboxRow(dataDir, 'oc_group1')!;
+    settleOutboxRow(dataDir, row.writeId, { platformLastSourceSeq: 0 });
+    expect(getBinding(dataDir, 'oc_group1')!.nextSourceSeq).toBe(2);
+  });
+
+  it('不传 lastSourceSeq 时行为不变（老调用方不受影响）', () => {
+    enqueueDesiredStatus(dataDir, 'oc_group1', 'in_progress');
+    const row = claimNextOutboxRow(dataDir, 'oc_group1')!;
+    settleOutboxRow(dataDir, row.writeId, { platformStateRev: 3 });
+    const b = getBinding(dataDir, 'oc_group1')!;
+    expect(b.nextSourceSeq).toBe(2);
+    expect(b.platformStateRev).toBe(3);
+  });
+});
