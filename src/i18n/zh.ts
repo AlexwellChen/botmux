@@ -573,7 +573,7 @@ export const messages: Record<string, string> = {
   'help.card': '/card       - 手动弹出当前会话的流式卡片（关流式时也能临时召唤，并恢复实时刷新；开了私密卡片则改发仅授权人可见的静态快照）',
   'help.term': '/term       - 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露）',
   'help.dashboard': '/dashboard [模块] - 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等）',
-  'help.issue': '/issue      - 打开 Issue Board 看板，直接在卡片上领取平台任务（自动建群并开工）；`/issue release` 在任务群里释放领取，任务退回待领取',
+  'help.issue': '/issue      - 打开 Issue Board 看板，直接在卡片上领取平台任务（自动建群并开工）；任务群里可发 `/issue status` 查现状、`/issue done` 验收完成、`/issue release` 退回待领取',
   'help.insight': '/insight    - 查看当前会话的工具调用摘要与风险建议（operator 专用）',
   'help.subscribe_doc': '/subscribe-lark-doc <文档链接|list|off> - 通过飞书 API 订阅文档（需要文档 User Token）',
   'help.watch_comment': '/watch-comment <文档链接|list|off> - 监听文档评论并把 AI 回复发回评论串',

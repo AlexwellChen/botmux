@@ -9,6 +9,7 @@ import {
   truncateDisplay,
   buildIssueKickoffCard,
   buildIssueDeliveryCard,
+  buildIssueStatusCard,
   claimFailureHint,
   matchRepo,
   rankRepos,
@@ -295,6 +296,76 @@ describe('交付播报卡', () => {
   });
 });
 
+// 这张卡的价值不是"报个状态"，而是把本机与平台的**不一致**摆出来——那三种情况平时都是静默的。
+describe('现状卡', () => {
+  const base = {
+    issueId: 'iss-1',
+    bindState: 'bound',
+    pendingWrites: 0,
+    platform: { title: '修一个 bug', status: 'in_progress' },
+    claimMine: true,
+  };
+
+  it('状态用人话，不出现 in_review 这种内部词', () => {
+    const flat = buildIssueStatusCard({ ...base, platform: { title: 'x', status: 'in_review' } });
+    expect(flat).toContain('待验收');
+    expect(flat).not.toContain('in_review');
+  });
+
+  it('本地绑定状态也翻成人话', () => {
+    expect(buildIssueStatusCard({ ...base, bindState: 'done' })).toContain('已验收完成');
+    expect(buildIssueStatusCard({ ...base, bindState: 'released' })).toContain('已释放');
+  });
+
+  // 领取被收走后群里继续干的活没人收，这是最该被看见的一条。
+  it('claim 不归本机时顶格警告', () => {
+    const flat = buildIssueStatusCard({ ...base, claimMine: false });
+    expect(flat).toContain('已经不归本机');
+  });
+
+  it('claim 仍在本机时不警告', () => {
+    expect(buildIssueStatusCard(base)).not.toContain('已经不归本机');
+  });
+
+  // 拉不到 ≠ 不存在：findIssueById 的 null 覆盖网络失败与已归档两种，不能替人下结论。
+  it('拉不到平台状态时说"拉不到"，不说"任务不存在"', () => {
+    const flat = buildIssueStatusCard({ issueId: 'iss-1', bindState: 'bound', pendingWrites: 0 });
+    expect(flat).toContain('拉不到');
+    expect(flat).not.toContain('不存在');
+  });
+
+  it('有积压回写时说明有几条、后台会重投', () => {
+    const flat = buildIssueStatusCard({ ...base, pendingWrites: 2 });
+    expect(flat).toContain('2');
+    expect(flat).toContain('重投');
+    expect(buildIssueStatusCard(base)).not.toContain('重投');
+  });
+
+  it('需要关注时把原因翻成人话', () => {
+    const flat = buildIssueStatusCard({
+      ...base,
+      platform: { title: 'x', status: 'needs_attention', attentionReason: 'claim_activate_timeout' },
+    });
+    expect(flat).toContain('需要关注');
+    expect(flat).toContain('5 分钟内没有开工回写');
+  });
+
+  // 平台上的标题/领取人都是人自由填的，同样会被 lark_md 击穿。
+  it('转义平台来的文本', () => {
+    const flat = buildIssueStatusCard({
+      ...base,
+      platform: { title: '</font><at user_id="all"></at>', status: 'in_progress', claimAgent: 'a`b' },
+    });
+    expect(flat).not.toContain('<at user_id=');
+    expect(flat).toContain('&lt;at');
+  });
+
+  it('有平台地址才给按钮', () => {
+    expect(buildIssueStatusCard({ ...base, issueUrl: 'https://p/?issue=iss-1#issues' })).toContain('在平台上查看');
+    expect(buildIssueStatusCard(base)).not.toContain('在平台上查看');
+  });
+});
+
 function renderBoard(sections: any = {}, page = 0) {
   return buildIssueBoardCard(board({
     sections: { needsAttention: [], todo: [], inProgress: [], inReview: [], done: [], ...sections },
@@ -374,5 +445,29 @@ describe('待领取翻页', () => {
     const flat = renderBoard({ todo: many }, 99);
     expect(flat).toContain('3/3');
     expect(flat).toContain('任务11');
+  });
+});
+
+// 任务 id 是人要照着复制的东西。escapeLarkMd 给 `_` 加反斜杠，而反斜杠在代码块里是字面量，
+// 复制走的就成了 `iss\_f93d…` —— 错的 id。
+describe('行内代码块', () => {
+  const ID = 'iss_f93d7d54f212da8f27f9014a';
+
+  it('任务 id 不被反斜杠转义', () => {
+    for (const flat of [
+      buildIssueStatusCard({ issueId: ID, bindState: 'bound', pendingWrites: 0 }),
+      buildIssueDeliveryCard({ issueId: ID, report: 'x' }),
+      buildIssueKickoffCard({ title: 't', workingDir: '/w/a_b', issueId: ID }),
+    ]) {
+      expect(flat).toContain(ID);
+      expect(flat).not.toContain('iss\\\\_');
+    }
+  });
+
+  // 代码块里唯一能击穿它的是反引号：漏掉的话后面半张卡会变成代码块。
+  it('反引号被去掉，卡片结构不被击穿', () => {
+    const flat = buildIssueStatusCard({ issueId: 'a`b`c', bindState: 'bound', pendingWrites: 0 });
+    const line = JSON.parse(flat).elements.map((e: any) => e.text?.content ?? '').find((c: string) => c.includes('平台任务'));
+    expect(line).toContain('`abc`');
   });
 });

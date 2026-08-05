@@ -16,11 +16,13 @@ import {
   findIssueById,
   writeIssueStatus,
 } from '../../platform/issue-client.js';
-import { claimIssueIntoGroup } from '../../services/issue-claim-flow.js';
-import { releaseIssue } from '../../services/issue-release.js';
+import { claimIssueIntoGroup, issueDetailUrl } from '../../services/issue-claim-flow.js';
+import { completeIssue, releaseIssue } from '../../services/issue-release.js';
+import { describeIssue } from '../../services/issue-status-view.js';
 import { createGroupWithBots } from '../../services/group-creator.js';
+import { buildIssueStatusCard } from './issue-card.js';
 import { sendMessage } from './client.js';
-import type { IssueCommandDeps } from './issue-command.js';
+import type { IssueCommandDeps, TerminalResult } from './issue-command.js';
 
 /**
  * kickoff 正文。写给 agent 看，所以要把它开工需要的一切都说全：干什么、在哪干、
@@ -185,19 +187,64 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
       return { ok: false, stage: r.stage, reason: r.reason };
     },
 
-    runRelease: async (anchorId: string) => {
-      const r = await releaseIssue(
-        {
-          dataDir: config.session.dataDir,
-          writeStatus: (issueId, args) => writeIssueStatus(issueId, args) as any,
-          fetchIssue: (teamId, issueId) => findIssueById(teamId, issueId),
-        },
+    runRelease: (anchorId: string) => settle(releaseIssue, anchorId),
+    runDone: (anchorId: string) => settle(completeIssue, anchorId),
+
+    runStatus: async (anchorId: string) => {
+      const r = await describeIssue(
+        { dataDir: config.session.dataDir, fetchIssue: (teamId, issueId) => findIssueById(teamId, issueId) },
         anchorId,
       );
-      if (r.ok) {
-        return { ok: true, issueId: r.issueId, alreadyReleasedOnPlatform: r.alreadyReleasedOnPlatform };
-      }
-      return { ok: false, reason: r.reason, ...(r.reason === 'platform' ? { detail: r.detail } : {}) };
+      if (!r.ok) return { ok: false, reason: r.reason };
+      const { binding, issue, pendingWrites, claimMine } = r.view;
+      const url = issueDetailUrl(binding.platformBaseUrl, binding.issueId);
+      return {
+        ok: true,
+        card: buildIssueStatusCard({
+          issueId: binding.issueId,
+          bindState: binding.bindState,
+          pendingWrites,
+          ...(binding.lastSyncedStatus ? { lastSyncedStatus: binding.lastSyncedStatus } : {}),
+          ...(claimMine !== undefined ? { claimMine } : {}),
+          ...(issue
+            ? {
+                platform: {
+                  title: issue.title,
+                  status: issue.status,
+                  ...(issue.attentionReason ? { attentionReason: issue.attentionReason } : {}),
+                  ...(issue.claim?.agent ? { claimAgent: issue.claim.agent } : {}),
+                  ...(issue.claim?.localTaskLabel ? { claimLabel: issue.claim.localTaskLabel } : {}),
+                },
+              }
+            : {}),
+          ...(url ? { issueUrl: url } : {}),
+        }),
+      };
     },
+  };
+}
+
+/** 释放与验收完成只差目标态，出参形状一致，装配也就共用一份。 */
+async function settle(
+  run: typeof releaseIssue,
+  anchorId: string,
+): Promise<TerminalResult> {
+  const r = await run(
+    {
+      dataDir: config.session.dataDir,
+      writeStatus: (issueId, args) => writeIssueStatus(issueId, args) as any,
+      fetchIssue: (teamId, issueId) => findIssueById(teamId, issueId),
+    },
+    anchorId,
+  );
+  if (r.ok) {
+    return { ok: true, issueId: r.issueId, alreadyReleasedOnPlatform: r.alreadyReleasedOnPlatform };
+  }
+  return {
+    ok: false,
+    reason: r.reason,
+    ...(r.reason === 'platform' ? { detail: r.detail } : {}),
+    // 终态是哪一种决定了给人的说法（作废 / 已释放 / 已完成）。
+    ...(r.reason === 'already_released' ? { bindState: r.binding.bindState } : {}),
   };
 }

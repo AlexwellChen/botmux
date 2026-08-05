@@ -85,10 +85,14 @@ export type AttentionReason =
  *  - `bound`   ：平台已接受 bind，本地会话可以 activate（发 kickoff @ bot）
  *  - `void`    ：补 bind 被平台拒（issue 被回收 / 别人领走 / 代次过期），这条作废
  *  - `released`：人主动释放（[[issue-release]]），issue 已退回平台待领取池
+ *  - `done`    ：人验收通过（`/issue done`），平台已终结这条 issue
  *
- * `void` 与 `released` 都是终态、都不再回写，但**不能合并**：`void` 是"平台不认这次领取"，
- * 对账见到它要考虑群是不是白建了；`released` 是"领取本来是好的，人不做了"，群里有正经的
- * 工作记录，对账不该去动它。区分开也让日志能说清一个群到底是怎么结束的。
+ * 三个终态都不再回写，但**不能合并**：`void` 是"平台不认这次领取"，对账见到它要考虑群是不是
+ * 白建了；`released` 是"领取本来是好的，人不做了"，群里有正经的工作记录，对账不该去动它；
+ * `done` 是"活干完并且验收了"。区分开也让日志能说清一个群到底是怎么结束的。
+ *
+ * 加终态时只改 `isActiveBindState` 一处——散落的 `!== 'void'` 式判断漏改一处，就会出现
+ * 「已结束的 issue 仍被当成本机持有」，而且全程不报错。
  */
 export interface IssueBinding {
   /**
@@ -115,7 +119,7 @@ export interface IssueBinding {
   claimId: string;
   /** 领取代次快照——回写栅栏，旧代次的迟到回写会被平台按 stale_epoch 丢弃。 */
   claimEpoch: number;
-  bindState: 'pending' | 'bound' | 'void' | 'released';
+  bindState: 'pending' | 'bound' | 'void' | 'released' | 'done';
   /** 会话所在的群。拉群模式下 === anchorId；话题模式下是承载话题的那个群。
    *  崩溃恢复据此复用已建的群而不是再建一个。 */
   chatId?: string;

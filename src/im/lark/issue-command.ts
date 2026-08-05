@@ -56,12 +56,26 @@ export interface IssueCommandDeps {
   allowedUsers: (larkAppId: string) => string[];
   /** 该 bot 配置的工作目录（未展开 `~`）。 */
   workingDirs: (larkAppId: string) => string[];
-  /** 跑 [[issue-release]]。按锚点释放，锚点由调用方从当前会话推出来。 */
-  runRelease: (anchorId: string) => Promise<
-    | { ok: true; issueId: string; alreadyReleasedOnPlatform: boolean }
-    | { ok: false; reason: 'no_binding' | 'already_released' | 'platform'; detail?: string }
+  /** 跑 [[issue-release]] 的 `releaseIssue`。按锚点释放，锚点由调用方从当前会话推出来。 */
+  runRelease: (anchorId: string) => Promise<TerminalResult>;
+  /** 跑 [[issue-release]] 的 `completeIssue`（验收完成）。与释放同形，只是目标态不同。 */
+  runDone: (anchorId: string) => Promise<TerminalResult>;
+  /** 跑 [[issue-status-view]]。只读，用来渲染 `/issue status` 卡片。 */
+  runStatus: (anchorId: string) => Promise<
+    | { ok: true; card: string }
+    | { ok: false; reason: 'no_binding' }
   >;
 }
+
+/**
+ * 释放 / 验收完成的共同返回形状。
+ *
+ * `bindState` 只在 `already_released` 时有意义：三个终态（void / released / done）要说的话
+ * 完全不同——"作废了"、"早就释放过了"、"已经验收完成了"——糊成一句人会以为自己记错了。
+ */
+export type TerminalResult =
+  | { ok: true; issueId: string; alreadyReleasedOnPlatform: boolean }
+  | { ok: false; reason: 'no_binding' | 'already_released' | 'platform'; detail?: string; bindState?: string };
 
 /** 命令入口的返回：card 是卡片 JSON 字符串，直接喂 `sessionReply(..., 'interactive')`。 */
 export type IssueCardResult = { card: string } | { toast: { type: 'error' | 'info'; content: string } };
@@ -165,64 +179,148 @@ export async function handleIssueCommand(
   return buildBoard(larkAppId, deps, { invokerOpenId: senderOpenId });
 }
 
+type Toast = { toast: { type: 'error' | 'info'; content: string } };
+
+function info(content: string): Toast {
+  return { toast: { type: 'info', content } };
+}
+function err(content: string): Toast {
+  return { toast: { type: 'error', content } };
+}
+
+/** 管理员门。三个群内命令共用；通过时返回 undefined。 */
+function adminGate(larkAppId: string, senderOpenId: string | undefined, deps: IssueCommandDeps): Toast | undefined {
+  if (!senderOpenId) return err('无法识别操作者身份');
+  const admins = deps.allowedUsers(larkAppId);
+  if (!admins.length) return err('这个 bot 还没有配置管理员');
+  if (!admins.includes(senderOpenId)) return err('只有管理员可以操作 Issue Board');
+  return undefined;
+}
+
 /**
- * `/issue release` → 释放当前会话领取的那个 issue。
+ * 依次试锚点，返回第一个「不是 no_binding」的结果。
  *
- * 在**领取时建出来的那个群里**发。锚点候选按 [[core/types]] 的 `sessionAnchorId` 语义给：
- * 拉群会话锚在 chatId、话题会话锚在 rootMessageId。调用方两个都传，这里依次试——比让
- * 调用方先判 scope 简单，两个地址空间（`oc_` / `om_`）不会撞，试错没有歧义。
+ * 锚点候选按 [[core/types]] 的 `sessionAnchorId` 语义给：拉群会话锚在 chatId、话题会话锚在
+ * rootMessageId。调用方两个都传、这里依次试——比让调用方先判 scope 简单，两个地址空间
+ * （`oc_` / `om_`）不会撞，试错没有歧义。
  *
- * 返回文本而不是卡片：这是个一次性动作，结果就一句话，发张卡反而重。
+ * 只要有一个锚点给出了非 no_binding 的结果就停：继续试下去会把真实失败盖成"没有领取记录"。
+ */
+async function tryAnchors<R extends { ok: boolean; reason?: string }>(
+  anchorCandidates: Array<string | undefined>,
+  run: (anchorId: string) => Promise<R>,
+): Promise<R | undefined> {
+  let last: R | undefined;
+  for (const anchorId of anchorCandidates.filter((a): a is string => !!a)) {
+    last = await run(anchorId);
+    if (last.ok || last.reason !== 'no_binding') break;
+  }
+  return last;
+}
+
+/** 三个终态 bindState 各自的说法。糊成一句「已结束」人会以为自己记错了。 */
+function terminalHint(bindState: string | undefined): string {
+  if (bindState === 'done') return '这条任务已经验收完成（done），平台上已经终结了。';
+  if (bindState === 'void') return '这条领取此前被平台拒绝、已作废，无需再操作。';
+  return '这条领取此前就已经释放了，无需重复操作。';
+}
+
+/**
+ * `/issue release` → 释放当前会话领取的那个 issue，退回平台「待领取」。
+ *
+ * 在**领取时建出来的那个群里**发。返回文本而不是卡片：这是个一次性动作，结果就一句话，
+ * 发张卡反而重。
  */
 export async function handleIssueRelease(
   larkAppId: string,
   senderOpenId: string | undefined,
   anchorCandidates: Array<string | undefined>,
   deps: IssueCommandDeps,
-): Promise<{ toast: { type: 'error' | 'info'; content: string } }> {
-  if (!senderOpenId) return { toast: { type: 'error', content: '无法识别操作者身份' } };
-  const admins = deps.allowedUsers(larkAppId);
-  if (!admins.length) return { toast: { type: 'error', content: '这个 bot 还没有配置管理员' } };
-  if (!admins.includes(senderOpenId)) {
-    return { toast: { type: 'error', content: '只有管理员可以操作 Issue Board' } };
-  }
+): Promise<Toast> {
+  const denied = adminGate(larkAppId, senderOpenId, deps);
+  if (denied) return denied;
 
-  const anchors = anchorCandidates.filter((a): a is string => !!a);
-  if (!anchors.length) return { toast: { type: 'error', content: '拿不到当前会话的锚点，无法定位领取记录' } };
-
-  // 逐个试，把「真的没有绑定」和「有绑定但释放失败」分开：只要有一个锚点给出了非
-  // no_binding 的结果，那就是它，别再往下试（试下去会把真实失败盖成"没有领取记录"）。
-  let last: Awaited<ReturnType<IssueCommandDeps['runRelease']>> | undefined;
-  for (const anchorId of anchors) {
-    last = await deps.runRelease(anchorId);
-    if (last.ok || last.reason !== 'no_binding') break;
-  }
-  if (!last) return { toast: { type: 'error', content: '拿不到当前会话的锚点，无法定位领取记录' } };
+  const last = await tryAnchors(anchorCandidates, deps.runRelease);
+  if (!last) return err('拿不到当前会话的锚点，无法定位领取记录');
 
   if (last.ok) {
     logger.info(`[issue] 释放成功 issue=${last.issueId} platform_already=${last.alreadyReleasedOnPlatform}`);
-    return {
-      toast: {
-        type: 'info',
-        content: last.alreadyReleasedOnPlatform
-          ? `✅ 已释放。平台上这条任务此前就已经不归本机了（可能被回收或已被别人领走），本机记录已同步。\n\n群和会话都还在，需要的话自己停会话或退群。`
-          : `✅ 已释放，任务已退回平台「待领取」，别人可以领了。\n\n群和会话都还在，**不会自动解散**——里面的对话记录还留着，要停会话发 \`/stop\`。`,
-      },
-    };
+    return info(
+      last.alreadyReleasedOnPlatform
+        ? '✅ 已释放。平台上这条任务此前就已经不归本机了（可能被回收或已被别人领走），本机记录已同步。\n\n群和会话都还在，需要的话自己停会话或退群。'
+        : '✅ 已释放，任务已退回平台「待领取」，别人可以领了。\n\n群和会话都还在，**不会自动解散**——里面的对话记录还留着，要停会话发 `/stop`。',
+    );
   }
-  if (last.reason === 'no_binding') {
-    return { toast: { type: 'error', content: '这个会话没有领取任何平台任务，没什么可释放的。' } };
-  }
-  if (last.reason === 'already_released') {
-    return { toast: { type: 'info', content: '这条领取此前就已经释放/作废了，无需重复操作。' } };
-  }
+  if (last.reason === 'no_binding') return err('这个会话没有领取任何平台任务，没什么可释放的。');
+  if (last.reason === 'already_released') return info(terminalHint(last.bindState));
+
   logger.warn(`[issue] 释放失败 detail=${last.detail}`);
-  return {
-    toast: {
-      type: 'error',
-      content: `❌ 释放失败：${last.detail}\n\n本机记录保持不变（平台仍认为这台机器持有），稍后可以再发一次 \`/issue release\`。`,
-    },
-  };
+  return err(
+    `❌ 释放失败：${last.detail}\n\n本机记录保持不变（平台仍认为这台机器持有），稍后可以再发一次 \`/issue release\`。`,
+  );
+}
+
+/**
+ * `/issue done` → 验收通过，把任务推到平台的终态。
+ *
+ * 这一步是**人的决策**，不是 agent 能自己走的：agent 交付只到「待验收」（[[issue-report]]），
+ * 之后由人看过产出再决定完成还是打回。所以入口是群里的管理员命令，而不是 `botmux` 的某个
+ * 子命令——放在 CLI 里 agent 就能自己盖章验收，那这个状态就没有意义了。
+ *
+ * 平台侧 `done` 会清掉 claim（`clearsClaim`），这条领取就此终结、不能再释放。
+ */
+export async function handleIssueDone(
+  larkAppId: string,
+  senderOpenId: string | undefined,
+  anchorCandidates: Array<string | undefined>,
+  deps: IssueCommandDeps,
+): Promise<Toast> {
+  const denied = adminGate(larkAppId, senderOpenId, deps);
+  if (denied) return denied;
+
+  const last = await tryAnchors(anchorCandidates, deps.runDone);
+  if (!last) return err('拿不到当前会话的锚点，无法定位领取记录');
+
+  if (last.ok) {
+    logger.info(`[issue] 验收完成 issue=${last.issueId} platform_already=${last.alreadyReleasedOnPlatform}`);
+    return info(
+      last.alreadyReleasedOnPlatform
+        ? '✅ 已标记完成。平台上这条任务此前就已经不归本机了，本机记录已同步。\n\n群和会话都还在，需要的话自己停会话或退群。'
+        : '🎉 已验收完成，平台上这条任务已终结（不能再释放了）。\n\n群和会话都还在，**不会自动解散**——要停会话发 `/stop`。',
+    );
+  }
+  if (last.reason === 'no_binding') return err('这个会话没有领取任何平台任务，没什么可验收的。');
+  if (last.reason === 'already_released') return info(terminalHint(last.bindState));
+
+  logger.warn(`[issue] 验收完成失败 detail=${last.detail}`);
+  // 平台的追赶白名单不允许 needs_attention → done。这是设计而不是故障，得说清楚下一步。
+  const blocked = /invalid_transition/.test(last.detail ?? '');
+  return err(
+    blocked
+      ? `❌ 平台拒绝了这次状态变更：${last.detail}\n\n多半是这条任务当前在「需要关注」——平台不允许从那里直接标完成。先去平台上处理（或发 \`/issue release\` 退回待领取）。`
+      : `❌ 标记完成失败：${last.detail}\n\n本机记录保持不变，稍后可以再发一次 \`/issue done\`。`,
+  );
+}
+
+/**
+ * `/issue status` → 摊开本机与平台两边的现状。
+ *
+ * 只读，所以**不设终态门**：这个命令的用处恰恰是在「这个群是不是已经结束了」存疑的时候
+ * 回答它，把终态 binding 当成"没有绑定"是把唯一的答案藏起来。
+ */
+export async function handleIssueStatus(
+  larkAppId: string,
+  senderOpenId: string | undefined,
+  anchorCandidates: Array<string | undefined>,
+  deps: IssueCommandDeps,
+): Promise<IssueCardResult> {
+  const denied = adminGate(larkAppId, senderOpenId, deps);
+  if (denied) return denied;
+
+  const last = await tryAnchors(anchorCandidates, deps.runStatus);
+  if (!last) return toast('拿不到当前会话的锚点，无法定位领取记录');
+  if (!last.ok) return toast('这个会话没有领取任何平台任务。');
+  return { card: last.card };
 }
 
 /** 卡片回调。所有 `issue_*` action 都走这里。 */

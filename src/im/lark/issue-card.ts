@@ -177,6 +177,17 @@ export function escapeLarkMd(s: string): string {
 }
 
 /**
+ * 行内代码块的安全渲染。
+ *
+ * **不能**拿 `escapeLarkMd` 往代码块里塞：它给 `_` `*` 这些加反斜杠，而反斜杠在代码块里是
+ * **字面量**——`iss_f93d7d54…` 会显示成 `iss\_f93d7d54…`，人照着复制走的是错的任务 id。
+ * 代码块里唯一能击穿它的是反引号本身（换行同理，会把块撑破），去掉这两样就够。
+ */
+function code(s: string): string {
+  return `\`${s.replace(/[`\r\n]+/g, '')}\``;
+}
+
+/**
  * 按**显示宽度**截断（CJK 算两列），不是按字符数。
  *
  * 按 `length` 截会让中英文两种标题在卡片上宽窄差一倍：30 个汉字铺满两行，30 个字母才半行。
@@ -467,8 +478,8 @@ export function buildIssueKickoffCard(data: IssueKickoffCardData, _locale?: Loca
   }
 
   elements.push({ tag: 'hr' });
-  elements.push(h(`📁 工作目录　\`${data.workingDir}\``));
-  elements.push(h(`🔖 平台任务　\`${data.issueId}\``));
+  elements.push(h(`📁 工作目录　${code(data.workingDir)}`));
+  elements.push(h(`🔖 平台任务　${code(data.issueId)}`));
 
   if (data.issueUrl) {
     elements.push({
@@ -485,8 +496,13 @@ export function buildIssueKickoffCard(data: IssueKickoffCardData, _locale?: Loca
   }
 
   elements.push({ tag: 'hr' });
-  // 释放入口只在这里露出来。不说的话人不会知道有这个命令，只能去平台上 force-detach。
-  elements.push(h('_做完会自动汇报。不想做了就在本群发 `/issue release`，任务退回「待领取」（群不会解散）。_'));
+  // 这三个命令只在这里露出来。不写的话人根本不知道它们存在，遇事只能去平台上 force-detach。
+  elements.push(
+    h(
+      '_做完会自动汇报。本群可用：`/issue status` 看现状 · `/issue done` 验收完成 ·'
+      + ' `/issue release` 退回「待领取」（群都不会解散）。_',
+    ),
+  );
   return JSON.stringify({ config: { wide_screen_mode: true }, elements });
 }
 
@@ -529,7 +545,7 @@ export function buildIssueDeliveryCard(data: IssueDeliveryCardData, _locale?: Lo
   }
 
   elements.push({ tag: 'hr' });
-  elements.push(h(`🔖 平台任务　\`${escapeLarkMd(data.issueId)}\``));
+  elements.push(h(`🔖 平台任务　${code(data.issueId)}`));
   if (data.issueUrl) {
     elements.push({
       tag: 'action',
@@ -538,6 +554,121 @@ export function buildIssueDeliveryCard(data: IssueDeliveryCardData, _locale?: Lo
           tag: 'button',
           text: { tag: 'plain_text', content: '去平台验收' },
           type: 'primary',
+          url: data.issueUrl,
+          value: {},
+        },
+      ],
+    });
+  }
+  return JSON.stringify({ config: { wide_screen_mode: true }, elements });
+}
+
+/** 平台状态 → 人话。卡上不该出现 `in_review` 这种只有读过代码的人才懂的词。 */
+const STATUS_LABEL: Record<string, string> = {
+  open: '⚪️ 待领取',
+  claimed: '🟣 已领取（还没开工）',
+  in_progress: '🔵 进行中',
+  in_review: '🟡 待验收',
+  done: '✅ 已完成',
+  cancelling: '🟠 取消中',
+  needs_attention: '🔴 需要关注',
+  reopened: '🔁 已重开',
+};
+
+/** 需要关注的原因 → 人话。不翻译的话卡上只有一串下划线命名，等于没说。 */
+const ATTENTION_LABEL: Record<string, string> = {
+  cancel_delivery_timeout: '取消指令迟迟没有回执',
+  claim_activate_timeout: '领取后 5 分钟内没有开工回写',
+  task_blocked: 'agent 报告被卡住',
+  run_timeout: '运行超时',
+};
+
+/** 本地绑定状态 → 人话。终态各有各的含义，别糊成一句「已结束」。 */
+const BIND_STATE_LABEL: Record<string, string> = {
+  pending: '已领取，还没向平台绑定',
+  bound: '已绑定，本机正持有',
+  void: '绑定被平台拒绝，已作废',
+  released: '已释放，任务退回平台',
+  done: '已验收完成',
+};
+
+export interface IssueStatusCardData {
+  issueId: string;
+  bindState: string;
+  /** 平台侧现状。undefined = 没拉到（网络/已归档），卡上必须说成"拉不到"而不是"没有"。 */
+  platform?: {
+    title: string;
+    status: string;
+    attentionReason?: string;
+    claimAgent?: string;
+    claimLabel?: string;
+  };
+  /** 平台上这条 claim 是否还归本机。undefined = 无法判定。 */
+  claimMine?: boolean;
+  /** 发件箱里还没发出去的回写条数。 */
+  pendingWrites: number;
+  /** 本机认为已同步到的状态（用于和平台对照）。 */
+  lastSyncedStatus?: string;
+  issueUrl?: string;
+}
+
+/**
+ * `/issue status`：本机与平台两边的现状对照。
+ *
+ * 卡片的重点不是"报个状态"，而是把**两边不一致**摆出来——回写卡在发件箱、claim 已经被平台
+ * 收走、任务掉进需要关注，这三种情况在出问题时都是静默的，人只有主动查才看得见。所以：
+ *  - claim 不归本机 → 顶格红字警告（这个群继续干下去的产出没人收）
+ *  - 有待发回写 → 明说有几条、后台会重投，免得人以为状态更新丢了
+ *  - 平台拉不到 → 说"拉不到"，绝不说"任务不存在"（`findIssueById` 的 null 本就无法区分二者）
+ */
+export function buildIssueStatusCard(data: IssueStatusCardData, _locale?: Locale): string {
+  const elements: any[] = [];
+  const p = data.platform;
+
+  elements.push(h(`🔎 **任务现状**${p ? `：${escapeLarkMd(truncateDisplay(p.title, 60))}` : ''}`));
+
+  if (data.claimMine === false) {
+    elements.push(
+      h('🔴 **平台上这条任务的领取已经不归本机**（被回收、租约过期或已被别人领走）。本群再干下去的产出，平台这边不会记在这条任务上。'),
+    );
+  }
+
+  elements.push({ tag: 'hr' });
+  if (p) {
+    const status = STATUS_LABEL[p.status] ?? escapeLarkMd(p.status);
+    const reason = p.attentionReason ? ATTENTION_LABEL[p.attentionReason] ?? escapeLarkMd(p.attentionReason) : undefined;
+    elements.push(h(`平台状态　${status}${reason ? `　<font color="grey">（${reason}）</font>` : ''}`));
+    if (p.claimAgent || p.claimLabel) {
+      const who = [p.claimAgent, p.claimLabel].filter(Boolean).map((x) => escapeLarkMd(truncateDisplay(String(x), 40)));
+      elements.push(h(`领取人　　<font color="grey">${who.join('　·　')}</font>`));
+    }
+  } else {
+    // 拉不到 ≠ 不存在：findIssueById 的 null 同时covers 网络失败与已归档，不能替人下结论。
+    elements.push(h('平台状态　<font color="grey">拉不到（平台不可达，或这条任务已归档）</font>'));
+  }
+
+  elements.push(
+    h(
+      `本机绑定　${escapeLarkMd(BIND_STATE_LABEL[data.bindState] ?? data.bindState)}`
+      + (data.lastSyncedStatus ? `　<font color="grey">已同步到 ${STATUS_LABEL[data.lastSyncedStatus] ?? escapeLarkMd(data.lastSyncedStatus)}</font>` : ''),
+    ),
+  );
+
+  if (data.pendingWrites > 0) {
+    elements.push(
+      h(`⏳ 还有 **${data.pendingWrites}** 条状态回写没发出去，后台每 30 秒重投一次（不用手动重试）。`),
+    );
+  }
+
+  elements.push({ tag: 'hr' });
+  elements.push(h(`🔖 平台任务　${code(data.issueId)}`));
+  if (data.issueUrl) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '在平台上查看' },
           url: data.issueUrl,
           value: {},
         },

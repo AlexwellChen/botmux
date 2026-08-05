@@ -32,6 +32,7 @@ import {
   enqueueDesiredStatus,
   failOutboxRow,
   getBinding,
+  isActiveBindState,
   settleOutboxRow,
   type AttentionReason,
   type IssueStatus,
@@ -161,9 +162,7 @@ export async function projectStatus(
     // enqueue 返回 null 有三种情况，要分开：终态 binding（no_binding 语义）、已经同步
     // 到位（idle）、有 inflight 挡着（busy）。混成一个"失败"会让调用方分不清
     // "已经是这个状态了" 和 "发不出去"。
-    if (binding.bindState !== 'pending' && binding.bindState !== 'bound') {
-      return { ok: false, reason: 'no_binding' };
-    }
+    if (!isActiveBindState(binding.bindState)) return { ok: false, reason: 'no_binding' };
     if (binding.lastSyncedStatus === desired) return { ok: false, reason: 'idle' };
     // 已经在追同一个目标：那条行还没发出去，直接发它，不要另起一条。
     return flushNextStatus(deps, anchorId);

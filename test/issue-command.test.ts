@@ -2,7 +2,9 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   handleIssueCardAction,
   handleIssueCommand,
+  handleIssueDone,
   handleIssueRelease,
+  handleIssueStatus,
   type IssueCommandDeps,
 } from '../src/im/lark/issue-command.js';
 import {
@@ -26,8 +28,12 @@ const ISSUE = {
 function deps(over: Partial<IssueCommandDeps> = {}) {
   const runClaim = vi.fn(async () => ({ ok: true as const, chatId: 'oc_new', chatName: 'g #abcd', shareLink: 'https://l' }));
   const runRelease = vi.fn(async () => ({ ok: true as const, issueId: 'iss-1', alreadyReleasedOnPlatform: false }));
+  const runDone = vi.fn(async () => ({ ok: true as const, issueId: 'iss-1', alreadyReleasedOnPlatform: false }));
+  const runStatus = vi.fn(async () => ({ ok: true as const, card: '{"elements":[]}' }));
   const base: IssueCommandDeps = {
     runRelease,
+    runDone,
+    runStatus,
     fetchTeams: async () => ({ ok: true, value: [{ teamId: 't1', teamName: 'A' }, { teamId: 't2', teamName: 'B' }] }),
     fetchIssues: async () => ({
       ok: true,
@@ -38,7 +44,13 @@ function deps(over: Partial<IssueCommandDeps> = {}) {
     workingDirs: () => [],
     ...over,
   };
-  return { d: base, runClaim, runRelease: base.runRelease as any };
+  return {
+    d: base,
+    runClaim,
+    runRelease: base.runRelease as any,
+    runDone: base.runDone as any,
+    runStatus: base.runStatus as any,
+  };
 }
 
 function cb(value: Record<string, string>, operator = ME, option?: string) {
@@ -281,6 +293,94 @@ describe('释放', () => {
     const r = await handleIssueRelease(APP, ME, [undefined, undefined], d);
     expect(r.toast.type).toBe('error');
     expect(runRelease).not.toHaveBeenCalled();
+  });
+
+  // 三个终态说的是三件不同的事，糊成一句「已结束」人会以为自己记错了。
+  it('已是终态时按 bindState 分别措辞', async () => {
+    const say = async (bindState: string) => {
+      const { d } = deps({ runRelease: async () => ({ ok: false, reason: 'already_released', bindState }) as any });
+      return (await handleIssueRelease(APP, ME, ['oc_task'], d)).toast.content;
+    };
+    expect(await say('done')).toContain('验收完成');
+    expect(await say('void')).toContain('作废');
+    expect(await say('released')).toContain('已经释放');
+  });
+});
+
+// 验收是**人的决策**：agent 交付只到「待验收」，标完成必须由人在群里发命令。
+describe('验收完成', () => {
+  it('管理员在任务群里验收 → 成功，并说明不能再释放', async () => {
+    const { d, runDone } = deps();
+    const r = await handleIssueDone(APP, ME, ['oc_task', 'om_root'], d);
+    expect(runDone).toHaveBeenCalledWith('oc_task');
+    expect(r.toast.type).toBe('info');
+    expect(r.toast.content).toContain('不能再释放');
+  });
+
+  it('非管理员被拒，且不触发任何写', async () => {
+    const { d, runDone } = deps();
+    const r = await handleIssueDone(APP, 'ou_stranger', ['oc_task'], d);
+    expect(r.toast).toMatchObject({ type: 'error', content: '只有管理员可以操作 Issue Board' });
+    expect(runDone).not.toHaveBeenCalled();
+  });
+
+  // 平台的追赶白名单不允许 needs_attention → done。回一句 invalid_transition 等于没说，
+  // 得告诉人为什么以及下一步干什么。
+  it('平台拒绝 invalid_transition → 解释「需要关注」不能直接标完成', async () => {
+    const { d } = deps({
+      runDone: async () => ({ ok: false, reason: 'platform', detail: 'conflict: invalid_transition' }) as any,
+    });
+    const r = await handleIssueDone(APP, ME, ['oc_task'], d);
+    expect(r.toast.type).toBe('error');
+    expect(r.toast.content).toContain('需要关注');
+    expect(r.toast.content).toContain('/issue release');
+  });
+
+  it('其它平台失败照常提示可重试', async () => {
+    const { d } = deps({
+      runDone: async () => ({ ok: false, reason: 'platform', detail: 'network: ETIMEDOUT' }) as any,
+    });
+    const r = await handleIssueDone(APP, ME, ['oc_task'], d);
+    expect(r.toast.content).toContain('ETIMEDOUT');
+    expect(r.toast.content).toContain('/issue done');
+  });
+
+  it('这个会话根本没领过任务 → 说清楚而不是报错', async () => {
+    const { d } = deps({ runDone: async () => ({ ok: false, reason: 'no_binding' }) as any });
+    expect((await handleIssueDone(APP, ME, ['oc_task'], d)).toast.content).toContain('没有领取任何平台任务');
+  });
+
+  it('第一个锚点没有绑定时继续试第二个', async () => {
+    const runDone = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, reason: 'no_binding' })
+      .mockResolvedValueOnce({ ok: true, issueId: 'iss-1', alreadyReleasedOnPlatform: false });
+    const { d } = deps({ runDone: runDone as any });
+    await handleIssueDone(APP, ME, ['oc_task', 'om_root'], d);
+    expect(runDone.mock.calls.map((c) => c[0])).toEqual(['oc_task', 'om_root']);
+  });
+});
+
+describe('查看现状', () => {
+  it('管理员在任务群里查 → 出卡片', async () => {
+    const { d, runStatus } = deps();
+    const r = await handleIssueStatus(APP, ME, ['oc_task', 'om_root'], d);
+    expect(runStatus).toHaveBeenCalledWith('oc_task');
+    expect(r).toHaveProperty('card');
+  });
+
+  // 只读也走同一道门：状态里带着领取人、平台深链这些不该外泄的东西。
+  it('非管理员被拒', async () => {
+    const { d, runStatus } = deps();
+    const r = await handleIssueStatus(APP, 'ou_stranger', ['oc_task'], d);
+    expect(r).toMatchObject({ toast: { type: 'error' } });
+    expect(runStatus).not.toHaveBeenCalled();
+  });
+
+  it('没有绑定时说清楚，不出空卡', async () => {
+    const { d } = deps({ runStatus: async () => ({ ok: false, reason: 'no_binding' }) as any });
+    const r = await handleIssueStatus(APP, ME, ['oc_task'], d);
+    expect(r).toMatchObject({ toast: { content: expect.stringContaining('没有领取任何平台任务') } });
   });
 });
 

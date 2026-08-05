@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { releaseIssue, type ReleaseDeps } from '../src/services/issue-release.js';
+import { completeIssue, releaseIssue, type ReleaseDeps } from '../src/services/issue-release.js';
 import {
   createBinding,
   enqueueDesiredStatus,
@@ -214,6 +214,57 @@ describe('释放之后', () => {
         platformBaseUrl: 'https://platform.example',
         claimId: 'd'.repeat(32),
         claimEpoch: 4,
+      }),
+    ).not.toThrow();
+  });
+});
+
+// 验收完成与释放共用 settleTerminal，所以这里只钉住"不一样的那部分"：目标态、本地终态、
+// 以及平台拒绝时不能悄悄把本地改掉。
+describe('验收完成', () => {
+  it('回写 done 成功 → binding 转 done', async () => {
+    seedBinding();
+    const { d, writeStatus } = deps();
+    const r = await completeIssue(d, ANCHOR);
+    expect(r).toMatchObject({ ok: true, issueId: 'iss-1' });
+    expect(writeStatus).toHaveBeenCalledWith('iss-1', expect.objectContaining({ status: 'done' }));
+    expect(getBinding(dataDir, ANCHOR)?.bindState).toBe('done');
+  });
+
+  // 平台先行、本地后写：平台没点头就动本地，会出现"本机以为完成了、平台还挂着"的分裂。
+  it('平台拒绝 → 本地保持 bound，可重试', async () => {
+    seedBinding();
+    const { d } = deps({
+      writeStatus: vi.fn(async () => ({ ok: false, reason: 'conflict', status: 409, error: 'invalid_transition' }) as any),
+    });
+    const r = await completeIssue(d, ANCHOR);
+    expect(r).toMatchObject({ ok: false, reason: 'platform' });
+    expect(String((r as any).detail)).toMatch(/invalid_transition/);
+    expect(getBinding(dataDir, ANCHOR)?.bindState).toBe('bound');
+  });
+
+  // done 会被平台清 claim，这条领取就此终结——再释放是没有意义的操作，得拦住并说清楚。
+  it('完成之后不能再释放，且能看出终态是 done', async () => {
+    seedBinding();
+    await completeIssue(deps().d, ANCHOR);
+    const r = await releaseIssue(deps().d, ANCHOR);
+    expect(r).toMatchObject({ ok: false, reason: 'already_released' });
+    expect((r as any).binding.bindState).toBe('done');
+  });
+
+  it('已完成的 binding 不再算活跃，同一 issue 可以重新领', async () => {
+    seedBinding();
+    await completeIssue(deps().d, ANCHOR);
+    expect(() =>
+      createBinding(dataDir, {
+        anchorId: 'oc_new',
+        larkAppId: 'cli_worker',
+        scope: 'chat',
+        issueId: 'iss-1',
+        teamId: 't1',
+        platformBaseUrl: 'https://platform.example',
+        claimId: 'e'.repeat(32),
+        claimEpoch: 5,
       }),
     ).not.toThrow();
   });
