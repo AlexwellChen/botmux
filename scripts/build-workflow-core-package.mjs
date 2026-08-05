@@ -31,6 +31,11 @@ await rm(distDir, { recursive: true, force: true });
 await mkdir(distDir, { recursive: true });
 
 const common = {
+  // Pin the working directory so esbuild's metafile input keys are deterministic
+  // regardless of how this script is invoked (repoRoot via `pnpm workflow-core:build`
+  // vs packages/workflow-core via npm's `prepare`). assertBundleInputsAllowed keys
+  // its allowlist off these paths, so they must not shift with process.cwd().
+  absWorkingDir: repoRoot,
   bundle: true,
   entryPoints,
   legalComments: 'none',
@@ -59,8 +64,8 @@ const [esmResult, cjsResult] = await Promise.all([
 
 assertNoBundledThirdPartyModules(esmResult.metafile);
 assertNoBundledThirdPartyModules(cjsResult.metafile);
-assertNoBotmuxRuntimeAdapters(esmResult.metafile);
-assertNoBotmuxRuntimeAdapters(cjsResult.metafile);
+assertBundleInputsAllowed(esmResult.metafile);
+assertBundleInputsAllowed(cjsResult.metafile);
 
 const tscPath = packageRequire.resolve('typescript/bin/tsc');
 const declarations = spawnSync(
@@ -88,26 +93,61 @@ function assertNoBundledThirdPartyModules(metafile) {
   }
 }
 
-function assertNoBotmuxRuntimeAdapters(metafile) {
-  const forbidden = [
-    '/src/adapters/',
-    '/src/core/session-marker.ts',
-    '/src/im/',
-    '/src/workflows/v3/botmux-host-policy.ts',
-    '/src/workflows/v3/daemon-run.ts',
-    '/src/workflows/v3/ephemeral-pool.ts',
-    '/src/workflows/v3/host.ts',
-    '/src/workflows/v3/human-gate.ts',
-    '/src/workflows/v3/runtime.ts',
-    '/src/workflows/v3/worker-fence.ts',
-  ];
-  const contaminated = Object.keys(metafile.inputs).filter((input) => {
-    const normalized = `/${input.replaceAll('\\', '/')}`;
-    return forbidden.some((segment) => normalized.includes(segment));
-  });
-  if (contaminated.length > 0) {
+function assertBundleInputsAllowed(metafile) {
+  // Allowlist, not denylist: a new daemon-only module pulled in for VALUE
+  // (not `import type`, which esbuild erases) must FAIL the build rather than
+  // silently ride along. A denylist can only catch modules someone remembered
+  // to enumerate; the pruned public `.d.ts` graph would also hide such a leak
+  // from assertTypeBoundary. So every non-entry `src/` bundle input must be an
+  // explicitly-blessed daemon-free module here. Adding a legitimately portable
+  // module means adding it to this set on purpose — that review is the point.
+  const allowedSourceInputs = new Set([
+    'src/utils/canonical-input-hash.ts',
+    'src/utils/file-lock.ts',
+    'src/utils/fs-durability.ts',
+    'src/utils/logger.ts',
+    'src/utils/process-identity.ts',
+    'src/workflows/shared/idempotency-key.ts',
+    'src/workflows/v3/artifact-contract.ts',
+    'src/workflows/v3/attempt-ledger.ts',
+    'src/workflows/v3/contract.ts',
+    'src/workflows/v3/core-control.ts',
+    'src/workflows/v3/dag.ts',
+    'src/workflows/v3/gate-policy.ts',
+    'src/workflows/v3/gate-wait-store.ts',
+    'src/workflows/v3/host-bindings.ts',
+    'src/workflows/v3/host-effect-ledger.ts',
+    'src/workflows/v3/host-execution.ts',
+    'src/workflows/v3/in-process-attempt-lease.ts',
+    'src/workflows/v3/journal.ts',
+    'src/workflows/v3/orchestrator.ts',
+    'src/workflows/v3/portable-artifact-snapshot.ts',
+    'src/workflows/v3/portable-final-outputs.ts',
+    'src/workflows/v3/portable-run-snapshot.ts',
+    'src/workflows/v3/portable-runtime.ts',
+    'src/workflows/v3/runtime-host-contract.ts',
+    'src/workflows/v3/shared-node-runtime.ts',
+    'src/workflows/v3/shared-runtime.ts',
+    'src/workflows/v3/state.ts',
+    'src/workflows/v3/template-bindings.ts',
+  ]);
+  const packageSourcePrefix = 'packages/workflow-core/src/';
+  const unexpected = Object.keys(metafile.inputs)
+    .map((input) => input.replaceAll('\\', '/'))
+    .filter((input) => {
+      // Package entry façades live under packages/workflow-core/src/; only
+      // main-repo src/ inputs are gated by the allowlist.
+      if (input.includes(packageSourcePrefix)) return false;
+      const idx = input.indexOf('src/');
+      if (idx < 0) return false;
+      const relativeToSrc = input.slice(idx);
+      return !allowedSourceInputs.has(relativeToSrc);
+    });
+  if (unexpected.length > 0) {
     throw new Error(
-      `workflow-core must not bundle daemon, Lark, session, or worker adapters:\n${contaminated.join('\n')}`,
+      'workflow-core bundled a main-repo module not on the daemon-free allowlist '
+      + '(add it to allowedSourceInputs only after confirming it pulls no daemon, '
+      + `Lark, session, or worker code):\n${unexpected.join('\n')}`,
     );
   }
 }
