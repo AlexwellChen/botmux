@@ -30,6 +30,7 @@ const ARGS = {
   larkAppId: 'cli_worker',
   creatorLarkAppId: 'cli_creator',
   ownerUnionIds: ['on_alice'],
+  workingDir: '/w/botmux',
   kickoffPrompt: '接手这个 issue',
 };
 
@@ -103,6 +104,14 @@ describe('顺利路径', () => {
     expect(groupOpts[0].name).toContain(claimMarker('c'.repeat(32)));
     expect(groupOpts[0].ownerUnionIds).toEqual(['on_alice']);
     expect(groupOpts[0].larkAppIds).toContain('cli_worker');
+  });
+
+  // 不传 bindWorkingDir 的话，人在卡片里选的仓库根本不生效——会话会起在 bot 的默认目录，
+  // agent 在错误的仓库动手且毫无报错。
+  it('选中的仓库必须作为 bindWorkingDir 绑到新群上', async () => {
+    const { d, groupOpts } = deps();
+    await claimIssueIntoGroup(d, ARGS);
+    expect(groupOpts[0].bindWorkingDir).toBe('/w/botmux');
   });
 });
 

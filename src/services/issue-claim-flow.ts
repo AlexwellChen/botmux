@@ -76,6 +76,12 @@ export interface ClaimFlowArgs {
   peerLarkAppIds?: string[];
   /** 把人按 union_id 拉进群（open_id 是 app-scoped 的，跨 bot 不通用）。 */
   ownerUnionIds?: string[];
+  /**
+   * agent 干活的目录。会作为 `bindWorkingDir` 绑到新群上（oncall 绑定），**必须传**——
+   * 不传的话人在卡片里选的仓库根本不会生效，会话会起在 bot 的默认目录里，
+   * 等于让 agent 在错误的仓库动手，而且没有任何报错。
+   */
+  workingDir: string;
   kickoffPrompt: string;
 }
 
@@ -145,6 +151,7 @@ export async function claimIssueIntoGroup(
       creatorLarkAppId: args.creatorLarkAppId,
       larkAppIds: botIds,
       name: `${args.issue.title} ${claimMarker(claimId)}`,
+      bindWorkingDir: args.workingDir,
       ...(args.ownerUnionIds?.length ? { ownerUnionIds: args.ownerUnionIds } : {}),
       onChatCreated: (createdChatId: string) => {
         // 同步钩子：createGroupWithBots 返回前这两次写就已经落盘。后面的邀人/转让/
