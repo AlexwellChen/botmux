@@ -570,6 +570,7 @@ export const messages: Record<string, string> = {
   'help.card': '/card       - Manually post the streaming card for this session (summons it even when streaming is off, and resumes live updates; with private-card mode on, sends a static snapshot visible only to authorized users instead)',
   'help.term': '/term       - Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group)',
   'help.dashboard': '/dashboard [module] - Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.)',
+  'help.issue': '/issue      - Open the Issue Board and claim a platform task right from the card (auto-creates a group and starts work)',
   'help.insight': '/insight    - Show tool-call summary and risk suggestions for this session (operators only)',
   'help.subscribe_doc': '/subscribe-lark-doc <doc link|list|off> - Subscribe through the Feishu API (requires a doc-scoped User Token)',
   'help.watch_comment': '/watch-comment <doc link|list|off> - Watch doc comments and post AI replies back into their threads',

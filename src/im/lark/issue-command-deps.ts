@@ -63,7 +63,19 @@ export type ActivateSession = (args: {
   workingDir: string;
 }) => Promise<string>;
 
-export function buildIssueCommandDeps(activate?: ActivateSession): IssueCommandDeps {
+/**
+ * daemon 在启动时把内部建会话入口注册进来。
+ *
+ * 用模块级注册而不是让 card-handler 直接 import daemon：daemon 是顶层编排，反向依赖它
+ * 会成环。注册前领取会干净地停在 activate 阶段（见 ActivateSession 的注释）。
+ */
+let registeredActivate: ActivateSession | undefined;
+
+export function setIssueActivate(fn: ActivateSession): void {
+  registeredActivate = fn;
+}
+
+export function buildIssueCommandDeps(activate: ActivateSession | undefined = registeredActivate): IssueCommandDeps {
   return {
     fetchTeams: () => fetchTeams() as any,
     fetchIssues: (teamId: string) => fetchIssues(teamId) as any,
