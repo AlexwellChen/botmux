@@ -186,6 +186,110 @@ function writeBindings(dataDir: string, all: Record<string, IssueBinding>): void
   atomicWriteFileSync(bindingsPath(dataDir), JSON.stringify(all, null, 2) + '\n');
 }
 
+// ── claim 意图 ──────────────────────────────────────────────────────────────
+//
+// 补上文件头点名的那个窗口：**claim 成功之后、建群之前**。
+//
+// binding 的主键是 anchorId，而 anchor 要建完群才有；在那之前 claimId 只活在内存里。
+// 这段时间崩溃 = 平台上有一个已 claim 的 issue，本机却既不知道 claimId、也认不出刚建出来
+// 的群属于谁。所以 claim 一返回就先把意图落盘，它是「本机领了这个 issue」的**唯一**持久
+// 证据，直到 binding 建立为止。
+//
+// 双通道反查：本地这份意图 + 群名/seed 正文里带的 claimId。少哪一边都会留下认不出的孤儿。
+
+export interface IssueClaimIntent {
+  /** 主键。高熵随机，与平台 claim 用的是同一个值。 */
+  claimId: string;
+  issueId: string;
+  teamId: string;
+  claimEpoch: number;
+  platformBaseUrl: string;
+  /** 平台 claim 返回的 stateRev，后续 bind 的 CAS 基线。 */
+  platformStateRev: number;
+  /** 这个 issue 交给哪个 bot 跑（决定 localTaskRef 的 appId 段）。 */
+  larkAppId: string;
+  scope: 'chat' | 'thread';
+  /**
+   * 建群/发 seed 拿到 anchor 后回填。它出现 = 群已存在，对账时**不要再建一个**。
+   * 注意这份回填本身也可能崩在中间，所以对账不能只信它，还要按 claimId 去群里反查。
+   */
+  anchorId?: string;
+  chatId?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+function claimIntentsPath(dataDir: string): string {
+  return join(dataDir, 'issue-claims.json');
+}
+
+function writeClaimIntents(dataDir: string, all: Record<string, IssueClaimIntent>): void {
+  atomicWriteFileSync(claimIntentsPath(dataDir), JSON.stringify(all, null, 2) + '\n');
+}
+
+export function listClaimIntents(dataDir: string): IssueClaimIntent[] {
+  return Object.values(readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {}));
+}
+
+export function getClaimIntent(dataDir: string, claimId: string): IssueClaimIntent | null {
+  return readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {})[claimId] ?? null;
+}
+
+/**
+ * 记下一次领取意图。**必须在 platform claim 返回成功后立刻调用，早于任何建群动作**。
+ *
+ * 同 claimId 重入返回既有记录（claim 本身幂等，重试不该产生第二条意图）。
+ */
+export function recordClaimIntent(
+  dataDir: string,
+  input: Omit<IssueClaimIntent, 'createdAt' | 'updatedAt'>,
+  now: number = Date.now(),
+): IssueClaimIntent {
+  const all = readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {});
+  const existing = all[input.claimId];
+  if (existing) return existing;
+  const intent: IssueClaimIntent = { ...input, createdAt: now, updatedAt: now };
+  all[intent.claimId] = intent;
+  writeClaimIntents(dataDir, all);
+  return intent;
+}
+
+/** 回填 anchorId / chatId（建群成功后）。 */
+export function updateClaimIntent(
+  dataDir: string,
+  claimId: string,
+  patch: Partial<Omit<IssueClaimIntent, 'claimId' | 'createdAt'>>,
+  now: number = Date.now(),
+): IssueClaimIntent | null {
+  const all = readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {});
+  const cur = all[claimId];
+  if (!cur) return null;
+  const next = { ...cur, ...patch, claimId: cur.claimId, createdAt: cur.createdAt, updatedAt: now };
+  all[claimId] = next;
+  writeClaimIntents(dataDir, all);
+  return next;
+}
+
+/**
+ * 领取流程走完（binding 已 bound）后清掉意图——此后 binding 自己就是完整证据。
+ *
+ * ⚠️ 清除必须**晚于** binding 落盘。反过来先清意图再写 binding，中间崩溃就同时丢掉了两份
+ * 证据，那个群彻底认不回来——这正是意图存在的意义。
+ */
+export function clearClaimIntent(dataDir: string, claimId: string): boolean {
+  const all = readJson<Record<string, IssueClaimIntent>>(claimIntentsPath(dataDir), {});
+  if (!all[claimId]) return false;
+  delete all[claimId];
+  writeClaimIntents(dataDir, all);
+  return true;
+}
+
+/** 对账分类：意图还在、但没有对应 binding 的，就是需要人/流程接手的悬空领取。 */
+export function listDanglingClaimIntents(dataDir: string): IssueClaimIntent[] {
+  const bound = new Set(listBindings(dataDir).map((b) => b.claimId));
+  return listClaimIntents(dataDir).filter((i) => !bound.has(i.claimId));
+}
+
 /** 注意没有 `localTaskRef`：它由 `buildLocalTaskRef(anchorId, larkAppId)` 内生，见上。 */
 export type CreateBindingInput = Omit<
   IssueBinding,

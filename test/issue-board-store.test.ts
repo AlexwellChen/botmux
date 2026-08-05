@@ -5,18 +5,24 @@ import { join } from 'node:path';
 import {
   buildLocalTaskRef,
   claimNextOutboxRow,
+  clearClaimIntent,
   createBinding,
   enqueueDesiredStatus,
   failOutboxRow,
   findActiveBindingByIssue,
   findBindingByClaimId,
   getBinding,
+  getClaimIntent,
+  listClaimIntents,
+  listDanglingClaimIntents,
   listOutbox,
   pruneOutbox,
+  recordClaimIntent,
   removeBinding,
   resetInflightToPending,
   settleOutboxRow,
   updateBinding,
+  updateClaimIntent,
   type CreateBindingInput,
 } from '../src/services/issue-board-store.js';
 
@@ -312,5 +318,66 @@ describe('pruneOutbox', () => {
     const rows = listOutbox(dataDir, 'oc_group1');
     expect(rows.filter((r) => r.state === 'done')).toHaveLength(2);
     expect(rows.filter((r) => r.state === 'pending')).toHaveLength(1); // 未完成的绝不清
+  });
+});
+
+describe('claim 意图（补 claim 成功→建群之间的窗口）', () => {
+  function intent(over: Partial<Parameters<typeof recordClaimIntent>[1]> = {}) {
+    return {
+      claimId: 'c-random-1',
+      issueId: 'iss-1',
+      teamId: 't1',
+      claimEpoch: 1,
+      platformBaseUrl: 'https://platform.example',
+      platformStateRev: 2,
+      larkAppId: 'cli_app',
+      scope: 'chat' as const,
+      ...over,
+    };
+  }
+
+  it('记录后可按 claimId 反查，anchorId 先缺席（建群前本来就没有）', () => {
+    const i = recordClaimIntent(dataDir, intent());
+    expect(i.anchorId).toBeUndefined();
+    expect(getClaimIntent(dataDir, 'c-random-1')?.issueId).toBe('iss-1');
+  });
+
+  // claim 本身幂等，网络重试不该在本地留下两条意图。
+  it('同 claimId 重入返回既有记录', () => {
+    const first = recordClaimIntent(dataDir, intent());
+    const again = recordClaimIntent(dataDir, intent({ issueId: 'iss-999' }));
+    expect(again.createdAt).toBe(first.createdAt);
+    expect(again.issueId).toBe('iss-1');
+  });
+
+  it('建群后回填 anchorId/chatId，claimId 与 createdAt 不被 patch 覆盖', () => {
+    const first = recordClaimIntent(dataDir, intent());
+    const p = updateClaimIntent(dataDir, 'c-random-1', { anchorId: 'oc_g1', chatId: 'oc_g1' });
+    expect(p?.anchorId).toBe('oc_g1');
+    expect(p?.createdAt).toBe(first.createdAt);
+    expect(updateClaimIntent(dataDir, '不存在', { anchorId: 'x' })).toBeNull();
+  });
+
+  // 这条是整个机制的用途所在：意图在、binding 不在 = 悬空领取，对账要认领回来。
+  it('悬空判定：有意图无 binding → 列出；binding 建好后不再列出', () => {
+    recordClaimIntent(dataDir, intent());
+    expect(listDanglingClaimIntents(dataDir).map((i) => i.claimId)).toEqual(['c-random-1']);
+    createBinding(dataDir, seed());
+    expect(listDanglingClaimIntents(dataDir)).toEqual([]);
+  });
+
+  it('清除只影响指定 claimId，重复清除返回 false', () => {
+    recordClaimIntent(dataDir, intent());
+    recordClaimIntent(dataDir, intent({ claimId: 'c-random-2', issueId: 'iss-2' }));
+    expect(clearClaimIntent(dataDir, 'c-random-1')).toBe(true);
+    expect(clearClaimIntent(dataDir, 'c-random-1')).toBe(false);
+    expect(listClaimIntents(dataDir).map((i) => i.claimId)).toEqual(['c-random-2']);
+  });
+
+  it('损坏的 issue-claims.json 不抛，按空表处理', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dataDir, 'issue-claims.json'), 'not json at all');
+    expect(listClaimIntents(dataDir)).toEqual([]);
+    expect(() => recordClaimIntent(dataDir, intent())).not.toThrow();
   });
 });
