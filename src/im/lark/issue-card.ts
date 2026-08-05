@@ -7,9 +7,13 @@
  * 领取由**你 @ 的那个 bot** 承接：`larkAppId` 就是承接方，不需要再选。想让别的 bot 干，
  * 就去 @ 它发 `/issue`。少一次选择，语义也天然。
  *
- * 仓库不新造配置：直接用该 bot 已有的 `workingDirs`（仓库选择卡片本来就在用它）。平台只
- * 存展示用的 `targetRepoLabel`，这里按目录名做一次匹配把它预选上，匹配不上就让人在下拉里挑
- * ——不拦人，也不猜。
+ * 仓库不新造配置：候选来自 `scanMultipleProjects(configuredWorkingDirs(bot))` —— 现有仓库
+ * 选择卡片用的同一套扫描。注意**不能**直接用 `workingDirs` 原值：实测发现它常常配的是一个
+ * 工作区父目录（`~/claude-code-workspace`）而不是仓库列表，直接拿来当候选，选中的会是工作区
+ * 根目录，等于让 agent 在错误的位置动手。扫描一层才拿得到真正的仓库和 worktree。
+ *
+ * 平台只存展示用的 `targetRepoLabel`，这里按仓库名做一次匹配把它预选上，匹配不上就让人在
+ * 下拉里挑——不拦人，也不猜。
  *
  * Security（沿用 groups-card 的约定）：
  *  - `action.value` 不经 Lark 校验，**绝不**从里面读身份字段；调用者身份只认 operator.*
@@ -30,6 +34,10 @@ export const ISSUE_ACTION_CLAIM_CANCEL = 'issue_claim_cancel' as const;
 
 /** 一页放几条。看板是给人扫的，多了反而看不动；和 groups-card 保持一致。 */
 const PAGE_SIZE = 5;
+
+/** Lark 的 select_static 选项数上限（与 groups-card 的 JUMP_PAGE_MAX_OPTIONS 同源）。
+ *  实测一个工作区能扫出 58 个仓库/worktree，不截断会直接超限。 */
+const MAX_REPO_OPTIONS = 50;
 
 export interface IssueRowData {
   issueId: string;
@@ -57,15 +65,22 @@ export interface IssueBoardCardData {
   page: number;
 }
 
+/** 一个可选仓库。来自 project-scanner 的 `ProjectInfo`，只取卡片用得到的三个字段。 */
+export interface RepoChoice {
+  name: string;
+  path: string;
+  branch?: string;
+}
+
 export interface ClaimConfirmCardData {
   teamId: string;
   issueId: string;
   title: string;
   repoLabel?: string;
   stateRev: number;
-  /** 该 bot 已配置的工作目录。空数组时确认按钮置灰并说明原因。 */
-  workingDirs: string[];
-  /** 当前选中的目录（首次进入由 matchWorkingDir 预选）。 */
+  /** 扫出来的候选仓库。空数组时不给确认按钮并说明原因。 */
+  repos: RepoChoice[];
+  /** 当前选中的仓库路径（首次进入由 matchRepo 预选）。 */
   selectedDir?: string;
 }
 
@@ -74,22 +89,55 @@ export type ClaimResultCardData =
   | { ok: false; title: string; stage: string; reason: string; hint?: string };
 
 /**
- * 把平台的展示标签匹配到本机某个工作目录。
+ * 把平台的展示标签匹配到本机某个仓库，返回它的路径。
  *
  * 平台只有 `targetRepoLabel`（"botmux"、"botmux 平台"…），是给人看的，没有路径。这里做的
  * 是**预选**不是决定：匹配上就把下拉默认值设好省一次点击，匹配不上返回 undefined，让人自己
- * 在下拉里挑。刻意不做模糊匹配——猜错目录会让 agent 在错误的仓库里动手，代价远大于多点一下。
+ * 在下拉里挑。刻意不做模糊匹配——猜错仓库会让 agent 在错误的地方动手，代价远大于多点一下。
+ *
+ * 优先精确命中仓库名，再退一步允许去掉空格/下划线/连字符后相等（"botmux 平台" 这种带空格
+ * 的标签能对上 `botmux-platform`）。前缀不算命中：`bot` 不该选中 `botmux`。
  */
-export function matchWorkingDir(label: string | undefined, dirs: string[]): string | undefined {
+export function matchRepo(label: string | undefined, repos: RepoChoice[]): string | undefined {
   if (!label) return undefined;
   const want = label.trim().toLowerCase();
   if (!want) return undefined;
-  const basename = (d: string) => (d.replace(/\/+$/, '').split('/').pop() ?? '').toLowerCase();
-  // 先精确命中目录名，再退一步允许目录名去掉分隔符后相等（"botmux-platform" ↔ "botmux platform"）。
-  const exact = dirs.find((d) => basename(d) === want);
-  if (exact) return exact;
+  const exact = repos.find((r) => r.name.toLowerCase() === want);
+  if (exact) return exact.path;
   const norm = (s: string) => s.replace(/[\s_-]+/g, '');
-  return dirs.find((d) => norm(basename(d)) === norm(want));
+  return repos.find((r) => norm(r.name.toLowerCase()) === norm(want))?.path;
+}
+
+/**
+ * 按与标签的相关度给候选仓库排序并截断到 Lark 的选项上限。
+ *
+ * 与 {@link matchRepo} 分工明确：那个决定**选中谁**（严格，宁缺毋滥），这个只决定**先显示
+ * 谁**（宽松，含子串即可）。排序永远不会替人做选择，所以这里放宽是安全的——而不放宽的话，
+ * 标签没精确命中时人得在几十个仓库里自己翻，实测一个工作区能扫出 58 个。
+ *
+ * 截断是必要的：超过上限 Lark 会拒绝或静默丢弃。被截掉的部分由调用方在卡片上说明，
+ * 不能让人以为"没有就是不存在"。
+ */
+export function rankRepos(
+  label: string | undefined,
+  repos: RepoChoice[],
+  limit: number = MAX_REPO_OPTIONS,
+): { options: RepoChoice[]; truncated: number } {
+  const want = (label ?? '').trim().toLowerCase();
+  const norm = (s: string) => s.replace(/[\s_-]+/g, '');
+  const score = (r: RepoChoice): number => {
+    if (!want) return 3;
+    const n = r.name.toLowerCase();
+    if (n === want) return 0;
+    if (norm(n) === norm(want)) return 1;
+    if (norm(n).includes(norm(want)) || norm(want).includes(norm(n))) return 2;
+    return 3;
+  };
+  const sorted = [...repos].sort((a, b) => {
+    const d = score(a) - score(b);
+    return d !== 0 ? d : a.name.localeCompare(b.name);
+  });
+  return { options: sorted.slice(0, limit), truncated: Math.max(0, sorted.length - limit) };
 }
 
 function h(content: string): any {
@@ -203,9 +251,9 @@ export function buildClaimConfirmCard(data: ClaimConfirmCardData, _locale?: Loca
     stateRev: String(data.stateRev),
   };
 
-  if (!data.workingDirs.length) {
-    // 没配工作目录就领，agent 起来也不知道该在哪动手——与其领了再报错，不如在这里说清楚。
-    elements.push(h('⚠️ 这个 bot 还没有配置任何工作目录（`workingDirs`），无法领取。'));
+  if (!data.repos.length) {
+    // 扫不到仓库就领，agent 起来也不知道该在哪动手——与其领了再报错，不如在这里说清楚。
+    elements.push(h('⚠️ 在这个 bot 的工作目录下没有扫到任何仓库，无法领取。'));
     elements.push({
       tag: 'action',
       actions: [
@@ -219,12 +267,17 @@ export function buildClaimConfirmCard(data: ClaimConfirmCardData, _locale?: Loca
     return JSON.stringify({ config: { wide_screen_mode: true }, elements });
   }
 
-  const selected = data.selectedDir ?? data.workingDirs[0];
+  const { options, truncated } = rankRepos(data.repoLabel, data.repos);
+  // 选中项必须在选项里，否则 initial_option 落空、下拉显示为未选。
+  const selected =
+    data.selectedDir && options.some((r) => r.path === data.selectedDir)
+      ? data.selectedDir
+      : options[0].path;
   elements.push(
     h(
       data.repoLabel
-        ? `平台标注仓库：\`${data.repoLabel}\`${data.selectedDir ? '（已自动匹配）' : '（未匹配到本地目录，请手动选择）'}`
-        : '平台未标注仓库，请选择工作目录',
+        ? `平台标注仓库：\`${data.repoLabel}\`${data.selectedDir ? '（已自动匹配）' : '（未匹配到本地仓库，请手动选择）'}`
+        : '平台未标注仓库，请选择工作仓库',
     ),
   );
   elements.push({
@@ -232,13 +285,22 @@ export function buildClaimConfirmCard(data: ClaimConfirmCardData, _locale?: Loca
     actions: [
       {
         tag: 'select_static',
-        placeholder: { tag: 'plain_text', content: '选择工作目录' },
+        placeholder: { tag: 'plain_text', content: '选择仓库' },
         initial_option: selected,
-        options: data.workingDirs.map((d) => ({ text: { tag: 'plain_text', content: d }, value: d })),
+        // 下拉里显示仓库名 + 分支，比一串绝对路径好认——同名 worktree 靠分支区分。
+        options: options.map((r) => ({
+          text: { tag: 'plain_text', content: r.branch ? `${r.name} (${r.branch})` : r.name },
+          value: r.path,
+        })),
         value: { action: ISSUE_ACTION_CLAIM_DIR, ...base },
       },
     ],
   });
+  elements.push(h(`　\`${selected}\``));
+  if (truncated > 0) {
+    // 说清楚被截了，别让人以为"下拉里没有就是不存在"。
+    elements.push(h(`_候选较多，仅列出最相关的 ${options.length} 个（另有 ${truncated} 个未显示）_`));
+  }
   elements.push({
     tag: 'action',
     actions: [
