@@ -23,10 +23,14 @@
  * 危害被第 2 步的 held 挡住了：没发 kickoff 就没有任何 bot 被 @ 起来，daemon 不会创建
  * 会话，**本机没有 agent 在跑**——与旧叙事想要的安全性质相同，只是换了达成方式。
  *
- * 对账要认出孤儿群，就必须在建群**之前**留下 claimId→issue 的痕迹（否则 claimId 只活在
- * 内存里，崩了既找不回 claim、也认不出哪个群是它的）。⚠️ 这份「claim 意图」存储**本刀还
- * 没有**——本模块只含 binding + outbox。拉群领取那一刀必须补上，并把 claimId 也写进群名/
- * seed 正文，让启动对账能反查。届时的对账策略：
+ * 对账要认出孤儿群，就必须留下 claimId→issue 的痕迹（否则 claimId 只活在内存里，崩了既
+ * 找不回 claim、也认不出哪个群是它的）。落点要钉在 **claim 成功之后、建群之前**——危险
+ * 窗口从 claim 返回的那一刻就开始了，写「建群前」不够精确：claim 已成功而意图未落盘时崩
+ * 溃，同样丢 claimId。held 只保证「没有 agent 在跑」，不保证「能对账续跑」，这两件事别混。
+ *
+ * ⚠️ 这份「claim 意图」存储**本刀还没有**——本模块只含 binding + outbox。拉群领取那一刀
+ * 必须补上（存 claimId / issueId / teamId / claimEpoch / stateRev），并把 claimId 同时写进
+ * 群名或 seed 正文，形成「本地意图 + 群侧标记」双通道反查。届时的对账策略：
  *  - 有 claim 意图、无 binding → 按 claimId 反查群：找到就补写 binding 续跑，找不到就
  *    释放 claim（或直接等平台 lease 到期由 sweeper 回收）
  *  - 有 binding 且 `bindState==='pending'` → 重试 bind；被平台拒（issue 被回收/别人领走/
