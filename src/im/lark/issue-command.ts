@@ -58,10 +58,26 @@ export interface IssueCommandDeps {
   workingDirs: (larkAppId: string) => string[];
 }
 
+/** 命令入口的返回：card 是卡片 JSON 字符串，直接喂 `sessionReply(..., 'interactive')`。 */
 export type IssueCardResult = { card: string } | { toast: { type: 'error' | 'info'; content: string } };
+
+/**
+ * 卡片回调的返回。**结构与命令入口不同**：Lark 的 callback 响应要求
+ * `card: { type: 'raw', data: <对象> }`，直接回一个 JSON 字符串会被判非法，
+ * 客户端报 `code 200672`（实测踩过：卡片能发出来，但一点按钮就报错）。
+ */
+export type IssueCardCallbackResult =
+  | { card: { type: 'raw'; data: Record<string, unknown> } }
+  | { toast: { type: 'error' | 'info'; content: string } };
 
 function toast(content: string): IssueCardResult {
   return { toast: { type: 'error', content } };
+}
+
+/** 把内部统一产出的卡片字符串包成 Lark 回调要的信封。 */
+function asCallback(r: IssueCardResult): IssueCardCallbackResult {
+  if ('toast' in r) return r;
+  return { card: { type: 'raw', data: JSON.parse(r.card) as Record<string, unknown> } };
 }
 
 /** 平台 issue → 卡片行。只留卡片用得到的字段，别把整个 doc 塞进 action.value。 */
@@ -146,6 +162,14 @@ export async function handleIssueCommand(
 
 /** 卡片回调。所有 `issue_*` action 都走这里。 */
 export async function handleIssueCardAction(
+  data: CardActionData,
+  larkAppId: string,
+  deps: IssueCommandDeps,
+): Promise<IssueCardCallbackResult> {
+  return asCallback(await handleIssueCardActionInner(data, larkAppId, deps));
+}
+
+async function handleIssueCardActionInner(
   data: CardActionData,
   larkAppId: string,
   deps: IssueCommandDeps,

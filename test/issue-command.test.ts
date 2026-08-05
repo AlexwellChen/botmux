@@ -137,7 +137,7 @@ describe('看板导航', () => {
   it('取消回到看板', async () => {
     const r = await handleIssueCardAction(cb({ action: ISSUE_ACTION_CLAIM_CANCEL, invoker_open_id: ME, teamId: 't1' }), APP, deps().d);
     expect('card' in r).toBe(true);
-    expect((r as any).card).toContain('待领取');
+    expect(JSON.stringify((r as any).card.data)).toContain('待领取');
   });
 });
 
@@ -150,7 +150,7 @@ describe('领取', () => {
       d,
     );
     expect('card' in r).toBe(true);
-    expect((r as any).card).toContain('修一个 bug');
+    expect(JSON.stringify((r as any).card.data)).toContain('修一个 bug');
   });
 
   // 人手动选过之后，不能再被自动匹配覆盖掉。
@@ -173,7 +173,7 @@ describe('领取', () => {
     expect(runClaim).toHaveBeenCalledWith(
       expect.objectContaining({ workingDir: '/w/botmux', teamId: 't1', larkAppId: APP, invokerOpenId: ME }),
     );
-    expect((r as any).card).toContain('已领取');
+    expect(JSON.stringify((r as any).card.data)).toContain('已领取');
   });
 
   it('没选目录不发起领取', async () => {
@@ -208,7 +208,7 @@ describe('领取', () => {
       APP,
       d,
     );
-    const card = (r as any).card;
+    const card = JSON.stringify((r as any).card.data);
     expect(card).toContain('activate');
     expect(card).toContain('不必重新领取');
   });
@@ -218,5 +218,31 @@ describe('未知 action', () => {
   it('不静默吞掉，回一个可见的错误', async () => {
     const r = await handleIssueCardAction(cb({ action: 'issue_不存在的动作', invoker_open_id: ME, teamId: 't1' }), APP, deps().d);
     expect(r).toMatchObject({ toast: { content: expect.stringContaining('未知操作') } });
+  });
+});
+
+// 实测踩过：卡片能发出来，但一点按钮客户端就报 code 200672——Lark 的 callback 响应
+// 要求 `card: { type:'raw', data:<对象> }`，回一个 JSON 字符串会被判非法。
+describe('回调返回信封', () => {
+  it('回调返回 raw 信封而不是 JSON 字符串', async () => {
+    const r: any = await handleIssueCardAction(
+      cb({ action: ISSUE_ACTION_PAGE, invoker_open_id: ME, teamId: 't1', page: '0' }),
+      APP,
+      deps().d,
+    );
+    expect(r.card.type).toBe('raw');
+    expect(typeof r.card.data).toBe('object');
+    expect(Array.isArray(r.card.data.elements)).toBe(true);
+  });
+
+  it('命令入口仍返回字符串（sessionReply 要的是 interactive 字符串）', async () => {
+    const r: any = await handleIssueCommand(APP, ME, deps().d);
+    expect(typeof r.card).toBe('string');
+  });
+
+  it('toast 分支两边形状一致，不被信封包装', async () => {
+    const r: any = await handleIssueCardAction(cb({ action: ISSUE_ACTION_PAGE, teamId: 't1' }), APP, deps().d);
+    expect(r.toast.content).toBeTruthy();
+    expect(r.card).toBeUndefined();
   });
 });
