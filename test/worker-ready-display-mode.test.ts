@@ -37,6 +37,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     type: 'streaming',
     readUrl: args[2],
     localCliReady: args[15] === true,
+    // Signature tail after the master merge: 15 localCliReady, 16 usage,
+    // 17 runtimeDisplayName, 18 serviceTierBadge.
+    serviceTierBadge: args[18],
   })),
   buildSessionCard: vi.fn(() => '{"type":"session"}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
@@ -63,6 +66,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -83,7 +89,7 @@ vi.mock('../src/core/dashboard-events.js', () => ({
 }));
 
 vi.mock('../src/core/dashboard-rows.js', () => ({
-  composeRowFromActive: vi.fn(),
+  composeRowFromActive: vi.fn(() => ({ tokenUsage: undefined })),
 }));
 
 vi.mock('../src/skills/installer.js', () => ({
@@ -221,6 +227,105 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
   });
 
+  it('patches a static Codex card when executor tier changes without a screen update', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      workerPort: 9999,
+      streamCardId: 'om_static_card',
+      streamCardPending: false,
+    });
+    ds.session.cliId = 'codex';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    await flush();
+    expect(ds.codexServiceTier?.nonDefault).toBe(true);
+    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2])).toMatchObject({ serviceTierBadge: '⚡ priority' });
+
+    fakeWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'default', nonDefault: false,
+      },
+    });
+    await flush();
+    expect(ds.codexServiceTier?.nonDefault).toBe(false);
+    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2]).serviceTierBadge).toBeUndefined();
+  });
+
+  it('clears tier state at worker-generation setup and ignores stale-worker updates', async () => {
+    const staleWorker = makeFakeWorker();
+    const replacement = makeFakeWorker();
+    const ds = makeDs({
+      worker: staleWorker,
+      workerPort: 9999,
+      streamCardId: 'om_static_card',
+      codexServiceTier: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    ds.session.cliId = 'claude-code';
+
+    __testOnly_setupWorkerHandlers(ds, staleWorker);
+    expect(ds.codexServiceTier).toBeUndefined();
+    ds.worker = replacement;
+    staleWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    await flush();
+
+    expect(ds.codexServiceTier).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not rewrite a frozen card when teardown clears the live tier', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      workerPort: 9999,
+      streamCardId: 'om_frozen_card',
+      streamCardNonce: 'nonce_frozen',
+      parkedStreamCardNonce: 'nonce_frozen',
+    });
+    ds.session.cliId = 'codex';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    updateMessageMock.mockClear();
+    fakeWorker.emit('message', { type: 'codex_service_tier', snapshot: null });
+    await flush();
+
+    expect(ds.codexServiceTier).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not retain a pending tier refresh when no live card exists', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker, workerPort: null, streamCardId: undefined });
+    ds.session.cliId = 'codex';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    ds.pendingCodexTierCardRefresh = true;
+    fakeWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    await flush();
+
+    expect(ds.pendingCodexTierCardRefresh).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
   it('POST path forwards ready.turnId to sessionReply for initial alias cards', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({ streamCardPending: true, streamCardId: undefined, worker: fakeWorker });
@@ -244,6 +349,73 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(logs).not.toContain('view_cap');
   });
 
+  it('treats port=0 as ready without Web Terminal and keeps screen/screenshot state flowing', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      session: { ...makeDs().session, backendType: 'zmx' },
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+      displayMode: 'screenshot',
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 0, token: 'unused', viewToken: 'unused-view' });
+    await flush();
+
+    expect(ds.workerReady).toBe(true);
+    expect(ds.workerPort).toBeNull();
+    expect(ds.workerToken).toBeNull();
+    expect(ds.workerViewToken).toBeNull();
+    expect(ds.session.webPort).toBeUndefined();
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(sessionReplyMock.mock.calls[0][1]).readUrl).toBe('');
+
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'plain zmx history',
+      status: 'idle',
+    });
+    fakeWorker.emit('message', {
+      type: 'screenshot_uploaded',
+      imageKey: 'img_zmx_history',
+      status: 'idle',
+    });
+    await flush();
+
+    expect(ds.lastScreenContent).toBe('plain zmx history');
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.currentImageKey).toBe('img_zmx_history');
+  });
+
+  it('ignores every message from a replaced worker generation', async () => {
+    const staleWorker = makeFakeWorker();
+    const currentWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: currentWorker,
+      workerReady: false,
+      workerPort: null,
+      lastScreenContent: 'current generation',
+      lastScreenStatus: 'working',
+    });
+
+    __testOnly_setupWorkerHandlers(ds, staleWorker);
+    staleWorker.emit('message', { type: 'ready', port: 9999, token: 'stale-token' });
+    staleWorker.emit('message', {
+      type: 'screen_update',
+      content: 'stale generation',
+      status: 'idle',
+    });
+    await flush();
+
+    expect(ds.workerReady).toBe(false);
+    expect(ds.workerPort).toBeNull();
+    expect(ds.workerToken).toBeNull();
+    expect(ds.lastScreenContent).toBe('current generation');
+    expect(ds.lastScreenStatus).toBe('working');
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
   it('doc-native session never posts a streaming card to the virtual doc: chat id', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({
@@ -264,6 +436,34 @@ describe('Worker ready: set_display_mode re-sync', () => {
     await flush();
 
     expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('doc-native session never posts a TUI prompt card to the virtual doc: chat id', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'chat',
+      chatId: 'doc:doc_token_123',
+      session: {
+        ...makeDs().session,
+        scope: 'chat',
+        chatId: 'doc:doc_token_123',
+        rootMessageId: 'doc:doc_token_123',
+      },
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'tui_prompt',
+      description: 'Approve command?',
+      options: [{ text: 'Yes', selected: false }],
+      multiSelect: false,
+      turnId: 'turn-doc',
+    });
+    await flush();
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(ds.tuiPromptCardId).toBeUndefined();
   });
 
   it('POST path sends set_display_mode when displayMode is screenshot', async () => {

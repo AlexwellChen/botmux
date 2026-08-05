@@ -31,7 +31,8 @@ import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
 import { tmuxEnv } from '../../setup/ensure-tmux.js';
-import { buildBotmuxEnvAssignments, resolveUserShell, SHELL_WRAPPER_SCRIPT, shellLaunchArgv, TmuxBackend } from './tmux-backend.js';
+import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellLaunchArgv, TmuxBackend } from './tmux-backend.js';
+import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 
 function shellescape(s: string): string {
@@ -623,7 +624,7 @@ export class TmuxPipeBackend implements SessionBackend {
       '-x', String(opts.cols),
       '-y', String(opts.rows),
       '--',
-      ...shellLaunchArgv(shellSpec.shell, shellSpec.flags), '-c', SHELL_WRAPPER_SCRIPT, '_',
+      ...shellLaunchArgv(shellSpec.shell, shellSpec.flags), '-c', shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env)), '_',
       opts.cwd,
       ...envAssignments,
       bin, ...args,
@@ -683,6 +684,30 @@ export class TmuxPipeBackend implements SessionBackend {
   captureViewport(): string {
     // No `-S`/`-E` flags = tmux default = current viewport only.
     return this.captureWithBounds('');
+  }
+
+  captureInputState(): {
+    viewport: string;
+    cursor: { x: number; y: number };
+  } | null {
+    if (this.exited) return null;
+    const cursor = this.getCursorPosition();
+    if (!cursor) return null;
+    try {
+      const viewport = execFileSync(
+        'tmux', ['capture-pane', '-p', '-t', this.paneTarget],
+        {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 2000,
+          maxBuffer: 16 * 1024 * 1024,
+          env: tmuxEnv(),
+        },
+      );
+      return { viewport, cursor };
+    } catch {
+      return null;
+    }
   }
 
   private captureWithBounds(bounds: string, opts?: { restoreCursor?: boolean }): string {

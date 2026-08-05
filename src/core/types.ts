@@ -10,6 +10,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -22,6 +23,10 @@ export interface FrozenCard {
   displayMode?: DisplayMode;
   /** Latest uploaded image_key for the frozen card (only when displayMode === 'screenshot'). */
   imageKey?: string;
+  /** Rendered service-tier badge (`⚡ priority`) captured at freeze time so a
+   *  recalled Codex card keeps its per-turn tier instead of being re-decorated
+   *  with the session's current tier. Absent = no badge. */
+  codexServiceTierBadge?: string;
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -39,6 +44,10 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
 export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
+  /** True after the current worker generation has completed init. Kept
+   * separate from workerPort because backends without a Web Terminal still
+   * emit screen/idle/screenshot updates and support native local attach. */
+  workerReady?: boolean;
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
   /** Independent read-only xterm capability. Optional for hydrated/legacy
@@ -188,6 +197,13 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** Executor-observed Codex settings for this worker/rollout generation. */
+  codexServiceTier?: CodexServiceTierSnapshot;
+  /** Tier change arrived while a card POST was in-flight. */
+  pendingCodexTierCardRefresh?: boolean;
+  /** The currently referenced card has been frozen/parked for handoff. Tier
+   * updates belong to the successor card and must not rewrite this snapshot. */
+  parkedStreamCardNonce?: string;
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns
    *  this URL directly (bypassing the local terminal proxy) so the dashboard
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the
@@ -195,6 +211,10 @@ export interface DaemonSession {
   riffAccessUrl?: string;
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
+  /** Interval that re-PATCHes the live streaming card with fresh Context/Token
+   *  usage while a turn is executing (streaming display mode). Armed on the
+   *  working edge, cleared on idle/turn-end/card removal. */
+  usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
   lastCodexAppInput?: CodexAppTurnInput;
@@ -241,6 +261,10 @@ export interface DaemonSession {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
+  /** A final ScreenAnalyzer TUI answer has been dispatched and is waiting for
+   * the worker's resolved/failed ACK. Claimed synchronously by card-handler so
+   * duplicate clicks cannot inject a second key sequence into the same CLI. */
+  tuiPromptProcessing?: boolean;
   /** turnId of the last stuck_warning posted — dedup so we don't spam the
    *  thread with repeated warnings for the same unresolved turn. */
   stuckWarningTurnId?: string;
@@ -422,4 +446,29 @@ export function activeSessionKey(ds: DaemonSession): string {
  * cards and other chat API calls must never target it. */
 export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>): boolean {
   return ds.scope === 'chat' && ds.chatId.startsWith('doc:');
+}
+
+/** A session created by the HTTP control API (`waitForFinalOutput` /
+ * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*` /
+ * `http_wait_*` address, NOT a real Lark chat. Any Feishu chat API call
+ * targeting it (sendMessage / card / reply / roster probe) would fail — these
+ * sessions are request/response only and must never touch Lark transport. */
+export function isHttpVirtualSession(chatId: string): boolean {
+  return chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+}
+
+/** Central Lark-transport capability gate for a live session. Returns false —
+ * meaning "no Feishu side effects are permitted for this session" — when either
+ * the owning bot is core-only (`apiOnly`, never connected to Feishu) OR the
+ * session's surface is a synthetic HTTP virtual chat. Every auxiliary-UI /
+ * reply / card / roster seam should fail-closed on `!larkTransportEnabled(...)`
+ * instead of re-deriving the condition, so a new no-Feishu surface is covered
+ * everywhere by construction. `doc:` sessions keep their own dedicated routing
+ * (comment API), so they are intentionally NOT folded in here. */
+export function larkTransportEnabled(
+  ds: Pick<DaemonSession, 'chatId'> & { apiOnly?: boolean },
+): boolean {
+  if (ds.apiOnly === true) return false;
+  if (isHttpVirtualSession(ds.chatId)) return false;
+  return true;
 }
