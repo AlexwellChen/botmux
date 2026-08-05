@@ -63,6 +63,14 @@ export interface IssueBoardCardData {
   };
   /** todo 段的页码（只有待领取需要翻页，其它段是概览计数）。 */
   page: number;
+  /**
+   * 发起人的 `ou_*`。会被打进**每一个** action.value，回调时与 Lark 校验过的
+   * operator.open_id 比对——群里别人点了不算。
+   *
+   * 不是洁癖：平台的 claim 按**本机 owner** 记，不按点击者记。谁点都能领的话，任务记在
+   * owner 头上而实际点的是别人，归属直接错位。
+   */
+  invokerOpenId: string;
 }
 
 /** 一个可选仓库。来自 project-scanner 的 `ProjectInfo`，只取卡片用得到的三个字段。 */
@@ -82,6 +90,8 @@ export interface ClaimConfirmCardData {
   repos: RepoChoice[];
   /** 当前选中的仓库路径（首次进入由 matchRepo 预选）。 */
   selectedDir?: string;
+  /** 见 IssueBoardCardData.invokerOpenId。 */
+  invokerOpenId: string;
 }
 
 export type ClaimResultCardData =
@@ -169,7 +179,7 @@ export function buildIssueBoardCard(data: IssueBoardCardData, _locale?: Locale):
             text: { tag: 'plain_text', content: t.teamName },
             value: t.teamId,
           })),
-          value: { action: ISSUE_ACTION_TEAM },
+          value: { action: ISSUE_ACTION_TEAM, invoker_open_id: data.invokerOpenId },
         },
       ],
     });
@@ -195,6 +205,7 @@ export function buildIssueBoardCard(data: IssueBoardCardData, _locale?: Locale):
         type: 'primary',
         value: {
           action: ISSUE_ACTION_CLAIM_OPEN,
+          invoker_open_id: data.invokerOpenId,
           teamId: data.teamId,
           issueId: r.issueId,
           // stateRev 随卡片往返：领取时作为 expectedStateRev，别人先改过就会 409，
@@ -215,25 +226,25 @@ export function buildIssueBoardCard(data: IssueBoardCardData, _locale?: Locale):
       tag: 'button',
       text: { tag: 'plain_text', content: '‹ 上一页' },
       disabled: page <= 0,
-      value: { action: ISSUE_ACTION_PAGE, teamId: data.teamId, page: String(page - 1) },
+      value: { action: ISSUE_ACTION_PAGE, invoker_open_id: data.invokerOpenId, teamId: data.teamId, page: String(page - 1) },
     });
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: `${page + 1}/${pages}` },
       disabled: true,
-      value: { action: ISSUE_ACTION_PAGE, teamId: data.teamId, page: String(page) },
+      value: { action: ISSUE_ACTION_PAGE, invoker_open_id: data.invokerOpenId, teamId: data.teamId, page: String(page) },
     });
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: '下一页 ›' },
       disabled: page >= pages - 1,
-      value: { action: ISSUE_ACTION_PAGE, teamId: data.teamId, page: String(page + 1) },
+      value: { action: ISSUE_ACTION_PAGE, invoker_open_id: data.invokerOpenId, teamId: data.teamId, page: String(page + 1) },
     });
   }
   actions.push({
     tag: 'button',
     text: { tag: 'plain_text', content: '🔄 刷新' },
-    value: { action: ISSUE_ACTION_REFRESH, teamId: data.teamId, page: String(page) },
+    value: { action: ISSUE_ACTION_REFRESH, invoker_open_id: data.invokerOpenId, teamId: data.teamId, page: String(page) },
   });
   elements.push({ tag: 'action', actions });
 
@@ -246,6 +257,7 @@ export function buildClaimConfirmCard(data: ClaimConfirmCardData, _locale?: Loca
   elements.push(h(`**领取「${data.title}」**`));
 
   const base = {
+    invoker_open_id: data.invokerOpenId,
     teamId: data.teamId,
     issueId: data.issueId,
     stateRev: String(data.stateRev),
