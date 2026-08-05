@@ -27,11 +27,14 @@ import {
   clearClaimIntent,
   createBinding,
   findActiveBindingByIssue,
+  getBinding,
   recordClaimIntent,
   updateBinding,
   updateClaimIntent,
   type IssueBinding,
+  type IssueStatus,
 } from './issue-board-store.js';
+import { projectStatus } from './issue-status-writer.js';
 
 /**
  * 群名里带的领取标记。对账时靠它把「平台上有 claim、本地没有 binding」的孤儿群认回来
@@ -93,8 +96,34 @@ export interface ClaimFlowDeps {
   announce?: (chatId: string, card: string) => Promise<void>;
   /** 播报失败时的旁路（生产接 logger；不注入就静默）。 */
   onAnnounceError?: (reason: string) => void;
+  /** in_progress 回写失败时的旁路（同上）。失败不推翻领取，但必须留下痕迹。 */
+  onStatusError?: (reason: string) => void;
   /** 发 kickoff（@ 目标 bot）把会话激活。返回 messageId。 */
   activate: (chatId: string, botLarkAppId: string, prompt: string) => Promise<string>;
+  /**
+   * 激活成功后把平台状态推到 `in_progress`。
+   *
+   * **必填，不是可选**：平台的 activation lease 只扫 `status=claimed`（5 分钟），不回写
+   * in_progress 的话 sweeper 会把任务打成 `needs_attention(claim_activate_timeout)`，而
+   * 那个状态**回不去**——平台只放行 `task_blocked` 恢复成 in_progress，超时的只能
+   * open/reopened（都清 claim），群里的活就废了。做成可选依赖的话，漏传不会有任何报错，
+   * 引信就这么静默装回去了；宁可编译期逼调用方给。
+   *
+   * 与 fetchIssue 一起构成 [[issue-status-writer]] 的 `StatusWriterDeps`，回写走那边的
+   * `projectStatus`——sourceSeq 分配、串行、409 对账、退避只实现一次。
+   */
+  writeStatus: (
+    issueId: string,
+    args: {
+      claimId: string;
+      claimEpoch: number;
+      sourceSeq: number;
+      status: IssueStatus;
+      expectedStateRev: number;
+    },
+  ) => Promise<IssueClientResult<{ issue: PlatformIssue }>>;
+  /** 撞 409 时判断「平台还认不认这个 claim」。见 issue-status-writer。 */
+  fetchIssue: (teamId: string, issueId: string) => Promise<PlatformIssue | null>;
   newClaimId?: () => string;
   now?: () => number;
 }
@@ -284,7 +313,22 @@ export async function claimIssueIntoGroup(
     return { ok: false, stage: 'activate', reason: String((e as Error)?.message ?? e), binding: readyBinding, chatId };
   }
 
+  // ── 6.5 投影 in_progress（拆掉平台的 activation lease 引信）──────────────
+  //
+  // 平台 sweeper 只扫 `status=claimed` 且租约过期的任务；进了 in_progress 就不再按 5 分钟
+  // activation lease 回收。必须在 activate 成功后**立刻**推：晚一步 agent 就可能被打成
+  // needs_attention(claim_activate_timeout)，而那是条单向门——之后既回不到在跑、也交付不了。
+  //
+  // 走 projectStatus 而不是自己拼一次发送：那边带 409 对账（bind 到 activate 之间隔着几秒，
+  // 期间任何人动一下这条 issue，stateRev 就变了）。发不出去也不推翻领取——binding 已 bound、
+  // 行留在发件箱里，[[issue-outbox-pump]] 会接着重投。
+  const projected = await projectStatus(deps, readyBinding.anchorId, 'in_progress');
+  if (!projected.ok && projected.reason === 'platform') {
+    deps.onStatusError?.(projected.detail);
+  }
+  const finalBinding = getBinding(deps.dataDir, readyBinding.anchorId) ?? readyBinding;
+
   // ── 7. 意图退休（晚于 binding 落盘）───────────────────────────────────────
   clearClaimIntent(deps.dataDir, claimId);
-  return { ok: true, binding: readyBinding, chatId, kickoffMessageId };
+  return { ok: true, binding: finalBinding, chatId, kickoffMessageId };
 }

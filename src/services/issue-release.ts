@@ -27,34 +27,11 @@
  *    释放了，这里只需把本地补记成 released。这正是"我想撒手但平台一直拒绝我"的死结场景，
  *    不处理的话人只能去手改 JSON。
  */
-import {
-  clearClaimIntent,
-  claimNextOutboxRow,
-  enqueueDesiredStatus,
-  failOutboxRow,
-  getBinding,
-  settleOutboxRow,
-  updateBinding,
-  type IssueBinding,
-} from './issue-board-store.js';
-import type { IssueClientResult, PlatformIssue } from '../platform/issue-client.js';
+import { clearClaimIntent, getBinding, updateBinding, type IssueBinding } from './issue-board-store.js';
+import { projectStatus, type StatusWriterDeps } from './issue-status-writer.js';
 
-export interface ReleaseDeps {
-  dataDir: string;
-  writeStatus: (
-    issueId: string,
-    args: {
-      claimId: string;
-      claimEpoch: number;
-      sourceSeq: number;
-      status: 'open';
-      expectedStateRev: number;
-    },
-  ) => Promise<IssueClientResult<{ issue: PlatformIssue }>>;
-  /** 撞 409 时用来判断「平台还认不认这个 claim」。拿不到就当作无法判定，不猜。 */
-  fetchIssue: (teamId: string, issueId: string) => Promise<PlatformIssue | null>;
-  now?: () => number;
-}
+/** 发送侧完全复用 [[issue-status-writer]]：回写只有一条路径。 */
+export type ReleaseDeps = StatusWriterDeps;
 
 export type ReleaseResult =
   | { ok: true; binding: IssueBinding; issueId: string; alreadyReleasedOnPlatform: boolean }
@@ -80,68 +57,19 @@ export async function releaseIssue(deps: ReleaseDeps, anchorId: string): Promise
     return { ok: false, reason: 'already_released', binding };
   }
 
-  enqueueDesiredStatus(deps.dataDir, anchorId, 'open', {}, now());
-  const sending = claimNextOutboxRow(deps.dataDir, anchorId, now());
+  const r = await projectStatus(deps, anchorId, 'open');
 
-  let alreadyReleasedOnPlatform = false;
-  if (!sending) {
-    // 取不到待发行有两种可能，得分开：
-    //  - 上一次释放已经发成功、只是崩在了改本地 binding 之前 → 平台早就放开了，这里补完
-    //    本地那一半即可（幂等重入，正是"先平台后本地"写序留下的可恢复形态）；
-    //  - 另有一条 inflight 正在发 → 串行约束不允许插队，让人稍后再来。
-    if (binding.lastSyncedStatus !== 'open') {
-      return { ok: false, reason: 'platform', detail: 'outbox_busy（上一条回写还在发送中，稍后重试）', binding };
-    }
-    alreadyReleasedOnPlatform = true;
-  }
+  // `idle` = 发件箱里没有待发行且 lastSyncedStatus 已经是 open —— 上一次释放发成功了、
+  // 只是崩在改本地 binding 之前（"平台先行、本地后写"留下的可恢复形态）。补完本地那一半。
+  const alreadyReleasedOnPlatform =
+    (r.ok && !r.applied) || (!r.ok && r.reason === 'idle' && binding.lastSyncedStatus === 'open');
 
-  if (sending) {
-    let expectedStateRev = sending.expectedStateRev ?? binding.platformStateRev ?? 0;
-    let res = await deps.writeStatus(binding.issueId, {
-      claimId: binding.claimId,
-      claimEpoch: binding.claimEpoch,
-      sourceSeq: sending.sourceSeq,
-      status: 'open',
-      expectedStateRev,
-    });
-
-    if (!res.ok && res.reason === 'conflict') {
-      const fresh = await deps.fetchIssue(binding.teamId, binding.issueId);
-      if (fresh && fresh.claim?.claimId !== binding.claimId) {
-        // 平台上这条已经不归本机了 —— 释放的目的已经达成，别再打了。
-        alreadyReleasedOnPlatform = true;
-        settleOutboxRow(deps.dataDir, sending.writeId, { platformStateRev: fresh.stateRev }, now());
-      } else if (fresh) {
-        // claim 还是我的，纯粹是 CAS 基线过期。拿新 stateRev 重发**同一条**行：它上一次没被
-        // 应用，sourceSeq 复用是安全的（平台只在 `<= lastSourceSeq` 时才当重复丢弃）。
-        expectedStateRev = fresh.stateRev;
-        res = await deps.writeStatus(binding.issueId, {
-          claimId: binding.claimId,
-          claimEpoch: binding.claimEpoch,
-          sourceSeq: sending.sourceSeq,
-          status: 'open',
-          expectedStateRev,
-        });
-      }
-    }
-
-    if (!alreadyReleasedOnPlatform) {
-      if (!res.ok) {
-        const detail = 'error' in res ? `${res.reason}: ${res.error}` : res.reason;
-        failOutboxRow(deps.dataDir, sending.writeId, detail, {}, now());
-        // 本地保持原状：平台还认为这台机器持有，本机也得继续这么认，否则就是分裂。
-        return { ok: false, reason: 'platform', detail, binding };
-      }
-      settleOutboxRow(
-        deps.dataDir,
-        sending.writeId,
-        {
-          platformStateRev: res.value.issue.stateRev,
-          ...(res.value.issue.claim ? { platformLastSourceSeq: res.value.issue.claim.lastSourceSeq } : {}),
-        },
-        now(),
-      );
-    }
+  if (!r.ok && !alreadyReleasedOnPlatform) {
+    // 平台还认为这台机器持有，本机也得继续这么认，否则就是分裂。
+    const detail = r.reason === 'busy'
+      ? 'outbox_busy（上一条回写还在发送中，稍后重试）'
+      : r.reason === 'platform' ? r.detail : r.reason;
+    return { ok: false, reason: 'platform', detail, binding };
   }
 
   // 平台已确认，现在才动本地。

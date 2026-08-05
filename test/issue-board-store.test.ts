@@ -212,6 +212,18 @@ describe('outbox 串行 pump', () => {
     expect(claimNextOutboxRow(dataDir, 'oc_group1')).toBeNull();
   });
 
+  // 409 对账发现 claim 已易主时用：这条行不用再发了，但平台**没有**采纳它。若照常写
+  // lastSyncedStatus，下一次投影同一状态会走幂等分支直接回成功，平台却纹丝不动——静默谎报。
+  it('applied:false 结算：标 done 但不写 lastSyncedStatus', () => {
+    enqueueDesiredStatus(dataDir, 'oc_group1', 'in_review');
+    const row = claimNextOutboxRow(dataDir, 'oc_group1')!;
+    settleOutboxRow(dataDir, row.writeId, { platformStateRev: 20, applied: false });
+    const b = getBinding(dataDir, 'oc_group1')!;
+    expect(b.lastSyncedStatus).toBeUndefined();
+    expect(b.platformStateRev).toBe(20);
+    expect(listOutbox(dataDir, 'oc_group1').every((r) => r.state === 'done')).toBe(true);
+  });
+
   it('失败退回 pending 并按退避推迟；到点后可再领', () => {
     enqueueDesiredStatus(dataDir, 'oc_group1', 'in_progress');
     const row = claimNextOutboxRow(dataDir, 'oc_group1')!;

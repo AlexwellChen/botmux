@@ -13,8 +13,8 @@ import {
   claimIssue,
   fetchIssues,
   fetchTeams,
+  findIssueById,
   writeIssueStatus,
-  type PlatformIssue,
 } from '../../platform/issue-client.js';
 import { claimIssueIntoGroup } from '../../services/issue-claim-flow.js';
 import { releaseIssue } from '../../services/issue-release.js';
@@ -150,6 +150,10 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
             if (!activate) throw new Error('activate_not_wired');
             return activate({ chatId, larkAppId: botLarkAppId, prompt, workingDir });
           },
+          writeStatus: (issueId, args) => writeIssueStatus(issueId, args) as any,
+          fetchIssue: (teamId, issueId) => findIssueById(teamId, issueId),
+          onStatusError: (reason) =>
+            logger.warn(`[issue] in_progress 回写失败（领取仍成功，pump 会重投）：${reason}`),
         },
         {
           issue,
@@ -186,18 +190,7 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
         {
           dataDir: config.session.dataDir,
           writeStatus: (issueId, args) => writeIssueStatus(issueId, args) as any,
-          fetchIssue: async (teamId, issueId) => {
-            const list = await fetchIssues(teamId);
-            if (!list.ok) return null;
-            for (const section of Object.values(list.value)) {
-              const hit = (section as PlatformIssue[]).find((i) => i._id === issueId);
-              if (hit) return hit;
-            }
-            // 列表里没有 ≠ 拿不到。分段列表只覆盖活跃状态，issue 被归档就不在里面了——
-            // 那种情况平台上肯定已经不是本机的 claim，返回 null 会让释放停在"无法判定"。
-            // 但也不能凭空造一个"不是我的"，所以这里如实返回 null，由上层报错让人去平台看。
-            return null;
-          },
+          fetchIssue: (teamId, issueId) => findIssueById(teamId, issueId),
         },
         anchorId,
       );

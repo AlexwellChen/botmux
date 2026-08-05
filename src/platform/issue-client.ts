@@ -165,6 +165,30 @@ export function fetchIssues(
 }
 
 /**
+ * 按 id 单查一条 issue。
+ *
+ * 平台**没有**「按 id 单查」的机器接口，只能从分段列表里捞——这是唯一的实现方式，所以收口
+ * 在这里，别让每个调用方各抄一遍（回写的 409 对账、领取确认、交付都要用它）。
+ *
+ * 返回 null 有两种含义且**无法区分**：拉列表失败，或 issue 不在活跃分段里（已归档）。
+ * 调用方一律按「无法判定」处理，不要把 null 当成「平台上没有/不是我的」——那会让
+ * 409 对账做出相反的决定。
+ */
+export async function findIssueById(
+  teamId: string,
+  issueId: string,
+  opts: IssueClientOptions = {},
+): Promise<PlatformIssue | null> {
+  const list = await fetchIssues(teamId, opts);
+  if (!list.ok) return null;
+  for (const section of Object.values(list.value)) {
+    const hit = (section as PlatformIssue[]).find((i) => i._id === issueId);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
  * 领取。`claimId` 必须是**高熵随机**（`crypto.randomBytes(16).toString('hex')`），
  * 绝不能由 issueId 派生——平台的幂等分支现在会连 machineId/unionId 一起校验，派生键在
  * 多机场景下会直接撞 409 `already_claimed`（早失败，好过静默把别人的 claim 当成自己的）。

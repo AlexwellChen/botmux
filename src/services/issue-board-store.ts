@@ -511,11 +511,17 @@ export function claimNextOutboxRow(
   return rows[idx];
 }
 
-/** 发送成功：标 done，并把平台返回的 stateRev / 已同步状态写回 binding。 */
+/**
+ * 发送成功：标 done，并把平台返回的 stateRev / 已同步状态写回 binding。
+ *
+ * `applied: false` 用于「这条行不必再发了，但平台**没有**采纳它」——目前只有一种情况：
+ * 409 对账发现 claim 已易主。此时**绝不能**写 `lastSyncedStatus`：写了本地就以为
+ * "已经是 in_review 了"，下一次交付会走幂等分支直接回成功，而平台上那条压根没变。
+ */
 export function settleOutboxRow(
   dataDir: string,
   writeId: string,
-  result: { platformStateRev?: number; platformLastSourceSeq?: number },
+  result: { platformStateRev?: number; platformLastSourceSeq?: number; applied?: boolean },
   now: number = Date.now(),
 ): void {
   const rows = readOutbox(dataDir);
@@ -541,7 +547,7 @@ export function settleOutboxRow(
     dataDir,
     row.anchorId,
     {
-      lastSyncedStatus: row.targetStatus,
+      ...(result.applied === false ? {} : { lastSyncedStatus: row.targetStatus }),
       ...(result.platformStateRev !== undefined ? { platformStateRev: result.platformStateRev } : {}),
       ...(syncedSeq !== undefined && syncedSeq !== binding?.nextSourceSeq ? { nextSourceSeq: syncedSeq } : {}),
     },

@@ -16,6 +16,7 @@ import {
   listBindings,
   listClaimIntents,
   listDanglingClaimIntents,
+  listOutbox,
 } from '../src/services/issue-board-store.js';
 
 let dataDir: string;
@@ -61,6 +62,11 @@ function deps(over: Partial<ClaimFlowDeps> = {}) {
       calls.push('activate');
       return 'om_kickoff';
     },
+    writeStatus: async (_id, a) => {
+      calls.push(`status:${a.status}`);
+      return { ok: true, value: { issue: { ...ISSUE, status: a.status, stateRev: 4, claim: { lastSourceSeq: a.sourceSeq } } } } as any;
+    },
+    fetchIssue: async () => ({ ...ISSUE, stateRev: 4, claim: { claimId: 'c'.repeat(32) } }) as any,
     ...over,
   };
   return { d: base, calls, groupOpts };
@@ -80,15 +86,41 @@ describe('顺利路径', () => {
     const { d, calls } = deps();
     const r = await claimIssueIntoGroup(d, ARGS);
     expect(r.ok).toBe(true);
-    expect(calls).toEqual(['claim', 'createGroup', 'bind', 'activate']);
+    expect(calls).toEqual(['claim', 'createGroup', 'bind', 'activate', 'status:in_progress']);
     if (!r.ok) return;
     expect(r.chatId).toBe('oc_new');
     expect(r.kickoffMessageId).toBe('om_kickoff');
     expect(r.binding.bindState).toBe('bound');
     expect(r.binding.localTaskRef).toBe('oc_new::cli_worker');
-    expect(r.binding.platformStateRev).toBe(3);
+    expect(r.binding.platformStateRev).toBe(4);
     // 意图只在窗口期存在，走完就该清掉
     expect(listClaimIntents(dataDir)).toEqual([]);
+  });
+
+  // 平台 bind 之后给 5 分钟 activation 租约，到期还停在 claimed 就被 sweeper 打成
+  // needs_attention(claim_activate_timeout)——那是条单向门，回不到在跑也交付不了。
+  // 「开工即写 in_progress」就是拆这颗引信，所以它必须有独立用例盯着。
+  it('activate 之后立刻把 issue 推到 in_progress（拆掉 activation lease 引信）', async () => {
+    const { d, calls } = deps();
+    const r = await claimIssueIntoGroup(d, ARGS);
+    expect(r.ok).toBe(true);
+    expect(calls.indexOf('status:in_progress')).toBeGreaterThan(calls.indexOf('activate'));
+    expect(getBinding(dataDir, 'oc_new')?.lastSyncedStatus).toBe('in_progress');
+    expect(listOutbox(dataDir, 'oc_new').every((row) => row.state === 'done')).toBe(true);
+  });
+
+  // 回写失败不该推翻已经建好的群和绑定：行留在发件箱里，pump 会重投。
+  it('in_progress 回写失败仍算领取成功，行留在发件箱待重投', async () => {
+    const errors: string[] = [];
+    const { d } = deps({
+      writeStatus: async () => ({ ok: false, reason: 'server', status: 503, error: 'boom' }) as any,
+      onStatusError: (e) => errors.push(e),
+    });
+    const r = await claimIssueIntoGroup(d, ARGS);
+    expect(r.ok).toBe(true);
+    expect(errors.join()).toMatch(/boom/);
+    expect(getBinding(dataDir, 'oc_new')?.bindState).toBe('bound');
+    expect(listOutbox(dataDir, 'oc_new').some((row) => row.state === 'pending')).toBe(true);
   });
 
   // held 是「群已建、binding 未写」那个窗口的唯一兜底：没 kickoff 就没有 agent 在跑。
@@ -195,7 +227,7 @@ describe('开工播报', () => {
     const { d, sent, calls } = withAnnounce();
     await claimIssueIntoGroup(d, ARGS);
     // 先播报再激活：agent 的输出要跟在任务说明后面，顺序读起来才对
-    expect(calls).toEqual(['claim', 'createGroup', 'bind', 'announce', 'activate']);
+    expect(calls).toEqual(['claim', 'createGroup', 'bind', 'announce', 'activate', 'status:in_progress']);
     expect(sent[0].chatId).toBe('oc_new');
   });
 

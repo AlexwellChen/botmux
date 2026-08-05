@@ -8,6 +8,7 @@ import {
   escapeLarkMd,
   truncateDisplay,
   buildIssueKickoffCard,
+  buildIssueDeliveryCard,
   claimFailureHint,
   matchRepo,
   rankRepos,
@@ -249,6 +250,48 @@ describe('开工播报卡', () => {
     expect(buildIssueKickoffCard({ ...base, issueUrl: 'https://p/?issue=iss-1#issues' }))
       .toContain('在平台上查看');
     expect(buildIssueKickoffCard(base)).not.toContain('在平台上查看');
+  });
+});
+
+// 平台 /status 只收状态不收正文，所以交付说明只能落在群里，见 buildIssueDeliveryCard 的注释。
+describe('交付播报卡', () => {
+  const base = { issueId: 'iss-1', title: '修一个 bug', report: '改了 A 和 B，跑过测试。' };
+
+  it('带上交付说明正文', () => {
+    const flat = buildIssueDeliveryCard(base);
+    expect(flat).toContain('已交付，等待验收');
+    expect(flat).toContain('改了 A 和 B');
+  });
+
+  // 重复交付时若还说"已交付"，验收的人会以为交了两次。
+  it('平台上已是待验收时换措辞', () => {
+    const flat = buildIssueDeliveryCard({ ...base, alreadyInReview: true });
+    expect(flat).toContain('已经是待验收状态');
+    expect(flat).not.toContain('已交付，等待验收');
+  });
+
+  it('超长交付说明截断', () => {
+    const flat = buildIssueDeliveryCard({ ...base, report: 'x'.repeat(4000) });
+    expect(flat).toContain('…');
+    expect(flat.length).toBeLessThan(2000);
+  });
+
+  it('交付说明为空时不留空块', () => {
+    const flat = buildIssueDeliveryCard({ ...base, report: '   \n  ' });
+    expect(flat).toContain('已交付，等待验收');
+    expect(flat).toContain('iss-1');
+  });
+
+  // report 正文是 agent 自由书写的，直接塞进 lark_md 会被解释成标记。
+  it('转义正文里的 lark_md，防止越权渲染', () => {
+    const flat = buildIssueDeliveryCard({ ...base, report: '搞定了 </font><at user_id="all"></at>' });
+    expect(flat).not.toContain('<at user_id=');
+    expect(flat).toContain('&lt;at');
+  });
+
+  it('有平台地址才给验收按钮', () => {
+    expect(buildIssueDeliveryCard({ ...base, issueUrl: 'https://p/?issue=iss-1#issues' })).toContain('去平台验收');
+    expect(buildIssueDeliveryCard(base)).not.toContain('去平台验收');
   });
 });
 

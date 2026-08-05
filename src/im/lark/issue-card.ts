@@ -490,6 +490,63 @@ export function buildIssueKickoffCard(data: IssueKickoffCardData, _locale?: Loca
   return JSON.stringify({ config: { wide_screen_mode: true }, elements });
 }
 
+export interface IssueDeliveryCardData {
+  title?: string;
+  issueId: string;
+  /** agent 执行 `botmux report` 时写的交付说明。 */
+  report: string;
+  issueUrl?: string;
+  /** 重复交付（平台上已经是待验收）时措辞不同，别让人以为交付了两次。 */
+  alreadyInReview?: boolean;
+}
+
+/** 交付说明的展示上限。完整正文在会话里本来就有，这里只是给验收的人一个摘要。 */
+const DELIVERY_REPORT_MAX = 1200;
+
+/**
+ * 交付播报：`botmux report` 成功后发回任务群。
+ *
+ * 之所以必须发：平台的 `/status` 接口**只收状态、不收正文**（claimId/claimEpoch/sourceSeq/
+ * status/expectedStateRev，没有 note 字段）。交付说明在平台上无处可放，验收的人只会看到状态
+ * 变成「待验收」，完全不知道交付了什么。在补上平台侧的备注字段之前，群里是这段文字唯一
+ * 能落地的地方——否则它就只是 `botmux report` 的一行 stdout，谁也看不见。
+ */
+export function buildIssueDeliveryCard(data: IssueDeliveryCardData, _locale?: Locale): string {
+  const elements: any[] = [];
+  elements.push(
+    h(
+      data.alreadyInReview
+        ? `📮 **已经是待验收状态**${data.title ? `：${escapeLarkMd(truncateDisplay(data.title, 60))}` : ''}`
+        : `✅ **已交付，等待验收**${data.title ? `：${escapeLarkMd(truncateDisplay(data.title, 60))}` : ''}`,
+    ),
+  );
+
+  const body = data.report.trim();
+  if (body) {
+    const excerpt = body.length > DELIVERY_REPORT_MAX ? `${body.slice(0, DELIVERY_REPORT_MAX)}…` : body;
+    elements.push({ tag: 'hr' });
+    elements.push(h(excerpt.split('\n').map(escapeLarkMd).join('\n')));
+  }
+
+  elements.push({ tag: 'hr' });
+  elements.push(h(`🔖 平台任务　\`${escapeLarkMd(data.issueId)}\``));
+  if (data.issueUrl) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '去平台验收' },
+          type: 'primary',
+          url: data.issueUrl,
+          value: {},
+        },
+      ],
+    });
+  }
+  return JSON.stringify({ config: { wide_screen_mode: true }, elements });
+}
+
 /** 失败阶段 → 给人的下一步提示。措辞对应 issue-claim-flow 里那张「失败留下什么」表。 */
 export function claimFailureHint(stage: string): string | undefined {
   switch (stage) {
