@@ -22,7 +22,7 @@
  * Run:  pnpm vitest run test/daemon-rename-route.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => {
@@ -119,6 +119,21 @@ const OWNER = 'ou_owner';
 const PEER = 'ou_peer_bot';
 const PEER_UNION = 'on_peer_bot';
 const NOW = new Date().toISOString();
+const repoFixtureDirs: string[] = [];
+
+function makeRepoFixtureDir(): string {
+  const root = join(mocks.dataDir, 'repo-fixtures');
+  mkdirSync(root, { recursive: true });
+  const dir = mkdtempSync(join(root, 'repo-'));
+  repoFixtureDirs.push(dir);
+  return dir;
+}
+
+function cleanupRepoFixtureDirs(): void {
+  for (const dir of repoFixtureDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 function makeEventData(messageId: string, text: string, rootId?: string): any {
   return {
@@ -165,6 +180,7 @@ function makePeerRepoEventDataWithSplitFooter(
   messageId: string,
   rootId?: string,
 ): any {
+  const repoPath = makeRepoFixtureDir();
   return {
     sender: { sender_id: { open_id: PEER, union_id: PEER_UNION }, sender_type: 'app' },
     message: {
@@ -174,7 +190,7 @@ function makePeerRepoEventDataWithSplitFooter(
       message_type: 'interactive',
       content: JSON.stringify({
         elements: [[
-          { tag: 'text', text: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission\n' },
+          { tag: 'text', text: `/repo ${repoPath}\n` },
           { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
           { tag: 'text', text: "<font color='grey'> </font>" },
           { tag: 'a', text: '·', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
@@ -191,6 +207,7 @@ function makePeerRepoEventDataWithV2FooterElement(
   messageId: string,
   rootId?: string,
 ): any {
+  const repoPath = makeRepoFixtureDir();
   return {
     sender: { sender_id: { open_id: PEER, union_id: PEER_UNION }, sender_type: 'app' },
     message: {
@@ -202,7 +219,7 @@ function makePeerRepoEventDataWithV2FooterElement(
         schema: '2.0',
         body: {
           elements: [
-            { tag: 'markdown', content: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission' },
+            { tag: 'markdown', content: `/repo ${repoPath}` },
             { tag: 'hr' },
             {
               element_id: 'botmux_reply_footer',
@@ -590,6 +607,7 @@ describe('/repo trusted sibling production routing', () => {
   });
 
   afterEach(() => {
+    cleanupRepoFixtureDirs();
     rmSync(crossRefPath(), { force: true });
     rmSync(botsConfigPath(), { force: true });
     rmSync(botsInfoPath(), { force: true });
