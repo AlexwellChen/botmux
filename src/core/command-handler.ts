@@ -1489,7 +1489,8 @@ export async function handleCommand(
             const initiallyBuffered =
               (ds!.pendingPrompt?.trim().length ?? 0) > 0 ||
               (ds!.pendingAttachments?.length ?? 0) > 0 ||
-              (ds!.pendingFollowUps?.length ?? 0) > 0;
+              (ds!.pendingFollowUps?.length ?? 0) > 0 ||
+              ds!.pendingChatContext !== undefined;
             const availableBots = initiallyBuffered
               ? await getAvailableBots(ds!.larkAppId, ds!.chatId)
               : [];
@@ -1505,7 +1506,8 @@ export async function handleCommand(
             const hasBufferedInput =
               pendingPrompt.trim().length > 0 ||
               (ds!.pendingAttachments?.length ?? 0) > 0 ||
-              (ds!.pendingFollowUps?.length ?? 0) > 0;
+              (ds!.pendingFollowUps?.length ?? 0) > 0 ||
+              ds!.pendingChatContext !== undefined;
             // Nothing to submit at all (bare `/repo`: the message IS the command).
             // The CLI boots idle, so the user's NEXT real message is its first
             // turn and must carry the full new-topic opening — see
@@ -1535,6 +1537,7 @@ export async function handleCommand(
                     codexAppMessageContext: ds!.pendingCodexAppMessageContext,
                     codexAppFollowUps: ds!.pendingCodexAppFollowUps,
                     codexAppFollowUpContexts: ds!.pendingCodexAppFollowUpContexts,
+                    chatContext: ds!.pendingChatContext,
                   },
                 )
               : { content: '' };
@@ -1579,6 +1582,7 @@ export async function handleCommand(
             ds!.pendingCodexAppText = undefined;
             ds!.pendingCodexAppApplicationContext = undefined;
             ds!.pendingCodexAppMessageContext = undefined;
+            ds!.pendingChatContext = undefined;
             ds!.pendingAttachments = undefined;
             ds!.pendingMentions = undefined;
             ds!.pendingSubstituteTrigger = undefined;
