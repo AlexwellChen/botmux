@@ -3766,7 +3766,7 @@ export async function transferSession(
  *  byte-level fork we can reproduce — they are refused. Riff / other pure-remote
  *  backends have no local rollout to fork either. */
 const FORK_CAPABLE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
-  'claude-code', 'seed', 'relay', 'aiden', 'codex',
+  'claude-code', 'seed', 'relay', 'codex',
 ]);
 
 /** True when this session can be byte-level forked via a CLI-native primitive.
@@ -3819,7 +3819,16 @@ export async function forkSession(
   targetRootMessageId: string,
   targetChatType: 'group' | 'p2p',
   targetScope: 'thread' | 'chat',
-  opts?: { forkWorkerImpl?: typeof forkWorker },
+  opts?: {
+    forkWorkerImpl?: typeof forkWorker;
+    childTitle?: string;
+    forkTaskText?: string;
+    larkThreadId?: string;
+    buildInitialPrompt?: (childSessionId: string) => string | CliTurnPayload;
+    turnId?: string;
+    senderOpenId?: string;
+    senderIsBot?: boolean;
+  },
 ): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> {
   if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
     return { ok: false, error: 'target_chat_type_unsupported' };
@@ -3872,7 +3881,8 @@ export async function forkSession(
 
   // ── Mint the child session row (new botmux sessionId) ──
   const parentTitle = ds.session.title || '';
-  const childTitle = parentTitle ? `🔱 ${parentTitle}` : '🔱 分身';
+  const childTitle = opts?.childTitle?.trim()
+    || (parentTitle ? `🔱 ${parentTitle}` : '🔱 分身');
   const childSession = sessionStore.createSession(
     targetChatId,
     targetRootMessageId,
@@ -3884,10 +3894,16 @@ export async function forkSession(
   // child's first spawn resumes it and forks forward (pendingForkSession), then
   // the worker persists the child's own new id and clears the marker.
   childSession.forkedFrom = ds.session.sessionId;
+  childSession.forkTaskText = opts?.forkTaskText;
+  childSession.larkThreadId = opts?.larkThreadId;
+  childSession.lastCallerOpenId = opts?.senderOpenId;
+  childSession.quoteTargetId = opts?.turnId;
+  childSession.quoteTargetSenderOpenId = opts?.senderOpenId;
+  childSession.quoteTargetSenderIsBot = opts?.senderIsBot;
   childSession.pendingForkSession = true;
   childSession.cliSessionId = srcCliSessionId;
   childSession.cliId = ds.session.cliId;
-  childSession.workingDir = ds.session.workingDir;
+  childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
   childSession.ownerOpenId = ds.session.ownerOpenId;
   childSession.backendType = ds.session.backendType;
   // Bot identity on the PERSISTED row. Every other createSession caller sets
@@ -3928,6 +3944,9 @@ export async function forkSession(
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
   childSession.model = ds.session.model;
   childSession.reasoningEffort = ds.session.reasoningEffort;
+  childSession.cliRuntime = ds.session.cliRuntime
+    ? { ...ds.session.cliRuntime, update: { ...ds.session.cliRuntime.update } }
+    : undefined;
   childSession.cliPathOverride = ds.session.cliPathOverride;
   childSession.wrapperCli = ds.session.wrapperCli;
   childSession.agentFrozen = ds.session.agentFrozen;
@@ -3950,7 +3969,7 @@ export async function forkSession(
     cliVersion: getCurrentCliVersion(),
     lastMessageAt: Date.now(),
     hasHistory: true,           // forked child resumes (forks) prior history on first spawn
-    workingDir: ds.session.workingDir,
+    workingDir: ds.workingDir ?? ds.session.workingDir,
     ownerOpenId: ds.session.ownerOpenId,
     // Fresh card in the target anchor — never inherit the source's card id.
     streamCardId: undefined,
@@ -3986,7 +4005,19 @@ export async function forkSession(
   // codex fork). The SOURCE ds is never touched.
   const fkw = opts?.forkWorkerImpl ?? forkWorker;
   try {
-    fkw(childDs, '', /*resume*/true);
+    const initialPrompt = opts?.buildInitialPrompt?.(childSession.sessionId) ?? '';
+    if (initialPrompt) {
+      rememberLastCliInput(
+        childDs,
+        opts?.forkTaskText ?? (typeof initialPrompt === 'string' ? initialPrompt : initialPrompt.content),
+        initialPrompt,
+      );
+    }
+    fkw(
+      childDs,
+      initialPrompt,
+      opts?.turnId ? { resume: true, turnId: opts.turnId } : true,
+    );
   } catch (err) {
     logger.error(
       `[${childSession.sessionId.substring(0, 8)}] fork child worker spawn failed: `
