@@ -24,6 +24,22 @@ describe('offline explicit session backing cleanup', () => {
     });
   }
 
+  it('passes the exact owner session id when destroying ZMX', async () => {
+    const killPersistent = vi.fn();
+    const probePersistent = vi.fn(() => 'missing' as const);
+
+    await expect(cleanupExplicitSessionBacking(
+      { sessionId: SID, backendType: 'zmx' },
+      { killPersistent, probePersistent },
+    )).resolves.toEqual({
+      ok: true,
+      kind: 'destroyed_persistent',
+      backendType: 'zmx',
+      name: 'bmx-abcd1234',
+    });
+    expect(killPersistent).toHaveBeenCalledWith('zmx', 'bmx-abcd1234', SID);
+  });
+
   it('does not report success when a persistent backend still exists after kill', async () => {
     const result = await cleanupExplicitSessionBacking(
       { sessionId: SID, backendType: 'tmux' },

@@ -85,10 +85,10 @@ export async function cleanupExplicitSessionBacking(
   const kill = deps.killPersistent ?? killPersistentSession;
   const probe = deps.probePersistent ?? probePersistentSession;
   try {
-    // ZMX destruction is identity-verified and refuses a name-only kill.
-    // Passing the owner session id is harmless for the other backends and
-    // preserves the fail-closed contract for newly added persistent backends.
-    kill(input.backendType, name, input.sessionId);
+    // ZMX destruction is identity-verified and refuses a name-only kill. Keep
+    // the established two-argument contract for the other backends.
+    if (input.backendType === 'zmx') kill(input.backendType, name, input.sessionId);
+    else kill(input.backendType, name);
     // Backend kill helpers are intentionally idempotent and historically
     // swallow command errors. Offline explicit abandon needs a stronger
     // contract: only publish closed after a post-kill probe confirms absence.

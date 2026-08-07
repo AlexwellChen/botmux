@@ -79,6 +79,13 @@ function createFixture(options: {
     worker.signalCode = null;
     worker.kill = vi.fn();
     worker.send = vi.fn((message: any) => {
+      if (message.type === 'close_commit') {
+        queueMicrotask(() => {
+          worker.exitCode = 0;
+          worker.emit('exit', 0, null);
+        });
+        return;
+      }
       if (message.type === 'close_abort') {
         queueMicrotask(() => worker.emit('message', {
           type: 'close_abort_result',
@@ -146,6 +153,7 @@ describe('Riff explicit close', () => {
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
       alreadyClosed: false,
+      known: true,
     });
     expect(cancelRiffTaskMock).toHaveBeenCalledWith(
       expect.objectContaining({ baseUrl: 'https://riff.invalid' }),
@@ -180,6 +188,7 @@ describe('Riff explicit close', () => {
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
       alreadyClosed: false,
+      known: true,
     });
     expect(fixture.worker.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'close',
