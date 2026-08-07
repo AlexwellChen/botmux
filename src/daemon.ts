@@ -360,11 +360,15 @@ import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import {
   setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
+  setAskPersistStore as setAskPersistStoreBroker,
   registerAsk as registerAskBroker,
+  restorePersistedAsks as restorePersistedAsksBroker,
   findPendingAskByAnchor,
   submitCustomReply,
 } from './core/ask-broker.js';
+import { createAskPersistStore } from './core/ask-persist-store.js';
 import { parseAskBody } from './core/ask-api.js';
+import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 import { normalizeVcMeetingEvents } from './vc-agent/normalizer.js';
@@ -525,6 +529,13 @@ import {
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
+/** False until restoreActiveSessions() finishes. During the startup window the
+ *  IPC server is already listening but activeSessions is empty, so a reconnecting
+ *  ask hook would fail session lookup and get a 403 origin_unproven — which the
+ *  CLI would treat as permanent and passthrough into a stuck native picker
+ *  (codex P1-2). While false, /api/asks returns a retryable 503 for unknown
+ *  sessions instead, so the reconnecting hook keeps waiting through the restore. */
+let sessionsRestored = false;
 const VC_MEETING_DELIVERY_LEASE_MS = 15 * 60_000;
 const VC_MEETING_DELIVERY_LEASE_SCAN_MS = 60_000;
 const VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS = 3_000;
@@ -5115,6 +5126,21 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   if ('error' in parsed) return jsonRes(res, 400, { ok: false, error: parsed.error });
 
   const askSession = findActiveBySessionId(parsed.sessionId);
+  // Startup window (codex P1-2): IPC is listening but sessions aren't restored
+  // yet, so a reconnecting ask hook's session lookup misses and would otherwise
+  // get a permanent 403. Return a RETRYABLE 503 so the hook keeps waiting
+  // (blocking Claude, no native picker) until restore finishes and it can bind.
+  // Predicate is a shared pure function (unit-tested directly — codex P1-2 seam).
+  // NOTE: this gate does NOT exempt trusted-host callers — a normal unsandbox
+  // hook IS the trusted-host path (HMAC fetchDaemonIpc), so exempting it would
+  // let the very reconnecting hook we must protect register a lost
+  // non-resumable ask during the restore window.
+  if (shouldReturnAskStartupNotReady({
+    hasSession: !!askSession,
+    sessionsRestored,
+  })) {
+    return jsonRes(res, 503, { ok: false, error: 'startup_not_ready' });
+  }
   let boundAsk = parsed;
   if (!isTrustedHostIpcRequest(req)) {
     const body = raw && typeof raw === 'object' && !Array.isArray(raw)
@@ -5199,6 +5225,15 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     questions: boundAsk.questions,
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
+    // Invocation identity (from the hook; enables cross-restart re-attach).
+    requestId: boundAsk.requestId,
+    originKind: boundAsk.originKind,
+    // Authoritative persistence gate (codex P1-4): derive resumability from the
+    // authenticated session's FROZEN backend, not the client's origin string. A
+    // PTY-backed session dies with the daemon, so its ask must NOT persist; only
+    // a restart-surviving mux backend (tmux/herdr/zellij/zmx) is resumable.
+    backendSurvivesRestart:
+      !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
   });
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
@@ -18728,6 +18763,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     evaluateAskAnswerTalk(appId, chatId, openId, chatType, actor),
   );
 
+  // Resume pending `botmux ask` cards that outlived a daemon restart. Each is
+  // restored as a DORMANT ask (card still live in Feishu, no waiter yet). The
+  // surviving CLI hook — whose /api/asks connection dropped on restart and is
+  // retrying — re-registers the same ask by its stable key and re-attaches a
+  // waiter, so the answer flows back through the normal hook directive instead
+  // of the CLI falling into a stuck native picker. Scoped to this daemon's bot.
+  try {
+    // Bind the durable store to the real data dir (dependency-injected so unit
+    // tests use a temp dir and never touch live data — codex P1-4).
+    setAskPersistStoreBroker(createAskPersistStore(join(config.session.dataDir, 'asks')));
+    restorePersistedAsksBroker(Date.now(), cfg.larkAppId);
+  } catch (e) {
+    logger.warn(`[ask] restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();
 
@@ -19260,6 +19310,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   await restoreActiveSessions(activeSessions);
+  // Restore complete → /api/asks may now safely 403 unknown sessions again; a
+  // reconnecting ask hook that raced the restore got retryable 503s until here.
+  sessionsRestored = true;
 
   // Now that activeSessions is populated, release the forward-followup flush
   // barrier. Persisted seeds were loaded into the buffer at dispatcher startup
