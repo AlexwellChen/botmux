@@ -35,7 +35,7 @@ import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
-import { pickTurnReplyTarget } from './core/reply-target.js';
+import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
@@ -3198,7 +3198,7 @@ interface SessionData {
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
-  replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
   /** Current persisted worker lifetime and its exact input-queue receipts. */
   workerGeneration?: number;
   dispatchInputReceipts?: Record<string, {
@@ -6506,7 +6506,8 @@ import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
-  shouldBlockMentionBackByParticipants,
+  mentionBackAmbiguity,
+  mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -7539,7 +7540,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-    ?? s.quoteTargetSenderOpenId;
+    ?? turnReplyTarget?.senderOpenId;
 
   // @ hard-gate (config.send.requireMentionDecision, default on): force the
   // model to make an explicit @ decision before sending. --top-level publish
@@ -7554,12 +7555,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
 
-  // Register bots so the Lark client works. MUST run before the participant
-  // gate below: that gate calls getGroupStats → getBotClient, which throws
-  // "Bot not registered" in this standalone `botmux send` process (a fresh
-  // process with an empty registry) — getGroupStats would then soft-fail to
-  // {999,999} and wrongly block --mention-back even in a true 1v1. registerBot
-  // is idempotent, so the downstream send path reuses these same clients.
+  // Register bots so the downstream Lark client works. registerBot is
+  // idempotent, so all send paths reuse these same clients.
   // envPinnedRiffBot is re-registered LAST so a remote env credential is never
   // clobbered by a stale bots.json entry for the same app.
   const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
@@ -7567,30 +7564,20 @@ async function cmdSend(rest: string[]): Promise<void> {
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
-  // Participant gate for --mention-back: in a true 1v1 the triggerer is the
-  // only counterpart so auto-@-ing them back is unambiguous, but once a third
-  // party joins (humans + bots > 2) "who triggered this turn" is no longer
-  // reliably "who should be addressed". Force an explicit --mention there.
-  // Symmetric with the inbound un-@ gate (event-dispatcher getGroupStats).
-  // Only fetch when mention-back is actually requested AND the chat isn't a p2p
-  // DM (inherently 1v1) — keeps the common send path free of an API round-trip.
-  if (mentionBack && s.chatType !== 'p2p' && s.larkAppId && s.chatId && !sendTopLevel) {
-    try {
-      const { getGroupStats } = await import('./im/lark/event-dispatcher.js');
-      const { userCount, botCount } = await getGroupStats(s.larkAppId, s.chatId);
-      if (shouldBlockMentionBackByParticipants({ chatType: s.chatType, userCount, botCount })) {
-        console.error(
-          `--mention-back 在多人会话（当前 ${userCount} 人 + ${botCount} bot）里不可用：`
-          + '"回复触发这轮的人/bot" 在多方场景可能 @ 错对象。请改用 --mention <ou:Name> 显式点名，'
-          + '或 --no-mention 不 @。',
-        );
-        process.exit(2);
-      }
-    } catch (err: any) {
-      // getGroupStats already soft-fails to {999,999} (→ block) internally, so
-      // reaching here means the dynamic import itself failed. Fail-closed to a
-      // clear error rather than silently letting a possibly-wrong @ through.
-      console.error(`无法确认会话人数以校验 --mention-back：${err?.message ?? err}。请改用 --mention <ou:Name> 或 --no-mention。`);
+  // Ambiguity gate for --mention-back. --mention-back means "@ back the one
+  // counterpart who triggered this turn"; that is only unambiguous when this
+  // turn's window had a single counterpart. Once 2+ distinct people/bots took
+  // part (a human + a peer bot, two humans, the triggerer plus someone they
+  // @-ed, a type-ahead follow-up from a third party, …), block --mention-back
+  // and hand the model the exact candidates so it can --mention <open_id> the
+  // right one instead of guessing (or mis-@-ing the lone human). Reads the
+  // persisted per-turn participant window — no group-stats round-trip. Explicit
+  // VC turns carry their own single-target origin, so they skip this gate.
+  if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
+    const window = collectTurnWindowParticipants(s, currentTurnId);
+    const ambiguity = mentionBackAmbiguity({ chatType: s.chatType, participants: window.participants, incomplete: window.incomplete });
+    if (ambiguity.ambiguous) {
+      console.error(mentionBackAmbiguityError(ambiguity.candidates, ambiguity.incomplete));
       process.exit(2);
     }
   }
@@ -8057,7 +8044,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
         : s, {
           isOncall: !!oncallEntry,
-          isSubstitute: turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
+          isSubstitute: isChatScope && turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });

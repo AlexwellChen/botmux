@@ -81,7 +81,7 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
-import { createImgNumberer, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { createImgNumberer, extractPostAtParticipants, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -93,7 +93,7 @@ import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
-import type { Session, VcMeetingImTurnOrigin } from './types.js';
+import type { Session, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
@@ -189,7 +189,7 @@ import { triggerSessionTurn } from './core/trigger-session.js';
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -15383,6 +15383,58 @@ function fastToggleUnsupportedBackend(ds: DaemonSession | undefined): boolean {
   return ds.initConfig?.codexRpcInput === true;
 }
 
+/** Three-state is-bot for a turn's SENDER (candidate display, not routing):
+ *  true = provably a bot (platform sender_type app/bot, OR a known peer via the
+ *  foreign-bot signal); false = provably human (sender_type === 'user'); and
+ *  undefined = unknown (sender_type missing/other AND not a recognised peer) —
+ *  must NOT be coerced to "human". Distinct from the routing/owner boolean
+ *  `isForeignBot*`, which is false for both "human" and "unknown". */
+function senderIsBotTriState(
+  senderType: string | undefined,
+  isForeignBot: boolean,
+): boolean | undefined {
+  if (isForeignBot || senderType === 'app' || senderType === 'bot') return true;
+  if (senderType === 'user') return false;
+  return undefined;
+}
+
+/** Extract post rich-text inline `at` participants from the given message(s),
+ *  concatenated (NOT key/name-merged — the core dedupes by open_id, and stable
+ *  cross-message identity is open/app id, never the per-message key). Pass the
+ *  current message and, when a forward seed folds into the same turn, the seed
+ *  too. Kept separate from buildTurnParticipants so a registration-race loser's
+ *  winner can carry the ALREADY-extracted seed+follow-up set through prepared
+ *  without re-depending on ctx.forwardSeedData. */
+function collectPostAtMentions(...messages: Array<{ content?: string } | null | undefined>): LarkMention[] {
+  return messages.flatMap(m => extractPostAtParticipants(m));
+}
+
+/** Build the turn-window counterparts contributed by ONE inbound turn via the
+ *  pure {@link buildTurnParticipantsFrom}, supplying the daemon deps (self
+ *  open_id + self app_id for self-exclusion of app_id-form self @s + the
+ *  peer-bot predicate). `postAtMentions` are post inline-@ participants already
+ *  extracted (see collectPostAtMentions) — concatenated with structured
+ *  `mentions`. See that helper for the contract. */
+function buildTurnParticipants(
+  larkAppId: string,
+  senderOpenId: string | undefined,
+  senderIsBot: boolean | undefined,
+  mentions: LarkMention[] | undefined,
+  senderName?: string,
+  postAtMentions?: LarkMention[],
+): { participants: TurnParticipant[]; incomplete: boolean } {
+  const selfBot = getBot(larkAppId);
+  return buildTurnParticipantsFrom(
+    { openId: senderOpenId, isBot: senderIsBot, name: senderName },
+    [...(mentions ?? []), ...(postAtMentions ?? [])],
+    selfBot.botOpenId,
+    (openId) => isKnownPeerBot(config.session.dataDir, larkAppId, openId),
+    selfBot.config.larkAppId,
+  );
+}
+
+
+
 /** Preserve the established mid-session passthrough semantics when a cold-start
  * scratch loses its registration race to a concurrently-created real session. */
 function deliverPassthroughToExistingSession(
@@ -15409,9 +15461,14 @@ function deliverPassthroughToExistingSession(
     const substituteReplyMode = turn.substitute
       ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
       : 'thread';
+    // Passthrough is a raw CLI command (no @-mentions) — window is the sender only.
+    const passthroughWindow = buildTurnParticipants(larkAppId, turn.senderOpenId, turn.senderIsBot, undefined);
     beginReplyTargetTurn(ds, turn.replyRootId, turn.messageId, new Date().toISOString(), {
       quoteOnly: substituteReplyMode === 'quote',
       substitute: turn.substitute,
+      senderOpenId: turn.senderOpenId,
+      participants: passthroughWindow.participants,
+      participantsIncomplete: passthroughWindow.incomplete,
     });
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
@@ -15472,14 +15529,27 @@ async function startInitialPassthroughSession(args: {
   creatorOpenId: string | undefined;
   /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
   botSender?: boolean;
+  /** 本轮触发者是否 bot，用于 reply attribution（--mention-back 不对称门禁）。
+   *  与 quota 用的 platform-stamped botSender 分开传：这里用 caller 已算好的
+   *  cross-ref 兜底身份（thread 的 isForeignBot / new-topic 的 isForeignBotSender），
+   *  这样飞书 sender_type 缺失/变值但已识别 peer 时冷启动 passthrough 也归属为 bot，
+   *  不扩大 quota 的信任边界。 */
+  senderIsBot?: boolean;
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
+    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender, senderIsBot,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
     return;
   }
+  // Reply attribution's is-bot. `resolvedSenderIsBot` is a BOOLEAN for the
+  // legacy consumers that need one (pendingSender.type, quoteTargetSenderIsBot,
+  // loser-handoff turn.senderIsBot). `resolvedSenderIsBotTriState` keeps
+  // "unknown" as undefined for the participant candidate label — never coerce an
+  // unknown sender to "human". NOT for quota (that stays on botSender above).
+  const resolvedSenderIsBotTriState = senderIsBotTriState(parsed.senderType, senderIsBot === true);
+  const resolvedSenderIsBot = senderIsBot ?? (parsed.senderType === 'app' || parsed.senderType === 'bot');
 
   const botCfg = getBot(larkAppId).config;
   refreshCliVersion(botCfg);
@@ -15492,7 +15562,7 @@ async function startInitialPassthroughSession(args: {
   const initialPassthroughSender = directChatSender ?? (senderOpenId
     ? {
       openId: senderOpenId,
-      type: parsed.senderType === 'app' || parsed.senderType === 'bot' ? 'bot' as const : 'user' as const,
+      type: resolvedSenderIsBot ? 'bot' as const : 'user' as const,
     }
     : undefined);
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
@@ -15506,7 +15576,7 @@ async function startInitialPassthroughSession(args: {
   session.lastCallerOpenId = senderOpenId;
   session.quoteTargetId = parsed.messageId;
   session.quoteTargetSenderOpenId = senderOpenId;
-  session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
+  session.quoteTargetSenderIsBot = resolvedSenderIsBot;
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
   sessionStore.updateSession(session);
@@ -15543,7 +15613,8 @@ async function startInitialPassthroughSession(args: {
     ds.session.workingDir = pinnedWorkingDir;
     sessionStore.updateSession(ds.session);
   }
-  beginReplyTargetTurn(ds, replyRootId, messageId);
+  const initialWindow = buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name);
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
   if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
@@ -15557,7 +15628,7 @@ async function startInitialPassthroughSession(args: {
         messageId,
         replyRootId,
         senderOpenId,
-        senderIsBot: parsed.senderType === 'app' || parsed.senderType === 'bot',
+        senderIsBot: resolvedSenderIsBot,
         substitute,
       });
     } else {
@@ -15865,6 +15936,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           senderUnionId: teamTrustUnionId,
           memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
           botSender: isBotSenderType,
+          // Reply attribution uses the cross-ref-resolved is-bot (foreign peer
+          // bots included), matching the twin new-topic spawn path so冷启动
+          // passthrough 也能让 bot→bot 的 --mention-back 直通不对称门禁。
+          senderIsBot: isForeignBotSender,
           // New-topic senders are humans here (mirrors the normal new-topic
           // spawn path, which assigns ownership unconditionally too).
           ownerOpenId: senderOpenId,
@@ -16135,7 +16210,12 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const substituteReplyMode = substituteTrigger
     ? (botCfg.substituteMode?.replyMode ?? 'thread')
     : 'thread';
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
+  // Post inline-@ participants from BOTH the current message and a folded
+  // forward seed — extracted once so the CAS-loser handoff below can carry the
+  // exact same set (a race-losing scratch's seed @s must not vanish).
+  const newTopicPostAt = collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
+  const newTopicWindow = buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, newTopicPostAt);
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
   if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
@@ -16156,6 +16236,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           queueAlreadyAppended: true,
           senderResolved: true,
           sender: newTopicSender,
+          postParticipantMentions: newTopicPostAt,
         },
       );
     }
@@ -16740,6 +16821,13 @@ interface PreparedThreadReply {
   queueAlreadyAppended: true;
   senderResolved: true;
   sender: ResolvedSender | undefined;
+  /** Post inline-@ participants already extracted from the current AND
+   *  forward-seed messages at new-topic time. Carried so a registration-race
+   *  loser's winner rebinds the turn with the COMPLETE seed+follow-up window —
+   *  otherwise the seed's post @s (rolled back with the losing scratch) vanish
+   *  and a "seed post @OtherBot + follow-up @self only" turn fails open. Pre-
+   *  extracted (not raw messages) so this never re-depends on ctx.forwardSeedData. */
+  postParticipantMentions?: LarkMention[];
 }
 
 async function handleThreadReply(
@@ -16990,6 +17078,10 @@ async function handleThreadReply(
           senderUnionId: threadTeamTrustUnionId,
           memberUnionId: threadSenderUnionId, // 原始 union（人腿），不锁 bot
           botSender: isBotSenderType || isForeignBot,
+          // Reply attribution: platform-stamped OR cross-ref-resolved bot →
+          // treat as bot for --mention-back (never mis-attribute a peer bot as
+          // human when飞书 sender_type 缺失/变值但已识别 peer).
+          senderIsBot: isBotSenderType || isForeignBot,
           // Bot-started cold starts get no human owner (mirrors the auto-create
           // path) — see the ownership note on startInitialPassthroughSession.
           ownerOpenId: isForeignBot ? undefined : threadSenderOpenId,
@@ -17238,7 +17330,15 @@ async function handleThreadReply(
     const substituteReplyMode = substituteTrigger
       ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
+    // Sender name is best-effort here: getThreadSender() resolves later (this
+    // hot path avoids an await before the buffering barrier), so the candidate
+    // list may show open_id without a name — the ambiguity decision itself is
+    // unaffected. Post inline-@s: on a prepared (registration-race loser) handoff
+    // use the COMPLETE pre-extracted seed+follow-up set; otherwise extract from
+    // this message.
+    const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message);
+    const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -17463,7 +17563,9 @@ async function handleThreadReply(
     const substituteReplyMode = substituteTrigger
       ? (botCfg.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
+    const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message);
+    const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt);
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete });
     sessionStore.updateSession(newDs.session);
     const creationKey = sessionKey(anchor, larkAppId);
     if (!setActiveSessionIfActive(activeSessions, creationKey, newDs)) {
@@ -17481,6 +17583,10 @@ async function handleThreadReply(
           queueAlreadyAppended: true,
           senderResolved: true,
           sender: autoCreateSender,
+          // Second CAS loser: carry the complete pre-extracted seed+follow-up
+          // post @s too, or a double-race (new-topic scratch → auto-create →
+          // auto-create loses again) drops the seed's post participants.
+          postParticipantMentions: autoCreatePostAt,
         });
       }
       return;

@@ -30,7 +30,9 @@ function fnRegion(name: string, span = 6000): string {
 }
 
 describe('startInitialPassthroughSession ownership', () => {
-  const region = fnRegion('startInitialPassthroughSession');
+  // span widened past the default: the fn body grew (per-turn participant
+  // window build) and the registration-loser handoff sits ~6.1k chars in.
+  const region = fnRegion('startInitialPassthroughSession', 8000);
 
   it('never falls back from an explicit undefined owner to the sender', () => {
     expect(region).not.toContain('ownerOpenId ??');
@@ -55,7 +57,9 @@ describe('startInitialPassthroughSession ownership', () => {
   it('hands a registration loser to the post-rollback winner with live passthrough semantics', () => {
     expect(region).toContain('rollbackRejectedSessionAndGetWinner(activeSessions, creationKey, ds)');
     expect(region).toContain('deliverPassthroughToExistingSession(winner, cmd, commandContent, anchor, larkAppId, {');
-    expect(region).toContain("senderIsBot: parsed.senderType === 'app' || parsed.senderType === 'bot'");
+    // Loser handoff reuses the caller-resolved is-bot attribution (cross-ref
+    // included), not a raw sender_type recompute — same as the primary path.
+    expect(region).toContain('senderIsBot: resolvedSenderIsBot');
     expect(region).toContain('substitute,');
   });
 });
