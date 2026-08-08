@@ -1453,6 +1453,14 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
           break;
         }
+        // A live Riff worker owns a remote task rooted in its original cwd.
+        // killWorker/restart deliberately refuse to replace that generation,
+        // so persisting a new cwd here would report success while the remote
+        // task keeps running in the old directory.
+        if (isRiffBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
+          break;
+        }
         // Cheap preflight avoids creating a requested directory when the
         // current FIFO already makes the switch impossible.  The mutation
         // below repeats this check after draining peer admissions.

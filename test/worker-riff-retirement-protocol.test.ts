@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
+const commandHandlerSource = readFileSync(new URL('../src/core/command-handler.ts', import.meta.url), 'utf8');
+const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
 
 describe('worker Riff retirement protocol', () => {
   it('refuses Riff generation restart before the local restart helper can run', () => {
@@ -130,5 +132,24 @@ describe('worker Riff retirement protocol', () => {
     expect(exitStart).toBeGreaterThanOrEqual(0);
     expect(exitHandler).toContain("phase: 'uncertain'");
     expect(exitHandler).not.toContain('ds.riffCloseState = undefined');
+  });
+
+  it('rejects Riff cwd and role switches before mutating persisted workingDir', () => {
+    const commandStart = commandHandlerSource.indexOf("case '/cd':");
+    const commandEnd = commandHandlerSource.indexOf("case '/repo':", commandStart);
+    const command = commandHandlerSource.slice(commandStart, commandEnd);
+    const commandGuard = command.indexOf('if (isRiffBackendSession(ds))');
+    expect(commandGuard).toBeGreaterThanOrEqual(0);
+    expect(command.indexOf('validateWorkingDir(', commandGuard)).toBeGreaterThan(commandGuard);
+    expect(command.indexOf('repinSessionWorkingDir(', commandGuard)).toBeGreaterThan(commandGuard);
+
+    const routeStart = dashboardIpcSource.indexOf("ipcRoute('POST', '/api/sessions/:sessionId/cd'");
+    const routeEnd = dashboardIpcSource.indexOf('function findSessionRecord(', routeStart);
+    const route = dashboardIpcSource.slice(routeStart, routeEnd);
+    const routeGuard = route.indexOf('if (isRiffBackendSession(ds))');
+    expect(routeGuard).toBeGreaterThanOrEqual(0);
+    expect(route.indexOf('validateRoleLibraryPath(', routeGuard)).toBeGreaterThan(routeGuard);
+    expect(route.indexOf('repinSessionWorkingDir(', routeGuard)).toBeGreaterThan(routeGuard);
+    expect(route).toContain("error: 'riff_cd_unsupported'");
   });
 });

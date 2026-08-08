@@ -298,6 +298,7 @@ export const messages: Record<string, string> = {
   'cmd.restart.timed_out': '⌛ {cliName} 重启超时，尚未恢复就绪。',
   'cmd.restart.terminated': '{cliName} 进程已终止，下次发消息时将自动恢复。',
   'cmd.restart.riff_unsupported': '⚠️ Riff 会话不支持重启。请先用 /close 关闭当前远程会话，再发送新消息创建会话。',
+  'cmd.cd.riff_unsupported': '⚠️ Riff 会话不支持中途切换工作目录或角色。请先用 /close 关闭当前远程会话，再从新目录创建会话。',
   'cmd.cd.usage': '用法：/cd <path>\n例如：/cd ~/projects/my-app',
   'cmd.cd.switched': '工作目录已切换到 {path}，下次发消息时将在新目录下恢复。',
   'cmd.cd.created_switched': '📁 目录不存在，已自动创建并切换到 {path}，下次发消息时将在新目录下恢复。',

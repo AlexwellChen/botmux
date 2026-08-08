@@ -297,6 +297,7 @@ export const messages: Record<string, string> = {
   'cmd.restart.timed_out': '⌛ {cliName} restart timed out before becoming ready.',
   'cmd.restart.terminated': '{cliName} has been terminated; it will auto-resume on your next message.',
   'cmd.restart.riff_unsupported': '⚠️ Riff sessions cannot be restarted. Use /close to close the current remote session, then send a new message to create one.',
+  'cmd.cd.riff_unsupported': '⚠️ Riff sessions cannot switch working directory or role in place. Use /close to close the current remote session, then create one from the new directory.',
   'cmd.cd.usage': 'Usage: /cd <path>\nExample: /cd ~/projects/my-app',
   'cmd.cd.switched': 'Working directory switched to {path}. It will resume there on your next message.',
   'cmd.cd.created_switched': '📁 Directory did not exist — created it and switched to {path}. It will resume there on your next message.',

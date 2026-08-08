@@ -1188,6 +1188,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_cd_unsupported' });
   }
+  // Riff restart/kill is intentionally refused to preserve remote task
+  // lineage. Reject before validation/repin so the persisted cwd cannot drift
+  // from the still-running sandbox.
+  if (isRiffBackendSession(ds)) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'riff_cd_unsupported',
+      message: t('cmd.cd.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+    });
+  }
   // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
   // 下面 repinSessionWorkingDir 把 ds.workingDir 钉过去之后，那个 bot 的沙盒会话
   // 就拿到了对方整棵角色库的 readWrite（打穿 fs-policy 的跨 bot 隔离）。
