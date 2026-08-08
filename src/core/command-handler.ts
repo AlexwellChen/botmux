@@ -1552,7 +1552,7 @@ export async function handleCommand(
         // its anchor can be reused.  The generic repo-switch path closes and
         // immediately reforks; if remote cancellation fails, that would fall
         // through to the double-fork kill and orphan the remote task.
-        if (ds && isRiffBackendSession(ds)) {
+        if (ds && !ds.pendingRepo && isRiffBackendSession(ds)) {
           await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
           logger.warn(`[${logTag}] Repo switch refused: Riff session requires explicit close before replacement`);
           break;

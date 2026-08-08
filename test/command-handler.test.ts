@@ -2917,6 +2917,34 @@ describe('handleCommand', () => {
       expect(deleteMessage).not.toHaveBeenCalled();
     });
 
+    it('retries /repo after a synchronous first Riff fork failure stamps the backend', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        initialStartPending: true,
+        pendingPrompt: 'first prompt',
+        worker: null,
+      });
+      const deps = makeDeps(ds);
+      vi.mocked(forkWorker)
+        .mockImplementationOnce(() => {
+          ds.session.backendType = 'riff';
+          ds.initConfig = { backendType: 'riff' } as any;
+          throw new Error('riff child fork failed');
+        })
+        .mockImplementationOnce(() => {});
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+      expect(ds.pendingRepo).toBe(true);
+      expect(ds.worker).toBeNull();
+      expect(ds.session.backendType).toBe('riff');
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      expect(forkWorker).toHaveBeenCalledTimes(2);
+      expect(ds.pendingRepo).toBe(false);
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).not.toContain('/close');
+    });
+
     it('should boot the CLI idle (no prompt submitted) when launched via /repo itself', async () => {
       const ds = makeDaemonSession({
         pendingRepo: true,

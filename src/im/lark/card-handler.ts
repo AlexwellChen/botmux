@@ -3386,6 +3386,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(targetDs.larkAppId)) } };
   }
 
+  // Reject a live Riff repo/worktree replacement before slug generation or
+  // any local/remote Git side effect. First-spawn pendingRepo selections stay
+  // recoverable when a synchronous fork failure has already stamped Riff.
+  if (!targetDs.pendingRepo && isRiffBackendSession(targetDs)) {
+    await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, localeForBot(targetDs.larkAppId)));
+    logger.warn(`[${tag(targetDs)}] Repo switch refused before Git work: Riff session requires explicit close before replacement`);
+    return;
+  }
+
   // Resolve the project name from cached scan
   const cached = lastRepoScan.get(targetDs.chatId);
   const project = cached?.find(p => p.path === selectedPath);

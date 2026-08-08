@@ -1115,6 +1115,23 @@ describe('repo select card — plain switch', () => {
 });
 
 describe('repo select card — worktree open', () => {
+  it('rejects a live Riff worktree picker before create or push side effects', async () => {
+    const ds = makeDs({
+      pendingRepo: false,
+      initConfig: { backendType: 'riff' } as any,
+      session: { ...makeDs().session, backendType: 'riff' },
+    });
+    const { deps, sessionReply } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
+
+    expect(createRepoWorktree).not.toHaveBeenCalled();
+    expect(pushWorktreeBranch).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.worktreeCreating).not.toBe(true);
+    expect(vi.mocked(sessionReply).mock.calls.map(c => c[1]).join()).toContain('/close');
+  });
+
   it('rejects a stale direct single-select picker before any worktree side effect', async () => {
     const ds = makeDs({
       pendingRepo: true,
