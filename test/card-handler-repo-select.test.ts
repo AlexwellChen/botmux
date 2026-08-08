@@ -307,6 +307,32 @@ afterEach(async () => {
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 describe('repo select card — plain switch', () => {
+  it('refuses a card repo switch over a live Riff generation before teardown or refork', async () => {
+    const ds = makeDs({
+      pendingRepo: false,
+      workingDir: '/remote/riff',
+      worker: { killed: false } as any,
+      initConfig: { backendType: 'riff' } as any,
+    });
+    ds.session.cliId = 'riff';
+    ds.session.backendType = 'riff';
+    ds.session.riffParentTaskId = 'task-live';
+    ds.session.workingDir = '/remote/riff';
+    const oldSession = ds.session;
+    const { deps, sessionReply } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(teardownAuthoritativePersistentBackingBeforeClose).not.toHaveBeenCalled();
+    expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.session).toBe(oldSession);
+    expect(ds.workingDir).toBe('/remote/riff');
+    expect(ds.session.riffParentTaskId).toBe('task-live');
+    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('/close');
+  });
+
   it('rejects a callback from any card id other than the currently published picker', async () => {
     const ds = makeDs({
       pendingRepo: true,

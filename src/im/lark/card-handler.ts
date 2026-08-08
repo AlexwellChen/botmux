@@ -450,6 +450,17 @@ export async function commitRepoSelection(
     return false;
   }
 
+  // A live Riff generation cannot use the generic close-and-refork branch.
+  // Riff teardown is a remote prepare/commit protocol; a failed cancellation
+  // followed by forkWorker would reach the double-fork kill and orphan the
+  // still-live remote task.  Require an explicit /close before any card,
+  // worktree, or manual-directory selection can replace this generation.
+  if (!ds.pendingRepo && isRiffBackendSession(ds)) {
+    await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, locTarget));
+    logger.warn(`[${tag(ds)}] Repo switch refused: Riff session requires explicit close before replacement`);
+    return false;
+  }
+
   if (!ds.pendingRepo
     && hasProtectedSessionMutationOwnership(ds)) {
     await sessionReply(
