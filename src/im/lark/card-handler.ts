@@ -450,6 +450,17 @@ export async function commitRepoSelection(
     return false;
   }
 
+  // A live Riff generation cannot use the generic close-and-refork branch.
+  // Riff teardown is a remote prepare/commit protocol; a failed cancellation
+  // followed by forkWorker would reach the double-fork kill and orphan the
+  // still-live remote task.  Require an explicit /close before any card,
+  // worktree, or manual-directory selection can replace this generation.
+  if (!ds.pendingRepo && isRiffBackendSession(ds)) {
+    await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, locTarget));
+    logger.warn(`[${tag(ds)}] Repo switch refused: Riff session requires explicit close before replacement`);
+    return false;
+  }
+
   if (!ds.pendingRepo
     && hasProtectedSessionMutationOwnership(ds)) {
     await sessionReply(
@@ -3373,6 +3384,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   if (!allowRepo) {
     logger.info(`Repo card action blocked for ${operatorOpenId} (pending=${targetDs.pendingRepo})`);
     return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(targetDs.larkAppId)) } };
+  }
+
+  // Reject a live Riff repo/worktree replacement before slug generation or
+  // any local/remote Git side effect. First-spawn pendingRepo selections stay
+  // recoverable when a synchronous fork failure has already stamped Riff.
+  if (!targetDs.pendingRepo && isRiffBackendSession(targetDs)) {
+    await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, localeForBot(targetDs.larkAppId)));
+    logger.warn(`[${tag(targetDs)}] Repo switch refused before Git work: Riff session requires explicit close before replacement`);
+    return;
   }
 
   // Resolve the project name from cached scan
