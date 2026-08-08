@@ -52,7 +52,10 @@ describe('API-only bot mode — boot-time Feishu decoupling (source lock)', () =
     // botHandlers.set stays unconditional (replay paths may read it); only the
     // WSClient start is gated.
     expect(block).toContain('if (!cfg.apiOnly) {');
-    expect(block).toContain('startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, botEventHandlers');
+    // The dispatcher start is deferred into a startEventDispatchers thunk (args
+    // split across lines after the PR #597 merge); assert the gated call, not a
+    // single-line arg signature.
+    expect(block).toContain('startEventDispatchers.push(() => startLarkEventDispatcher(');
     expect(block.indexOf('if (!cfg.apiOnly) {'))
       .toBeLessThan(block.indexOf('startLarkEventDispatcher('));
   });

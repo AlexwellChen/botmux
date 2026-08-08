@@ -311,6 +311,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // resolves as idempotent close so unrelated tests don't need to think
   // about it.
   closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false })),
+  withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   // `isRelayableRealSession(ds)` — true when ds.worker is set OR persisted
   // CLI markers exist (session.cliId / session.lastCliInput). The default
   // makeSession fixture sets cliId='claude-code' so most tests pass the
@@ -490,7 +491,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { closeSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from '../src/core/worker-pool.js';
+import { closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -588,11 +589,18 @@ function makeLarkMessage(content: string, overrides: Partial<LarkMessage> = {}):
   };
 }
 
+// The most-recently constructed deps' activeSessions map. In production
+// `setActiveSessionsRegistry(activeSessions)` makes worker-pool's authoritative
+// `closeSession` delete from this very map; the mock below models that same
+// registry removal so /close tests can assert the session is gone.
+let lastMadeActiveSessions: Map<string, DaemonSession> | undefined;
+
 function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
   const activeSessions = new Map<string, DaemonSession>();
   if (ds) {
     activeSessions.set(sessionKey(ROOT_ID, ds.larkAppId), ds);
   }
+  lastMadeActiveSessions = activeSessions;
   return {
     activeSessions,
     sessionReply: vi.fn(async () => 'reply-msg-id'),
@@ -1199,6 +1207,15 @@ describe('handleCommand', () => {
       // command must delegate this side effect instead of publishing a second
       // patch itself.
       publishClosedSessionPatch(sessionId);
+      // Model the authoritative registry removal too: in production
+      // setActiveSessionsRegistry wires worker-pool's map to deps.activeSessions,
+      // so closeSession deletes the closed session from it. /close no longer
+      // deletes the key itself — it delegates to this lifecycle.
+      if (lastMadeActiveSessions) {
+        for (const [k, candidate] of lastMadeActiveSessions) {
+          if (candidate.session.sessionId === sessionId) lastMadeActiveSessions.delete(k);
+        }
+      }
       return { ok: true, alreadyClosed: false, known: true };
     });
     vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
@@ -2156,6 +2173,24 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('已自动创建并切换');
     });
 
+    it('should reject before path creation while Codex App dispatch ownership is non-empty', async () => {
+      vi.mocked(existsSync).mockReturnValue(false);
+      const ds = makeDaemonSession();
+      ds.session.codexAppDispatchLedger = [
+        { dispatchId: 'd-1', turnId: 't-1', state: 'accepted', content: 'owned' },
+      ];
+      const originalWorkingDir = ds.workingDir;
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /brand-new/owned'), deps, LARK_APP_ID);
+
+      expect(mkdirSync).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe(originalWorkingDir);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('未结算');
+    });
+
     it('should reject /cd when auto-create fails', async () => {
       vi.mocked(existsSync).mockReturnValue(false);
       vi.mocked(mkdirSync).mockImplementationOnce(() => { throw new Error('EACCES: permission denied'); });
@@ -2369,14 +2404,18 @@ describe('handleCommand', () => {
 
       expect(ds.workingDir).toBe('/home/testuser/project-b');
       // ds.session is replaced by createSession result (pendingRepo is false → else branch)
-      expect(killWorker).toHaveBeenCalledWith(ds);
-      expect(sessionStore.closeSession).toHaveBeenCalled();
+      expect(closeWorkerPoolSession).toHaveBeenCalledWith('sess-001');
       expect(sessionStore.createSession).toHaveBeenCalledWith(
         CHAT_ID, ROOT_ID, 'project-b (dev)', 'group', undefined,
       );
       expect(ds.session.sessionId).toBe('new-session-123');
       expect(ds.hasHistory).toBe(false);
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(withActiveSessionKeyLock).toHaveBeenCalledWith(
+        deps.activeSessions,
+        sessionKey(ROOT_ID, LARK_APP_ID),
+        expect.any(Function),
+      );
     });
 
     it('keeps the old ZMX session active when repo-switch teardown is refused', async () => {
@@ -2782,25 +2821,29 @@ describe('handleCommand', () => {
   // ─── bare /repo while pending (replaces the old /skip command) ────────────
 
   describe('/repo (bare) while pending', () => {
-    it('does not consume the pending launch while a card commit owns the shared claim', async () => {
+    it('retains the opening reservation and buffers when forkWorker fails before accept', async () => {
       const ds = makeDaemonSession({
         pendingRepo: true,
-        pendingRepoCommitInFlight: true,
-        pendingPrompt: 'hello world',
-        pendingTurnId: 'om_pending_turn',
+        initialStartPending: true,
+        pendingPrompt: 'first prompt',
+        pendingFollowUps: ['buffered follow-up'],
       });
       const deps = makeDeps(ds);
+      vi.mocked(forkWorker).mockImplementationOnce(() => {
+        expect(ds.pendingRepo).toBe(true);
+        expect(ds.initialStartPending).toBe(true);
+        expect(ds.pendingPrompt).toBe('first prompt');
+        expect(ds.pendingFollowUps).toEqual(['buffered follow-up']);
+        throw new Error('fork preaccept failed');
+      });
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
-      expect(forkWorker).not.toHaveBeenCalled();
-      expect(getAvailableBots).not.toHaveBeenCalled();
       expect(ds.pendingRepo).toBe(true);
-      expect(ds.pendingRepoCommitInFlight).toBe(true);
-      expect(ds.pendingPrompt).toBe('hello world');
-      expect(ds.pendingTurnId).toBe('om_pending_turn');
-      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
-      expect(replies).toContain('已有一个 worktree 正在创建');
+      expect(ds.initialStartPending).toBe(true);
+      expect(ds.pendingPrompt).toBe('first prompt');
+      expect(ds.pendingFollowUps).toEqual(['buffered follow-up']);
+      expect(deleteMessage).not.toHaveBeenCalled();
     });
 
     it('should boot the CLI idle (no prompt submitted) when launched via /repo itself', async () => {
@@ -2816,7 +2859,7 @@ describe('handleCommand', () => {
 
       // No buffered message → spawn idle with an empty prompt so the user's NEXT
       // message becomes the first prompt (not an empty/boilerplate user_message).
-      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', { turnId: 'om_repo_command_only' });
       expect(buildNewTopicPrompt).not.toHaveBeenCalled();
       // …and that NEXT message must still get the full new-topic opening, so the
       // empty start has to leave a durable, persisted marker behind.
@@ -3005,7 +3048,7 @@ describe('handleCommand', () => {
       expect(forkWorker).toHaveBeenCalledWith(ds, {
         content: 'WRAPPED:clean',
         codexAppInput,
-      });
+      }, false);
       expect(ds.pendingSubstituteTrigger).toBeUndefined();
     });
 

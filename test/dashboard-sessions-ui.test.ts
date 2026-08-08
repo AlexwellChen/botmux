@@ -7,6 +7,8 @@ import { SessionsKanbanView, type SessionsKanbanCallbacks, type SessionsKanbanSt
 import {
   canRestartSession,
   CLI_FILTER_OPTIONS,
+  SESSION_STATUS_OPTIONS,
+  deriveSessionBoardColumn,
   groupSessionsByTopic,
   isUnknownChatSession,
   restartConfirmMessage,
@@ -509,6 +511,11 @@ describe('dashboard sessions filters', () => {
     expect((html.match(/<article class="session-card/g) ?? []).length).toBe(1);
   });
 
+  it('surfaces stalled sessions as a filterable needs-you state', () => {
+    expect(SESSION_STATUS_OPTIONS).toContain('stalled');
+    expect(deriveSessionBoardColumn({ status: 'stalled' })).toBe('needs-you');
+  });
+
   it('derives CLI filter options from the shared CLI registry', () => {
     expect(CLI_FILTER_OPTIONS).toContain('codex');
     expect(CLI_FILTER_OPTIONS).toContain('codex-app');
@@ -596,6 +603,7 @@ describe('dashboard sessions kanban react view', () => {
         { sessionId: 's-todo', status: 'idle', cliId: 'codex', title: 'Todo', botName: 'Bot A', lastMessageAt: 2000 },
         { sessionId: 's-progress', status: 'working', cliId: 'codex', title: 'Working', botName: 'Bot A', lastMessageAt: 3000 },
         { sessionId: 's-review', status: 'limited', cliId: 'codex', title: 'Review', botName: 'Bot A', lastMessageAt: 4000 },
+        { sessionId: 's-stalled', status: 'stalled', cliId: 'codex-app', title: 'Stalled', botName: 'Bot A', lastMessageAt: 4500 },
         { sessionId: 's-done', status: 'closed', cliId: 'codex', title: 'Done', botName: 'Bot A', lastMessageAt: 5000 },
       ],
     });
@@ -609,6 +617,7 @@ describe('dashboard sessions kanban react view', () => {
     expect(html).toContain('data-id="s-progress"');
     expect(html).toContain('role="button"');
     expect(html).toContain('class="session-signal"');
+    expect(html).toContain('长时间无进展');
     expect(html).toContain('class="card-act kanban-card-act"');
   });
 

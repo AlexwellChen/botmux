@@ -10,14 +10,23 @@ import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
-import { closeSession, forkWorker, getCurrentCliVersion, sendWorkerInput, setActiveSessionIfActive } from './worker-pool.js';
+import {
+  forkWorker,
+  getCurrentCliVersion,
+  hasQueuedActivationAdmissionGate,
+  sendWorkerInput,
+  withActiveSessionKeyLock,
+} from './worker-pool.js';
 import { armTriggerFinalSuppression, disarmTriggerFinalSuppression, inheritTriggerReplyAnchor } from './trigger-final-suppression.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
-import { sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
+import { activeSessionKey, sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import type { CliTurnPayload } from '../types.js';
+import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
+import { stagePendingRepoSetup } from './pending-repo-journal.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -190,7 +199,18 @@ function waitForSessionFinalOutput(
         resolve({ ok: false, triggerId, errorCode: 'trigger_failed', error: err.message });
       },
     });
-    dispatchTurn();
+    try {
+      dispatchTurn();
+    } catch (err) {
+      clearTimeout(timer);
+      ds.pendingWaitPromises?.delete(triggerId);
+      resolve({
+        ok: false,
+        triggerId,
+        errorCode: 'trigger_failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   });
 }
 
@@ -273,7 +293,7 @@ function buildExistingSessionContent(
   });
 }
 
-export async function triggerSessionTurn(
+async function triggerSessionTurnAdmitted(
   req: TriggerRequest,
   deps: TriggerSessionDeps,
   internal?: TriggerSessionInternalOptions,
@@ -444,97 +464,159 @@ export async function triggerSessionTurn(
     };
   }
 
-  if (ds?.worker && !ds.worker.killed) {
-    const content = buildExistingSessionContent(
-      ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
-    );
-    markSessionActivity(ds);
-    rememberInput(ds, prompt, content);
-
-    if (req.options?.waitForFinalOutput) {
-      return waitForSessionFinalOutput(
-        ds,
+  const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
+    // Ownership guard (PR #597): the target must still be the live, registered
+    // occupant before we dispatch. Validate by object identity at its canonical
+    // key AND — because a session can legitimately be reached via a non-canonical
+    // routing key (e.g. an external trigger addressed a chat-scope session by a
+    // fold-back rootMessageId anchor) — accept it if it is still registered
+    // anywhere in the map. This keeps the guard against eviction/replacement
+    // while not rejecting a validly-found session whose canonical key differs
+    // from the lookup key.
+    const targetKey = activeSessionKey(target);
+    const stillRegistered = deps.activeSessions.get(targetKey) === target
+      || [...deps.activeSessions.values()].includes(target);
+    if (!stillRegistered || target.session.status !== 'active') {
+      return {
+        ok: false,
         triggerId,
-        req.options?.timeoutMs ?? 120_000,
-        (text) => ({
-          ok: true,
-          triggerId,
-          action: 'completed',
-          target: { kind: 'turn', sessionId: ds!.session.sessionId, chatId },
-          output: { content: text },
-          message: 'delivered to existing session and completed',
-        }),
-        () => {
-          const dispatchAttempt = prepareStableDispatch(ds!, false);
-          armFinalOutputSuppression(ds!, dispatchAttempt);
-          sendWorkerInput(ds!, content, triggerId, {
-            ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-          });
-        },
-      );
+        errorCode: 'session_not_found',
+        error: `active session ownership changed before dispatch: ${target.session.sessionId}`,
+      };
     }
+    const workerIsLive = !!target.worker && !target.worker.killed;
+    if (!workerIsLive && (target.pendingRepo || target.initialStartPending
+      || target.worktreeCreating || target.session.queued
+      || hasProtectedSessionMutationOwnership(target))) {
+      const state = target.pendingRepo
+        ? 'pending_repo'
+        : target.initialStartPending
+          ? 'initial_start_pending'
+          : target.worktreeCreating
+            ? 'worktree_creating'
+            : target.session.queued
+              ? 'queued_backlog'
+              : 'durable_owner';
+      return {
+        ok: false,
+        triggerId,
+        errorCode: 'trigger_failed',
+        error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
+      };
+    }
+    const content = buildExistingSessionContent(
+      target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
+    );
+    const queuedBehindActivation = workerIsLive
+      && hasQueuedActivationAdmissionGate(target);
+    const recordAcceptedInput = (): void => {
+      markSessionActivity(target);
+      rememberInput(target, prompt, content);
+    };
 
-    if (req.options?.asyncReturnSessionId) {
-      beginAsyncTrigger(ds, triggerId);
-      const dispatchAttempt = prepareStableDispatch(ds, false);
-      armFinalOutputSuppression(ds, dispatchAttempt);
-      sendWorkerInput(ds, content, triggerId, {
+    if (workerIsLive) {
+      if (req.options?.waitForFinalOutput) {
+        return waitForSessionFinalOutput(
+          target,
+          triggerId,
+          req.options?.timeoutMs ?? 120_000,
+          (text) => ({
+            ok: true,
+            triggerId,
+            action: 'completed',
+            target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
+            output: { content: text },
+            message: 'delivered to existing session and completed',
+          }),
+          () => {
+            const dispatchAttempt = prepareStableDispatch(target, false);
+            armFinalOutputSuppression(target, dispatchAttempt);
+            const accepted = sendWorkerInput(target, content, triggerId, {
+              ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+            });
+            if (!accepted) throw new Error('worker refused trigger input before acceptance');
+            recordAcceptedInput();
+          },
+        );
+      }
+
+      if (req.options?.asyncReturnSessionId) {
+        beginAsyncTrigger(target, triggerId);
+        const dispatchAttempt = prepareStableDispatch(target, false);
+        armFinalOutputSuppression(target, dispatchAttempt);
+        const accepted = sendWorkerInput(target, content, triggerId, {
+          ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        });
+        if (!accepted) {
+          target.asyncTriggerResults?.delete(triggerId);
+          if (target.latestAsyncTriggerId === triggerId) target.latestAsyncTriggerId = undefined;
+          return {
+            ok: false,
+            triggerId,
+            errorCode: 'trigger_failed',
+            error: 'worker refused async trigger input before acceptance',
+          };
+        }
+        recordAcceptedInput();
+        return buildAsyncQueuedResponse(
+          triggerId,
+          target.session.sessionId,
+          chatId,
+          'delivered to existing session; poll by sessionId or triggerId for final output',
+        );
+      }
+
+      const dispatchAttempt = prepareStableDispatch(target, false);
+      armFinalOutputSuppression(target, dispatchAttempt);
+      armLoudFinalSuppression(target);
+      const accepted = sendWorkerInput(target, content, stableTurnId ? triggerId : loudTurnId, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       });
-      return buildAsyncQueuedResponse(
+      if (!accepted) {
+        disarmLoudFinalSuppression(target);
+        return {
+          ok: false,
+          triggerId,
+          errorCode: 'trigger_failed',
+          error: 'worker refused trigger input before acceptance',
+        };
+      }
+      recordAcceptedInput();
+      return {
+        ok: true,
         triggerId,
-        ds.session.sessionId,
-        chatId,
-        'delivered to existing session; poll by sessionId or triggerId for final output',
-      );
+        action: queuedBehindActivation ? 'queued' : 'delivered',
+        target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
+        message: queuedBehindActivation
+          ? 'durably queued behind the existing activation'
+          : 'delivered to existing session',
+      };
     }
 
-    const dispatchAttempt = prepareStableDispatch(ds, false);
-    armFinalOutputSuppression(ds, dispatchAttempt);
-    armLoudFinalSuppression(ds);
-    if (!sendWorkerInput(ds, content, stableTurnId ? triggerId : loudTurnId, {
-      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-    })) {
-      disarmLoudFinalSuppression(ds);
-    }
-    return {
-      ok: true,
-      triggerId,
-      action: 'delivered',
-      target: { kind: 'turn', sessionId: ds.session.sessionId, chatId },
-      message: 'delivered to existing session',
-    };
-  }
+    recordAcceptedInput();
 
-  // An explicit session target stays bound to that session even while its
-  // worker is dormant. The old rootMessageId-only condition accidentally fell
-  // through to createSession for chat-scope sessions, which is unsafe for a
-  // durable meeting receiver whose projection pins one receiverSessionId.
-  if (ds) {
-    const content = buildExistingSessionContent(
-      ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
-    );
-    markSessionActivity(ds);
-    rememberInput(ds, prompt, content);
-
+    // An explicit session target stays bound to that session even while its
+    // worker is dormant. The old rootMessageId-only condition accidentally
+    // fell through to createSession for chat-scope sessions, which is unsafe
+    // for a durable meeting receiver whose projection pins one receiver id.
     if (req.options?.waitForFinalOutput) {
       return waitForSessionFinalOutput(
-        ds,
+        target,
         triggerId,
         req.options?.timeoutMs ?? 120_000,
         (text) => ({
           ok: true,
           triggerId,
           action: 'completed',
-          target: { kind: 'turn', sessionId: ds!.session.sessionId, chatId },
+          target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
           output: { content: text },
           message: 'delivered to existing session and completed',
         }),
         () => {
-          const dispatchAttempt = prepareStableDispatch(ds!, true);
-          armFinalOutputSuppression(ds!, dispatchAttempt);
-          forkWorker(ds!, content, {
-            resume: ds!.hasHistory,
+          const dispatchAttempt = prepareStableDispatch(target, true);
+          armFinalOutputSuppression(target, dispatchAttempt);
+          forkWorker(target, content, {
+            resume: target.hasHistory,
             turnId: triggerId,
             ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
           });
@@ -543,27 +625,27 @@ export async function triggerSessionTurn(
     }
 
     if (req.options?.asyncReturnSessionId) {
-      beginAsyncTrigger(ds, triggerId);
-      const dispatchAttempt = prepareStableDispatch(ds, true);
-      armFinalOutputSuppression(ds, dispatchAttempt);
-      forkWorker(ds, content, {
-        resume: ds.hasHistory,
+      beginAsyncTrigger(target, triggerId);
+      const dispatchAttempt = prepareStableDispatch(target, true);
+      armFinalOutputSuppression(target, dispatchAttempt);
+      forkWorker(target, content, {
+        resume: target.hasHistory,
         turnId: triggerId,
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       });
       return buildAsyncQueuedResponse(
         triggerId,
-        ds.session.sessionId,
+        target.session.sessionId,
         chatId,
         'delivered to existing session; poll by sessionId or triggerId for final output',
       );
     }
 
-    const dispatchAttempt = prepareStableDispatch(ds, true);
-    armFinalOutputSuppression(ds, dispatchAttempt);
-    armLoudFinalSuppression(ds);
-    forkWorker(ds, content, {
-      resume: ds.hasHistory,
+    const dispatchAttempt = prepareStableDispatch(target, true);
+    armFinalOutputSuppression(target, dispatchAttempt);
+    armLoudFinalSuppression(target);
+    forkWorker(target, content, {
+      resume: target.hasHistory,
       turnId: triggerId,
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     });
@@ -571,10 +653,12 @@ export async function triggerSessionTurn(
       ok: true,
       triggerId,
       action: 'queued',
-      target: { kind: 'turn', sessionId: ds.session.sessionId, chatId },
+      target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
       message: 'queued existing session turn',
     };
-  }
+  };
+
+  if (ds) return deliverToExisting(ds);
 
   const wd = resolveWorkingDir(larkAppId, chatId);
   if (!wd.ok) {
@@ -595,49 +679,6 @@ export async function triggerSessionTurn(
     scope = 'thread';
   }
 
-  const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group');
-  const now = Date.now();
-  session.larkAppId = larkAppId;
-  session.scope = scope;
-  if (shouldOpenOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
-  session.lastMessageAt = new Date(now).toISOString();
-  session.workingDir = wd.workingDir;
-  session.cliId = bot.config.cliId;
-  // Per-turn model / reasoning-effort override — scoped to codex-family bots
-  // (the documented B-mode target) and to a freshly-created trigger session.
-  // Gating on cliId keeps the contract honest and bounded: it never silently
-  // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
-  // worker never reaches here. reasoningEffort is codex-only regardless (other
-  // adapters ignore it); model is gated here so it can't leak to non-codex CLIs.
-  const isCodexFamily = bot.config.cliId === 'codex' || bot.config.cliId === 'codex-app';
-  if (isCodexFamily) {
-    if (typeof req.options?.model === 'string' && req.options.model.trim()) {
-      session.model = req.options.model.trim();
-    }
-    if (req.options?.reasoningEffort) {
-      session.reasoningEffort = req.options.reasoningEffort;
-    }
-  }
-  sessionStore.updateSession(session);
-
-  messageQueue.ensureQueue(anchor);
-
-  const newDs: DaemonSession = {
-    session,
-    worker: null,
-    workerPort: null,
-    workerToken: null,
-    larkAppId,
-    chatId,
-    chatType: 'group',
-    scope,
-    spawnedAt: Date.parse(session.createdAt) || now,
-    cliVersion: getCurrentCliVersion(),
-    lastMessageAt: now,
-    hasHistory: false,
-    workingDir: wd.workingDir,
-  };
-
   // 仅默认目录 + auto-worktree：chat 驱动的 webhook 开新会话且落在本 bot 自己的默认目录时，走
   // pendingRepo 挂起 + 异步提交（登记挂起→关键路径外建 worktree→commitRepoSelection 提交+fork），
   // detach 后立即返回 queued。规则：**仅普通 webhook 适用**——HTTP 应答模式（waitForFinalOutput /
@@ -650,14 +691,96 @@ export async function triggerSessionTurn(
     && !stableTurnId
     && wd.fromBotDefault
     && botAutoWorktreeEnabled(larkAppId);
-  if (useAutoWt) {
-    // Register BEFORE the detached commit so its guard + the router's pendingRepo
-    // buffering both see the session. pendingRepo=true → no force-fork in the window.
-    newDs.pendingRepo = true;      // router buffers concurrent events; commit clears it
-    newDs.pendingPrompt = prompt;  // folded into the first turn by commitRepoSelection
+
+  // New trigger sessions participate in the same first-owner lock as resume,
+  // dashboard creation, and scheduled creation.  The earlier routing lookup
+  // necessarily precedes chat-membership/mode awaits, so it is only a hint;
+  // the owner must be re-read at the commit point.  Publish a reservation
+  // before any post-registration await so resume can never pass its final
+  // check and then have this trigger overwrite it.
+  const key = sessionKey(anchor, larkAppId);
+  const claim = await withActiveSessionKeyLock(deps.activeSessions, key, () => {
+    const current = deps.activeSessions.get(key);
+    if (current) return { kind: 'existing' as const, ds: current };
+
+    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group');
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.scope = scope;
+    if (shouldOpenOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
+    session.lastMessageAt = new Date(now).toISOString();
+    session.workingDir = wd.workingDir;
+    session.cliId = bot.config.cliId;
+    // Per-turn model / reasoning-effort override — scoped to codex-family bots
+    // (the documented B-mode target) and to a freshly-created trigger session.
+    // Gating on cliId keeps the contract honest and bounded: it never silently
+    // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
+    // worker never reaches here. reasoningEffort is codex-only regardless (other
+    // adapters ignore it); model is gated here so it can't leak to non-codex CLIs.
+    const isCodexFamily = bot.config.cliId === 'codex' || bot.config.cliId === 'codex-app';
+    if (isCodexFamily) {
+      if (typeof req.options?.model === 'string' && req.options.model.trim()) {
+        session.model = req.options.model.trim();
+      }
+      if (req.options?.reasoningEffort) {
+        session.reasoningEffort = req.options.reasoningEffort;
+      }
+    }
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+
+    const newDs: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType: 'group',
+      scope,
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: wd.workingDir,
+    };
+    // Retain the complete opening input until a worker or repo workflow has
+    // synchronously accepted it. This is both the route reservation and the
+    // retry payload if a write-ahead hook/fork throws before acceptance.
+    newDs.pendingPrompt = prompt;
     newDs.pendingCodexAppText = codexAppText;
     newDs.pendingCodexAppApplicationContext = codexAppApplicationContext || undefined;
     newDs.pendingCodexAppMessageContext = codexAppMessageContext;
+    if (useAutoWt) {
+      newDs.pendingRepo = true;
+      try {
+        stagePendingRepoSetup(newDs, {
+          mode: 'auto_worktree',
+          baseDir: wd.workingDir,
+          turnId: triggerId,
+        });
+      } catch (err) {
+        // The route was never published, but createSession already persisted
+        // an active row. Close only this unaccepted row so a staging fault
+        // cannot reappear as an unregistered owner after restart.
+        try { sessionStore.closeSession(session.sessionId); }
+        catch { /* keep the original admission error */ }
+        throw err;
+      }
+    } else {
+      newDs.initialStartPending = true;
+    }
+    deps.activeSessions.set(key, newDs);
+    return { kind: 'created' as const, ds: newDs };
+  });
+
+  if (claim.kind === 'existing') return deliverToExisting(claim.ds);
+  const newDs = claim.ds;
+  const session = newDs.session;
+
+  if (useAutoWt) {
+    // The key-lock claim registered pendingRepo before this dynamic import;
+    // repo commit and inbound routing therefore see the same reservation.
     // Stamp the trigger turn id so commitRepoSelection's deferred fork carries it
     // and the armed final_output suppression can match this turn.
     // Known, intentional degradation: if a HUMAN message folds into this pending
@@ -672,16 +795,6 @@ export async function triggerSessionTurn(
     // not a hard guarantee — consistent with the 256/TTL best-effort bound.
     if (loudTurnId) newDs.pendingTurnId = loudTurnId;
     armLoudFinalSuppression(newDs);
-    if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
-      disarmLoudFinalSuppression(newDs);
-      await closeSession(session.sessionId);
-      return {
-        ok: false,
-        triggerId,
-        errorCode: 'trigger_failed',
-        error: 'session route is reserved by an active persisted session',
-      };
-    }
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
       ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),
@@ -704,9 +817,22 @@ export async function triggerSessionTurn(
   // /is_in_chat) for no-transport sessions: an apiOnly bot or an HTTP virtual
   // chat has no real Lark chat to enumerate, and probing a synthetic id only
   // adds a failing network round-trip + latency. No peer bots → empty roster.
-  const availableBots = larkTransportEnabled({ chatId, apiOnly: bot.config.apiOnly })
-    ? await getAvailableBots(larkAppId, chatId)
-    : [];
+  let availableBots: Awaited<ReturnType<typeof getAvailableBots>>;
+  try {
+    availableBots = larkTransportEnabled({ chatId, apiOnly: bot.config.apiOnly })
+      ? await getAvailableBots(larkAppId, chatId)
+      : [];
+  } catch (err) {
+    // Prompt construction failed before any worker existed. Retire only the
+    // still-owned reservation so a retry is not blocked by a ghost active row.
+    await withActiveSessionKeyLock(deps.activeSessions, key, () => {
+      if (deps.activeSessions.get(key) === newDs && newDs.initialStartPending) {
+        deps.activeSessions.delete(key);
+        sessionStore.closeSession(session.sessionId);
+      }
+    });
+    throw err;
+  }
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,
@@ -728,19 +854,28 @@ export async function triggerSessionTurn(
       codexAppMessageContext,
     },
   );
-  // Register right before the fork branches (no await between here and forkWorker)
-  // so a concurrent inbound message can't observe this session worker-less and
-  // race a duplicate re-fork — the set-and-fork atomicity the original path had.
-  if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
-    await closeSession(session.sessionId);
+  // No await from the ownership check through forkWorker. The reservation and
+  // opening buffers are released only after synchronous pre-accept succeeds.
+  if (deps.activeSessions.get(key) !== newDs
+    || newDs.session.status !== 'active'
+    || !newDs.initialStartPending) {
+    if (newDs.session.status !== 'closed') sessionStore.closeSession(session.sessionId);
     return {
       ok: false,
       triggerId,
       errorCode: 'trigger_failed',
-      error: 'session was closed while the trigger was being prepared',
+      error: 'new trigger session lost its first-owner reservation before startup',
     };
   }
   rememberInput(newDs, prompt, promptInput);
+
+  const releaseInitialReservation = (): void => {
+    newDs.initialStartPending = false;
+    newDs.pendingPrompt = undefined;
+    newDs.pendingCodexAppText = undefined;
+    newDs.pendingCodexAppApplicationContext = undefined;
+    newDs.pendingCodexAppMessageContext = undefined;
+  };
 
   if (req.options?.waitForFinalOutput) {
     return waitForSessionFinalOutput(
@@ -761,17 +896,19 @@ export async function triggerSessionTurn(
         forkWorker(newDs, promptInput, dispatchAttempt === undefined
           ? triggerId
           : { turnId: triggerId, dispatchAttempt });
+        releaseInitialReservation();
       },
     );
   }
 
   if (req.options?.asyncReturnSessionId) {
-    beginAsyncTrigger(newDs, triggerId);
     const dispatchAttempt = prepareStableDispatch(newDs, true);
     armFinalOutputSuppression(newDs, dispatchAttempt);
     forkWorker(newDs, promptInput, dispatchAttempt === undefined
       ? triggerId
       : { turnId: triggerId, dispatchAttempt });
+    releaseInitialReservation();
+    beginAsyncTrigger(newDs, triggerId);
     return buildAsyncQueuedResponse(
       triggerId,
       session.sessionId,
@@ -786,12 +923,17 @@ export async function triggerSessionTurn(
     forkWorker(newDs, promptInput, dispatchAttempt === undefined
       ? triggerId
       : { turnId: triggerId, dispatchAttempt });
+    releaseInitialReservation();
   }
   else if (loudTurnId) {
     armLoudFinalSuppression(newDs);
     forkWorker(newDs, promptInput, loudTurnId);
+    releaseInitialReservation();
   }
-  else forkWorker(newDs, promptInput);
+  else {
+    forkWorker(newDs, promptInput);
+    releaseInitialReservation();
+  }
 
   return {
     ok: true,
@@ -800,4 +942,15 @@ export async function triggerSessionTurn(
     target: { kind: 'turn', sessionId: session.sessionId, chatId },
     message: 'queued new session turn',
   };
+}
+
+export async function triggerSessionTurn(
+  req: TriggerRequest,
+  deps: TriggerSessionDeps,
+  internal?: TriggerSessionInternalOptions,
+): Promise<TriggerResponse> {
+  return withBotTurnAdmission(
+    deps.larkAppId,
+    () => triggerSessionTurnAdmitted(req, deps, internal),
+  );
 }
