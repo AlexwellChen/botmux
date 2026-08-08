@@ -305,6 +305,10 @@ import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
 import { RIFF_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
+import {
+  managedOriginCapabilityPath,
+  replaceManagedOriginCapabilityFile,
+} from './managed-origin-capability.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -5597,6 +5601,12 @@ export type ForkResumeOrTurnId = boolean | string | {
   /** Correlates a worker restart across the detach/refork boundary so late
    * lifecycle events from the retired worker are not misattributed. */
   restartAttemptId?: string;
+  /** At-most-once turn (idempotency lease): the worker must NEVER replay this
+   *  input after a CLI exit — not via inflight carry-over, not from the still-
+   *  queued pendingMessages. Once the daemon terminalizes the turn, re-executing
+   *  it on an auto-restarted CLI would violate at-most-once (codex #776 round-7
+   *  finding #1). */
+  atMostOnce?: boolean;
 };
 
 /** Central quarantine decision for one fork boundary — the SINGLE authority that
@@ -5760,6 +5770,7 @@ export function forkWorker(
   let initDispatchAttempt: number | undefined;
   let restartAttemptId: string | undefined;
   let initCodexAppInputGateFrozen = promptInput === ds.session.queuedActivationInput;
+  let initAtMostOnce: boolean | undefined;
   if (typeof resumeOrTurnId === 'string') {
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
@@ -5768,6 +5779,7 @@ export function forkWorker(
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
     restartAttemptId = resumeOrTurnId.restartAttemptId;
     initCodexAppInputGateFrozen ||= resumeOrTurnId.codexAppInputGateFrozen === true;
+    initAtMostOnce = resumeOrTurnId.atMostOnce;
   } else {
     resume = resumeOrTurnId;
   }
@@ -6380,6 +6392,9 @@ export function forkWorker(
     ...((ds.session.codexAppGenerationCommits?.length ?? 0) > 0
       ? { codexAppGenerationCommits: ds.session.codexAppGenerationCommits }
       : {}),
+    // At-most-once (idempotency lease): ride the flag on the init message so the
+    // worker tags the keyed init prompt no-replay (codex #776 round-7 #1).
+    ...(initAtMostOnce ? { atMostOnce: true } : {}),
     vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
@@ -8393,8 +8408,47 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin with mismatched sessionId`);
           break;
         }
+        // macOS uses one stable per-session pathname visible inside Seatbelt.
+        // Only the daemon handler for the CURRENT ChildProcess generation may
+        // replace it. Stale workers can still emit IPC, but the identity guard
+        // above drops them before filesystem mutation, so they cannot overwrite
+        // a successor capability (or unlink it during teardown).
+        if (process.platform === 'darwin' && msg.originChannelId) {
+          if (!/^[a-f0-9]{64}$/.test(msg.originChannelId)) {
+            ds.managedTurnOrigin = undefined;
+            logger.error(`[${t}] Refused managed origin publication with an invalid pane channel`);
+            break;
+          }
+          try {
+            const ipcPort = Number(process.env.BOTMUX_DAEMON_IPC_PORT);
+            replaceManagedOriginCapabilityFile(
+              managedOriginCapabilityPath(
+                config.session.dataDir,
+                msg.sessionId,
+                msg.originChannelId,
+              ),
+              JSON.stringify({
+                sessionId: msg.sessionId,
+                channelId: msg.originChannelId,
+                capability: msg.capability,
+                ...(Number.isSafeInteger(ipcPort) && ipcPort > 0 && ipcPort <= 65_535
+                  ? { ipcPort }
+                  : {}),
+                ...(msg.turnId ? { turnId: msg.turnId } : {}),
+                ...(msg.dispatchAttempt !== undefined
+                  ? { dispatchAttempt: msg.dispatchAttempt }
+                  : {}),
+              }),
+            );
+          } catch (err) {
+            ds.managedTurnOrigin = undefined;
+            logger.error(`[${t}] Failed to publish daemon-owned managed origin capability: ${err instanceof Error ? err.message : String(err)}`);
+            break;
+          }
+        }
         ds.managedTurnOrigin = {
           capability: msg.capability,
+          ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
@@ -8418,6 +8472,12 @@ function setupWorkerHandlers(
           && ds.managedTurnOrigin?.capability
           && ds.managedTurnOrigin.capability !== msg.capability) {
           logger.warn(`[${t}] Ignored stale managed turn origin revoke after capability rotation`);
+          break;
+        }
+        if (msg.originChannelId
+          && ds.managedTurnOrigin?.originChannelId
+          && ds.managedTurnOrigin.originChannelId !== msg.originChannelId) {
+          logger.warn(`[${t}] Ignored managed_turn_origin_revoked for a different pane channel`);
           break;
         }
         if (!msg.capability && ds.managedTurnOrigin
@@ -9010,6 +9070,10 @@ function deliverFinalOutput(
     // (with content + usage) after a daemon restart drops the in-memory Map.
     // Stamp the owning bot for cross-bot isolation.
     asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
+    // This idempotent async turn produced its terminal output — clear the
+    // worker-exit convergence stamp so a later graceful exit of this generation
+    // is not retro-failed (codex #776 round-6 finding #1).
+    if (ds.idempotentAsyncTurn?.triggerId === msg.turnId) ds.idempotentAsyncTurn = undefined;
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     onComplete?.(true);
