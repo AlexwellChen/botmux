@@ -211,14 +211,40 @@ export function getDaemonStreamingCardUsageSnapshot(
   effectiveCliId?: CliId,
   opts?: { fresh?: boolean },
 ): CardUsageSnapshot {
+  // Runtime identity is derived from in-memory fields only, so it is available
+  // without reading the transcript. The disk read (getDaemonSessionUsageSnapshot)
+  // is deferred until we know usage will actually render — a footer/off bot must
+  // not pay a per-tick transcript parse just to throw the tokens away.
+  const runtimeModel = ds.activeModel?.trim() || ds.session.model?.trim();
+  const reasoningEffort = ds.activeReasoningEffort?.trim()
+    || ds.session.reasoningEffort?.trim();
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
-      return { context: null, tokens: null };
+      return {
+        context: null,
+        tokens: null,
+        ...(runtimeModel ? { model: runtimeModel } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+      };
     }
   } catch {
     // Missing runtime config → default 'streaming' → show usage (best-effort).
   }
-  return getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: opts?.fresh ?? false });
+  const snapshot = getDaemonSessionUsageSnapshot(
+    ds,
+    effectiveCliId,
+    { fresh: opts?.fresh ?? false },
+  );
+  // Model comes only from an explicitly-wired executor runtime (TRAE/Codex set
+  // ds.activeModel from their rollout settings) or the user-configured launch
+  // model — never snapshot.tokens.model. That field is the RAW transcript model
+  // and for relay-style CLIs is an internal routing code (e.g. `ark/relay-code`)
+  // that must not surface on a user card.
+  return {
+    ...snapshot,
+    ...(runtimeModel ? { model: runtimeModel } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+  };
 }
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -694,6 +720,59 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
   if (!ds.pendingLocalCliButtonRefresh) return;
   ds.pendingLocalCliButtonRefresh = undefined;
   scheduleLocalCliOpenReadinessPatch(ds);
+}
+
+/** PATCH the live card when the executor reports a different active runtime.
+ * Runtime identity stays attached to the streaming usage line. */
+function scheduleActiveRuntimePatch(ds: DaemonSession): void {
+  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+    ds.pendingActiveRuntimeCardRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardNonce && ds.parkedStreamCardNonce === ds.streamCardNonce) {
+    ds.pendingActiveRuntimeCardRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardId === CARD_POSTING_SENTINEL) {
+    ds.pendingActiveRuntimeCardRefresh = true;
+    return;
+  }
+  if (!ds.streamCardId || !workerHasInitialized(ds)) {
+    ds.pendingActiveRuntimeCardRefresh = undefined;
+    return;
+  }
+  ds.pendingActiveRuntimeCardRefresh = undefined;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    ds.lastScreenContent ?? '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    status === 'limited' ? ds.usageLimit : undefined,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+  scheduleCardPatch(ds, cardJson);
+}
+
+function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
+  if (!ds.pendingActiveRuntimeCardRefresh) return;
+  ds.pendingActiveRuntimeCardRefresh = undefined;
+  scheduleActiveRuntimePatch(ds);
 }
 
 /** PATCH a live card when rollout settings change, even if the PTY is static. */
@@ -1340,6 +1419,7 @@ export async function postFreshStreamingCard(
     recallFrozenCards(ds);
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
+    flushPendingActiveRuntimePatch(ds);
     flushPendingCodexServiceTierPatch(ds);
     // Manual /card during a working turn lands a live card whose subsequent
     // screen_updates are working→working (no status edge) — arm the periodic
@@ -1353,6 +1433,7 @@ export async function postFreshStreamingCard(
     ds.streamCardPending = prevPending;
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
+    flushPendingActiveRuntimePatch(ds);
     flushPendingCodexServiceTierPatch(ds);
     // Rolled back to the prior card identity — re-sync so a restored still-live
     // working card keeps (or resumes) its refresh rather than losing the timer.
@@ -6649,6 +6730,13 @@ function setupWorkerHandlers(
   // Codex badge before a role switch starts a non-Codex worker.
   ds.codexServiceTier = undefined;
   ds.pendingCodexTierCardRefresh = undefined;
+  // Active runtime is likewise authority of this exact worker generation. The
+  // new worker republishes it via active_runtime after re-reading the rollout;
+  // clear it here so the window between respawn and that first observation
+  // cannot leave a stale model/effort tail on the card.
+  ds.activeModel = undefined;
+  ds.activeReasoningEffort = undefined;
+  ds.pendingActiveRuntimeCardRefresh = undefined;
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
   const handlerLarkAppId = ds.larkAppId;
@@ -7185,6 +7273,7 @@ function setupWorkerHandlers(
           recallFrozenCards(ds);
           flushPendingLocalCliOpenReadinessPatch(ds);
           flushPendingRiffUrlPatch(ds);
+          flushPendingActiveRuntimePatch(ds);
           flushPendingCodexServiceTierPatch(ds);
           // Fresh ready POST: if this turn is already `working` (e.g. relay
           // resume where the CLI kept running), arm here — same authorized arm
@@ -7374,6 +7463,29 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'active_runtime': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored active_runtime from stale worker generation`);
+          break;
+        }
+        const model = msg.model?.trim() || undefined;
+        const reasoningEffort = msg.reasoningEffort?.trim() || undefined;
+        if (
+          ds.activeModel === model
+          && ds.activeReasoningEffort === reasoningEffort
+        ) {
+          break;
+        }
+        ds.activeModel = model;
+        ds.activeReasoningEffort = reasoningEffort;
+        scheduleActiveRuntimePatch(ds);
+        break;
+      }
+
       case 'codex_service_tier': {
         if (
           ds.worker !== worker
@@ -7386,6 +7498,13 @@ function setupWorkerHandlers(
         ds.codexServiceTier = effectiveCliId === 'codex'
           ? (msg.snapshot ?? undefined)
           : undefined;
+        // Model/effort now flow through the active_runtime channel (Codex
+        // publishes them from every turn_context, same as TRAE), so this
+        // handler is scoped to the ⚡ service-tier badge only and must NOT
+        // also write activeModel/activeReasoningEffort — doing so would race
+        // the active_runtime writer and, since thread_settings_applied is not
+        // emitted in many sessions, could clobber the good value with a stale
+        // one.
         scheduleCodexServiceTierPatch(ds);
         break;
       }
@@ -7538,6 +7657,7 @@ function setupWorkerHandlers(
               recallFrozenCards(ds);
               flushPendingLocalCliOpenReadinessPatch(ds);
               flushPendingRiffUrlPatch(ds);
+              flushPendingActiveRuntimePatch(ds);
               flushPendingCodexServiceTierPatch(ds);
               // New-turn POST is the FIRST working screen_update of the turn —
               // the else (same-turn PATCH) branch never runs for it, so arm the
@@ -7554,6 +7674,7 @@ function setupWorkerHandlers(
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
               ds.streamCardId = undefined;
               clearPendingLocalCliOpenReadinessPatch(ds);
+              ds.pendingActiveRuntimeCardRefresh = undefined;
               ds.pendingCodexTierCardRefresh = undefined;
               persistStreamCardState(ds);
             });
