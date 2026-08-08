@@ -372,6 +372,22 @@ import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/d
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { shutdownBackendDisposition } from './core/persistent-backend.js';
+import {
+  abortRiffShutdownFleet,
+  canAbortVerifiedExitedRiffPreparation,
+  collectUniqueDaemonShutdownSessions,
+  commitPreparedRiffShutdown,
+  isPreparedRiffSessionCurrent,
+  persistPreparedRiffShutdownFleet,
+  prepareRiffFleetForShutdown,
+  type FencedRiffShutdownParticipant,
+  type PreparedRiffShutdown,
+} from './core/riff-shutdown-detach.js';
+import {
+  BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS,
+  DAEMON_SHUTDOWN_MAX_MS,
+  DAEMON_WORKER_EXIT_GRACE_MS,
+} from './core/shutdown-budgets.js';
 import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consumer-isolation.js';
 import {
   markSessionActivity,
@@ -21020,21 +21036,154 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     overloadTimer.unref?.();
   }
 
-  // Graceful shutdown. Sends SIGTERM (or `{type:'close'}` IPC via killWorker)
-  // to every worker, then waits up to SHUTDOWN_GRACE_MS for them to exit
+  // Graceful shutdown. Riff owners first run a three-phase non-cancelling drain
+  // that durably ACKs every exact final task lineage as one fleet transaction.
+  // No worker exits until every participant is prepared and fresh-verified.
+  // Ordinary workers then receive SIGTERM / close IPC and the daemon waits up
+  // to DAEMON_WORKER_EXIT_GRACE_MS for them to exit
   // before sending SIGKILL to stragglers. Without the wait, daemon
   // `process.exit(0)` races worker signal delivery — and any worker whose
   // main thread is in a sync code path (e.g. the bridge fingerprint scan
   // bug fixed in v2.9.2) loses the signal and survives as a ppid=1 orphan
   // forever (we'd accumulated 841 such orphans across daemon restarts,
   // consuming ~65 GB of RAM until manually SIGKILL'd).
-  const SHUTDOWN_GRACE_MS = 3000;
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    const shutdownDeadlineMs = Date.now() + DAEMON_SHUTDOWN_MAX_MS;
+    const mutationResult = await tryWithBotTurnMutation(
+      cfg.larkAppId,
+      BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS,
+      async () => {
     setSessionLifecycleShutdown(true);
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
+
+    const initialShutdownFleet = collectUniqueDaemonShutdownSessions(activeSessions.values());
+    if (!initialShutdownFleet.ok) {
+      setSessionLifecycleShutdown(false);
+      shuttingDown = false;
+      logger.error(`Daemon remains online: ${initialShutdownFleet.error}`);
+      return;
+    }
+
+    // Preflight Riff before stopping services/removing descriptors. A failed
+    // drain or persistence write aborts every successfully prepared peer, so a
+    // refused shutdown returns to a live fleet instead of leaving an early
+    // participant workerless.
+    const riffCandidates = initialShutdownFleet.sessions
+      .filter(ds => shutdownBackendDisposition(ds) === 'riff-drain-detach');
+    const riffPrepareResults = await prepareRiffFleetForShutdown(riffCandidates, {
+      deadlineMs: shutdownDeadlineMs,
+    });
+    const riffPrepared = riffPrepareResults.filter(
+      (entry): entry is { ds: DaemonSession; result: PreparedRiffShutdown } => entry.result.ok,
+    );
+    const riffFenced = riffPrepareResults.filter(
+      (entry): entry is { ds: DaemonSession; result: FencedRiffShutdownParticipant } =>
+        entry.result.fence !== 'none',
+    );
+
+    const abortRiffFleet = async (
+      reason: string,
+      retainFenced: ReadonlySet<DaemonSession> = new Set(),
+    ): Promise<void> => {
+      for (const ds of retainFenced) {
+        logger.error(
+          `[${ds.session.sessionId.slice(0, 8)}] Riff shutdown participant remains fenced: `
+          + 'durable/runtime ownership could not be reconciled safely',
+        );
+      }
+      const aborts = await abortRiffShutdownFleet(riffFenced
+        .filter(({ ds }) => !retainFenced.has(ds))
+        .map(({ ds, result }) => ({ ds, result })), {
+          deadlineMs: shutdownDeadlineMs,
+        });
+      for (const { ds, result } of aborts) {
+        if (result.ok) continue;
+        logger.error(
+          `[${ds.session.sessionId.slice(0, 8)}] Riff shutdown rollback was not ACKed: `
+          + `${result.error ?? 'unknown'}; admission remains fail-closed`,
+        );
+      }
+      setSessionLifecycleShutdown(false);
+      shuttingDown = false;
+      logger.error(`Daemon remains online: ${reason}`);
+    };
+
+    const riffPrepareFailures = riffPrepareResults.filter(entry => !entry.result.ok);
+    if (riffPrepareFailures.length > 0) {
+      for (const { ds, result } of riffPrepareFailures) {
+        if (result.ok) continue;
+        logger.error(
+          `[${ds.session.sessionId.slice(0, 8)}] Daemon shutdown prepare refused: `
+          + `${result.error}${result.taskId ? ` (task ${result.taskId})` : ''}`,
+        );
+      }
+      await abortRiffFleet(
+        `${riffPrepareFailures.length} Riff owner(s) could not be safely drained`,
+      );
+      return;
+    }
+
+    const riffPersistence = persistPreparedRiffShutdownFleet(riffPrepared, {
+      deadlineMs: shutdownDeadlineMs,
+    });
+    if (!riffPersistence.ok) {
+      const retainIds = new Set(riffPersistence.retainFencedSessionIds);
+      const retainFenced = new Set(riffPrepared
+        .filter(({ ds }) => retainIds.has(ds.session.sessionId))
+        .map(({ ds }) => ds));
+      logger.error(`Daemon shutdown lineage verification refused: ${riffPersistence.error}`);
+      await abortRiffFleet(
+        `${riffPersistence.sessionIds.length} Riff lineage row(s) could not be fresh-verified`,
+        retainFenced,
+      );
+      return;
+    }
+
+    // Recheck generation ownership while every participant is still fenced and
+    // daemon services remain live.
+    const currentShutdownFleet = collectUniqueDaemonShutdownSessions(activeSessions.values());
+    if (!currentShutdownFleet.ok) {
+      const ambiguousSessionId = currentShutdownFleet.sessionId;
+      await abortRiffFleet(
+        `Riff ownership became ambiguous after shutdown preflight: ${currentShutdownFleet.error}`,
+        new Set(riffPrepared
+          .filter(({ ds }) => ds.session.sessionId === ambiguousSessionId)
+          .map(({ ds }) => ds)),
+      );
+      return;
+    }
+    const currentRiffOwners = currentShutdownFleet.sessions
+      .filter(ds => shutdownBackendDisposition(ds) === 'riff-drain-detach');
+    const riffPreparedOwners = new Set(riffPrepared.map(entry => entry.ds));
+    const riffGenerationMismatch = currentRiffOwners.some(ds => !riffPreparedOwners.has(ds))
+      || riffPrepared.some(({ ds, result }) =>
+        !currentRiffOwners.includes(ds) || !isPreparedRiffSessionCurrent(ds, result));
+    if (riffGenerationMismatch) {
+      const retainFenced = new Set(riffPrepared
+        .filter(({ ds, result }) =>
+          (!currentRiffOwners.includes(ds) || !isPreparedRiffSessionCurrent(ds, result))
+          && !canAbortVerifiedExitedRiffPreparation(ds, result))
+        .map(({ ds }) => ds));
+      await abortRiffFleet(
+        'Riff ownership changed after shutdown preflight',
+        retainFenced,
+      );
+      return;
+    }
+
+    // Validate-all above, then commit-all synchronously with no await or
+    // callback boundary between peers.
+    const riffRetiredWorkers: ChildProcess[] = [];
+    for (const { ds, result } of riffPrepared) {
+      if (!commitPreparedRiffShutdown(ds, result)) {
+        throw new Error(`Riff shutdown commit invariant lost for ${ds.session.sessionId}`);
+      }
+      if (result.worker) riffRetiredWorkers.push(result.worker);
+    }
+
     scheduler.stopScheduler();
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
@@ -21068,23 +21217,33 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     const pendingExits: Array<Promise<void>> = [];
     const survivors: ChildProcess[] = [];
-    for (const [, ds] of activeSessions) {
+    const trackWorkerExit = (w: ChildProcess): void => {
+      if (w.exitCode !== null || w.signalCode !== null) return;
+      pendingExits.push(new Promise<void>(resolve => {
+        w.once('exit', () => resolve());
+        // Close the check/listener race if exit landed between the first
+        // status read and once().
+        if (w.exitCode !== null || w.signalCode !== null) resolve();
+      }));
+      survivors.push(w);
+    };
+    for (const worker of riffRetiredWorkers) trackWorkerExit(worker);
+    for (const ds of currentShutdownFleet.sessions) {
       if (ds.worker && !ds.worker.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
         const w = ds.worker;
-        // Capture the exit promise BEFORE killWorker nulls ds.worker.
-        if (w.exitCode === null && w.signalCode === null) {
-          pendingExits.push(new Promise<void>(resolve => {
-            w.once('exit', () => resolve());
-          }));
-          survivors.push(w);
+        const disposition = shutdownBackendDisposition(ds);
+        if (disposition === 'riff-drain-detach') {
+          throw new Error(`undrained Riff generation after atomic commit: ${ds.session.sessionId}`);
         }
+        // Capture the exit promise BEFORE killWorker nulls ds.worker.
+        trackWorkerExit(w);
         // Branch by the session's FROZEN backend (stamped on Session.backendType
         // at spawn), NOT the bot's live config — a dashboard backendType edit must
         // not change how a running session is torn down, or we'd e.g. try to
         // detach-preserve a "herdr" session whose real pane is tmux (freeze-once).
         // undefined (frozen pty, or unresolvable legacy) → non-persistent → killWorker.
-        if (shutdownBackendDisposition(ds) === 'detach') {
+        if (disposition === 'detach') {
           // Persistent backends (tmux / herdr / zellij / zmx): just kill the worker process —
           // the multiplexer session survives for re-attach. The worker's SIGTERM
           // handler calls backend.kill(), which only DETACHES. Going through
@@ -21104,7 +21263,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     if (pendingExits.length > 0) {
-      const timeout = new Promise<void>(resolve => setTimeout(resolve, SHUTDOWN_GRACE_MS));
+      const exitGraceMs = Math.min(
+        DAEMON_WORKER_EXIT_GRACE_MS,
+        Math.max(0, shutdownDeadlineMs - Date.now()),
+      );
+      const timeout = new Promise<void>(resolve => setTimeout(resolve, exitGraceMs));
       await Promise.race([Promise.all(pendingExits), timeout]);
       let stragglers = 0;
       for (const w of survivors) {
@@ -21114,7 +21277,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         }
       }
       if (stragglers > 0) {
-        logger.warn(`${stragglers}/${survivors.length} worker(s) didn't exit within ${SHUTDOWN_GRACE_MS}ms — SIGKILL'd to prevent ppid=1 orphans.`);
+        logger.warn(`${stragglers}/${survivors.length} worker(s) didn't exit within ${exitGraceMs}ms — SIGKILL'd to prevent ppid=1 orphans.`);
       }
     }
 
@@ -21125,6 +21288,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     removePidFile();
     process.exit(gracefulProcessExitCode());
+      },
+    );
+    if (!mutationResult.acquired) {
+      shuttingDown = false;
+      logger.error(
+        `Daemon remains online: could not acquire exclusive shutdown mutation lease `
+        + `(${mutationResult.reason})`,
+      );
+    }
   };
 
   process.on('SIGTERM', () => { shutdown().catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });

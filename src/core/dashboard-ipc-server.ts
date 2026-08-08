@@ -181,6 +181,7 @@ import { requestAgentSessionRename } from './session-rename.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
+import { isRiffBackendSession } from './persistent-backend.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 import {
@@ -1049,6 +1050,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_restart_unsupported' });
   }
+  // Riff owns a remote task lineage. Its worker deliberately refuses restart
+  // because destroy + respawn would sever or replace that lineage. Reject at
+  // the daemon boundary so the dashboard never reports HTTP 200 for a no-op.
+  if (isRiffBackendSession(ds)) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'riff_restart_unsupported',
+      message: t('cmd.restart.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+    });
+  }
   if (rejectProtectedSessionMutation(res, [ds])) return;
   const cliId = ds.session.cliId ?? 'unknown';
   if (ds.worker && !ds.worker.killed) {
@@ -1349,6 +1360,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   // 终端会话。与 /suspend、/restart、/slash 同款排除。
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_cd_unsupported' });
+  }
+  // Riff restart/kill is intentionally refused to preserve remote task
+  // lineage. Reject before validation/repin so the persisted cwd cannot drift
+  // from the still-running sandbox.
+  if (isRiffBackendSession(ds)) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'riff_cd_unsupported',
+      message: t('cmd.cd.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+    });
   }
   // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
   // 下面 repinSessionWorkingDir 把 ds.workingDir 钉过去之后，那个 bot 的沙盒会话

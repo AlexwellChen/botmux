@@ -2876,7 +2876,7 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.message ?? body?.error ?? r.status}`);
         return false;
       }
       restartCooldownIds.current.add(row.sessionId);

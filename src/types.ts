@@ -863,10 +863,18 @@ export type DaemonToWorker =
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
    *  it; all other CLIs ignore it. */
   | { type: 'rename_session'; title: string }
-  | { type: 'close' }
+  | { type: 'close'; requestId?: string }
+  | { type: 'close_commit'; requestId: string }
+  | { type: 'close_abort'; requestId: string }
+  /** Fence new Riff writes, drain accepted writes, and report exact lineage. */
+  | { type: 'riff_shutdown_prepare'; requestId: string }
+  /** Final lineage is durable; detach the worker generation. */
+  | { type: 'riff_shutdown_commit'; requestId: string }
+  /** Shutdown could not commit; restore Riff write admission. */
+  | { type: 'riff_shutdown_abort'; requestId: string }
   /** Retire only this worker/observer during a routing transfer. Persistent
    * backends and Riff keep their owned CLI/task alive for the replacement
-   * worker to reattach; PTY keeps its historical cold-resume behavior. */
+  * worker to reattach; PTY keeps its historical cold-resume behavior. */
   | { type: 'detach_for_transfer'; requestId: string }
   | { type: 'suspend' }
   /** Kill the CLI and respawn it with --resume. `updateWorkingDir`（可选）
@@ -1105,4 +1113,25 @@ export type WorkerToDaemon =
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }
   | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string; turnId?: string; dispatchAttempt?: number }
-  | { type: 'riff_task_id'; taskId: string | null };
+  | { type: 'riff_task_id'; taskId: string | null }
+  | {
+      type: 'riff_shutdown_result';
+      requestId: string;
+      phase: 'prepare' | 'abort';
+      ok: boolean;
+      taskId: string | null;
+      error?: string;
+    }
+  | {
+      type: 'close_abort_result';
+      requestId: string;
+      ok: boolean;
+      error?: string;
+    }
+  | {
+      type: 'close_result';
+      requestId: string;
+      ok: boolean;
+      taskId?: string;
+      error?: string;
+    };

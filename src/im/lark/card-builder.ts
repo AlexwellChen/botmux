@@ -408,7 +408,7 @@ export function buildSessionCard(
       });
     }
   }
-  if (showManageButtons && !adoptMode) {
+  if (showManageButtons && !adoptMode && effectiveCliId !== 'riff') {
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.restart_cli', { cliName }, locale) },
