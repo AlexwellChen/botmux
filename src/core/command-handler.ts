@@ -4025,6 +4025,24 @@ async function blockTakeoverWhilePendingRepo(
   return true;
 }
 
+/**
+ * A live Riff worker cannot be replaced through the generic adopt/import
+ * refork path: that path sends a request-less close and then kills the local
+ * worker, while Riff requires its remote task to finish the explicit
+ * prepare/commit close protocol first. Refuse before target validation or any
+ * persisted ownership mutation so the original lineage stays recoverable.
+ */
+async function blockRiffTakeover(
+  ds: DaemonSession,
+  sessionReply: (rid: string, content: string, msgType?: string) => Promise<string>,
+): Promise<boolean> {
+  if (!isRiffBackendSession(ds)) return false;
+  const loc = localeForBot(ds.larkAppId);
+  await sessionReply(sessionAnchorId(ds), t('cmd.takeover.riff_unsupported', undefined, loc));
+  logger.warn(`[${tag(ds)}] Takeover refused: Riff session requires explicit close before replacement`);
+  return true;
+}
+
 export async function startCodexAppThreadSession(
   thread: CodexAppThreadSummary,
   ds: DaemonSession,
@@ -4040,6 +4058,7 @@ export async function startCodexAppThreadSession(
     return;
   }
 
+  if (await blockRiffTakeover(ds, sessionReply)) return;
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
   const targetSessionId = ds.session.sessionId;
@@ -4094,6 +4113,8 @@ export async function startAdoptSession(
     await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
     return;
   }
+
+  if (await blockRiffTakeover(ds, sessionReply)) return;
 
   const zellij = isZellijTarget(target);
   if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
@@ -4256,6 +4277,7 @@ export async function startResumeImportSession(
     return;
   }
 
+  if (await blockRiffTakeover(ds, sessionReply)) return;
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
   const targetSessionId = ds.session.sessionId;

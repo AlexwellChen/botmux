@@ -477,7 +477,7 @@ vi.mock('../src/services/card-mode-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
@@ -3611,6 +3611,99 @@ describe('handleCommand', () => {
   // ─── /adopt ─────────────────────────────────────────────────────────────
 
   describe('/adopt', () => {
+    function makeLiveRiffSession(): DaemonSession {
+      return makeDaemonSession({
+        workingDir: '/remote/riff',
+        worker: { killed: false } as any,
+        initConfig: { backendType: 'riff' } as any,
+        session: makeSession({
+          cliId: 'riff',
+          backendType: 'riff',
+          riffParentTaskId: 'task-live',
+          workingDir: '/remote/riff',
+        }),
+      });
+    }
+
+    it('refuses adopt over a live Riff generation before mutating ownership', async () => {
+      const ds = makeLiveRiffSession();
+      const deps = makeDeps(ds);
+      const target = {
+        source: 'tmux' as const,
+        tmuxTarget: '0:1.0',
+        cliPid: 4242,
+        sessionId: 'host-cli',
+        cliId: 'claude-code' as const,
+        cwd: '/local/adopt',
+        paneCols: 80,
+        paneRows: 24,
+      };
+
+      await startAdoptSession(target, ds, deps, LARK_APP_ID);
+
+      expect(validateAdoptTarget).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(forkAdoptWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/remote/riff');
+      expect(ds.session.workingDir).toBe('/remote/riff');
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect(ds.session.riffParentTaskId).toBe('task-live');
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('/close'),
+        undefined,
+        LARK_APP_ID,
+      );
+    });
+
+    it('refuses resume import over a live Riff generation before mutating lineage', async () => {
+      const ds = makeLiveRiffSession();
+      const deps = makeDeps(ds);
+
+      await startResumeImportSession({
+        cliSessionId: 'native-resume-id', cwd: '/local/resume', title: 'Imported task', lastActivityAt: 1,
+      }, ds, deps, LARK_APP_ID);
+
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/remote/riff');
+      expect(ds.session.workingDir).toBe('/remote/riff');
+      expect(ds.session.cliSessionId).toBeUndefined();
+      expect(ds.session.riffParentTaskId).toBe('task-live');
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('/close'),
+        undefined,
+        LARK_APP_ID,
+      );
+    });
+
+    it('refuses a Codex App thread takeover over a live Riff generation', async () => {
+      const ds = makeLiveRiffSession();
+      const deps = makeDeps(ds);
+
+      await startCodexAppThreadSession({
+        threadId: 'codex-thread-id',
+        name: 'Imported Codex thread',
+        preview: 'preview',
+        cwd: '/local/codex-app',
+      }, ds, deps, LARK_APP_ID);
+
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/remote/riff');
+      expect(ds.session.workingDir).toBe('/remote/riff');
+      expect(ds.session.cliId).toBe('riff');
+      expect(ds.session.cliSessionId).toBeUndefined();
+      expect(ds.session.riffParentTaskId).toBe('task-live');
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('/close'),
+        undefined,
+        LARK_APP_ID,
+      );
+    });
+
     it('refuses adopt while the session is still on the pendingRepo gate and posts a close-session card', async () => {
       const ds = makeDaemonSession({
         pendingRepo: true,
