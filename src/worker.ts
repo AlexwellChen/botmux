@@ -40,7 +40,7 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
   decideHardTimeoutAction,
   decideSettleMarkReady,
@@ -4526,6 +4526,19 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       continue;
     }
 
+    // Gate let this through, so the final is a real answer. NON-ADOPT only: if
+    // the model appended a trailing sentinel line (the "did work, forgot to
+    // send, ended with the sentinel" shape), strip it so the literal token never
+    // reaches Lark — the prose before it is what the user should see; a
+    // pure-sentinel final was already suppressed by isBridgeNothingToSendFinal,
+    // so what remains is non-empty (guard and skip if not). ADOPT must NEVER
+    // touch the text: the adopted CLI is botmux-unaware, transcript drain is its
+    // only channel, and it may legitimately output that literal string as
+    // content — shouldSuppressBridgeEmit(adoptMode) already refuses to interpret
+    // the sentinel, so stripping here would break that contract.
+    const postText = bridgePostText(assistantText, adoptMode);
+    if (!adoptMode && postText.trim().length === 0) continue;
+
     if (turn.isLocal) {
       if (turn.userUuid) {
         // Local turn (adopt mode only): also surface the user prompt so the
@@ -4537,7 +4550,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
         // a normally-typed pane prompt.
         const userEv = drained.events.find(e => e.uuid === turn.userUuid);
         const rawUserText = userEv ? extractTurnStartText(userEv) : '';
-        const fields = formatLocalTurnFields(rawUserText, assistantText);
+        const fields = formatLocalTurnFields(rawUserText, postText);
         if (!fields) continue;
         send({
           type: 'final_output',
@@ -4551,7 +4564,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
         continue;
       }
       // Headless local turn — see formatHeadlessLocalTurnContent for context.
-      const headlessContent = formatHeadlessLocalTurnContent(assistantText);
+      const headlessContent = formatHeadlessLocalTurnContent(postText);
       if (!headlessContent) continue;
       send({
         type: 'final_output',
@@ -4566,7 +4579,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
 
     send({
       type: 'final_output',
-      content: assistantText,
+      content: postText,
       lastUuid,
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
@@ -5430,12 +5443,21 @@ function emitReadyCodexTurns(): void {
       );
       continue;
     }
+    // NON-ADOPT only: strip a trailing sentinel line so the literal token never
+    // reaches Lark (prose+sentinel = "did work, forgot to send" — post the
+    // prose). A pure-sentinel final was suppressed above, and the fallback
+    // string carries no sentinel, so `postContent` is normally non-empty (guard
+    // and skip if not). ADOPT must NEVER touch the text — the adopted CLI is
+    // botmux-unaware and may output that literal string as content; the gate
+    // already refuses to interpret the sentinel under adoptMode.
+    const postContent = bridgePostText(content, adoptMode);
+    if (!adoptMode && postContent.trim().length === 0) continue;
     if (turn.isLocal) {
       // Local turn (adopt only): user typed in iTerm. Surface both sides
       // so the Lark thread sees a complete exchange instead of an orphan
       // reply. formatLocalTurnFields caps both texts to keep within
       // Lark's per-message limit; daemon owns the card chrome.
-      const fields = formatLocalTurnFields(turn.userText ?? '', content);
+      const fields = formatLocalTurnFields(turn.userText ?? '', postContent);
       if (!fields) continue;
       send({
         type: 'final_output',
@@ -5452,7 +5474,7 @@ function emitReadyCodexTurns(): void {
     send({
       type: 'final_output',
       ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
-      content,
+      content: postContent,
       lastUuid: turn.turnId,
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
@@ -7018,10 +7040,19 @@ async function handleTrustedCodexAppMarker(
       log(`${cliName()} native turn ${nativeTurnId.substring(0, 12)} mapped to botmux turn ${turnId.substring(0, 12)}`);
     }
     let suppressDelivery = false;
-    if (finalContent && startedAtMs !== undefined) {
+    // What actually reaches Lark: strip a trailing sentinel line so the literal
+    // token never posts. `finalContent` stays RAW above (the steer_superseded
+    // validator asserts finalContent==='' and must see the unstripped payload).
+    // If nothing remains after stripping, this was a pure-silence final → treat
+    // as suppressed so the daemon persists the FIFO advance without delivering.
+    const deliverableContent = stripTrailingBridgeSentinelLine(finalContent);
+    if (deliverableContent.trim().length === 0 && finalContent.trim().length > 0) {
+      suppressDelivery = true;
+    }
+    if (deliverableContent && startedAtMs !== undefined) {
       const suppressMarkers = readSendMarkers();
-      const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: finalContent };
-      suppressDelivery = shouldSuppressBridgeEmit(
+      const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: deliverableContent };
+      suppressDelivery = suppressDelivery || shouldSuppressBridgeEmit(
         gateInput,
         completedAtMs + 5_001,
         suppressMarkers,
@@ -7051,7 +7082,7 @@ async function handleTrustedCodexAppMarker(
       // deliverFinalOutput, and tag the disposition so the sink is explicit.
       const persisted = await waitForCodexAppDaemonPersistence(requestId, () => send({
         type: 'final_output',
-        content: (suppressDelivery || isSuperseded) ? '' : finalContent,
+        content: (suppressDelivery || isSuperseded) ? '' : deliverableContent,
         lastUuid: turnId,
         turnId,
         ...(replyTurnId ? { replyTurnId } : {}),
@@ -7095,7 +7126,7 @@ async function handleTrustedCodexAppMarker(
       if (finalContent && !suppressDelivery) {
       send({
         type: 'final_output',
-        content: finalContent,
+        content: deliverableContent,
         lastUuid: turnId,
         turnId,
         ...(finalUsage ? { usage: finalUsage } : {}),
