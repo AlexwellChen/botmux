@@ -51,34 +51,47 @@ describe('configured PM2 fleet start authority', () => {
   });
 
   it('preserves raw PM2 stop-exit-code elements for exact policy validation', () => {
-    expect(normalizeRawPm2StopExitCodes([42, '0foo'])).toEqual([42, '0foo']);
-    expect(normalizeRawPm2StopExitCodes([42, '0x0'])).toEqual([42, '0x0']);
-    expect(normalizeRawPm2StopExitCodes([42, null])).toEqual([42, null]);
-    expect(normalizeRawPm2StopExitCodes('42')).toEqual(['42']);
+    expect(normalizeRawPm2StopExitCodes([DAEMON_GRACEFUL_EXIT_CODE, '0foo']))
+      .toEqual([DAEMON_GRACEFUL_EXIT_CODE, '0foo']);
+    expect(normalizeRawPm2StopExitCodes([DAEMON_GRACEFUL_EXIT_CODE, '0x0']))
+      .toEqual([DAEMON_GRACEFUL_EXIT_CODE, '0x0']);
+    expect(normalizeRawPm2StopExitCodes([DAEMON_GRACEFUL_EXIT_CODE, null]))
+      .toEqual([DAEMON_GRACEFUL_EXIT_CODE, null]);
+    expect(normalizeRawPm2StopExitCodes(String(DAEMON_GRACEFUL_EXIT_CODE)))
+      .toEqual([String(DAEMON_GRACEFUL_EXIT_CODE)]);
     expect(normalizeRawPm2StopExitCodes(null)).toEqual([null]);
   });
 
   it.each([
-    [42, '0foo'],
-    [42, '0x0'],
-    [42, null],
+    [DAEMON_GRACEFUL_EXIT_CODE, '0foo'],
+    [DAEMON_GRACEFUL_EXIT_CODE, '0x0'],
+    [DAEMON_GRACEFUL_EXIT_CODE, null],
   ])('rejects restart-suppressing raw stop-exit-code extras: %j', stopExitCodes => {
     expect(() => assertDaemonPm2GracefulExitPolicy('start-idempotent-ready', [{
       ...row('botmux-a', 0),
       autorestart: true,
       stopExitCodes,
-    }])).toThrow(/does not prove signal-death autorestart.*stop_exit_codes=\[42\]/);
+    }])).toThrow(new RegExp(
+      `does not prove signal-death autorestart.*stop_exit_codes=\\[${DAEMON_GRACEFUL_EXIT_CODE}\\]`,
+    ));
   });
 
   it('accepts only the numeric sentinel or its canonical decimal string', () => {
-    for (const stopExitCodes of [[42], ['42']]) {
+    for (const stopExitCodes of [
+      [DAEMON_GRACEFUL_EXIT_CODE],
+      [String(DAEMON_GRACEFUL_EXIT_CODE)],
+    ]) {
       expect(() => assertDaemonPm2GracefulExitPolicy('start-idempotent-ready', [{
         ...row('botmux-a', 0),
         autorestart: true,
         stopExitCodes,
       }])).not.toThrow();
     }
-    for (const stopExitCodes of [['042'], ['42foo'], ['0x2a']]) {
+    for (const stopExitCodes of [
+      [`0${DAEMON_GRACEFUL_EXIT_CODE}`],
+      [`${DAEMON_GRACEFUL_EXIT_CODE}foo`],
+      [`0x${DAEMON_GRACEFUL_EXIT_CODE.toString(16)}`],
+    ]) {
       expect(() => assertDaemonPm2GracefulExitPolicy('start-idempotent-ready', [{
         ...row('botmux-a', 0),
         autorestart: true,

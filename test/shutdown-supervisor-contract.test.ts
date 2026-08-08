@@ -15,6 +15,7 @@ import {
   RIFF_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
 } from '../src/core/shutdown-budgets.js';
 import { DAEMON_GRACEFUL_EXIT_CODE } from '../src/core/supervisor-shutdown-protocol.js';
+import { PM2_GRACEFUL_EXIT_CODE } from '../src/pm2-graceful-exit.js';
 
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
@@ -28,6 +29,7 @@ describe('graceful shutdown supervisor contract', () => {
   it('uses a nonzero daemon-only graceful sentinel because PM2 maps signal death to zero', () => {
     expect(DAEMON_GRACEFUL_EXIT_CODE).toBeGreaterThan(0);
     expect(DAEMON_GRACEFUL_EXIT_CODE).toBeLessThan(256);
+    expect(DAEMON_GRACEFUL_EXIT_CODE).toBe(PM2_GRACEFUL_EXIT_CODE);
     expect(bundledPm2God).toContain('God.handleExit(clu, code || 0, signal);');
 
     const ecosystemStart = cli.indexOf('function ecosystemConfig(');
@@ -36,14 +38,15 @@ describe('graceful shutdown supervisor contract', () => {
       cli.indexOf("name: 'botmux-dashboard'", ecosystemStart),
       cli.indexOf('const cfg = { apps };', ecosystemStart),
     );
-    expect(daemonPolicy).toContain('stop_exit_codes: [DAEMON_GRACEFUL_EXIT_CODE]');
+    expect(daemonPolicy).toContain('stop_exit_codes: managedExit.stopExitCodes');
     expect(daemonPolicy).not.toContain('stop_exit_codes: [0]');
-    expect(dashboardPolicy).toContain('stop_exit_codes: [0]');
+    expect(dashboardPolicy).toContain('stop_exit_codes: managedExit.stopExitCodes');
+    expect(cli.match(/\.\.\.managedExit\.env/g)).toHaveLength(2);
 
     const shutdownStart = daemon.indexOf('const shutdown = async () => {');
     const shutdownEnd = daemon.indexOf("process.on('SIGTERM'", shutdownStart);
     const shutdown = daemon.slice(shutdownStart, shutdownEnd);
-    expect(shutdown).toContain('process.exit(DAEMON_GRACEFUL_EXIT_CODE);');
+    expect(shutdown).toContain('process.exit(gracefulProcessExitCode());');
     expect(shutdown).not.toContain('process.exit(0);');
     expect(cli).toContain('assertDaemonPm2GracefulExitPolicy(');
     expect(cli).toContain('`${operation}-handler-ready-pm2-policy`');
