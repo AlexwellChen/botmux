@@ -180,7 +180,7 @@ import {
   forkWorker,
   requestSessionRestart,
 } from '../src/core/worker-pool.js';
-import { sessionKey } from '../src/core/types.js';
+import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -558,15 +558,15 @@ describe('Card integration: full event flow', () => {
       expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
     });
 
-    it('close should kill worker and remove session', async () => {
+    it('close should remove session and deliver the closed card', async () => {
       const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession();
       const sessions = new Map<string, DaemonSession>();
-      const sKey = sessionKey(ROOT_ID, APP_ID);
+      const sKey = activeSessionKey(ds);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
+      await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId), deps, APP_ID);
 
       expect(sessionStore.closeSession).toHaveBeenCalledWith(
         ds.session.sessionId,
@@ -629,11 +629,15 @@ describe('Card integration: full event flow', () => {
       try {
         const ds = makeDaemonSession();
         const sessions = new Map<string, DaemonSession>();
-        const sKey = sessionKey(ROOT_ID, APP_ID);
+        const sKey = activeSessionKey(ds);
         sessions.set(sKey, ds);
         const deps = makeDeps(sessions);
 
-        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner'), deps, APP_ID);
+        await handleCardAction(
+          makeCloseEvent(ROOT_ID, 'ou_owner', undefined, ds.session.sessionId),
+          deps,
+          APP_ID,
+        );
 
         expect(sessionStore.closeSession).toHaveBeenCalledWith(
           ds.session.sessionId,
@@ -674,11 +678,15 @@ describe('Card integration: full event flow', () => {
       try {
         const ds = makeDaemonSession();
         const sessions = new Map<string, DaemonSession>();
-        const sKey = sessionKey(ROOT_ID, APP_ID);
+        const sKey = activeSessionKey(ds);
         sessions.set(sKey, ds);
         const deps = makeDeps(sessions);
 
-        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner', 'private'), deps, APP_ID);
+        await handleCardAction(
+          makeCloseEvent(ROOT_ID, 'ou_owner', 'private', ds.session.sessionId),
+          deps,
+          APP_ID,
+        );
 
         expect(sessionStore.closeSession).toHaveBeenCalledWith(
           ds.session.sessionId,
@@ -911,7 +919,7 @@ describe('Card integration: full event flow', () => {
       const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({ scope: 'thread' });
       const sessions = new Map<string, DaemonSession>();
-      const sKey = sessionKey(ROOT_ID, APP_ID);
+      const sKey = activeSessionKey(ds);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
@@ -1319,6 +1327,7 @@ describe('Card integration: full event flow', () => {
       // sessionReply was used to surface the rejection message.
       expect(deps.sessionReply).toHaveBeenCalled();
     });
+
   });
 
   describe('Scenario 8: usage-limit retry action', () => {
