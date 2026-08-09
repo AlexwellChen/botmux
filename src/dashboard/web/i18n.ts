@@ -2153,7 +2153,7 @@ const zh: DashboardMessages = {
   'workflow.v3.cancelPending': '取消请求已持久化；正在等待运行中的节点收敛。',
   'workflow.v3.cancelled': '运行已取消。',
   'workflow.v3.cancelAlreadyTerminal': '运行已先一步进入终态，未再提交取消。',
-  'workflow.v3.cancelAuthRequired': '需要 Dashboard 写权限：请在终端运行 `botmux dashboard` 获取一次性链接后重试。',
+  'workflow.v3.cancelAuthRequired': '需要 Dashboard 写权限：请在终端运行 `botmux dashboard` 获取当前登录链接后重试。',
   'workflow.v3.cancelFailed': '取消失败：{error}',
 };
 
@@ -4307,7 +4307,7 @@ const en: DashboardMessages = {
   'workflow.v3.cancelPending': 'The cancel request is durable; waiting for running nodes to drain.',
   'workflow.v3.cancelled': 'Run cancelled.',
   'workflow.v3.cancelAlreadyTerminal': 'The run reached a terminal state first; no cancel was submitted.',
-  'workflow.v3.cancelAuthRequired': 'Dashboard write access is required. Run `botmux dashboard` in a terminal, open its one-time link, then retry.',
+  'workflow.v3.cancelAuthRequired': 'Dashboard write access is required. Run `botmux dashboard` in a terminal, open its current login link, then retry.',
   'workflow.v3.cancelFailed': 'Cancel failed: {error}',
 };
 

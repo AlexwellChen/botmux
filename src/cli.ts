@@ -153,6 +153,11 @@ import {
   runBoundedPm2StartTransaction,
 } from './cli/pm2-start-transaction.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import {
+  DASHBOARD_COMMAND_USAGE,
+  executeDashboardCommand,
+  formatDashboardFallbackFailure,
+} from './cli/dashboard-command.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import {
   formatGlobalInstallCommand,
@@ -4209,7 +4214,7 @@ async function printDashboardHintWithRetry(): Promise<void> {
   }
   // Soft fallback
   if (last?.reason === 'no-active-token') {
-    console.log('   面板: 运行 `botmux dashboard` 获取链接');
+    console.log('   面板: 运行 `botmux dashboard` 创建登录链接');
   } else if (last?.reason === 'no-secret') {
     console.log('   面板: dashboard 凭证未就绪，启动后可用 `botmux dashboard` 获取链接');
   } else if (last?.reason === 'wrong-service') {
@@ -4219,13 +4224,23 @@ async function printDashboardHintWithRetry(): Promise<void> {
   }
 }
 
-/**
- * Print a fresh dashboard URL by HMAC-authing to the dashboard process's
- * loopback rotation endpoint. Each call invalidates the previously-issued
- * token, so sharing a URL is the same as sharing a one-shot session.
- */
-async function cmdDashboard(): Promise<void> {
-  const r = await callDashboardEndpoint('/__cli/rotate');
+/** Get or create the current dashboard URL, or explicitly rotate it. Bare
+ * `dashboard` is the non-rotating get-or-create form; help and invalid
+ * subcommands never call either credential endpoint. */
+async function cmdDashboard(args: string[]): Promise<void> {
+  const execution = await executeDashboardCommand(args, callDashboardEndpoint);
+  if (execution.kind === 'help') {
+    console.log(DASHBOARD_COMMAND_USAGE);
+    return;
+  }
+  if (execution.kind === 'invalid') {
+    console.error(`未知 dashboard 子命令: ${execution.argument}`);
+    console.error(DASHBOARD_COMMAND_USAGE);
+    process.exitCode = 2;
+    return;
+  }
+
+  const { action, result: r } = execution;
   if (r.ok) {
     // 首行保持纯 URL（脚本/复制取第一行即可）；走中心化平台时再补一行本地直连兜底。
     console.log(r.url);
@@ -4252,8 +4267,7 @@ async function cmdDashboard(): Promise<void> {
     );
     if (r.detail) console.error(`  详情: ${r.detail}`);
   } else {
-    // `no-active-token` can't occur on rotate (it always mints); fall through.
-    console.error('Rotation failed:', r.detail ?? r.reason);
+    console.error(formatDashboardFallbackFailure(action, r));
   }
   process.exit(1);
 }
@@ -6815,7 +6829,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
-  dashboard   打印新的 Web Dashboard 一次性登录 URL（旧 token 同时失效）
+  dashboard current
+              获取当前 Web Dashboard 登录 URL（裸 \`dashboard\` 同义；没有则创建）
+  dashboard rotate
+              显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
   list        列出活跃会话（交互式选择并连接 tmux）
@@ -12900,7 +12917,7 @@ switch (command) {
   case 'status':  cmdStatus(); break;
   case 'upgrade':
   case 'update':  cmdUpgrade(); break;
-  case 'dashboard': await cmdDashboard(); break;
+  case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;
   case 'bind': {
     // `botmux bind <code>` — 把本机绑定到中心化平台
     const { cmdBind } = await import('./platform/bind.js');

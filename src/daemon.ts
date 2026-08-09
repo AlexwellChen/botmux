@@ -176,7 +176,7 @@ import {
   cancelSessionReadyAck,
   waitForSessionReadyAck,
 } from './core/session-ready-handshake.js';
-import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
+import { loadOrCreateDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
 import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
@@ -19799,9 +19799,8 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
   try {
     const dir = join(homedir(), '.botmux');
     const portFile = join(dir, '.dashboard-port');
-    const tokenFile = join(dir, '.dashboard-token');
     const port = existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : String(config.dashboard.port);
-    const tok = existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8').trim() : '';
+    const tok = loadPersistedToken(join(dir, '.dashboard-token')) ?? '';
     // buildDashboardUrls swaps in the central-platform machine subdomain when
     // 远程访问 is on and this host is bound, so the restart-report DM links to the
     // platform dashboard instead of an unreachable local host:port. In that case
