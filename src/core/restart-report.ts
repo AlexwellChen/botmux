@@ -91,9 +91,12 @@ export interface RestartReportWiring {
   /** Send the interactive card as a p2p DM to the owner. */
   sendCard: (openId: string, cardJson: string) => Promise<void>;
   githubAuth?: GithubAuthResolveOptions;
-  now?: number;
+  /** Injectable clock for deterministic tests. */
+  now?: number | (() => number);
   log?: (msg: string) => void;
   wait?: (ms: number) => Promise<void>;
+  /** Optional caller/test ceiling. Production leaves this unset so a durable
+   *  prepared intent is followed until it commits, aborts, or becomes stale. */
   preparedCommitWaitMs?: number;
 }
 
@@ -105,15 +108,20 @@ export interface RestartReportWiring {
  */
 export async function sendRestartReportIfPending(w: RestartReportWiring): Promise<void> {
   const log = w.log ?? (() => {});
-  const now = () => w.now ?? Date.now();
+  const now = () => typeof w.now === 'function' ? w.now() : w.now ?? Date.now();
   const wait = w.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
   let claim = claimRestartIntentForReport(now());
-  let remainingPreparedWaitMs = Math.max(0, w.preparedCommitWaitMs ?? 45_000);
-  const pollMs = 100;
-  while (claim.state === 'prepared' && remainingPreparedWaitMs > 0) {
-    const delayMs = Math.min(pollMs, remainingPreparedWaitMs);
+  let remainingPreparedWaitMs = w.preparedCommitWaitMs === undefined
+    ? undefined
+    : Math.max(0, w.preparedCommitWaitMs);
+  const pollMs = 500;
+  while (claim.state === 'prepared') {
+    if (remainingPreparedWaitMs !== undefined && remainingPreparedWaitMs <= 0) return;
+    const delayMs = remainingPreparedWaitMs === undefined
+      ? pollMs
+      : Math.min(pollMs, remainingPreparedWaitMs);
     await wait(delayMs);
-    remainingPreparedWaitMs -= delayMs;
+    if (remainingPreparedWaitMs !== undefined) remainingPreparedWaitMs -= delayMs;
     claim = claimRestartIntentForReport(now());
   }
   if (claim.state !== 'claimed') return;
