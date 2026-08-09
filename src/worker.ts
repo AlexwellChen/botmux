@@ -43,7 +43,8 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { bridgePostText, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, shouldEmitEmptyCompletedBridgeFallback, shouldEmitFailedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
   decideSettleMarkReady,
@@ -136,10 +137,10 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexThreadSettings, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
-import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, traexHistorySidIsOwned } from './services/traex-transcript.js';
+import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
@@ -3313,10 +3314,9 @@ const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
-/** uuids of Claude transcript rate-limit records we've already turned into a
- *  `limited` emit. drainTranscript re-reads from offset 0 on truncation /
- *  rotation and emitReadyTurns re-drains from 0, so the same rate_limit record
- *  can resurface; keying on the record's stable uuid makes the emit idempotent. */
+/** uuids of structured transcript rate-limit records already turned into a
+ *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
+ *  stable record uuid keeps the notification idempotent. */
 const emittedRateLimitUuids = new Set<string>();
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
@@ -3343,6 +3343,8 @@ let codexBridgeRolloutPath: string | undefined;
 let codexBridgeOffset = 0;
 let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
+let publishedActiveRuntime: TraexRuntimeSnapshot = {};
+let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
@@ -3353,6 +3355,29 @@ const codexServiceTierTracker = new CodexServiceTierTracker(
   resolveCodexServiceTierSnapshot,
   snapshot => send({ type: 'codex_service_tier', snapshot }),
 );
+
+function publishActiveRuntime(runtime: TraexRuntimeSnapshot): void {
+  const normalized: TraexRuntimeSnapshot = {
+    ...(runtime.model?.trim() ? { model: runtime.model.trim() } : {}),
+    ...(runtime.reasoningEffort?.trim()
+      ? { reasoningEffort: runtime.reasoningEffort.trim() }
+      : {}),
+  };
+  if (
+    activeRuntimePublished
+    && normalized.model === publishedActiveRuntime.model
+    && normalized.reasoningEffort === publishedActiveRuntime.reasoningEffort
+  ) {
+    return;
+  }
+  activeRuntimePublished = true;
+  publishedActiveRuntime = normalized;
+  send({
+    type: 'active_runtime',
+    model: normalized.model ?? null,
+    reasoningEffort: normalized.reasoningEffort ?? null,
+  });
+}
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
 let hermesBridgeDbPath: string | undefined;
@@ -3426,6 +3451,19 @@ function formatHeadlessLocalTurnContent(assistantText: string): string | null {
 
 function emptyCompletedBridgeFallbackContent(): string {
   return t('worker.empty_final_completed', { cliName: cliName() });
+}
+
+function failedBridgeFallbackContent(errorCode?: string, summary?: string, partialText?: string): string {
+  const reason = summary || t('worker.failed_reason_unavailable');
+  const key = errorCode === CODEX_INVALID_REQUEST_ERROR_CODE
+    ? 'worker.empty_final_failed_invalid_request'
+    : errorCode === CODEX_AUTH_ERROR_CODE
+      ? 'worker.empty_final_failed_auth'
+      : errorCode === CODEX_CONNECTION_ERROR_CODE
+        ? 'worker.empty_final_failed_connection'
+        : 'worker.empty_final_failed';
+  const failure = t(key, { cliName: cliName(), reason });
+  return partialText?.trim() ? `${partialText.trim()}\n\n${failure}` : failure;
 }
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
@@ -4903,10 +4941,23 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
     if (structuredBridgeIsCodex()) {
-      codexServiceTierTracker.observe(
-        rolloutPath,
-        (result as CodexDrainResult).latestThreadSettings,
-      );
+      const codex = result as CodexDrainResult;
+      codexServiceTierTracker.observe(rolloutPath, codex.latestThreadSettings);
+      // Reuse this drain's turn_context observation — split-live already read
+      // the whole rollout above, so no second full-file scan is needed.
+      publishActiveRuntime({
+        model: codex.latestModel,
+        reasoningEffort: codex.latestReasoningEffort,
+      });
+    }
+    // Reuse this drain's runtime observation instead of a second full-file
+    // scan — split-live already read the whole rollout above.
+    if (structuredBridgeIsTraex()) {
+      const traex = result as TraexDrainResult;
+      publishActiveRuntime({
+        model: traex.latestModel,
+        reasoningEffort: traex.latestReasoningEffort,
+      });
     }
     log(`Codex bridge split-live: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
     maybeEmitCodexAdoptPreamble(history);
@@ -4946,6 +4997,22 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     && mode !== 'split-live'
   ) {
     codexServiceTierTracker.observe(rolloutPath, scanCodexThreadSettings(rolloutPath));
+    // Codex baseline modes cursor to the tail without draining, so seed the
+    // active runtime (model/effort from turn_context) via a bounded backward
+    // read — same as TRAE below. split-live already published from its own
+    // drain; fresh-empty has no history and picks it up on first live ingest.
+    publishActiveRuntime(readLatestCodexRuntime(rolloutPath));
+  }
+  // TRAE baseline modes only cursor to the tail without draining, so seed the
+  // active runtime from a bounded backward read. split-live already published
+  // from its own drain; fresh-empty has no history and picks it up on first
+  // live ingest.
+  if (
+    structuredBridgeIsTraex()
+    && mode !== 'fresh-empty'
+    && mode !== 'split-live'
+  ) {
+    publishActiveRuntime(readLatestTraexRuntime(rolloutPath));
   }
   try {
     codexBridgeWatcher = fsWatch(rolloutPath, { persistent: false }, () => {
@@ -5344,11 +5411,21 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
+  if (structuredBridgeIsTraex()) {
+    const traex = result as TraexDrainResult;
+    publishActiveRuntime({
+      model: traex.latestModel ?? publishedActiveRuntime.model,
+      reasoningEffort: traex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort,
+    });
+  }
   if (structuredBridgeIsCodex()) {
-    codexServiceTierTracker.observe(
-      codexBridgeRolloutPath,
-      (result as CodexDrainResult).latestThreadSettings,
-    );
+    const codex = result as CodexDrainResult;
+    codexServiceTierTracker.observe(codexBridgeRolloutPath, codex.latestThreadSettings);
+    publishActiveRuntime({
+      model: codex.latestModel ?? publishedActiveRuntime.model,
+      reasoningEffort: codex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort,
+    });
+    maybeEmitCodexStructuredRateLimit(result.events);
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
@@ -5360,6 +5437,26 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
   // converge. Idempotent — IdleDetector.fireIdle no-ops while already idle.
   if (opts.signalIdle !== false && result.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
+  }
+}
+
+/** 将 Codex 的结构化 429 终态同步为既有的限流状态。 */
+function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]): void {
+  for (const ev of events) {
+    if (!isCodexRateLimitEvent(ev) || emittedRateLimitUuids.has(ev.uuid)) continue;
+    emittedRateLimitUuids.add(ev.uuid);
+    const usageLimit = structuredRateLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests');
+    usageLimitTracker.noteStructuredLimit();
+    send({
+      type: 'screen_update',
+      content: currentUsageLimitSnapshot(),
+      status: 'limited',
+      usageLimit,
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+    log(`Structured rate-limit detected in Codex transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
+    return;
   }
 }
 
@@ -5440,11 +5537,14 @@ function emitReadyCodexTurns(): void {
       finalText: turn.finalText,
       terminalStatus: turn.terminalStatus,
     };
-    const content = turn.finalText && turn.finalText.trim()
-      ? turn.finalText
-      : shouldEmitEmptyCompletedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
-        ? emptyCompletedBridgeFallbackContent()
-        : '';
+    const content = turn.terminalErrorCode !== CODEX_RATE_LIMIT_ERROR_CODE
+      && shouldEmitFailedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
+      ? failedBridgeFallbackContent(turn.terminalErrorCode, turn.terminalErrorSummary, turn.finalText)
+      : turn.finalText && turn.finalText.trim()
+        ? turn.finalText
+        : shouldEmitEmptyCompletedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
+          ? emptyCompletedBridgeFallbackContent()
+          : '';
     if (!content) continue;
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
@@ -5511,6 +5611,8 @@ function stopCodexBridge(): void {
     codexBridgeTimer = null;
   }
   codexServiceTierTracker.detach();
+  activeRuntimePublished = false;
+  publishedActiveRuntime = {};
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
   codexBridgePendingTail = '';
@@ -7999,7 +8101,7 @@ function scheduleSubmitFailureNotify(
   turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>,
   durableTerminalStatus: 'failed' | 'ambiguous' = 'failed',
 ): void {
-  const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
+  const preview = buildSubmitMessagePreview(msg);
   const emitDurableTerminal = (errorCode: string): void => {
     if (turnIdentity?.turnId && turnIdentity.dispatchAttempt !== undefined) {
       emitTurnTerminal(
@@ -11599,6 +11701,7 @@ async function spawnCli(
         log(`TRAE sandbox: resolved real traex leaf pid ${realPid} under bwrap supervisor ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+        codexAdoptPendingPid = realPid;
         publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
@@ -11630,6 +11733,7 @@ async function spawnCli(
     const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, outerBwrapActive) : cliPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+    if (cfg.cliId === 'traex') codexAdoptPendingPid = wiredPid;
     if (cfg.cliId === 'traex' && outerBwrapActive) startTraexSandboxPidResolve(cliPid);
   }
 
@@ -11662,6 +11766,7 @@ async function spawnCli(
           const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(pid, outerBwrapActive) : pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+          if (cfg.cliId === 'traex') codexAdoptPendingPid = wiredPid;
           if (cfg.cliId === 'traex' && outerBwrapActive) startTraexSandboxPidResolve(pid);
         }
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
