@@ -292,7 +292,7 @@ import {
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
 import { detectCliUsageLimit, usageLimitStateKey, structuredRateLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
-import { redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import {
   decideSubmitConfirmationAction,
   settleDeferredSubmitConfirmation,
@@ -1110,8 +1110,6 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
     engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
     engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
-    if (cfg.ownerOpenId) engineEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;
-    else delete engineEnv.BOTMUX_OWNER_OPEN_ID;
     // The app-server owns model execution in RPC mode. Its MCP gateway child
     // must inherit the trusted host socket just like a native CLI process does.
     if (sessionMcpGatewayHost) {
@@ -1126,6 +1124,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
     // falls back to the default provider. Re-sanitized (crossed IPC).
     Object.assign(engineEnv, sanitizePerBotEnv(cfg.env));
+    // Session identity is host-owned. Pin it after the config-controlled merge,
+    // matching every other backend and preventing stale owner resurrection.
+    applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),
@@ -11444,8 +11445,6 @@ async function spawnCli(
         sessionEnv.BOTMUX_DEFERRED_SCHEDULE_TOPIC_TITLE = cfg.deferredScheduleRun.topicTitle;
       }
     }
-    // Turn sender so `--mention-back` can resolve an @ target in the sandbox.
-    if (cfg.ownerOpenId) sessionEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;
     // Lark credentials so `botmux send` works inside the riff sandbox without a
     // local daemon or bots.json. The sandbox has no session data / bot config,
     // so cmdSend falls back to these env vars to call the Lark API directly.
@@ -11473,6 +11472,10 @@ async function spawnCli(
       mergedEnv.BOTMUX_API_ONLY = '1';
       mergedEnv.BOTMUX_CHAT_ID = cfg.chatId; // host-owned; never from config
     }
+    // Session identity is host-owned. Re-freeze it AFTER per-bot/riff config
+    // merge so a stale or user-supplied backend env cannot impersonate another
+    // owner (or resurrect an owner on an ownerless session).
+    applySessionOwnerEnv(mergedEnv, cfg.ownerOpenId);
     riffBackendConfig = Object.assign({}, cfg.backendConfig, { env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId });
     // 复用本地仓库+分支：多仓只认会话上的显式 stamp（仓库选择卡多选流按用户
     // 顺序写入 cfg.riffRepoDirs，首仓=primary）；否则仅对 workingDir 本身做单仓
@@ -12396,6 +12399,7 @@ async function spawnCli(
   if (cfg.apiOnly) childEnv.BOTMUX_API_ONLY = '1';
   else delete childEnv.BOTMUX_API_ONLY;
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  applySessionOwnerEnv(childEnv, cfg.ownerOpenId);
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
   // send` renders the role-name footer without reading bots.json (deny-by-
   // default → EPERM → role footer would silently fall back to the default
@@ -15697,7 +15701,7 @@ process.on('message', async (raw: unknown) => {
       sessionId = msg.sessionId;
       refreshTerminalViewToken();
       refreshTerminalWriteToken();
-      if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
+      applySessionOwnerEnv(process.env, msg.ownerOpenId);
       // Pin this worker's i18n locale early so every t() call below resolves
       // against the bot's chosen language without each callsite needing to
       // re-thread it.
