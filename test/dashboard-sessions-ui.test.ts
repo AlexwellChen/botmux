@@ -693,3 +693,41 @@ describe('dashboard sessions kanban react view', () => {
     expect(html).toContain('data-action="write-link"');
   });
 });
+
+describe('deriveSessionBoardColumn', () => {
+  it('drops closed sessions off the board', () => {
+    expect(deriveSessionBoardColumn({ status: 'closed' })).toBeNull();
+  });
+
+  it('routes needs-you signals ahead of runtime state', () => {
+    expect(deriveSessionBoardColumn({ status: 'working', pendingRepo: true })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'idle', tuiPromptActive: true })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'idle', agentAttention: { kind: 'x', reason: 'y', at: 1 } })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'limited' })).toBe('needs-you');
+  });
+
+  it('folds "starting" into the "working" (进行中) column', () => {
+    for (const status of ['starting', 'working', 'analyzing', 'active']) {
+      expect(deriveSessionBoardColumn({ status })).toBe('working');
+    }
+  });
+
+  it('treats idle/dormant with no open todos as idle', () => {
+    expect(deriveSessionBoardColumn({ status: 'idle' })).toBe('idle');
+    expect(deriveSessionBoardColumn({ status: 'dormant' })).toBe('idle');
+    // openTodos present but nothing left → still idle (task delivered).
+    expect(deriveSessionBoardColumn({ status: 'idle', openTodos: { total: 3, done: 3, remaining: 0, hasInProgress: false } })).toBe('idle');
+  });
+
+  it('routes an idle process with unfinished todos to the "待办" (todo) column', () => {
+    expect(deriveSessionBoardColumn({ status: 'idle', openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: false } })).toBe('todo');
+    expect(deriveSessionBoardColumn({ status: 'dormant', openTodos: { total: 2, done: 0, remaining: 2, hasInProgress: true } })).toBe('todo');
+  });
+
+  it('keeps running/needs-you state ahead of the todo task-state', () => {
+    // 运行态优先：机器还在跑就归「进行中」，即便有未完成 todo。
+    expect(deriveSessionBoardColumn({ status: 'working', openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: true } })).toBe('working');
+    // needs-you 信号仍最高优先。
+    expect(deriveSessionBoardColumn({ status: 'idle', pendingRepo: true, openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: false } })).toBe('needs-you');
+  });
+});
