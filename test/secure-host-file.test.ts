@@ -101,12 +101,14 @@ describe('secure host authority files', () => {
 });
 
 describe('withSecureHostParentSync', () => {
-  it('pins the parent for read+write and returns anchored paths', () => {
+  it('pins the parent for read+write and exposes no raw path capability', () => {
     const root = tempRoot();
     const file = join(root, '.botmux', '.dashboard-token');
     const result = withSecureHostParentSync(file, (parent) => {
       expect(parent.leafName).toBe('.dashboard-token');
-      expect(parent.leafPath).toBe(join(parent.parentPath, '.dashboard-token'));
+      // The handle must NOT hand out a raw /proc/self/fd path capability.
+      expect((parent as Record<string, unknown>).leafPath).toBeUndefined();
+      expect((parent as Record<string, unknown>).parentPath).toBeUndefined();
       expect(parent.readLeaf()).toBeNull(); // absent leaf reads as null, not a throw
       parent.writeLeaf('tok-value');
       return parent.readLeaf();
@@ -114,6 +116,21 @@ describe('withSecureHostParentSync', () => {
     expect(result).toBe('tok-value');
     expect(lstatSync(file).mode & 0o777).toBe(process.platform === 'win32' ? lstatSync(file).mode & 0o777 : 0o600);
     expect(readSecureHostFileSync(file)).toBe('tok-value');
+  });
+
+  it('serializes a get-or-create through withLeafLock', () => {
+    const root = tempRoot();
+    const file = join(root, '.botmux', '.dashboard-token');
+    const token = withSecureHostParentSync(file, (parent) =>
+      parent.withLeafLock(() => {
+        const existing = parent.readLeaf()?.trim() || null;
+        if (existing) return existing;
+        parent.writeLeaf('locked-token');
+        return 'locked-token';
+      }),
+    );
+    expect(token).toBe('locked-token');
+    expect(readSecureHostFileSync(file)).toBe('locked-token');
   });
 
   it('pins a safe credential dir under a 0777 ancestor on Linux; strict elsewhere', () => {
@@ -125,10 +142,12 @@ describe('withSecureHostParentSync', () => {
     const file = join(dir, '.dashboard-token');
 
     if (process.platform === 'linux') {
-      const token = withSecureHostParentSync(file, (parent) => {
-        parent.writeLeaf('anchored-token');
-        return parent.readLeaf();
-      });
+      const token = withSecureHostParentSync(file, (parent) =>
+        parent.withLeafLock(() => {
+          parent.writeLeaf('anchored-token');
+          return parent.readLeaf();
+        }),
+      );
       expect(token).toBe('anchored-token');
       expect(readSecureHostFileSync(file)).toBe('anchored-token');
     } else {
@@ -164,9 +183,10 @@ describe('withSecureHostParentSync', () => {
       return 0;
     });
     // After release the descriptor may be recycled to an unchecked directory,
-    // so both accessors must throw rather than touch /proc/self/fd/<fd>.
+    // so every capability must throw rather than touch /proc/self/fd/<fd>.
     expect(() => leaked.readLeaf()).toThrow(/句柄已释放/);
     expect(() => leaked.writeLeaf('after-release')).toThrow(/句柄已释放/);
+    expect(() => leaked.withLeafLock(() => 0)).toThrow(/句柄已释放/);
     // The one legitimate in-callback write is the only mutation that landed.
     expect(readSecureHostFileSync(file)).toBe('inside-token');
   });
@@ -180,5 +200,6 @@ describe('withSecureHostParentSync', () => {
       throw new Error('boom');
     })).toThrow('boom');
     expect(() => leaked.writeLeaf('after-throw')).toThrow(/句柄已释放/);
+    expect(() => leaked.withLeafLock(() => 0)).toThrow(/句柄已释放/);
   });
 });

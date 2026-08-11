@@ -9,7 +9,6 @@ import {
   withSecureHostParentSync,
   writeSecureHostFileSync,
 } from '../platform/secure-host-file.js';
-import { withFileLockSync } from '../utils/file-lock.js';
 
 const NONCE_TTL_MS = 60_000;
 const TS_WINDOW_S = 30;
@@ -190,7 +189,7 @@ export function persistToken(tokenPath: string, token: string): void {
  */
 export function loadOrCreatePersistedToken(tokenPath: string): string {
   return withSecureHostParentSync(tokenPath, (parent) =>
-    withFileLockSync(parent.leafPath, () => {
+    parent.withLeafLock(() => {
       const existing = parent.readLeaf(256)?.trim() || null;
       if (existing) return existing;
       const token = generateToken();
@@ -203,7 +202,7 @@ export function loadOrCreatePersistedToken(tokenPath: string): string {
 /** Generate and durably replace the token while serialized with first creation. */
 export function rotatePersistedToken(tokenPath: string): string {
   return withSecureHostParentSync(tokenPath, (parent) =>
-    withFileLockSync(parent.leafPath, () => {
+    parent.withLeafLock(() => {
       const token = generateToken();
       parent.writeLeaf(token);
       return token;
