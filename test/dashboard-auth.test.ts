@@ -3,7 +3,8 @@ import { createHmac } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import {
-  mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync, statSync,
+  chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
+  symlinkSync, writeFileSync, existsSync, statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -192,6 +193,168 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
   it('loadPersistedToken fails closed when the credential path is not a regular file', () => {
     expect(() => loadPersistedToken(dir)).toThrow();
   });
+});
+
+/**
+ * Regression: dashboard token ensure/rotate on a Linux dev box whose HOME is a
+ * symlink resolving onto a shared drive / 0777 ancestor. Before the FD-anchored
+ * fix, loadOrCreatePersistedToken()/rotatePersistedToken() ran the strict
+ * ancestor-chain assertion (via secureHostFilePath) before reaching the Linux
+ * FD-pinning path, so a single writable ancestor made `botmux dashboard` fail
+ * with `500 token_persist_failed` even though the direct write path succeeded.
+ */
+describe('token persistence under a symlinked HOME on a shared drive (Linux FD-pinning)', () => {
+  let base: string;
+
+  beforeEach(() => { base = mkdtempSync(join(tmpdir(), 'botmux-token-shared-')); });
+  afterEach(() => { rmSync(base, { recursive: true, force: true }); });
+
+  /**
+   * Build `<shared 0777>/real-home/.botmux` (0700, current user) and a HOME
+   * symlink pointing at real-home. Returns the token path as seen through the
+   * symlinked HOME plus the canonical (post-realpath) leaf path.
+   */
+  function sharedDriveHome(): { tokenPath: string; canonicalLeaf: string; botmux: string } {
+    const shared = join(base, 'shared');
+    mkdirSync(shared, { recursive: true });
+    chmodSync(shared, 0o777); // shared drive / group+other-writable ancestor
+    const realHome = join(shared, 'real-home');
+    mkdirSync(realHome, { recursive: true });
+    const botmux = join(realHome, '.botmux');
+    mkdirSync(botmux, { mode: 0o700 });
+    chmodSync(botmux, 0o700); // defeat umask so the dir is exactly 0700
+    const homeLink = join(base, 'home-link');
+    symlinkSync(realHome, homeLink);
+    return {
+      tokenPath: join(homeLink, '.botmux', '.dashboard-token'),
+      canonicalLeaf: join(realHome, '.botmux', '.dashboard-token'),
+      botmux,
+    };
+  }
+
+  it('ensures a token under a 0777 ancestor; leaf lands in the real dir at 0600', () => {
+    if (process.platform !== 'linux') return;
+    const { tokenPath, canonicalLeaf } = sharedDriveHome();
+
+    const token = loadOrCreatePersistedToken(tokenPath);
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    // Persisted through the symlink into the real (canonical) directory.
+    expect(readFileSync(canonicalLeaf, 'utf8').trim()).toBe(token);
+    expect(lstatSync(canonicalLeaf).mode & 0o777).toBe(0o600);
+    // Re-ensure reuses the same durable token instead of minting a new one.
+    expect(loadOrCreatePersistedToken(tokenPath)).toBe(token);
+    expect(loadPersistedToken(tokenPath)).toBe(token);
+  });
+
+  it('rotates the token under the same shared-drive path', () => {
+    if (process.platform !== 'linux') return;
+    const { tokenPath, canonicalLeaf } = sharedDriveHome();
+
+    const first = loadOrCreatePersistedToken(tokenPath);
+    const rotated = rotatePersistedToken(tokenPath);
+    expect(rotated).not.toBe(first);
+    expect(rotated).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(readFileSync(canonicalLeaf, 'utf8').trim()).toBe(rotated);
+    expect(lstatSync(canonicalLeaf).mode & 0o777).toBe(0o600);
+    expect(loadPersistedToken(tokenPath)).toBe(rotated);
+  });
+
+  it('ensures a token through a HOME symlink to a permission-safe plain dir', () => {
+    if (process.platform === 'win32') return;
+    // Safe layout: no writable ancestor, HOME is just a symlink indirection.
+    const realHome = join(base, 'real-home');
+    mkdirSync(join(realHome, '.botmux'), { recursive: true, mode: 0o700 });
+    chmodSync(join(realHome, '.botmux'), 0o700);
+    const homeLink = join(base, 'home-link');
+    symlinkSync(realHome, homeLink);
+    const tokenPath = join(homeLink, '.botmux', '.dashboard-token');
+
+    const token = loadOrCreatePersistedToken(tokenPath);
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(readFileSync(join(realHome, '.botmux', '.dashboard-token'), 'utf8').trim()).toBe(token);
+    expect(rotatePersistedToken(tokenPath)).not.toBe(token);
+  });
+
+  it('still refuses a token leaf symlink under a shared-drive HOME (target untouched)', () => {
+    if (process.platform === 'win32') return;
+    const { tokenPath, botmux } = sharedDriveHome();
+    const victim = join(botmux, 'victim');
+    writeFileSync(victim, 'keep-me', { mode: 0o600 });
+    symlinkSync(victim, realpathSync(botmux) + '/.dashboard-token');
+
+    expect(() => rotatePersistedToken(tokenPath)).toThrow();
+    expect(() => loadOrCreatePersistedToken(tokenPath)).toThrow();
+    expect(readFileSync(victim, 'utf8')).toBe('keep-me');
+  });
+
+  it('still refuses when ~/.botmux itself is group/other-writable', () => {
+    if (process.platform === 'win32') return;
+    const shared = join(base, 'shared');
+    mkdirSync(shared, { recursive: true });
+    chmodSync(shared, 0o777);
+    const realHome = join(shared, 'real-home');
+    const botmux = join(realHome, '.botmux');
+    mkdirSync(botmux, { recursive: true });
+    chmodSync(botmux, 0o770); // the credential dir itself is group-writable → unsafe
+    const homeLink = join(base, 'home-link');
+    symlinkSync(realHome, homeLink);
+    const tokenPath = join(homeLink, '.botmux', '.dashboard-token');
+
+    expect(() => loadOrCreatePersistedToken(tokenPath)).toThrow(/组内|其它用户写入/);
+    expect(() => rotatePersistedToken(tokenPath)).toThrow(/组内|其它用户写入/);
+  });
+
+  it('concurrent processes under a shared-drive symlinked HOME all return one token', async () => {
+    if (process.platform !== 'linux') return;
+    const { tokenPath, canonicalLeaf } = sharedDriveHome();
+    const goPath = join(base, 'go');
+    const authModuleUrl = new URL('../src/dashboard/auth.ts', import.meta.url).href;
+    const childSource = `
+      import { existsSync, writeFileSync } from 'node:fs';
+      const [tokenPath, readyPath, goPath] = process.argv.slice(1);
+      const { loadOrCreatePersistedToken } = await import(${JSON.stringify(authModuleUrl)});
+      writeFileSync(readyPath, 'ready');
+      while (!existsSync(goPath)) await new Promise(resolve => setTimeout(resolve, 5));
+      process.stdout.write(loadOrCreatePersistedToken(tokenPath));
+    `;
+    const children = Array.from({ length: 12 }, (_, index) => {
+      const readyPath = join(base, `ready-${index}`);
+      const child = spawn(process.execPath, [
+        '--import', 'tsx', '--input-type=module', '-e', childSource,
+        tokenPath, readyPath, goPath,
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', chunk => { stdout += String(chunk); });
+      child.stderr.on('data', chunk => { stderr += String(chunk); });
+      return { child, readyPath, stdout: () => stdout, stderr: () => stderr };
+    });
+
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!children.every(entry => existsSync(entry.readyPath))) {
+        if (Date.now() >= deadline) throw new Error('token children did not reach barrier');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      writeFileSync(goPath, 'go');
+      const exits = await Promise.all(children.map(async entry => {
+        const [code, signal] = await once(entry.child, 'close');
+        return { code, signal, stdout: entry.stdout(), stderr: entry.stderr() };
+      }));
+      for (const result of exits) {
+        expect(result, result.stderr).toMatchObject({ code: 0, signal: null });
+      }
+      const tokens = exits.map(result => result.stdout);
+      expect(new Set(tokens).size).toBe(1);
+      expect(tokens[0]).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      // The single durable winner is what the real (canonical) leaf holds.
+      expect(readFileSync(canonicalLeaf, 'utf8').trim()).toBe(tokens[0]);
+    } finally {
+      for (const { child } of children) {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }
+    }
+  }, 20_000);
 });
 
 describe('dashboard secret persistence', () => {

@@ -6,7 +6,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { dirname } from 'node:path';
 import {
   readSecureHostFileSync,
-  secureHostFilePath,
+  withSecureHostParent,
   writeSecureHostFileSync,
 } from '../platform/secure-host-file.js';
 import { withFileLockSync } from '../utils/file-lock.js';
@@ -179,26 +179,36 @@ export function persistToken(tokenPath: string, token: string): void {
  * Load the active token, creating and persisting the first one when absent.
  * The file lock makes get-or-create linearizable across dashboard processes:
  * every concurrent caller returns the same durable token.
+ *
+ * The credential directory is pinned once (Linux: via an open directory
+ * descriptor) and the lock, the read, and the write all resolve through that
+ * same anchor. This keeps the whole critical section on one directory inode —
+ * so a symlinked HOME whose target sits under a shared-drive / 0777 ancestor
+ * still succeeds, while an ancestor rename mid-section cannot redirect the lock
+ * or the token write into a substituted directory. `~/.botmux` itself must
+ * still be 0700 and owned by the current user; a leaf symlink is still refused.
  */
 export function loadOrCreatePersistedToken(tokenPath: string): string {
-  const securePath = secureHostFilePath(tokenPath);
-  return withFileLockSync(securePath, () => {
-    const existing = loadPersistedToken(securePath);
-    if (existing) return existing;
-    const token = generateToken();
-    persistToken(securePath, token);
-    return token;
-  });
+  return withSecureHostParent(tokenPath, (parent) =>
+    withFileLockSync(parent.leafPath, () => {
+      const existing = parent.readLeaf(256)?.trim() || null;
+      if (existing) return existing;
+      const token = generateToken();
+      parent.writeLeaf(token);
+      return token;
+    }),
+  );
 }
 
 /** Generate and durably replace the token while serialized with first creation. */
 export function rotatePersistedToken(tokenPath: string): string {
-  const securePath = secureHostFilePath(tokenPath);
-  return withFileLockSync(securePath, () => {
-    const token = generateToken();
-    persistToken(securePath, token);
-    return token;
-  });
+  return withSecureHostParent(tokenPath, (parent) =>
+    withFileLockSync(parent.leafPath, () => {
+      const token = generateToken();
+      parent.writeLeaf(token);
+      return token;
+    }),
+  );
 }
 
 /** Extract `botmux_dashboard_token` value from a Cookie header. */

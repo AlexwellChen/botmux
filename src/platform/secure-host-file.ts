@@ -275,38 +275,101 @@ function writePinnedSecureHostFileSync(
   }
 }
 
+/**
+ * Strict, durable atomic replace of a leaf under an already-acquired parent.
+ * Every path is resolved through `parent.path` (the pinned /proc/self/fd anchor
+ * on Linux), so a caller that holds the parent across several operations never
+ * re-resolves the swappable directory name between them.
+ */
+function writeSecureLeafFromParentSync(
+  parent: SecureHostParent,
+  leafName: string,
+  data: string,
+): void {
+  const resolved = join(parent.path, leafName);
+  let leafExists = false;
+  try {
+    lstatSync(resolved);
+    leafExists = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (leafExists) {
+    // Pin and validate the existing leaf before replacement. The final
+    // rename never follows a leaf symlink.
+    readSecureHostFileFromParentSync(parent, leafName, 64 * 1024);
+  }
+  if (parent.fd !== undefined) {
+    writePinnedSecureHostFileSync(parent, parent.fd, leafName, data);
+  } else {
+    atomicWriteFileSync(resolved, data, {
+      mode: 0o600,
+      durable: true,
+      followTargetSymlink: false,
+    });
+  }
+}
+
 /** Strict, durable atomic replace that never follows a leaf symlink. */
 export function writeSecureHostFileSync(filePath: string, data: string): void {
   const parent = acquireSecureHostParent(filePath);
-  const leafName = basename(filePath);
-  const resolved = join(parent.path, leafName);
   try {
-    let leafExists = false;
-    try {
-      lstatSync(resolved);
-      leafExists = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    if (leafExists) {
-      // Pin and validate the existing leaf before replacement. The final
-      // rename never follows a leaf symlink.
-      readSecureHostFileFromParentSync(parent, leafName, 64 * 1024);
-    }
-    if (parent.fd !== undefined) {
-      writePinnedSecureHostFileSync(
-        parent,
-        parent.fd,
-        leafName,
-        data,
-      );
-    } else {
-      atomicWriteFileSync(resolved, data, {
-        mode: 0o600,
-        durable: true,
-        followTargetSymlink: false,
-      });
-    }
+    writeSecureLeafFromParentSync(parent, basename(filePath), data);
+  } finally {
+    releaseSecureHostParent(parent);
+  }
+}
+
+/**
+ * A pinned view of the credential directory that stays valid for the whole
+ * callback. On Linux `leafPath` (and anything a caller derives from it, e.g. a
+ * sibling `.lock`) resolves through the opened directory descriptor, so an
+ * ancestor rename/replacement after acquisition cannot redirect subsequent
+ * lock/read/write operations into an attacker-substituted directory. On other
+ * platforms (and Linux without procfs) the parent is the canonical real path
+ * and the strict ancestor-chain check has already run.
+ */
+export interface SecureHostParentHandle {
+  /** Directory anchor to build the leaf and any sibling paths from. */
+  readonly parentPath: string;
+  /** Basename of the credential leaf. */
+  readonly leafName: string;
+  /** Anchored leaf path (`join(parentPath, leafName)`). */
+  readonly leafPath: string;
+  /** Read the pinned leaf (fail-closed on unsafe shapes); null if absent. */
+  readLeaf(maxBytes?: number): string | null;
+  /** Durably, atomically replace the pinned leaf without following a symlink. */
+  writeLeaf(data: string): void;
+}
+
+/**
+ * Acquire the secure parent directory once and expose it to `fn` as a pinned
+ * handle, releasing the descriptor afterwards. Use this instead of chaining
+ * {@link secureHostFilePath} + independent read/write calls when a credential
+ * needs a serialized get-or-create (lock → read → write): resolving the lock
+ * and the leaf through the same descriptor keeps the whole critical section on
+ * one directory inode. Unlike {@link secureHostFilePath}, this does not force
+ * the strict ancestor-chain assertion on Linux — the pinned descriptor already
+ * makes later operations independent of ancestor renames — so it works under a
+ * symlinked HOME or a shared-drive/0777 ancestor while `~/.botmux` itself stays
+ * 0700 and owned by the current user.
+ */
+export function withSecureHostParent<T>(
+  filePath: string,
+  fn: (handle: SecureHostParentHandle) => T,
+): T {
+  const parent = acquireSecureHostParent(filePath);
+  const leafName = basename(filePath);
+  try {
+    const handle: SecureHostParentHandle = {
+      parentPath: parent.path,
+      leafName,
+      leafPath: join(parent.path, leafName),
+      readLeaf: (maxBytes = 64 * 1024) =>
+        readSecureHostFileFromParentSync(parent, leafName, maxBytes),
+      writeLeaf: (data: string) => writeSecureLeafFromParentSync(parent, leafName, data),
+    };
+    return fn(handle);
   } finally {
     releaseSecureHostParent(parent);
   }

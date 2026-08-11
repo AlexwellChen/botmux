@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   readSecureHostFileSync,
   unlinkSecureHostFileSync,
+  withSecureHostParent,
   writeSecureHostFileSync,
 } from '../src/platform/secure-host-file.js';
 
@@ -95,5 +96,58 @@ describe('secure host authority files', () => {
 
     writeSecureHostFileSync(file, 'secret');
     expect(readSecureHostFileSync(file)).toBe('secret');
+  });
+});
+
+describe('withSecureHostParent', () => {
+  it('pins the parent for read+write and returns anchored paths', () => {
+    const root = tempRoot();
+    const file = join(root, '.botmux', '.dashboard-token');
+    const result = withSecureHostParent(file, (parent) => {
+      expect(parent.leafName).toBe('.dashboard-token');
+      expect(parent.leafPath).toBe(join(parent.parentPath, '.dashboard-token'));
+      expect(parent.readLeaf()).toBeNull(); // absent leaf reads as null, not a throw
+      parent.writeLeaf('tok-value');
+      return parent.readLeaf();
+    });
+    expect(result).toBe('tok-value');
+    expect(lstatSync(file).mode & 0o777).toBe(process.platform === 'win32' ? lstatSync(file).mode & 0o777 : 0o600);
+    expect(readSecureHostFileSync(file)).toBe('tok-value');
+  });
+
+  it('pins a safe credential dir under a 0777 ancestor on Linux; strict elsewhere', () => {
+    if (process.platform === 'win32') return;
+    const root = tempRoot();
+    chmodSync(root, 0o777);
+    const dir = join(root, '.botmux');
+    mkdirSync(dir, { mode: 0o700 });
+    const file = join(dir, '.dashboard-token');
+
+    if (process.platform === 'linux') {
+      const token = withSecureHostParent(file, (parent) => {
+        parent.writeLeaf('anchored-token');
+        return parent.readLeaf();
+      });
+      expect(token).toBe('anchored-token');
+      expect(readSecureHostFileSync(file)).toBe('anchored-token');
+    } else {
+      // Non-Linux keeps the conservative ancestor-chain requirement.
+      expect(() => withSecureHostParent(file, (parent) => parent.writeLeaf('x')))
+        .toThrow(/祖先目录替换/);
+    }
+  });
+
+  it('refuses a leaf symlink through the pinned handle without touching its target', () => {
+    if (process.platform === 'win32') return;
+    const root = tempRoot();
+    const dir = join(root, '.botmux');
+    mkdirSync(dir, { mode: 0o700 });
+    const victim = join(root, 'victim');
+    writeFileSync(victim, 'keep-me', { mode: 0o600 });
+    const file = join(dir, '.dashboard-token');
+    symlinkSync(victim, file);
+
+    expect(() => withSecureHostParent(file, (parent) => parent.writeLeaf('replace'))).toThrow();
+    expect(readFileSync(victim, 'utf8')).toBe('keep-me');
   });
 });
