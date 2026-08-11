@@ -321,13 +321,22 @@ export function writeSecureHostFileSync(filePath: string, data: string): void {
 }
 
 /**
- * A pinned view of the credential directory that stays valid for the whole
- * callback. On Linux `leafPath` (and anything a caller derives from it, e.g. a
- * sibling `.lock`) resolves through the opened directory descriptor, so an
- * ancestor rename/replacement after acquisition cannot redirect subsequent
- * lock/read/write operations into an attacker-substituted directory. On other
- * platforms (and Linux without procfs) the parent is the canonical real path
- * and the strict ancestor-chain check has already run.
+ * A pinned view of the credential directory that stays valid ONLY for the
+ * synchronous duration of the callback. On Linux `leafPath` (and anything a
+ * caller derives from it, e.g. a sibling `.lock`) resolves through the opened
+ * directory descriptor, so an ancestor rename/replacement after acquisition
+ * cannot redirect subsequent lock/read/write operations into an attacker-
+ * substituted directory. On other platforms (and Linux without procfs) the
+ * parent is the canonical real path and the strict ancestor-chain check has
+ * already run.
+ *
+ * The handle is single-use and fail-closed: once the owning
+ * {@link withSecureHostParentSync} call returns and releases the descriptor,
+ * `readLeaf`/`writeLeaf` throw {@link UnsafeHostAuthorityFileError}. This
+ * matters because the anchor is `/proc/self/fd/<fd>`: after the fd is closed
+ * the kernel may recycle that number for an unrelated directory that never
+ * passed the 0700/owner checks, so a leaked or post-release handle must never
+ * be allowed to operate on it.
  */
 export interface SecureHostParentHandle {
   /** Directory anchor to build the leaf and any sibling paths from. */
@@ -343,34 +352,65 @@ export interface SecureHostParentHandle {
 }
 
 /**
- * Acquire the secure parent directory once and expose it to `fn` as a pinned
- * handle, releasing the descriptor afterwards. Use this instead of chaining
- * {@link secureHostFilePath} + independent read/write calls when a credential
- * needs a serialized get-or-create (lock → read → write): resolving the lock
- * and the leaf through the same descriptor keeps the whole critical section on
- * one directory inode. Unlike {@link secureHostFilePath}, this does not force
- * the strict ancestor-chain assertion on Linux — the pinned descriptor already
- * makes later operations independent of ancestor renames — so it works under a
- * symlinked HOME or a shared-drive/0777 ancestor while `~/.botmux` itself stays
- * 0700 and owned by the current user.
+ * `T` constrained to a non-thenable so an `async` callback (or any callback
+ * returning a Promise) is a compile-time error. The pinned descriptor is
+ * released synchronously when the callback returns; an awaited continuation
+ * would run after release, on a possibly-recycled fd. See
+ * {@link withSecureHostParentSync}.
  */
-export function withSecureHostParent<T>(
+type NonThenable<T> = T extends PromiseLike<unknown> ? never : T;
+
+/**
+ * Acquire the secure parent directory once and expose it to `fn` as a pinned
+ * handle for the SYNCHRONOUS duration of the call, releasing the descriptor
+ * afterwards. Use this instead of chaining {@link secureHostFilePath} +
+ * independent read/write calls when a credential needs a serialized
+ * get-or-create (lock → read → write): resolving the lock and the leaf through
+ * the same descriptor keeps the whole critical section on one directory inode.
+ * Unlike {@link secureHostFilePath}, this does not force the strict
+ * ancestor-chain assertion on Linux — the pinned descriptor already makes later
+ * operations independent of ancestor renames — so it works under a symlinked
+ * HOME or a shared-drive/0777 ancestor while `~/.botmux` itself stays 0700 and
+ * owned by the current user.
+ *
+ * Fail-closed lifetime: `fn` MUST be synchronous. The `NonThenable` return
+ * bound rejects `async`/Promise-returning callbacks at compile time, and the
+ * handle additionally traps at runtime — after this function returns, any
+ * escaped handle's `readLeaf`/`writeLeaf` throws instead of touching the
+ * released (and possibly fd-recycled) `/proc/self/fd/<fd>` anchor.
+ */
+export function withSecureHostParentSync<T>(
   filePath: string,
-  fn: (handle: SecureHostParentHandle) => T,
+  fn: (handle: SecureHostParentHandle) => NonThenable<T>,
 ): T {
   const parent = acquireSecureHostParent(filePath);
   const leafName = basename(filePath);
+  let released = false;
+  const assertActive = (): void => {
+    if (released) {
+      throw new UnsafeHostAuthorityFileError('宿主凭证目录句柄已释放，禁止在回调返回后继续使用');
+    }
+  };
   try {
     const handle: SecureHostParentHandle = {
       parentPath: parent.path,
       leafName,
       leafPath: join(parent.path, leafName),
-      readLeaf: (maxBytes = 64 * 1024) =>
-        readSecureHostFileFromParentSync(parent, leafName, maxBytes),
-      writeLeaf: (data: string) => writeSecureLeafFromParentSync(parent, leafName, data),
+      readLeaf: (maxBytes = 64 * 1024) => {
+        assertActive();
+        return readSecureHostFileFromParentSync(parent, leafName, maxBytes);
+      },
+      writeLeaf: (data: string) => {
+        assertActive();
+        writeSecureLeafFromParentSync(parent, leafName, data);
+      },
     };
     return fn(handle);
   } finally {
+    // Invalidate the handle BEFORE closing the fd so a post-return caller
+    // (leaked closure, or an async continuation that slipped past the type
+    // bound) can never act on a recycled descriptor.
+    released = true;
     releaseSecureHostParent(parent);
   }
 }

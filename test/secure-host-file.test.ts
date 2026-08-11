@@ -13,8 +13,9 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   readSecureHostFileSync,
+  type SecureHostParentHandle,
   unlinkSecureHostFileSync,
-  withSecureHostParent,
+  withSecureHostParentSync,
   writeSecureHostFileSync,
 } from '../src/platform/secure-host-file.js';
 
@@ -99,11 +100,11 @@ describe('secure host authority files', () => {
   });
 });
 
-describe('withSecureHostParent', () => {
+describe('withSecureHostParentSync', () => {
   it('pins the parent for read+write and returns anchored paths', () => {
     const root = tempRoot();
     const file = join(root, '.botmux', '.dashboard-token');
-    const result = withSecureHostParent(file, (parent) => {
+    const result = withSecureHostParentSync(file, (parent) => {
       expect(parent.leafName).toBe('.dashboard-token');
       expect(parent.leafPath).toBe(join(parent.parentPath, '.dashboard-token'));
       expect(parent.readLeaf()).toBeNull(); // absent leaf reads as null, not a throw
@@ -124,7 +125,7 @@ describe('withSecureHostParent', () => {
     const file = join(dir, '.dashboard-token');
 
     if (process.platform === 'linux') {
-      const token = withSecureHostParent(file, (parent) => {
+      const token = withSecureHostParentSync(file, (parent) => {
         parent.writeLeaf('anchored-token');
         return parent.readLeaf();
       });
@@ -132,7 +133,7 @@ describe('withSecureHostParent', () => {
       expect(readSecureHostFileSync(file)).toBe('anchored-token');
     } else {
       // Non-Linux keeps the conservative ancestor-chain requirement.
-      expect(() => withSecureHostParent(file, (parent) => parent.writeLeaf('x')))
+      expect(() => withSecureHostParentSync(file, (parent) => parent.writeLeaf('x')))
         .toThrow(/祖先目录替换/);
     }
   });
@@ -147,7 +148,37 @@ describe('withSecureHostParent', () => {
     const file = join(dir, '.dashboard-token');
     symlinkSync(victim, file);
 
-    expect(() => withSecureHostParent(file, (parent) => parent.writeLeaf('replace'))).toThrow();
+    expect(() => withSecureHostParentSync(file, (parent) => parent.writeLeaf('replace'))).toThrow();
     expect(readFileSync(victim, 'utf8')).toBe('keep-me');
+  });
+
+  it('fails closed when a leaked handle is used after the call returns', () => {
+    const root = tempRoot();
+    const file = join(root, '.botmux', '.dashboard-token');
+    // Escape the handle out of the callback (models a sync closure leak or an
+    // async continuation that slipped past the compile-time NonThenable bound).
+    let leaked!: SecureHostParentHandle;
+    withSecureHostParentSync(file, (parent) => {
+      leaked = parent;
+      parent.writeLeaf('inside-token');
+      return 0;
+    });
+    // After release the descriptor may be recycled to an unchecked directory,
+    // so both accessors must throw rather than touch /proc/self/fd/<fd>.
+    expect(() => leaked.readLeaf()).toThrow(/句柄已释放/);
+    expect(() => leaked.writeLeaf('after-release')).toThrow(/句柄已释放/);
+    // The one legitimate in-callback write is the only mutation that landed.
+    expect(readSecureHostFileSync(file)).toBe('inside-token');
+  });
+
+  it('invalidates the handle even when the callback throws', () => {
+    const root = tempRoot();
+    const file = join(root, '.botmux', '.dashboard-token');
+    let leaked!: SecureHostParentHandle;
+    expect(() => withSecureHostParentSync(file, (parent) => {
+      leaked = parent;
+      throw new Error('boom');
+    })).toThrow('boom');
+    expect(() => leaked.writeLeaf('after-throw')).toThrow(/句柄已释放/);
   });
 });
