@@ -178,11 +178,24 @@ import {
   waitForSessionReadyAck,
 } from './core/session-ready-handshake.js';
 import { loadOrCreateDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
-import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
+import { daemonIpcAuthHeaders, fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
   bindSessionScopedIpcIdentity,
 } from './core/daemon-ipc-session-auth.js';
+import {
+  authorizeReportSessionRelayRequest,
+  buildOrchestratorReportTrigger,
+  REPORT_SESSION_RELAY_MAX_BYTES,
+  REPORT_SESSION_RELAY_ROUTE,
+} from './core/report-session-relay.js';
+import {
+  createDispatchReportBinding,
+  dispatchReportBindingSecretPath,
+  DISPATCH_REPORT_REGISTER_MAX_BYTES,
+  DISPATCH_REPORT_REGISTER_ROUTE,
+} from './core/dispatch-report-binding.js';
+import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -5277,6 +5290,196 @@ workflowDaemonMutationRoute('grant', async (reply, params, body, identity) => {
   // granted / already-granted → make sure the run is moving.
   v3GateRunner.driveDetached(runId);
   return reply(202, { ok: true, runId, ...outcome });
+});
+
+// ─── report session relay：隔离 CLI 的 dispatch 完成回注 ──────────────────
+//
+// Linux credential-only bwrap / macOS read isolation 都
+// 不允许 CLI 读取 `.dashboard-secret`。这里验证 source session 当前轮换的
+// capability，并把 dispatch root 与 daemon 自己的 live session 绑定；目标
+// app/session 只从宿主签名的 dispatch binding 派生，再由本 daemon 用 HMAC 转发。
+ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, DISPATCH_REPORT_REGISTER_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : undefined;
+  const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+  const seedText = typeof body?.seedText === 'string' ? body.seedText.trim() : '';
+  const targetChatId = typeof body?.targetChatId === 'string' ? body.targetChatId.trim() : '';
+  const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 200) : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_session_id' });
+  if (!seedText) {
+    return jsonRes(res, 400, { ok: false, error: 'missing_seed_text' });
+  }
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_target_chat_id' });
+  }
+  const ds = findActiveBySessionId(sessionId);
+  const verified = authorizeSessionScopedIpc({
+    trustedHost: isTrustedHostIpcRequest(req),
+    sessionExists: !!ds && ds.session.sessionId === sessionId,
+    receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: false,
+    sessionId,
+    ...(ds?.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
+    ...(typeof body?.originCapability === 'string'
+      ? { claimedCapability: body.originCapability }
+      : {}),
+    ...(typeof body?.originTurnId === 'string' ? { claimedTurnId: body.originTurnId } : {}),
+    ...(typeof body?.originDispatchAttempt === 'number'
+      ? { claimedDispatchAttempt: body.originDispatchAttempt }
+      : {}),
+  });
+  if (!verified.ok) return jsonRes(res, 403, { ok: false, error: verified.error });
+  if (!ds || !ds.larkAppId || ds.larkAppId !== selfDaemonLarkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'session_identity_incomplete' });
+  }
+
+  let dispatchRoot: string;
+  try {
+    dispatchRoot = await sendMessage(ds.larkAppId, targetChatId, seedText, 'text');
+  } catch (error) {
+    return jsonRes(res, 502, {
+      ok: false,
+      error: 'dispatch_seed_send_failed',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const bindingSecret = loadOrCreateDashboardSecret(
+    dispatchReportBindingSecretPath(config.session.dataDir),
+  );
+  const issuedAt = new Date().toISOString();
+  const reportBinding = createDispatchReportBinding(bindingSecret, {
+    dispatchRoot,
+    targetLarkAppId: ds.larkAppId,
+    targetSessionId: ds.session.sessionId,
+    sourceName: title || 'dispatched subtask',
+    issuedAt,
+  });
+  const stringArray = (value: unknown): string[] => Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+      .map(item => item.trim()).filter(Boolean).slice(0, 64)
+    : [];
+  try {
+    await recordDispatchRegistryEntry(
+      join(config.session.dataDir, 'orchestrate-dispatch.json'),
+      dispatchRoot,
+      {
+        orchRoot: ds.session.rootMessageId ?? '',
+        orchChatId: ds.session.chatId,
+        orchScope: ds.scope ?? ds.session.scope ?? 'thread',
+        orchAppId: ds.larkAppId,
+        orchSessionId: ds.session.sessionId,
+        targetChatId,
+        targetAppIds: stringArray(body?.targetAppIds),
+        title,
+        bots: stringArray(body?.bots),
+        createdAt: issuedAt,
+        reportBinding,
+      },
+    );
+  } catch (error) {
+    return jsonRes(res, 500, {
+      ok: false,
+      error: 'dispatch_registry_write_failed',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return jsonRes(res, 201, { ok: true, dispatchRoot });
+});
+
+ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const claimedSessionId = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>).sessionId
+    : undefined;
+  const ds = typeof claimedSessionId === 'string'
+    ? findActiveBySessionId(claimedSessionId)
+    : undefined;
+  let registry: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(readFileSync(
+      join(config.session.dataDir, 'orchestrate-dispatch.json'),
+      'utf8',
+    ));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      registry = parsed as Record<string, unknown>;
+    }
+  } catch { /* missing/malformed registry fails closed below */ }
+
+  const decision = authorizeReportSessionRelayRequest({
+    raw,
+    trustedHost: isTrustedHostIpcRequest(req),
+    session: ds
+      ? {
+          sessionId: ds.session.sessionId,
+          larkAppId: ds.larkAppId,
+          receiver: !!ds.session.vcMeetingReceiver,
+          scope: ds.scope ?? ds.session.scope,
+          rootMessageId: ds.session.rootMessageId,
+          ...(ds.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
+          ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
+          ...(ds.session.replyTargets ? { replyTargets: ds.session.replyTargets } : {}),
+          ...((ds.currentReplyTarget ?? ds.session.currentReplyTarget)
+            ? { currentReplyTarget: ds.currentReplyTarget ?? ds.session.currentReplyTarget }
+            : {}),
+        }
+      : undefined,
+    selfLarkAppId: selfDaemonLarkAppId,
+    registry,
+    bindingSecret: loadOrCreateDashboardSecret(
+      dispatchReportBindingSecretPath(config.session.dataDir),
+    ),
+  });
+  if (!decision.ok) {
+    return jsonRes(res, decision.status, { ok: false, error: decision.error });
+  }
+
+  const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
+  if (!targetDaemon) {
+    return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
+  }
+  const trigger = buildOrchestratorReportTrigger(decision, {
+    requestId: `report:${decision.source.sessionId}:${Date.now()}`,
+    receivedAt: new Date().toISOString(),
+  });
+  try {
+    const response = await fetchDaemonIpc(targetDaemon.ipcPort, '/api/trigger', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(trigger),
+    });
+    const responseBody: unknown = await response.json().catch(() => ({}));
+    return jsonRes(res, response.status, {
+      ...(responseBody && typeof responseBody === 'object' && !Array.isArray(responseBody)
+        ? responseBody as Record<string, unknown>
+        : {}),
+      reportTarget: decision.target,
+    });
+  } catch (error) {
+    return jsonRes(res, 502, {
+      ok: false,
+      error: 'orchestrator_daemon_unreachable',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 // ─── v3 session relay：sandbox / read-isolation 会话的 workflow 变更通道 ─────
@@ -20514,6 +20717,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // capability-gated receiver/readiness apertures in dashboard-ipc-server.
   loadOrCreateDashboardSecret(
     join(homedir(), '.botmux', '.dashboard-secret'),
+  );
+  // Create the dispatch-binding key before any credential-only child spawns.
+  // Linux bwrap snapshots `.dashboard-secret.*` authority leaves at launch;
+  // creating this later would leave the new key visible through its writable
+  // host-root bind until the pane cold-started.
+  loadOrCreateDashboardSecret(
+    dispatchReportBindingSecretPath(config.session.dataDir),
   );
   let markIpcReady!: () => void;
   const ipcReady = new Promise<void>((resolve) => { markIpcReady = resolve; });

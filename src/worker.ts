@@ -334,6 +334,7 @@ import {
   managedOriginDataRootProbeAccess,
   managedOriginIsolationSentinelAccess,
   managedOriginAttestationDirectory,
+  managedOriginCapabilityDirectory,
   managedOriginCapabilityPath,
   managedOriginRootLocatorPath,
   readManagedOriginAuthorityFile,
@@ -2459,6 +2460,7 @@ let currentBotmuxDispatchAttempt: number | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
+  const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
   const capability = {
     token: randomBytes(32).toString('hex'),
     ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
@@ -2471,6 +2473,25 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       ? [{
           path: join(sandboxRelayOutbox, RELAY_ORIGIN_CAPABILITY_BASENAME),
           body: JSON.stringify({ token: capability.token }),
+        }]
+      : []),
+    ...(readIsolationOriginChannelId
+      ? [{
+          path: managedOriginCapabilityPath(
+            process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+            sessionId!,
+            readIsolationOriginChannelId,
+          ),
+          body: JSON.stringify({
+            sessionId,
+            channelId: readIsolationOriginChannelId,
+            capability: capability.token,
+            ...(capability.turnId ? { turnId: capability.turnId } : {}),
+            ...(capability.dispatchAttempt !== undefined
+              ? { dispatchAttempt: capability.dispatchAttempt }
+              : {}),
+            ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
+          }),
         }]
       : []),
   ];
@@ -11614,6 +11635,19 @@ async function spawnCli(
         resolvedBin: canonicalPolicyPath(cliAdapter.resolvedBin),
       })
     : undefined;
+  const managedOriginChannelRequired = willReadIsolate
+    || credentialOnlySeatbelt
+    || credentialOnlyBwrap;
+  const managedOriginChannelPolicyDigest = (willReadIsolate || willWriteSandbox)
+    ? darwinIsolationPolicyDigest
+    : managedOriginChannelRequired
+      ? createHash('sha256').update(JSON.stringify({
+          domain: 'botmux.credential-origin-channel.v1',
+          platform: process.platform,
+          configuredBotmuxHome: canonicalPolicyPath(configuredBotmuxHome),
+          defaultBotmuxHome: canonicalPolicyPath(defaultBotmuxHome),
+        })).digest('hex')
+      : undefined;
 
   let mcpRuntimeManifest: SessionMcpRuntimeManifest | null = readSessionMcpRuntimeManifest(
     cfg.sessionId,
@@ -11779,8 +11813,7 @@ async function spawnCli(
         isolationRuntimeDataDir, 'read-isolation', `${cfg.sessionId}.boot`,
       );
       const marker = readManagedOriginAuthorityFile(markerPath);
-      const darwinPolicyExpected = process.platform === 'darwin'
-        && (willReadIsolate || willWriteSandbox);
+      const originChannelPolicyExpected = !!managedOriginChannelPolicyDigest;
       // A stamped pane must match even when the new policy is OFF. Otherwise a
       // disable followed by restart could reattach the still-confined process
       // without rebuilding its authority/profile. An unsafe planted marker
@@ -11789,16 +11822,16 @@ async function spawnCli(
         ? isolatedPaneReattachSafe(marker, {
             requiredCapabilities: appliedIsolationCapabilities,
             exactCapabilities: true,
-            ...(darwinPolicyExpected ? {
+            ...(originChannelPolicyExpected ? {
               readIsolation: willReadIsolate,
               writeSandbox: willWriteSandbox,
               requireOriginChannel: true,
-              policyDigest: darwinIsolationPolicyDigest!,
+              policyDigest: managedOriginChannelPolicyDigest,
             } : {}),
           })
         : marker === null && !hostEntryExistsNoFollow(markerPath);
       if (policyMatches) {
-        if (darwinPolicyExpected) {
+        if (originChannelPolicyExpected) {
           persistentPaneOriginChannelId = isolatedPaneOriginChannel(marker);
         }
         // Pane was spawned under the current isolation policy → still confined
@@ -11866,7 +11899,7 @@ async function spawnCli(
       }
     }
   }
-  readIsolationOriginChannelId = willReadIsolate
+  readIsolationOriginChannelId = managedOriginChannelRequired
     ? (persistentPaneOriginChannelId ?? randomBytes(32).toString('hex'))
     : null;
   if (readIsolationOriginChannelId) {
@@ -12509,7 +12542,23 @@ async function spawnCli(
       throw new Error('[read-isolation] origin channel is unavailable');
     }
     childEnv.BOTMUX_READ_ISOLATED = '1';
+  }
+  if (readIsolationOriginChannelId) {
     childEnv.BOTMUX_ORIGIN_CHANNEL_ID = readIsolationOriginChannelId;
+  }
+
+  // Credential-only children have no writable relay outbox. Publish the same
+  // rotating managed-origin claim through a host-owned per-channel directory
+  // before the Seatbelt/bwrap wrapper is compiled, then expose only that
+  // directory read-only below.
+  if (readIsolationOriginChannelId && !sandboxRequested) {
+    readIsolationOriginCapabilityFile = managedOriginCapabilityPath(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    );
+    ensureManagedOriginCapabilityLeafSafe(readIsolationOriginCapabilityFile);
+    publishSandboxRelayCapability({ failClosed: true });
   }
 
   // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.
@@ -12743,7 +12792,11 @@ async function spawnCli(
     if (readIsolationOriginCapabilityFile) {
       ensureManagedOriginCapabilityLeafSafe(readIsolationOriginCapabilityFile);
       publishSandboxRelayCapability({ failClosed: true });
-      mandatoryReadOnlyPaths.push(readIsolationOriginCapabilityFile);
+      mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(
+        dataDir,
+        cfg.sessionId,
+        readIsolationOriginChannelId!,
+      ));
       mandatoryReadOnlyPaths.push(managedOriginAttestationDirectory(
         dataDir,
         cfg.sessionId,
@@ -13031,12 +13084,12 @@ async function spawnCli(
         isolationPaneMarkerContent(
           cfg.daemonBootId ?? '',
           appliedIsolationCapabilities,
-          willReadIsolate || willWriteSandbox
+          managedOriginChannelPolicyDigest
             ? {
                 originChannelId: persistentPaneOriginChannelId!,
                 readIsolation: willReadIsolate,
                 writeSandbox: willWriteSandbox,
-                policyDigest: darwinIsolationPolicyDigest!,
+                policyDigest: managedOriginChannelPolicyDigest,
               }
             : undefined,
         ),
@@ -13121,12 +13174,17 @@ async function spawnCli(
     });
     const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(profileDir, { recursive: true });
+    const originDirectory = managedOriginCapabilityDirectory(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId!,
+    );
     const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
     replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
-      rules.denyPaths.map(canonical),
+      [...rules.denyPaths.map(canonical), canonical(profileDir)],
+      [canonical(originDirectory)],
       [],
-      [],
-      [],
+      [canonical(profileDir)],
       rules.denyRegexes,
       undefined,
       {
@@ -13221,7 +13279,14 @@ async function spawnCli(
     const credentialSandbox = prepareCredentialOnlySandbox({
       hideDirectories: [...hideDirectories],
       hideFiles: [...hideFiles],
-      readonlyPaths: [realpathSync(panePolicyDir)],
+      privateReadonlyDirectories: [{
+        parent: realpathSync(panePolicyDir),
+        directory: realpathSync(managedOriginCapabilityDirectory(
+          isolationRuntimeDataDir,
+          cfg.sessionId,
+          readIsolationOriginChannelId!,
+        )),
+      }],
       workingDir: spawnCwd,
       cliBin: credentialCliBin,
       cliArgs: spawnArgs,

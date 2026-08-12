@@ -8,6 +8,8 @@ import { logger } from '../utils/logger.js';
 import { cliAuthBind, verifyHmac } from '../dashboard/auth.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
+import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
+import { DISPATCH_REPORT_REGISTER_ROUTE } from './dispatch-report-binding.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
 import {
@@ -633,6 +635,11 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
+  // A sandboxed report cannot read the host HMAC secret. This narrow route
+  // validates the current session's rotating capability, binds the dispatch
+  // root server-side, then lets the trusted daemon relay to the orchestrator.
+  if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
+  if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.

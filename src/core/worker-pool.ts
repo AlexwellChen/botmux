@@ -8902,12 +8902,13 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin with mismatched sessionId`);
           break;
         }
-        // macOS uses one stable per-session pathname visible inside Seatbelt.
+        // Isolated children use one stable per-session pathname visible through
+        // an exact Seatbelt/bwrap read carve-out.
         // Only the daemon handler for the CURRENT ChildProcess generation may
         // replace it. Stale workers can still emit IPC, but the identity guard
         // above drops them before filesystem mutation, so they cannot overwrite
         // a successor capability (or unlink it during teardown).
-        if (process.platform === 'darwin' && msg.originChannelId) {
+        if (msg.originChannelId) {
           if (!/^[a-f0-9]{64}$/.test(msg.originChannelId)) {
             ds.managedTurnOrigin = undefined;
             logger.error(`[${t}] Refused managed origin publication with an invalid pane channel`);
