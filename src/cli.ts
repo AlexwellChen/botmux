@@ -7045,6 +7045,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
+       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
        --mention <open_id:name>        @提及（可重复）
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
@@ -8068,6 +8069,9 @@ import {
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
+import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
+import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
+import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import { resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
@@ -8187,12 +8191,17 @@ async function relaySend(
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
-  const FLAGS_VAL = new Set(['--mention', '--quote']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
     if (FLAGS_NOVAL.has(tok)) flags.push(tok);
     else if (FLAGS_VAL.has(tok) && i + 1 < rest.length) flags.push(tok, rest[++i]);
+    else {
+      const equals = tok.indexOf('=');
+      const flag = equals > 0 ? tok.slice(0, equals) : tok;
+      if (FLAGS_VAL.has(flag)) flags.push(flag, tok.slice(equals + 1));
+    }
     // else dropped
   }
   // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
@@ -8371,7 +8380,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
   const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean };
+  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean; feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput };
   try {
     // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
     // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
@@ -8391,6 +8400,7 @@ async function registerSelfFromCredFile(): Promise<void> {
     apiOnly: cred.apiOnly === true || undefined,
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
+    feedback: cred.feedback,
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -8454,6 +8464,14 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   const deferredTurnId = process.env.BOTMUX_DEFERRED_SCHEDULE_TURN_ID;
   const deferredRoutingAnchor = process.env.BOTMUX_DEFERRED_SCHEDULE_ROUTING_ANCHOR;
   const deferredCreatedAt = process.env.BOTMUX_DEFERRED_SCHEDULE_CREATED_AT;
+  let feedback: import('./services/feedback-policy.js').FeedbackPolicy | undefined;
+  try {
+    const rawFeedback = process.env.BOTMUX_FEEDBACK_POLICY;
+    if (rawFeedback) feedback = normalizeFeedbackPolicy(JSON.parse(rawFeedback));
+  } catch {
+    // A malformed/missing remote env snapshot must not accidentally enable UI.
+    feedback = undefined;
+  }
 
   const botConfig = {
     larkAppId: appId,
@@ -8462,6 +8480,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     brand,
     cliId: 'riff',
     allowedUsers: [],
+    feedback,
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -8821,6 +8840,25 @@ async function cmdSend(rest: string[]): Promise<void> {
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
   const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
+  const responseKindOccurrences = rest.filter(token => token === '--response-kind' || token.startsWith('--response-kind=')).length;
+  if (responseKindOccurrences > 1) {
+    console.error('botmux send: --response-kind 只能指定一次');
+    process.exit(2);
+  }
+  if (flagPresentButValueMissing(rest, '--response-kind')) {
+    console.error('botmux send: --response-kind 仅支持 progress|final|auxiliary');
+    process.exit(2);
+  }
+  const responseKind = argValue(rest, '--response-kind');
+  if (responseKind !== undefined && responseKind !== 'progress' && responseKind !== 'final' && responseKind !== 'auxiliary') {
+    console.error('botmux send: --response-kind 仅支持 progress|final|auxiliary');
+    process.exit(2);
+  }
+  // Backward-compatible default: an unclassified proactive send is non-final.
+  // Only an explicit `final` may opt into feedback controls and indexing;
+  // `progress` and `auxiliary` (interim / supplementary output) both deliver
+  // normally without a feedback region, matching the requirement's three roles.
+  const effectiveResponseKind = responseKind ?? 'progress';
   const managedCustomCardError = managedVcCustomCardError(
     !!vcMeetingManagedSendOrigin,
     customCardRequested,
@@ -9472,6 +9510,29 @@ async function cmdSend(rest: string[]): Promise<void> {
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+  let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
+  let feedbackWebhookDestinations: import('./services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
+  try {
+    const botConfig = getBot(s.larkAppId).config;
+    feedbackWebhookDestinations = botConfig.feedbackWebhooks?.destinations;
+    feedbackPolicy = resolveFeedbackPolicyForDelivery({
+      dataDir: config.session.dataDir,
+      larkAppId: s.larkAppId,
+      chatId: s.chatId,
+      bot: botConfig,
+    });
+  } catch {
+    feedbackPolicy = undefined;
+  }
+  const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
+  if (feedbackPolicy && effectiveResponseKind === 'final' && !feedbackRequesterSubjectId) {
+    console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
+    process.exit(2);
+  }
+  if (feedbackPolicy && effectiveResponseKind === 'final' && (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin)) {
+    console.error('botmux send: --response-kind final 仅支持当前会话内的普通最终答案卡片');
+    process.exit(2);
+  }
 
   // Ambiguity gate for --mention-back. --mention-back means "@ back the one
   // counterpart who triggered this turn"; that is only unambiguous when this
@@ -10034,6 +10095,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // we committed to sending — that's the boundary the gate cares about.
     const sentAtMs = Date.now();
     let messageId: string;
+    let feedbackBaseCard: Record<string, unknown> | undefined;
     let failedAttachments: { path: string; error: string }[] = [];
     let failedVideoAttachments: { path: string; coverPath: string; error: string }[] = [];
     const pureVideoSend = customCard
@@ -10181,12 +10243,53 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
-      const cardJson = JSON.stringify({
-        schema: '2.0',
-        config: { update_multi: true },
-        body: { direction: 'vertical', elements },
-      });
-      messageId = await dispatchPrimary(cardJson, 'interactive');
+      if (feedbackPolicy && effectiveResponseKind === 'final') {
+        const canonicalCard = { schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements: [...elements] } } as { schema: string; config: Record<string, unknown>; body: { direction: string; elements: unknown[] } };
+        const feedbackElement = buildFeedbackElement(feedbackPolicy);
+        const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
+        canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
+        feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
+        messageId = await dispatchPrimary(JSON.stringify(feedbackBaseCard), 'interactive');
+      } else {
+        messageId = await dispatchPrimary(JSON.stringify({
+          schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements },
+        }), 'interactive');
+      }
+    }
+
+    if (feedbackPolicy && effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+      const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
+      const correlationDiscriminator = currentTurnId ? messageId : undefined;
+      try {
+        const { getSkillFeedbackStore } = await import('./services/skill-feedback-store.js');
+        const feedbackStore = await getSkillFeedbackStore(resolveDataDir());
+        feedbackStore.recordTurnDelivery({
+          botAppId: appId,
+          sessionId: sid,
+          turnId: deliveryTurnId,
+          correlationDiscriminator,
+          nativeSessionId: s.cliSessionId,
+          platform: 'lark',
+          platformAppId: appId,
+          platformMessageId: messageId,
+          chatId: targetChatId,
+          topicRootId: sendTarget.mode === 'thread' ? sendTarget.rootMessageId : s.rootMessageId,
+          dispatchAttempt: originDispatchAttempt,
+          content: text,
+          cliId: s.cliId,
+          cardMode: 'feedback',
+          status: 'delivered',
+          policy: feedbackPolicy,
+          baseCard: feedbackBaseCard,
+          requesterSubjectId: feedbackRequesterSubjectId,
+          webhookDestinations: feedbackWebhookDestinations,
+          context: { ...(resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) } : {}) },
+        });
+      } catch (error) {
+        console.error(
+          `botmux send: feedback indexing failed after delivery: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
 
     // Bridge fallback marker — append-only jsonl per session. Same-thread

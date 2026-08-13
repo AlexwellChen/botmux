@@ -74,6 +74,9 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
+import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
+import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
@@ -169,8 +172,11 @@ import {
   getDaemonStreamingCardUsageSnapshot,
   postTurnStartingCard,
   isSessionTransferring,
+  snapshotCodexAppFinalSettlements,
+  codexAppFinalSettlementCount,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
+import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
@@ -20412,6 +20418,29 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  // The final-answer feedback subsystem is OPTIONAL: a bot with feedback
+  // disabled still opens the shared feedback DB here for turn-completion
+  // indexing, but a bootstrap failure (shared-dataDir lock storm, corruption,
+  // disk full) must NOT abort daemon startup for that bot — that would let one
+  // optional subsystem take down every PM2 bot sharing the dataDir. Fail soft:
+  // log and continue; delivery-time paths degrade to best-effort on their own.
+  let feedbackWebhookDispatcher: ReturnType<typeof startFeedbackWebhookDispatcher> | undefined;
+  try {
+    const feedbackWebhookStore = await getSkillFeedbackStore(config.session.dataDir);
+    const feedbackWebhookSecrets = new FeedbackWebhookSecretStore(config.session.dataDir);
+    feedbackWebhookDispatcher = startFeedbackWebhookDispatcher({
+      store: feedbackWebhookStore,
+      readSecret: ref => feedbackWebhookSecrets.get(ref),
+      onError: error => logger.warn(`[feedback-webhook] ${error instanceof Error ? error.message : String(error)}`),
+    });
+    await feedbackWebhookDispatcher.ready;
+  } catch (error) {
+    logger.error(
+      `[feedback] subsystem bootstrap failed; continuing without feedback indexing/webhooks: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    feedbackWebhookDispatcher = undefined;
+  }
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
   // closed; silently rotating here could strand peers on mismatched tokens.
@@ -20738,13 +20767,35 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onQueuedActivationSubmitted,
-    onTurnTerminal(ds, terminal, context) {
+    async onTurnTerminal(ds, terminal, context) {
+      // VC reconcile first: it is in-memory and latency-sensitive, and must not
+      // sit behind a synchronous SQLite write. (Master did only this enqueue.)
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
       if (terminal.dispatchAttempt !== undefined && enqueued?.accepted) {
         logger.info(
           `[vc-delivery] terminal queued ${terminal.status} turn=${terminal.turnId.slice(0, 12)} `
           + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
         );
+      }
+      // Feedback turn-completion persistence is a synchronous node:sqlite write.
+      // Route it through the nonblocking, tracked retry queue so a cross-process
+      // write-lock (a `botmux send --response-kind final` subprocess) can never
+      // stall the daemon event loop up to busy_timeout — the queue fails fast on
+      // contention and retries on a timer that yields the loop. apiOnly bots
+      // never produce a feedback delivery, so skip them outright; everyone else
+      // enqueues (a hosted-team may have enabled feedback with no bot-level
+      // config, so we must not gate on bot config alone).
+      if (!getBot(ds.larkAppId).config.apiOnly) {
+        void enqueueTurnTerminal({
+          dataDir: config.session.dataDir,
+          botAppId: ds.larkAppId,
+          sessionId: ds.session.sessionId,
+          terminal: { turnId: terminal.turnId, dispatchAttempt: terminal.dispatchAttempt, status: terminal.status },
+          onError: error => logger.error(
+            `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          ),
+        });
       }
     },
     onDeferredScheduleTurnSettled(ds, context) {
@@ -21687,6 +21738,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     scheduler.stopScheduler();
+    // NOTE: turn-terminal queue drain + webhook dispatcher stop are deliberately
+    // deferred until AFTER workers have stopped producing (see below). Draining
+    // here would close queue admission while worker terminal IPC handlers are
+    // still alive, so a turn completing during shutdown would have its terminal
+    // refused and never persisted (delivery cannot be reconstructed to
+    // completed/failed/cancelled after the fact). Keep the queue and dispatcher
+    // live through worker teardown.
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
@@ -21717,29 +21775,59 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     ipcHandle.close().catch(() => { /* swallow */ });
     if (terminalProxy) terminalProxy.close().catch(() => { /* swallow */ });
 
-    const pendingExits: Array<Promise<void>> = [];
-    const survivors: ChildProcess[] = [];
-    const trackWorkerExit = (w: ChildProcess): void => {
-      if (w.exitCode !== null || w.signalCode !== null) return;
-      pendingExits.push(new Promise<void>(resolve => {
-        w.once('exit', () => resolve());
-        // Close the check/listener race if exit landed between the first
-        // status read and once().
-        if (w.exitCode !== null || w.signalCode !== null) resolve();
-      }));
-      survivors.push(w);
+    // Producer-closed fence. We must not close the turn-terminal queue admission
+    // until every worker's IPC channel is truly closed — a worker whose 'exit'
+    // Producer-quiescence fence. A worker whose 'exit' fired can still have
+    // queued 'message' terminals in flight; the IPC `disconnect` event is the
+    // real "no more terminals from this producer" signal (see producer-quiescence
+    // helper — it deliberately keys on disconnect, not 'close', which stdio
+    // inherited by grandchildren can delay). Dedup by ChildProcess.
+    // Two INDEPENDENT shutdown concerns, tracked over the same worker set but
+    // never conflated (conflating them regresses process reaping):
+    //   • reaping (workersToReap / workerExited): every live worker PROCESS must
+    //     exit or be SIGKILLed — orphan prevention. Keys on process death, NOT
+    //     on `connected`.
+    //   • producer fence (producerClosed): every worker's IPC channel must
+    //     disconnect — the "no more terminal messages" signal that gates closing
+    //     the feedback queue admission. Keys on `disconnect`, NOT on exit.
+    const producerClosed: Array<Promise<void>> = [];
+    const workerExited: Array<Promise<void>> = [];
+    const reapCandidates: ChildProcess[] = [];
+    const trackedProducers = new Set<ChildProcess>();
+    const trackedReap = new Set<ChildProcess>();
+    const trackWorker = (w: ChildProcess): void => {
+      // Producer fence: disconnect-based, gates feedback admission only.
+      if (!trackedProducers.has(w)) {
+        trackedProducers.add(w);
+        const q = trackProducerQuiet(w);
+        if (!q.alreadyQuiet && q.done) producerClosed.push(q.done);
+      }
+      // Reaping: exit-based, orphan prevention. Registered BEFORE any signal so
+      // a fast exit is not missed; dedup by ChildProcess.
+      if (!trackedReap.has(w)) {
+        trackedReap.add(w);
+        const e = trackProcessExited(w);
+        if (!e.alreadyExited && e.done) { workerExited.push(e.done); reapCandidates.push(w); }
+      }
     };
-    for (const worker of riffRetiredWorkers) trackWorkerExit(worker);
+    for (const worker of riffRetiredWorkers) trackWorker(worker);
     for (const ds of currentShutdownFleet.sessions) {
-      if (ds.worker && !ds.worker.killed) {
+      const w = ds.worker;
+      if (!w) continue;
+      // Track EVERY non-null worker (both concerns) unconditionally. `killed`
+      // only means a signal was already sent — NOT that the process exited or
+      // the IPC channel disconnected (a worker can be `killed=true &&
+      // connected=true` right after .kill(), e.g. the promoted-activation
+      // IPC-failure path that kills but defers ds.worker cleanup). `killed` only
+      // decides whether we still need to SEND a stop signal; it never decides
+      // whether the worker is tracked for reaping or the producer fence.
+      trackWorker(w);
+      if (!w.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
-        const w = ds.worker;
         const disposition = shutdownBackendDisposition(ds);
         if (disposition === 'riff-drain-detach') {
           throw new Error(`undrained Riff generation after atomic commit: ${ds.session.sessionId}`);
         }
-        // Capture the exit promise BEFORE killWorker nulls ds.worker.
-        trackWorkerExit(w);
         // Branch by the session's FROZEN backend (stamped on Session.backendType
         // at spawn), NOT the bot's live config — a dashboard backendType edit must
         // not change how a running session is torn down, or we'd e.g. try to
@@ -21764,24 +21852,88 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     }
 
-    if (pendingExits.length > 0) {
-      const exitGraceMs = Math.min(
-        DAEMON_WORKER_EXIT_GRACE_MS,
-        Math.max(0, shutdownDeadlineMs - Date.now()),
-      );
-      const timeout = new Promise<void>(resolve => setTimeout(resolve, exitGraceMs));
-      await Promise.race([Promise.all(pendingExits), timeout]);
+    // --- Staged producer quiescence before touching the feedback queue -------
+    // Contract (fail-closed): the turn-terminal queue admission may be closed
+    // (inside drainTurnTerminalQueue) ONLY after BOTH fences confirm quiescent
+    // within the shared absolute deadline:
+    //   (1) every worker IPC channel disconnected — no NEW terminal message can
+    //       be delivered; and
+    //   (2) every in-flight Codex App final-settlement resolved — an already
+    //       delivered final_output whose handler is awaiting network delivery
+    //       has finished its cb.onTurnTerminal (which synchronously enqueues).
+    // If either fence is not quiescent by the deadline we DO NOT close admission
+    // (closing it would refuse a terminal a still-live producer may yet emit —
+    // strictly worse than the pre-feature behaviour). We keep admission open,
+    // warn loudly, and let the process exit on its budget.
+    // Every wait shares the single absolute `shutdownDeadlineMs`; a ref'd
+    // keepalive (waitAllWithin) holds the loop so a fire-and-forget SIGTERM
+    // handler cannot exit mid-wait once workers/services have stopped.
+    const remainingBudget = (): number => Math.max(0, shutdownDeadlineMs - Date.now());
+
+    // --- Phase 1: process reaping (orphan prevention) ------------------------
+    // Give every live worker PROCESS a normal grace to exit, then SIGKILL any
+    // still alive, then confirm exit within the shared deadline. This is keyed
+    // on process death (exitCode/signalCode), independent of IPC state, so a
+    // worker that ignores SIGTERM — or that already disconnected its IPC but is
+    // still running — is still reaped and cannot become a ppid=1 orphan.
+    if (workerExited.length > 0) {
+      const exitGraceDeadline = Math.min(shutdownDeadlineMs, Date.now() + DAEMON_WORKER_EXIT_GRACE_MS);
+      await waitAllWithin(workerExited, exitGraceDeadline);
       let stragglers = 0;
-      for (const w of survivors) {
+      for (const w of reapCandidates) {
         if (w.exitCode === null && w.signalCode === null) {
           stragglers++;
           try { w.kill('SIGKILL'); } catch { /* already dead */ }
         }
       }
       if (stragglers > 0) {
-        logger.warn(`${stragglers}/${survivors.length} worker(s) didn't exit within ${exitGraceMs}ms — SIGKILL'd to prevent ppid=1 orphans.`);
+        logger.warn(`${stragglers}/${reapCandidates.length} worker(s) didn't exit within grace — SIGKILL'd to prevent ppid=1 orphans.`);
+        // Confirm the SIGKILLed processes actually exit, still within the deadline.
+        await waitAllWithin(workerExited, shutdownDeadlineMs);
       }
     }
+
+    // --- Phase 2: producer disconnect fence (gates feedback admission) -------
+    // Separate from reaping: this only decides whether it is safe to close the
+    // feedback queue admission. A late (but in-deadline) disconnect still counts
+    // as quiescent — we do not force it via SIGKILL here (Phase 1 already
+    // handled process liveness). By this point most workers have exited (which
+    // also disconnects their IPC), so producerClosed is typically already
+    // settled; we still await it explicitly under the shared deadline.
+    const disconnectQuiesced = await waitAllWithin(producerClosed, shutdownDeadlineMs);
+
+    // Settlement fence: only meaningful once IPC is confirmed disconnected (no
+    // new settlement can be created). Await the snapshot, then re-read the count
+    // — 0 confirms every in-flight settlement (and its enqueue) has completed.
+    let settlementQuiesced = false;
+    if (disconnectQuiesced) {
+      await waitAllWithin(snapshotCodexAppFinalSettlements(), shutdownDeadlineMs);
+      settlementQuiesced = codexAppFinalSettlementCount() === 0;
+    }
+
+    if (disconnectQuiesced && settlementQuiesced) {
+      // Both fences quiescent: safe to close admission and drain the last
+      // terminals into the durable outbox, bounded by the remaining budget.
+      const drainBudget = remainingBudget();
+      if (drainBudget > 0) {
+        const undrained = await drainTurnTerminalQueue(drainBudget);
+        if (undrained > 0) logger.warn(`[turn-completion] shutdown drain timed out with ${undrained} pending`);
+      } else {
+        logger.error('[turn-completion] shutdown deadline exhausted before drain — in-memory queued turn terminals were NOT persisted and are LOST (they are not yet in the durable store)');
+      }
+    } else {
+      // Fail-closed: a producer may still emit a terminal. Do NOT close
+      // admission (that would refuse and lose it). Hold open, warn, and let the
+      // process exit on its budget; unfinished work stays in the durable store.
+      logger.error(
+        `[turn-completion] shutdown producer quiescence NOT confirmed `
+        + `(ipcDisconnected=${disconnectQuiesced} settlementsSettled=${settlementQuiesced}); `
+        + `leaving feedback queue admission OPEN to avoid refusing a late terminal`,
+      );
+    }
+    // Dispatcher stop always receives the hard-clamped remaining budget (never
+    // its internal 5s default), success or failure path alike.
+    await feedbackWebhookDispatcher?.stop(remainingBudget());
 
     // Flush any pending identity-cache writes before exit. The cache uses a
     // 2s debounce on disk persistence to dedupe writes from chatty groups; on
